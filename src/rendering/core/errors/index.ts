@@ -7,3 +7,6 @@
 export * from './RenderingError'
 export * from './InvalidShaderModuleError'
 export * from './InvalidCubeTextureError'
+export * from './InvalidMaterialError'
+export * from './InvalidMeshError'
+export * from './InvalidPerspectiveCameraError'

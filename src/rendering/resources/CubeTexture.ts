@@ -11,6 +11,7 @@ import {
   type TexturePixelSnapshot2D,
   type TexturePixelSource2D
 } from '@/rendering/resources/texturePixelSnapshot'
+import { assertValidCubeFaceDimensions } from '@/rendering/resources/assertValidCubeFaceDimensions'
 import type { TextureImageSource } from '@/rendering/resources/Texture2D'
 
 /**
@@ -203,25 +204,10 @@ function createCubeDataSnapshot(
     createCubeDataFaceSnapshot(label, faces[5], 5, storage)
   ]
 
-  const firstFace = snapshots[0]
-
-  snapshots.slice(1).forEach((face, offset) => {
-    const faceIndex = offset + 1
-
-    if (face.width !== firstFace.width || face.height !== firstFace.height) {
-      throw new InvalidCubeTextureError(
-        label,
-        `data face ${faceIndex} dimensions ${face.width} × ${face.height} do not match face 0 dimensions ${firstFace.width} × ${firstFace.height}`,
-        {
-          faceIndex,
-          expectedWidth: firstFace.width,
-          expectedHeight: firstFace.height,
-          receivedWidth: face.width,
-          receivedHeight: face.height
-        }
-      )
-    }
-  })
+  assertValidCubeFaceDimensions(
+    snapshots,
+    (reason, details) => new InvalidCubeTextureError(label, reason, details)
+  )
 
   return Object.freeze({
     kind: 'data',

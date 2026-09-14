@@ -163,6 +163,34 @@ describe('CubeTexture CPU resource', () => {
     ).toThrow(InvalidCubeTextureError)
   })
 
+  /**
+   * 六面尺寸彼此相同并不代表它们是合法的 cubemap face；每一面自身还必须是
+   * 正方形。
+   *
+   * @remarks
+   * 如果生产代码只比较六面是否同尺寸，而不检查 `width === height`，那么六个
+   * 2 × 1 的 face 会错误地通过这个测试。
+   */
+  it('拒绝六面尺寸相同但不是正方形的 data cubemap', () => {
+    const createTexture = (): CubeTexture => {
+      return new CubeTexture({
+        label: 'non-square-cubemap',
+        source: {
+          kind: 'data',
+          faces: createDataFaces(2, 1)
+        },
+        storage: {
+          format: 'rgba',
+          type: 'uint8'
+        },
+        colorSpace: 'linear'
+      })
+    }
+
+    expect(createTexture).toThrow(InvalidCubeTextureError)
+    expect(createTexture).toThrow(/face 0 must be square/)
+  })
+
   it('把 data face 的数据类型错误转换成 CubeTexture 领域错误', () => {
     const faces = createDataFaces()
 
