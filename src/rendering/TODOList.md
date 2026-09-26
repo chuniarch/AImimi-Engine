@@ -34,6 +34,45 @@ Before changing `Resource.dispose()`, add focused tests for the chosen ordering,
 - `src/rendering/core/Resource.ts`
 - `tests/unit/rendering/core/Resource.test.ts`
 
+## WebGL context restore retry policy
+
+**Status:** Deferred and undecided. The current `WebGLContextLifecycle` reports a current restore failure as `restore-failed`, but it does not automatically call `restore()` again.
+
+### Current behavior
+
+- A browser `webglcontextrestored` event starts one engine-side restore attempt.
+- If the current attempt fails in `restore()` or `onReady()`, the lifecycle records the failure, enters `restore-failed`, and notifies `onRestoreFailed(error)`.
+- `onRestoreFailed` and `onSuppressedError` are notification hooks. Neither hook performs or schedules another restore attempt.
+- A stale callback failure may be reported for diagnostics, but it cannot start a retry or overwrite a newer lifecycle state.
+- No retry timer, retry counter, backoff policy, or public manual-retry entry point exists yet.
+
+### Decisions required before implementation
+
+- Decide whether recovery uses an explicit manual retry API, bounded automatic retries, or both.
+- Decide which restore failures are retryable and which failures should remain terminal until external intervention.
+- If automatic retry is allowed, define the maximum attempt count, delay/backoff policy, and whether jitter is required.
+- Define how `dispose()`, a newer context-lost transition, and another browser restored event cancel or supersede an in-flight or scheduled retry.
+- Define transactional cleanup for a partially rebuilt backend so one failed attempt cannot leak GPU resources into the next attempt.
+- Define how the render loop, UI, logging, and telemetry observe retrying, final failure, and eventual recovery.
+- Preserve `transitionVersion` authority: a retry originating from a stale callback must never mutate the current lifecycle.
+
+### Required verification
+
+Before implementing retries, add focused tests using a controllable scheduler for eventual success, maximum-attempt exhaustion, no overlapping attempts, cancellation by `dispose()`, supersession by a newer lost/restored transition, partial-rebuild cleanup, and the resulting `state`/`lastFailure`/notification sequence.
+
+### Search marker
+
+```text
+TODO(webgl-context-restore-retry-policy)
+```
+
+### Related files
+
+- `src/rendering/backend/webgl1/WebGLContextLifecycle.ts`
+- `tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts`
+- future `src/rendering/backend/webgl1/WebGL1Backend.ts`
+- future backend and browser context-recovery tests
+
 ## Geometry topology expansion
 
 **Status:** Deferred. The current static Geometry contract supports `triangles`, `lines`, `line-strip`, and `triangle-strip` only.
