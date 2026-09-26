@@ -2,9 +2,9 @@ name: Code Quality Check
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, dev-refactor]
   pull_request:
-    branches: [main, dev]
+    branches: [main, dev, dev-refactor]
 
 env:
   NODE_VERSION: '22.23.1'
