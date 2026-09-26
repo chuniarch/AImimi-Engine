@@ -10,7 +10,7 @@ import { SceneNode } from '@/rendering/scene/SceneNode'
  * traversal 和 world matrix 等行为全部继承自 SceneNode。
  *
  * Group 不隐式拥有 Geometry、Material 或其他 Resource，也不负责释放 GPU 对象。
- * 资源的显式所有权由 Scene.own() 管理。
+ * 资源存活由 Scene.retain() / Scene.release() 登记，按 Scene 引用计数决定何时释放。
  *
  * 除稳定诊断类型以外，本类不引入新的场景图行为。
  */
