@@ -13,6 +13,7 @@
   "eslint.quiet": false,
   "eslint.run": "onType",
   "editor.codeActionsOnSave": {
+    "source.fixAll": "never",
     "source.fixAll.eslint": "explicit"
   },
   "[glsl]": {

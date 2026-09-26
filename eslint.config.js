@@ -2,9 +2,10 @@ import js from '@eslint/js'
 import html from '@html-eslint/eslint-plugin'
 import importPlugin from 'eslint-plugin-import'
 import markdown from 'eslint-plugin-markdown'
-import eslintPluginPrettierRecommended from 'eslint-plugin-prettier/recommended'
 import globals from 'globals'
 import tseslint from 'typescript-eslint'
+// 不要引入 eslint-plugin-prettier/recommended；具体原因见配置数组末尾。
+import eslintConfigPrettier from 'eslint-config-prettier'
 
 const javascriptAndTypeScriptFiles = ['**/*.{js,mjs,cjs,ts,mts,cts}']
 
@@ -461,17 +462,32 @@ export default [
   },
 
   // ============================================================
-  // 必须放在最后
+  // Prettier / ESLint 职责边界：必须放在最后
   // ============================================================
 
   /**
-   * 它同时完成三件事：
+   * 这里只使用 eslint-config-prettier：
    *
-   * 1. 注册 eslint-plugin-prettier；
-   * 2. 启用 prettier/prettier；
-   * 3. 使用 eslint-config-prettier 关闭冲突格式规则。
+   * 1. 它仅关闭与 Prettier 冲突的 ESLint 格式规则；
+   * 2. 它本身不会执行格式化；
+   * 3. 实际格式化由 VS Code 的 Prettier formatter 或 Prettier CLI 完成。
    *
-   * 这里不能再在后面重新开启 semi、quotes 等 ESLint 格式规则。
+   * 不要替换为：
+   *
+   * `eslint-plugin-prettier/recommended`
+   *
+   * 后者会启用 prettier/prettier，使 ESLint 在自动修复时再次调用
+   * Prettier。如果同时启用 editor.formatOnSave，就会形成两条
+   * Prettier 格式化路径；该集成方式还存在保存时误删光标附近字符
+   * 的已知问题。
+   *
+   * 本项目保持以下职责分离：
+   *
+   * - Prettier：代码格式化；
+   * - ESLint：代码质量检查与修复；
+   * - eslint-config-prettier：关闭双方冲突的 ESLint 格式规则。
+   *
+   * @see https://github.com/prettier/eslint-plugin-prettier/issues/783
    */
-  eslintPluginPrettierRecommended
+  eslintConfigPrettier
 ]
