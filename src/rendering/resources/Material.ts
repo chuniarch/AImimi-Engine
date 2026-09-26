@@ -1,10 +1,10 @@
 import { assertNever } from '@/errors/helper/helpers'
 import { Resource } from '@/rendering/core/Resource'
 import { InvalidMaterialError, ResourceDisposedError } from '@/rendering/core/errors'
+import type { Vec3Tuple } from '@/rendering/core/math/tuples'
 import { CubeTexture } from '@/rendering/resources/CubeTexture'
 import { ShaderModule } from '@/rendering/resources/ShaderModule'
 import { Texture2D } from '@/rendering/resources/Texture2D'
-import type { Vec3Tuple } from '@/rendering/scene/Transform'
 
 /** 与 shader 的 vec2/vec4 对应的固定长度数值。 */
 export type Vec2ParameterValue = readonly [number, number]

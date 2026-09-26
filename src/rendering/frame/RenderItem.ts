@@ -1,6 +1,6 @@
+import type { Mat4Tuple } from '@/rendering/core/math/tuples'
 import type { Geometry } from '@/rendering/resources/Geometry'
 import type { Material } from '@/rendering/resources/Material'
-import type { Mat4Tuple } from './ViewState'
 
 /**
  * 一个 Mesh 在本帧抽取出的绘制数据，而不是整个 Mesh。

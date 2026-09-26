@@ -2,8 +2,9 @@ import { describe, expect, expectTypeOf, it } from 'vitest'
 
 import type { DrawSubmission, RenderBackend } from '@/rendering/backend/RenderBackend'
 import type { ClearDescriptor, RenderSurface } from '@/rendering/backend/RenderSurface'
+import type { Mat4Tuple } from '@/rendering/core/math/tuples'
 import type { RenderItem } from '@/rendering/frame/RenderItem'
-import type { Mat4Tuple, ViewState } from '@/rendering/frame/ViewState'
+import type { ViewState } from '@/rendering/frame/ViewState'
 import { RenderTarget } from '@/rendering/resources/RenderTarget'
 
 /**

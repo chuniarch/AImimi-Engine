@@ -1,15 +1,6 @@
 import { mat4, quat, vec3 } from 'gl-matrix'
 
-/**
- * Transform 对外暴露的三分量只读值。
- *
- * @remarks
- * getter 每次创建新的 tuple，因此调用者无法持有或修改内部 gl-matrix vec3。
- *
- * 内部 TRS 使用 Float32 存储，因此 getter 返回的是经过 Float32 量化后的数值。
- * 例如，输入的 JavaScript `0.1` 可能读取为 `0.10000000149011612`。
- */
-export type Vec3Tuple = readonly [number, number, number]
+import type { Vec3Tuple } from '@/rendering/core/math/tuples'
 
 /** gl-matrix 的 `quat.fromEuler()` 使用角度，而 Transform 的公开 API 使用弧度。 */
 const RADIANS_TO_DEGREES = 180 / Math.PI
@@ -70,6 +61,10 @@ function setFloat32ComponentsIfChanged(current: vec3, next: Vec3Tuple): boolean 
  * - 通过复制 API 输出矩阵，避免泄漏内部 Float32Array。
  *
  * rotation 的公开单位固定为弧度，三个分量依次表示 X、Y、Z 欧拉角。
+ *
+ * `position`、`rotation`、`scale` 三个 getter 每次创建新的 tuple，因此调用者无法持有
+ * 或修改内部 gl-matrix vec3。内部 TRS 使用 Float32 存储，getter 返回的是经过 Float32
+ * 量化后的数值。例如，输入的 JavaScript `0.1` 可能读取为 `0.10000000149011612`。
  *
  * [DESIGN-WEIGHT:3][transform-dirty-version-separation]
  *

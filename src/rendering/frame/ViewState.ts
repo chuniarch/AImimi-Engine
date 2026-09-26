@@ -1,24 +1,4 @@
-import type { Vec3Tuple } from '@/rendering/scene/Transform'
-
-/** 列主序 4×4 矩阵的 16 个数值；不是对 Camera 内部 Float32Array 的引用。 */
-export type Mat4Tuple = readonly [
-  number,
-  number,
-  number,
-  number,
-  number,
-  number,
-  number,
-  number,
-  number,
-  number,
-  number,
-  number,
-  number,
-  number,
-  number,
-  number
-]
+import type { Mat4Tuple, Vec3Tuple } from '@/rendering/core/math/tuples'
 
 /**
  * 一次帧提取产生的相机值快照。
