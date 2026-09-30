@@ -93,7 +93,7 @@ const PARAMETER_TYPES: Readonly<Record<MaterialParameter['type'], true>> = {
 }
 
 /** 拒绝把 null、数组或普通标量当作对象描述。 */
-function requireObject(value: unknown, fieldName: string): void {
+function assertObject(value: unknown, fieldName: string): void {
   if (value === null || typeof value !== 'object' || Array.isArray(value))
     throw new InvalidMaterialError(fieldName, 'must be a non-array object')
 }
@@ -164,7 +164,7 @@ function copyNumberArray(value: unknown, length: number, fieldName: string): num
 }
 
 /** 纹理或 shader 被其他所有者提前释放时，在实际借用处明确拒绝使用。 */
-function requireAlive(resource: Resource, resourceType: string): void {
+function assertAlive(resource: Resource, resourceType: string): void {
   if (resource.disposed) {
     throw new ResourceDisposedError(resourceType)
   }
@@ -178,7 +178,7 @@ function requireAlive(resource: Resource, resourceType: string): void {
  * 这里不复制纹理像素、不 retain、不 release，也不访问 GPU。
  */
 function copyParameter(parameter: MaterialParameter, fieldName: string): MaterialParameter {
-  requireObject(parameter, fieldName)
+  assertObject(parameter, fieldName)
 
   const runtimeType: unknown = parameter.type
 
@@ -230,7 +230,7 @@ function copyParameter(parameter: MaterialParameter, fieldName: string): Materia
       if (!(parameter.value instanceof Texture2D)) {
         throw new InvalidMaterialError(fieldName, 'must reference a Texture2D resource')
       }
-      requireAlive(parameter.value, 'Texture2D')
+      assertAlive(parameter.value, 'Texture2D')
       return { type: 'texture2D', value: parameter.value }
     }
 
@@ -238,7 +238,7 @@ function copyParameter(parameter: MaterialParameter, fieldName: string): Materia
       if (!(parameter.value instanceof CubeTexture)) {
         throw new InvalidMaterialError(fieldName, 'must reference a CubeTexture resource')
       }
-      requireAlive(parameter.value, 'CubeTexture')
+      assertAlive(parameter.value, 'CubeTexture')
       return { type: 'cubeTexture', value: parameter.value }
     }
 
@@ -258,7 +258,7 @@ function copyParameter(parameter: MaterialParameter, fieldName: string): Materia
  */
 function createRenderState(input: RenderStateInput | undefined): RenderState {
   const state = defaultIfUndefined(input, {})
-  requireObject(state, 'state')
+  assertObject(state, 'state')
 
   for (const key of Object.keys(state)) {
     if (!['depthTest', 'depthWrite', 'depthFunction', 'cullMode'].includes(key)) {
@@ -283,7 +283,7 @@ function createRenderState(input: RenderStateInput | undefined): RenderState {
 }
 
 /** 名称按原样保存，不 trim 后改名，也不在 CPU 层解析 GLSL 的 uniform 声明。 */
-function requireParameterName(name: string): void {
+function assertValidParameterName(name: string): void {
   if (typeof name !== 'string' || name.trim().length === 0) {
     throw new InvalidMaterialError('parameterName', 'must be a non-empty string')
   }
@@ -303,8 +303,8 @@ function prepareParameter(
   name: string,
   parameter: MaterialParameter
 ): MaterialParameter {
-  requireParameterName(name)
-  requireAlive(shader, 'ShaderModule')
+  assertValidParameterName(name)
+  assertAlive(shader, 'ShaderModule')
 
   if (Object.values(shader.builtInUniforms).includes(name))
     throw new InvalidMaterialError('parameters.' + name, 'is reserved by builtInUniforms')
@@ -346,14 +346,14 @@ export class Material extends Resource {
   constructor(options: MaterialOptions) {
     super()
 
-    requireObject(options, 'options')
+    assertObject(options, 'options')
 
     const shader = options.shaderModule
 
     if (!(shader instanceof ShaderModule))
       throw new InvalidMaterialError('shaderModule', 'must reference a ShaderModule resource')
 
-    requireAlive(shader, 'ShaderModule')
+    assertAlive(shader, 'ShaderModule')
 
     this.shaderModuleValue = shader
     this.queueValue = requireChoice(
@@ -364,7 +364,7 @@ export class Material extends Resource {
     this.stateValue = createRenderState(options.state)
 
     if (options.parameters !== undefined) {
-      requireObject(options.parameters, 'parameters')
+      assertObject(options.parameters, 'parameters')
 
       for (const [name, parameter] of Object.entries(options.parameters)) {
         this.parametersValue.set(name, prepareParameter(shader, name, parameter))
@@ -376,7 +376,7 @@ export class Material extends Resource {
   get shaderModule(): ShaderModule {
     this.assertUsable()
     const shader = this.shaderModuleValue!
-    requireAlive(shader, 'ShaderModule')
+    assertAlive(shader, 'ShaderModule')
     return shader
   }
 
@@ -401,7 +401,7 @@ export class Material extends Resource {
    */
   getParameter(name: string): MaterialParameter | undefined {
     this.assertUsable()
-    requireParameterName(name)
+    assertValidParameterName(name)
     const parameter = this.parametersValue.get(name)
 
     return parameter === undefined ? undefined : copyParameter(parameter, 'parameters.' + name)
