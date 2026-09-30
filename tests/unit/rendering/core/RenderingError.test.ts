@@ -17,7 +17,7 @@ import {
   ShaderCompilationError,
   UnsupportedIndexTypeError,
   UnsupportedRenderFeatureError,
-  UnsupportedShaderVariantError,
+  UnsupportedShaderLanguageError,
   WebGLBackendDisposedError,
   WebGLContextCreationError,
   WebGLContextLostError,
@@ -165,8 +165,8 @@ describe('RenderingError', () => {
       code: 'PROGRAM_LINK_FAILED'
     },
     {
-      error: new UnsupportedShaderVariantError('prt', 'webgl1'),
-      code: 'UNSUPPORTED_SHADER_VARIANT'
+      error: new UnsupportedShaderLanguageError('prt', 'glsl-es-300', 'webgl1'),
+      code: 'UNSUPPORTED_SHADER_LANGUAGE'
     },
     {
       error: new UnsupportedIndexTypeError('Uint32Array', 'OES_element_index_uint is unavailable'),
@@ -280,6 +280,40 @@ describe('RenderingError', () => {
       shaderName: 'prt',
       infoLog: 'varying mismatch'
     })
+  })
+
+  /**
+   * 保护的错误实现：
+   *
+   * - message 把「当前 backend 不支持这种 language」说成「ShaderModule 缺少当前 backend 的变体」；
+   * - 错误上下文没有记录被拒绝的 language。
+   */
+  it('UnsupportedShaderLanguageError 记录被拒绝的 language 与拒绝它的 backend', () => {
+    const error = new UnsupportedShaderLanguageError('prt', 'glsl-es-300', 'webgl1')
+
+    expect(error.message).toBe(
+      'Shader prt uses glsl-es-300, which the webgl1 backend does not support'
+    )
+    expect(error.code).toBe('UNSUPPORTED_SHADER_LANGUAGE')
+    expect(error.details).toEqual({
+      shaderName: 'prt',
+      language: 'glsl-es-300',
+      backendKind: 'webgl1'
+    })
+  })
+
+  /**
+   * 保护的错误实现：只靠 EngineError 的 `this.constructor.name` 取名。
+   * 生产构建用 terser 压缩类名后，这样取到的 name 是空字符串。
+   */
+  it('UnsupportedShaderLanguageError 的 name 不依赖类名', () => {
+    // 模拟压缩器改掉类名：子类的 name 被清空，constructor.name 不再可信。
+    class Minified extends UnsupportedShaderLanguageError {}
+    Object.defineProperty(Minified, 'name', { value: '' })
+
+    const error = new Minified('prt', 'glsl-es-300', 'webgl1')
+
+    expect(error.name).toBe('UnsupportedShaderLanguageError')
   })
 
   /**

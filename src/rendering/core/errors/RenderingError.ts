@@ -251,21 +251,25 @@ export class ProgramLinkError extends RenderingError {
   }
 }
 
-/** 表示 ShaderModule 没有提供当前 backend 所需的源码变体。 */
-export class UnsupportedShaderVariantError extends RenderingError {
+/** 表示 ShaderModule 本身合法，但当前 backend 不支持它选择的 shader language。 */
+export class UnsupportedShaderLanguageError extends RenderingError {
   /**
-   * @param shaderName - 缺少变体的 ShaderModule 名称。
-   * @param backendKind - 请求源码变体的 backend 种类。
+   * @param shaderName - 被拒绝的 ShaderModule 名称。
+   * @param language - 该 ShaderModule 选择的 shader language。
+   * @param backendKind - 不支持该 language 的 backend 种类。
    */
-  constructor(shaderName: string, backendKind: string) {
+  constructor(shaderName: string, language: string, backendKind: string) {
     super(
-      `Shader ${shaderName} does not provide a ${backendKind} variant`,
-      'UNSUPPORTED_SHADER_VARIANT',
+      `Shader ${shaderName} uses ${language}, which the ${backendKind} backend does not support`,
+      'UNSUPPORTED_SHADER_LANGUAGE',
       {
         shaderName,
+        language,
         backendKind
       }
     )
+
+    this.name = 'UnsupportedShaderLanguageError'
   }
 }
 

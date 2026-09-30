@@ -4,7 +4,7 @@ import {
   ProgramLinkError,
   ResourceDisposedError,
   ShaderCompilationError,
-  UnsupportedShaderVariantError,
+  UnsupportedShaderLanguageError,
   WebGLBackendDisposedError,
   WebGLContextLostError,
   WebGLResourceCreationError
@@ -70,11 +70,28 @@ describe('WebGL1ProgramManager', () => {
     expect(b.manager.get(shader).program).not.toBe(first.program)
   })
 
-  it('GLSL ES 3.00 在任何 GPU 创建前拒绝', () => {
+  /** 在 compile 前拒绝，并在错误里记下被拒绝的 language；参数传反也会被发现。 */
+  it('GLSL ES 3.00 在任何 GPU 创建前拒绝，并记录被拒绝的 language', () => {
     const f = setup()
+    let caughtError: unknown
 
-    expect(() => f.manager.get(createShader('glsl-es-300'))).toThrow(UnsupportedShaderVariantError)
+    try {
+      f.manager.get(createShader('glsl-es-300'))
+    } catch (error) {
+      caughtError = error
+    }
 
+    expect(caughtError).toBeInstanceOf(UnsupportedShaderLanguageError)
+
+    if (!(caughtError instanceof UnsupportedShaderLanguageError)) {
+      throw new Error('Expected UnsupportedShaderLanguageError')
+    }
+
+    expect(caughtError.details).toEqual({
+      shaderName: 'triangle',
+      language: 'glsl-es-300',
+      backendKind: 'webgl1'
+    })
     expect(f.calls.createShader).not.toHaveBeenCalled()
   })
 

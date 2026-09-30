@@ -2,7 +2,7 @@ import {
   ProgramLinkError,
   ResourceDisposedError,
   ShaderCompilationError,
-  UnsupportedShaderVariantError,
+  UnsupportedShaderLanguageError,
   WebGLBackendDisposedError,
   WebGLContextLostError,
   WebGLResourceCreationError,
@@ -90,7 +90,7 @@ export class WebGL1ProgramManager {
     if (cached !== undefined) return cached.resource
 
     if (shader.language !== 'glsl-es-100') {
-      throw new UnsupportedShaderVariantError(shader.name, 'webgl1')
+      throw new UnsupportedShaderLanguageError(shader.name, shader.language, 'webgl1')
     }
 
     const gl = this.gl
