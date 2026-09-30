@@ -15,5 +15,7 @@ export class InvalidShaderModuleError extends RenderingError {
       shaderName,
       reason
     })
+
+    this.name = 'InvalidShaderModuleError'
   }
 }
