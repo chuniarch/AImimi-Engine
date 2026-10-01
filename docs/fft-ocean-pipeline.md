@@ -15,7 +15,7 @@ JONSWAP 参数
 对应当前主线文件：
 
 ```text
-src/scenes/water/fftOcean/loadFFTOceanScene-multi-layers-v3.ts
+src/scenes/water/fftOcean/loadFFTOceanScene-multi-layers-v4.ts
 src/renderers/passes/fft/FFTOceanComputePass-multi-layers-v3.ts
 src/simulation/ocean/fft/InitialSpectrum.ts
 src/simulation/ocean/spectrums/JONSWAPSpectrum.ts

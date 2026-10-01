@@ -97,12 +97,5 @@ export const ShaderPaths = {
   SINE_WAVE_FRAGMENT: urlJoin(S, 'water/simpleWaves/sineWave/fragment.frag'),
   // Gerstner Wave
   GERSTNER_WAVE_VERTEX: urlJoin(S, 'water/simpleWaves/gerstnerWave/vertex.vert'),
-  GERSTNER_WAVE_FRAGMENT: urlJoin(S, 'water/simpleWaves/gerstnerWave/fragment.frag'),
-
-  // ==================== Shadertoy ====================
-  SHADERTOY_COMMON_VERTEX: urlJoin(S, 'shadertoy/commonVertex.vert'),
-  SHADERTOY_LERRAIN_CLOUD_OVER_SEA_AND_PEAK_FRAGMENT: urlJoin(
-    S,
-    'shadertoy/lerrain/cloudsOverSeaAndPeaks/fragment.frag'
-  )
+  GERSTNER_WAVE_FRAGMENT: urlJoin(S, 'water/simpleWaves/gerstnerWave/fragment.frag')
 }

@@ -12,7 +12,7 @@
 
 ```text
 src/main.ts
-src/scenes/water/fftOcean/loadFFTOceanScene-multi-layers-v3.ts
+src/scenes/water/fftOcean/loadFFTOceanScene-multi-layers-v4.ts
 ```
 
 你应该能回答：

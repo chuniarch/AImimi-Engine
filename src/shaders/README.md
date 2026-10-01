@@ -67,10 +67,6 @@ shaders/
 │       ├── order2/           ← 2 阶球谐（4 系数）
 │       └── order3/           ← 3 阶球谐（9 系数）
 │
-├── shadertoy/                ← Shadertoy 风格的程序化着色实验
-│   └── lerrain/              ← 作者 lerrain 的作品移植
-│       └── cloudsOverSeaAndPeaks/  ← 云海与山峰
-│
 └── water/                    ← 水面相关
     ├── simpleWaves/          ← 解析式 GPU 波形（无需 CPU 配合）
     │   ├── sineWave/         ← 正弦波叠加
@@ -128,14 +124,6 @@ varying highp vec3 vWorldPos; // 顶点世界空间位置
 varying highp vec3 vNormalWorld; // 顶点世界空间法线
 varying highp vec2 vTexCoord; // 顶点 UV
 varying highp vec4 vTangent; // 顶点切线（必要时带 bitangent sign）
-```
-
-### Shadertoy 兼容 uniform（仅 shadertoy/ 子目录使用）
-
-```glsl
-uniform vec3 iResolution; // 视口分辨率（像素）
-uniform float iTime; // 着色器播放时间（秒）
-uniform vec4 iMouse; // 鼠标坐标（xy: current, zw: click）
 ```
 
 ## 四、跨文件约定（必读）

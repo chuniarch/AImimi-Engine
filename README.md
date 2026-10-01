@@ -82,16 +82,15 @@ FFT 海洋管线的端到端细节见 [docs/fft-ocean-pipeline.md](docs/fft-ocea
 
 ## 场景与模块 (Scenes & Modules)
 
-| 场景                | 内容                                |
-| ------------------- | ----------------------------------- |
-| `games202/hw1`      | 实时阴影 (Shadow Map → PCSS)        |
-| `games202/hw2`      | 预计算辐射传输 (PRT),球谐 (SH) 光照 |
-| `games202/hw3`      | 屏幕空间反射 (SSR),cave / cube 场景 |
-| `games202/hw4`      | Kulla-Conty 多次散射 BRDF + IBL     |
-| `water/fftOcean`    | 多层级 cascade FFT 海洋             |
-| `shadertoy/lerrian` | Shadertoy 移植                      |
-| `environment`       | 天空盒 (skybox) / 背景              |
-| `axes`              | 调试用坐标轴                        |
+| 场景             | 内容                                |
+| ---------------- | ----------------------------------- |
+| `games202/hw1`   | 实时阴影 (Shadow Map → PCSS)        |
+| `games202/hw2`   | 预计算辐射传输 (PRT),球谐 (SH) 光照 |
+| `games202/hw3`   | 屏幕空间反射 (SSR),cave / cube 场景 |
+| `games202/hw4`   | Kulla-Conty 多次散射 BRDF + IBL     |
+| `water/fftOcean` | 多层级 cascade FFT 海洋             |
+| `environment`    | 天空盒 (skybox) / 背景              |
+| `axes`           | 调试用坐标轴                        |
 
 `src/` 关键模块:`engine.ts`(引擎入口)、`renderers/`(pass 与 renderer)、`simulation/ocean/`(频谱与 IFFT)、`shaders/`、`materials/`、`scenes/`。
 

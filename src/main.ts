@@ -15,9 +15,7 @@ import { NetworkOfflineError } from './errors/EngineError/NetworkError/NetworkOf
 import { HttpError } from './errors/EngineError/NetworkError/HTTPError'
 import { EngineInitializationError } from './errors/EngineError/EngineInitializationError'
 
-// import { loadFFTOceanScene as loadFFTOceanSceneV3 } from './scenes/water/fftOcean/loadFFTOceanScene-multi-layers-v3'
 import { loadFFTOceanScene as loadFFTOceanSceneV4 } from './scenes/water/fftOcean/loadFFTOceanScene-multi-layers-v4'
-// import { loadScene as loadCloudsOverSeaAndPeaksScene } from './scenes/shadertoy/lerrian/cloudsOverSeaAndPeaks/loadScene'
 import { loadGames202Scenes } from './scenes/games202/loadGames202Scene'
 
 let titleEle = document.querySelector('head title')
@@ -58,8 +56,6 @@ engine
     // return engine.loadScene(loadWater)
     // fft ocean
     return engine.loadScene(loadFFTOceanSceneV4)
-    // ----- 加载 Shadertoy Scene -----
-    // return engine.loadScene(loadCloudsOverSeaAndPeaksScene)
   })
   .then(() => {
     engine.start()
