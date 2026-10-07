@@ -51,11 +51,10 @@ function fixture() {
     throw new Error('Test framebuffer is incomplete')
   }
 
-  const target = new RenderTarget({
-    width: 8,
-    height: 8,
-    colors: [{ format: 'rgba8' }]
-  })
+  const target = new RenderTarget(
+    { width: 8, height: 8, colors: [{ format: 'rgba8' }] },
+    { label: 'test/browser-surface' }
+  )
 
   const scope = new WebGL1SurfaceScope(gl, new WebGL1State(gl), {
     assertReady: () => {

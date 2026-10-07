@@ -157,11 +157,10 @@ function harness() {
     },
 
     target(width = 16, height = 8) {
-      const target = new RenderTarget({
-        width,
-        height,
-        colors: [{ format: 'rgba8' }]
-      })
+      const target = new RenderTarget(
+        { width, height, colors: [{ format: 'rgba8' }] },
+        { label: 'test/surface-scope' }
+      )
 
       const resource = { framebuffer: {}, width, height }
       resources.set(target, resource)

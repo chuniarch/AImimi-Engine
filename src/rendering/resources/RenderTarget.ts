@@ -41,6 +41,20 @@ export interface RenderTargetDescriptor {
 }
 
 /**
+ * RenderTarget 的诊断元数据，不属于 GPU 存储描述。
+ *
+ * @remarks
+ * [DESIGN-WEIGHT:2][render-target-diagnostic-label]
+ *
+ * label 必须显式提供且不能全为空白，例如 shadow/main 或 gbuffer/main。
+ * 允许多个目标重名；Manager 仍使用 RenderTarget 对象身份作为缓存键。
+ * 将它与 descriptor 分开，避免诊断名称参与附件布局、resize 或 revision 的语义。
+ */
+export interface RenderTargetOptions {
+  readonly label: string
+}
+
+/**
  * 保留预期字段名，但不信任字段是否存在以及字段值是否正确。
  *
  * @remarks
@@ -309,6 +323,17 @@ function createDescriptorSnapshot(value: unknown): RenderTargetDescriptor {
 export class RenderTarget extends Resource {
   protected override readonly resourceType = 'RenderTarget'
 
+  /**
+   * 创建时复制的诊断名称；对 TypeScript 调用者只读，不是唯一标识。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:2][render-target-diagnostic-label]
+   *
+   * 保存字符串值而非 options 引用，因此修改输入对象不会改变此标签。
+   * resize 只更新存储描述与 revision；dispose 仍保留标签，便于事后诊断。
+   */
+  public readonly label: string
+
   /** 当前完整的不可变 CPU 描述；正常释放通知结束后清空。 */
   private descriptorValue: RenderTargetDescriptor | null
   /** 描述版本，不是 GPU 已完成创建的证明，也不是撤销历史。 */
@@ -316,11 +341,21 @@ export class RenderTarget extends Resource {
 
   /**
    * @param descriptor - 完整尺寸与附件布局。
-   * @throws InvalidRenderTargetError 任一字段不合法；不会留下 GPU 半成品。
+   * @param options - 独立诊断选项，必须包含非空白的 label。
+   * @throws InvalidRenderTargetError 描述或标签不合法；不会留下 GPU 半成品。
    */
-  constructor(descriptor: RenderTargetDescriptor) {
+  constructor(descriptor: RenderTargetDescriptor, options: RenderTargetOptions) {
     super()
 
+    const input = requireRecord(options, 'options')
+    const label = input.label
+    if (typeof label !== 'string' || label.trim().length === 0) {
+      throw new InvalidRenderTargetError('options.label', 'must be a non-blank string', {
+        received: label
+      })
+    }
+
+    this.label = label
     this.descriptorValue = createDescriptorSnapshot(descriptor)
   }
 

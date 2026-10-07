@@ -102,12 +102,15 @@ function populate(f: ReturnType<typeof setup>) {
     geometry: geometry(),
     shader: shader(),
     cube: cube(),
-    target: new RenderTarget({
-      width: 4,
-      height: 4,
-      colors: [{ format: 'rgba8' }],
-      depth: { format: 'depth16' }
-    })
+    target: new RenderTarget(
+      {
+        width: 4,
+        height: 4,
+        colors: [{ format: 'rgba8' }],
+        depth: { format: 'depth16' }
+      },
+      { label: 'test/resource-manager' }
+    )
   }
   const gpu = {
     geometry: f.members.geometries.get(cpu.geometry),

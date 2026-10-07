@@ -57,11 +57,10 @@ describe('RenderBackend boundary contract', () => {
 
   /** 描述只借用目标；不 retain，也不把已释放目标自动替换为屏幕。 */
   it('scope descriptor 不取得目标生命周期所有权', () => {
-    const target = new RenderTarget({
-      width: 16,
-      height: 8,
-      colors: [{ format: 'rgba8' }]
-    })
+    const target = new RenderTarget(
+      { width: 16, height: 8, colors: [{ format: 'rgba8' }] },
+      { label: 'test/backend-surface' }
+    )
 
     const descriptor: RenderSurfaceScopeDescriptor = {
       surface: { kind: 'render-target', target },

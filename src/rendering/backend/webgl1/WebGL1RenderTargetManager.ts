@@ -78,7 +78,12 @@ export class WebGL1RenderTargetManager {
     const revision = target.revision
     if (old?.resource.revision === revision) return old.resource
 
-    const label = 'RenderTarget revision ' + revision
+    /**
+     * [DESIGN-WEIGHT:2][render-target-diagnostic-label]
+     * 名称定位逻辑用途，revision 定位本次存储配置；二者仅用于诊断。
+     * entries 仍按 target 对象身份缓存，不能因同名而合并不同目标。
+     */
+    const label = target.label + ' (RenderTarget revision ' + revision + ')'
     let next: WebGL1RenderTargetResource | undefined
 
     try {

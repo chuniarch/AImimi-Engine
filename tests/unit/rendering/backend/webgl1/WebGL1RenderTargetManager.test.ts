@@ -14,13 +14,16 @@ import { WebGL1RenderTargetManager } from '@/rendering/backend/webgl1/WebGL1Rend
 import { createFakeWebGL1TextureContext } from '../fakes/createFakeWebGL1TextureContext'
 
 /** CPU 允许多个槽位；设备是否支持由 Manager 单独决定。 */
-function target(colors = 1, depth = true): RenderTarget {
-  return new RenderTarget({
-    width: 8,
-    height: 4,
-    colors: Array.from({ length: colors }, () => ({ format: 'rgba8' as const })),
-    ...(depth ? { depth: { format: 'depth16' as const } } : {})
-  })
+function target(colors = 1, depth = true, label = 'test/render-target'): RenderTarget {
+  return new RenderTarget(
+    {
+      width: 8,
+      height: 4,
+      colors: Array.from({ length: colors }, () => ({ format: 'rgba8' as const })),
+      ...(depth ? { depth: { format: 'depth16' as const } } : {})
+    },
+    { label }
+  )
 }
 
 function setup(mrt = false) {
@@ -41,6 +44,63 @@ function setup(mrt = false) {
 }
 
 describe('WebGL1RenderTargetManager', () => {
+  /**
+   * FBO 检查失败必须指出具体逻辑目标与本次配置版本。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:2][render-target-diagnostic-label]
+   * 如果 Manager 仍只拼接类名，多个 revision 相同的目标将无法区分。
+   * 分别覆盖首次创建和 resize 后创建；只触发一次创建以保留真正的首个错误。
+   */
+  it.each([0, 1])('FBO 不完整时保留目标 label 与 revision %i', (revision) => {
+    const f = setup()
+    const cpu = target(1, true, 'fft/ping')
+    if (revision === 1) cpu.resize(16, 8)
+    f.api.checkFramebufferStatus.mockReturnValueOnce(0x8cd6)
+
+    let failure: unknown
+    try {
+      f.manager.get(cpu)
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(IncompleteFramebufferError)
+    const error = failure as IncompleteFramebufferError
+    expect(error.message).toContain('fft/ping')
+    expect(error.details.targetLabel).toContain('fft/ping')
+    expect(error.details.targetLabel).toContain('revision ' + revision)
+    expect(error.details.status).toBe(0x8cd6)
+  })
+
+  /**
+   * label 是诊断文本而非机器身份；重名不能合并两个 owner 的资源。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][render-target-cache-identity]
+   * 如果缓存错误地改成按 label 索引，第二个目标会借到第一个目标的 handle，
+   * 或释放第一个目标时连带破坏第二个目标；本测试同时观察这两种故障。
+   */
+  it('同名目标仍独立缓存，释放一个不会删除另一个的 GPU 对象', () => {
+    const f = setup()
+    const first = target(1, true, 'fft/shared')
+    const second = target(1, true, 'fft/shared')
+    const firstGPU = f.manager.get(first)
+    const secondGPU = f.manager.get(second)
+
+    expect(firstGPU.framebuffer).not.toBe(secondGPU.framebuffer)
+    expect(firstGPU.colorTextures[0]).not.toBe(secondGPU.colorTextures[0])
+    expect(f.manager.get(first)).toBe(firstGPU)
+    expect(f.manager.get(second)).toBe(secondGPU)
+
+    first.dispose()
+    expect(f.deleted).toContain(firstGPU.framebuffer)
+    expect(f.deleted).not.toContain(secondGPU.framebuffer)
+    expect(f.deleted).not.toContain(secondGPU.colorTextures[0])
+    expect(f.manager.get(second)).toBe(secondGPU)
+    f.manager.dispose()
+  })
+
   it('创建 rgba8 + depth16，缓存并解析附件，不取得 CPU 所有权', () => {
     const f = setup()
     const cpu = target()
