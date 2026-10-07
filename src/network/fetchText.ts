@@ -1,32 +1,23 @@
 import { HttpError } from '@/errors/EngineError/NetworkError/HTTPError'
 import { fetchWithTimeout } from './http'
 import { FetchOptions } from './types/fetch-options'
-import { NetworkError } from '@/errors/EngineError/NetworkError/BaseError'
 
 /**
- * 获取文本内容（处理 HTTP 状态）
- *
- * 职责：
- * - 检查 HTTP 状态码
- * - 解析为文本
- * - 抛出对应的 HTTP 错误
+ * 获取文本内容：检查 HTTP 状态，再读出全文。
+ * 取消、超时、网络错误都由 fetchWithTimeout 统一处理，这里不需要 try/catch。
  */
 export async function fetchTextWithTimeout(
   url: string,
   options: FetchOptions = {}
 ): Promise<string> {
-  try {
-    const response = await fetchWithTimeout(url, options)
-
-    // const DEBUG_FUNCTION_NAME = 'fetchTextWithTimeout'
-
-    // 判断 HTTP 状态
+  return fetchWithTimeout(url, options, async (response) => {
+    // 服务器回应了，但给的不是我们要的文件（404 等）：重试没用
     if (!response.ok) {
       throw new HttpError(url, response.status, response.statusText)
     }
 
+    // 开发服务器对不存在的路径常常回 index.html（SPA fallback），状态码却是 200
     const contentType = response.headers.get('content-type') ?? ''
-    // console.debug(`[${DEBUG_FUNCTION_NAME}] ${contentType}`)
     if (contentType.includes('text/html')) {
       throw new HttpError(
         url,
@@ -36,13 +27,5 @@ export async function fetchTextWithTimeout(
     }
 
     return await response.text()
-  } catch (error) {
-    // 如果已经是网络错误，包括 网络层 和 HTTP 层，以及 用户主动取消请求的 Abort Error，则直接抛出
-    if (error instanceof NetworkError || (error instanceof Error && error.name === 'AbortError')) {
-      throw error
-    }
-
-    // 防御性编程，可能抛出 response.text() 相关错误，需要上层处理
-    throw new NetworkError(url, error instanceof Error ? error.message : 'Unknown error')
-  }
+  })
 }
