@@ -55,8 +55,30 @@ export class RenderListBuilder {
     const viewMatrix = new Float32Array(16)
     const projection = new Float32Array(16)
 
+    /**
+     * 将相机的当前世界矩阵写入本次 build 独立创建的 Float32 缓冲。
+     *
+     * @remarks
+     * [DESIGN-WEIGHT:3][frame-camera-value-snapshot]
+     *
+     * copyWorldMatrixTo 会先更新相机及其祖先的世界矩阵，再复制 16 个分量。
+     * cameraWorld 不与 Camera 的内部矩阵共用存储，所以相机后续修改不会改变它。
+     * 但 cameraWorld 仍是可写的临时 Float32Array，复制本身并不等于冻结或验证。
+     */
     camera.copyWorldMatrixTo(cameraWorld)
 
+    /**
+     * 验证 16 个分量均为有限数，并生成冻结的普通数组 world。
+     *
+     * @remarks
+     * [DESIGN-WEIGHT:2][frame-camera-validation-copy]
+     *
+     * world 供下面求逆和提取世界位置使用。这里复用 copyMat4Snapshot，
+     * 因而同时执行验证、复制和冻结；第二次复制并非隔离 Camera 所必需，
+     * 因为上一行已经完成存储隔离，且 cameraWorld 不会被跨 Mesh 复用。
+     * 若未来将验证独立为不复制的操作，可直接用 cameraWorld 求逆、读取位置，
+     * 但仍须保留有限数验证及下面的不可逆矩阵检查。
+     */
     const world = copyMat4Snapshot(cameraWorld, 'camera.worldMatrix')
 
     if (mat4.invert(viewMatrix, world) === null)
