@@ -1,6 +1,7 @@
 import { mat4 } from 'gl-matrix'
 
 import { InvalidPerspectiveCameraError } from '@/rendering/core/errors'
+import { assertNonArrayObject, requireFiniteNumber } from '@/rendering/core/validation'
 import { Camera } from '@/rendering/scene/cameras/Camera'
 
 /** 一组完整的透视参数；构造及修改均显式提供全部字段。 */
@@ -13,16 +14,6 @@ export interface PerspectiveCameraOptions {
   readonly near: number
   /** 远裁剪平面到相机的正距离，必须大于 near；本版不接受 Infinity。 */
   readonly far: number
-}
-
-/** 验证 JS/外部数据的运行时类型，不只依赖会在编译后消失的 TS 类型。 */
-function requireFiniteNumber(value: unknown, fieldName: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value))
-    throw new InvalidPerspectiveCameraError(fieldName, 'must be a finite number', {
-      received: value
-    })
-
-  return value
 }
 
 /**
@@ -45,13 +36,38 @@ function requireFiniteNumber(value: unknown, fieldName: string): number {
  * @throws {@link InvalidPerspectiveCameraError} 输入类型、范围或参数关系不合法。
  */
 function copyValidatedOptions(options: PerspectiveCameraOptions): PerspectiveCameraOptions {
-  if (options === null || typeof options !== 'object' || Array.isArray(options))
-    throw new InvalidPerspectiveCameraError('options', 'must be a non-array object')
+  assertNonArrayObject(
+    options,
+    () => new InvalidPerspectiveCameraError('options', 'must be a non-array object')
+  )
 
-  const fovY = requireFiniteNumber(options.fovY, 'fovY')
-  const aspect = requireFiniteNumber(options.aspect, 'aspect')
-  const near = requireFiniteNumber(options.near, 'near')
-  const far = requireFiniteNumber(options.far, 'far')
+  // 每个字段只读取一次；失败工厂捕获原值，不重新访问可能带 getter 的外部对象。
+  const fovYInput = options.fovY
+  const fovY = requireFiniteNumber(
+    fovYInput,
+    () =>
+      new InvalidPerspectiveCameraError('fovY', 'must be a finite number', { received: fovYInput })
+  )
+  const aspectInput = options.aspect
+  const aspect = requireFiniteNumber(
+    aspectInput,
+    () =>
+      new InvalidPerspectiveCameraError('aspect', 'must be a finite number', {
+        received: aspectInput
+      })
+  )
+  const nearInput = options.near
+  const near = requireFiniteNumber(
+    nearInput,
+    () =>
+      new InvalidPerspectiveCameraError('near', 'must be a finite number', { received: nearInput })
+  )
+  const farInput = options.far
+  const far = requireFiniteNumber(
+    farInput,
+    () =>
+      new InvalidPerspectiveCameraError('far', 'must be a finite number', { received: farInput })
+  )
 
   if (fovY <= 0 || fovY >= Math.PI) {
     throw new InvalidPerspectiveCameraError('fovY', 'must satisfy 0 < fovY < PI', { fovY })

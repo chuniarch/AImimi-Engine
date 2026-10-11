@@ -1,4 +1,4 @@
-import { InvalidMeshError, ResourceDisposedError } from '@/rendering/core/errors'
+import { InvalidMeshError } from '@/rendering/core/errors'
 import { Geometry } from '@/rendering/resources/Geometry'
 import { Material } from '@/rendering/resources/Material'
 import { SceneNode } from '@/rendering/scene/SceneNode'
@@ -30,15 +30,15 @@ export class Mesh extends SceneNode {
    * @param geometry - 未释放的逻辑几何资源。
    * @param material - 未释放的逻辑材质资源。
    * @throws {@link InvalidMeshError} 输入不是对应的逻辑资源实例。
-   * @throws {@link ResourceDisposedError} 对应资源已释放。
+   * @throws ResourceDisposedError 对应资源已释放。
    */
   constructor(geometry: Geometry, material: Material) {
     super()
 
     if (!(geometry instanceof Geometry)) throw new InvalidMeshError('geometry')
     if (!(material instanceof Material)) throw new InvalidMeshError('material')
-    if (geometry.disposed) throw new ResourceDisposedError('Geometry')
-    if (material.disposed) throw new ResourceDisposedError('Material')
+    geometry.assertUsable()
+    material.assertUsable()
 
     this.geometryValue = geometry
     this.materialValue = material
@@ -51,20 +51,20 @@ export class Mesh extends SceneNode {
 
   /**
    * 返回借用的原 Geometry；不允许通过赋值替换引用。
-   * @throws {@link ResourceDisposedError} Geometry 已被其所有者释放。
+   * @throws ResourceDisposedError Geometry 已被其所有者释放。
    */
   get geometry(): Geometry {
-    if (this.geometryValue.disposed) throw new ResourceDisposedError('Geometry')
+    this.geometryValue.assertUsable()
     return this.geometryValue
   }
 
   /**
    * 返回借用的原 Material；这里只验证 Material 自身的生命周期。
    * shader/texture 依赖在 Material 及后续实际消费路径中分别验证。
-   * @throws {@link ResourceDisposedError} Material 已被其所有者释放。
+   * @throws ResourceDisposedError Material 已被其所有者释放。
    */
   get material(): Material {
-    if (this.materialValue.disposed) throw new ResourceDisposedError('Material')
+    this.materialValue.assertUsable()
     return this.materialValue
   }
 }

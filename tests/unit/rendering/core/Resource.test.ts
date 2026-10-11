@@ -20,17 +20,62 @@ class TestResource extends Resource {
   /** CPU 清理钩子的可观察调用次数。 */
   public cpuDisposeCount = 0
 
-  /** 暴露真实的 protected guard，供测试验证释放后的访问行为。 */
-  public assertAvailable(): void {
-    this.assertUsable()
-  }
-
   protected disposeCPUData(): void {
     this.cpuDisposeCount += 1
   }
 }
 
 describe('Resource', () => {
+  /**
+   * Given 通过基类引用借用的资源；When 外部调用存活检查；
+   * Then 不 retain、不 dispose、不通知 listener，资源状态完全不变。
+   * 保护把“检查可用”误写成“取得所有权”或“触发清理”的实现。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][resource-lifecycle-guard]
+   * 直接通过 Resource 调用；TypeScript 同时验证方法确实对外公开。
+   */
+  it('允许外部借用者检查生命周期且不改变资源状态', () => {
+    const concrete = new TestResource()
+    const resource: Resource = concrete
+    let notifications = 0
+
+    resource.onDispose(() => {
+      notifications += 1
+    })
+    resource.retainSceneReference()
+
+    expect(() => resource.assertUsable()).not.toThrow()
+    expect(() => resource.assertUsable()).not.toThrow()
+    expect(resource.sceneReferenceCount).toBe(1)
+    expect(resource.disposed).toBe(false)
+    expect(concrete.cpuDisposeCount).toBe(0)
+    expect(notifications).toBe(0)
+
+    resource.releaseSceneReference()
+  })
+
+  /**
+   * Given listener 尚在释放流程中、CPU 数据还未清理；When 再次检查资源；
+   * Then 已经拒绝使用，并按资源自己的稳定类型提供领域错误。
+   * 保护把 guard 错误地推迟到 CPU 清理后才生效的实现。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][resource-lifecycle-guard]
+   */
+  it('开始释放时公开检查立即拒绝使用，即使 CPU 清理尚未执行', () => {
+    const resource = new TestResource()
+
+    resource.onDispose(() => {
+      expect(resource.cpuDisposeCount).toBe(0)
+      expect(() => resource.assertUsable()).toThrow(ResourceDisposedError)
+    })
+
+    resource.dispose()
+
+    expect(resource.cpuDisposeCount).toBe(1)
+  })
+
   /**
    * 保护的错误实现：
    *
@@ -276,13 +321,13 @@ describe('Resource', () => {
     expect(resource.cpuDisposeCount).toBe(1)
   })
 
-  it('dispose 后拒绝 listener、受保护资源访问和新的 Scene 引用', () => {
+  it('dispose 后拒绝 listener、资源访问和新的 Scene 引用', () => {
     const resource = new TestResource()
 
     resource.dispose()
 
     expect(() => resource.onDispose(() => undefined)).toThrow(ResourceDisposedError)
-    expect(() => resource.assertAvailable()).toThrow(ResourceDisposedError)
+    expect(() => resource.assertUsable()).toThrow(ResourceDisposedError)
     expect(() => resource.retainSceneReference()).toThrow(ResourceDisposedError)
     expect(resource.sceneReferenceCount).toBe(0)
   })
@@ -298,7 +343,7 @@ describe('Resource', () => {
     let caughtError: unknown
 
     try {
-      resource.assertAvailable()
+      resource.assertUsable()
     } catch (error) {
       caughtError = error
     }

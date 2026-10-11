@@ -58,18 +58,27 @@ export abstract class Resource {
    */
   protected abstract disposeCPUData(): void
 
+  // ==================== public ====================
+
   /**
-   * 供子类公共方法在访问内部数据前统一验证生命周期。
+   * 供子类与外部借用者在使用本资源前统一验证生命周期。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][resource-lifecycle-guard]
+   *
+   * 错误中的稳定类型由资源自己的 resourceType 提供，调用者无需重复传入名称。
+   * 此方法只读取状态，不 retain、不 dispose，也不改变 listener 或 CPU 数据。
+   * finalizeDisposal() 在通知 listener 前标记 disposed，因此释放期间就已拒绝使用。
+   * 成功只证明本次检查时 CPU 资源存活，不保证 GPU 上传或 context 可用；
+   * 跨 await 后如需继续使用，调用方仍须遵守所有权约定并在消费处重新检查。
    *
    * @throws {@link ResourceDisposedError} 当资源已经完成或开始释放。
    */
-  protected assertUsable(): void {
+  public assertUsable(): void {
     if (this.disposedValue) {
       throw new ResourceDisposedError(this.resourceType)
     }
   }
-
-  // ==================== public ====================
 
   /** 当前资源是否已经进入 disposed 状态。 */
   get disposed(): boolean {
@@ -93,9 +102,7 @@ export abstract class Resource {
    * @throws {@link ResourceDisposedError} 当资源已经释放，避免创建永远不会触发的订阅。
    */
   onDispose(listener: DisposeListener): () => void {
-    if (this.disposedValue) {
-      throw new ResourceDisposedError(this.resourceType)
-    }
+    this.assertUsable()
 
     this.disposeListeners.add(listener)
 
