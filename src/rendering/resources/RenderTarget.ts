@@ -21,8 +21,32 @@ export type ColorAttachmentFormat = (typeof COLOR_ATTACHMENT_FORMATS)[number]
 /** 从实际允许列表推导深度格式联合类型。 */
 export type DepthAttachmentFormat = (typeof DEPTH_ATTACHMENT_FORMATS)[number]
 
+/** 当前颜色附件接受的过滤方式；不含任何 mipmap 过滤。 */
+const COLOR_ATTACHMENT_FILTERS = Object.freeze(['nearest', 'linear'] as const)
+
+/** 逻辑过滤方式，Backend 再映射为对应设备的常量。 */
+export type ColorAttachmentFilter = (typeof COLOR_ATTACHMENT_FILTERS)[number]
+
 /**
- * 一个离屏目标的完整逻辑描述。
+ * 调用者提供的附件采样设置；缺省字段使用 linear。
+ *
+ * @remarks
+ * [DESIGN-WEIGHT:2][render-target-descriptor-snapshot]
+ *
+ * 这里只描述 min/mag 过滤。本批附件固定无 mip、clamp-to-edge，
+ * 不用若干尚未实现的字段假装已支持任意纹理视图。
+ * RGBA 打包深度用于硬阴影时应显式选择 nearest，避免插值改变编码。
+ */
+export interface ColorAttachmentSamplerInput {
+  readonly minFilter?: ColorAttachmentFilter
+  readonly magFilter?: ColorAttachmentFilter
+}
+
+/** 已补齐默认值的冻结采样描述；消费者不再需要检查字段是否缺省。 */
+export type ColorAttachmentSampler = Readonly<Required<ColorAttachmentSamplerInput>>
+
+/**
+ * 一个离屏目标的构造输入描述。
  *
  * @remarks
  * width/height 使用像素单位，不是 CSS 尺寸；至少包含一个颜色附件。
@@ -30,13 +54,36 @@ export type DepthAttachmentFormat = (typeof DEPTH_ATTACHMENT_FORMATS)[number]
  * 多颜色附件可以被描述，是否有足够的 MRT 能力由具体 Backend 判断。
  *
  * TODO(render-target-subresources): 在环境烘焙或 FFT 接入前，一并设计浮点格式、
- * cubemap face/mip 写入视图、采样描述和手工 mip 所有权，并补齐能力及恢复测试。
+ * cubemap face/mip 写入视图、更多采样选项和手工 mip 所有权，并补齐能力及恢复测试。
  * 当前不把尚未支持的 face、mip、HDR 字段作为无效占位参数。
  */
 export interface RenderTargetDescriptor {
   readonly width: number
   readonly height: number
-  readonly colors: readonly { readonly format: ColorAttachmentFormat }[]
+  readonly colors: readonly {
+    readonly format: ColorAttachmentFormat
+    readonly sampler?: ColorAttachmentSamplerInput
+  }[]
+  readonly depth?: { readonly format: DepthAttachmentFormat }
+}
+
+/**
+ * RenderTarget 发布的完整描述，不再沿用允许缺省字段的输入类型。
+ *
+ * @remarks
+ * [DESIGN-WEIGHT:3][render-target-descriptor-snapshot]
+ *
+ * descriptor、colors 数组、每个颜色项及 sampler、可选 depth 均逐层冻结。
+ * resize 可安全复用这些不可变嵌套值，只替换最外层尺寸快照。
+ * readonly 提供静态检查；Object.freeze 才负责运行时禁止修改。
+ */
+export interface RenderTargetDescriptorSnapshot {
+  readonly width: number
+  readonly height: number
+  readonly colors: readonly {
+    readonly format: ColorAttachmentFormat
+    readonly sampler: ColorAttachmentSampler
+  }[]
   readonly depth?: { readonly format: DepthAttachmentFormat }
 }
 
@@ -217,6 +264,41 @@ function requireAttachmentFormat<T extends string>(
 }
 
 /**
+ * 验证可选 sampler，并发布与调用者隔离的完整冻结快照。
+ *
+ * @remarks
+ * [DESIGN-WEIGHT:3][render-target-descriptor-snapshot]
+ *
+ * 只有 undefined 表示使用默认值；null、数组、未知字段和非法过滤必须报错。
+ * 显式使用 nearest 时不能被默认 linear 覆盖。
+ *
+ * @param value - 尚未验证的 sampler 输入。
+ * @param fieldName - 当前颜色槽位的诊断路径。
+ * @throws InvalidRenderTargetError 形状、字段名或过滤值不合法。
+ */
+function createColorAttachmentSampler(value: unknown, fieldName: string): ColorAttachmentSampler {
+  const input: UnvalidatedFields<ColorAttachmentSamplerInput> =
+    value === undefined ? {} : requireRecord(value, fieldName)
+  requireKnownFields<ColorAttachmentSamplerInput>(input, ['minFilter', 'magFilter'], fieldName)
+
+  const minFilter = input.minFilter
+  const magFilter = input.magFilter
+
+  return Object.freeze({
+    minFilter: requireAttachmentFormat(
+      minFilter === undefined ? 'linear' : minFilter,
+      COLOR_ATTACHMENT_FILTERS,
+      fieldName + '.minFilter'
+    ),
+    magFilter: requireAttachmentFormat(
+      magFilter === undefined ? 'linear' : magFilter,
+      COLOR_ATTACHMENT_FILTERS,
+      fieldName + '.magFilter'
+    )
+  })
+}
+
+/**
  * 验证渲染目标描述，并创建由内部拥有的不可变快照。
  *
  * @remarks
@@ -247,7 +329,7 @@ function requireAttachmentFormat<T extends string>(
  * @returns 已验证、复制并逐层冻结的完整描述。
  * @throws InvalidRenderTargetError 任一描述字段不符合当前契约。
  */
-function createDescriptorSnapshot(value: unknown): RenderTargetDescriptor {
+function createDescriptorSnapshot(value: unknown): RenderTargetDescriptorSnapshot {
   const input: UnvalidatedFields<RenderTargetDescriptor> = requireRecord(value, 'descriptor')
 
   requireKnownFields<RenderTargetDescriptor>(
@@ -265,19 +347,24 @@ function createDescriptorSnapshot(value: unknown): RenderTargetDescriptor {
   }
 
   const entries: readonly unknown[] = rawColors
-  const colors: { readonly format: ColorAttachmentFormat }[] = []
+  const colors: RenderTargetDescriptorSnapshot['colors'][number][] = []
 
   for (let index = 0; index < entries.length; index++) {
     const fieldName = 'colors[' + index + ']'
     const color = requireRecord(entries[index], fieldName)
-    requireKnownFields(color, ['format'], fieldName)
+    requireKnownFields<RenderTargetDescriptor['colors'][number]>(
+      color,
+      ['format', 'sampler'],
+      fieldName
+    )
 
     const format = requireAttachmentFormat(
       color.format,
       COLOR_ATTACHMENT_FORMATS,
       fieldName + '.format'
     )
-    colors.push(Object.freeze({ format }))
+    const sampler = createColorAttachmentSampler(color.sampler, fieldName + '.sampler')
+    colors.push(Object.freeze({ format, sampler }))
   }
 
   let depth: RenderTargetDescriptor['depth']
@@ -335,7 +422,7 @@ export class RenderTarget extends Resource {
   public readonly label: string
 
   /** 当前完整的不可变 CPU 描述；正常释放通知结束后清空。 */
-  private descriptorValue: RenderTargetDescriptor | null
+  private descriptorValue: RenderTargetDescriptorSnapshot | null
   /** 描述版本，不是 GPU 已完成创建的证明，也不是撤销历史。 */
   private revisionValue = 0
 
@@ -360,7 +447,7 @@ export class RenderTarget extends Resource {
   }
 
   /** 返回已深层冻结的快照；调用者缓存旧快照不会跟随 resize 改变。 */
-  get descriptor(): RenderTargetDescriptor {
+  get descriptor(): RenderTargetDescriptorSnapshot {
     this.assertUsable()
     return this.descriptorValue!
   }
@@ -372,7 +459,7 @@ export class RenderTarget extends Resource {
   }
 
   /**
-   * 只改变尺寸，保留附件数量和格式。
+   * 只改变尺寸，保留附件数量、格式和冻结的 sampler。
    *
    * @remarks
    * [DESIGN-WEIGHT:3][render-target-atomic-resize]

@@ -111,7 +111,7 @@ describe('RenderTarget CPU contract', () => {
 
     expect(target).toBeInstanceOf(Resource)
     expect(target.revision).toBe(0)
-    expect(snapshot).toEqual(input)
+    expect(snapshot).toEqual(normalizedDescriptor())
     expect(snapshot).not.toBe(input)
     expect(snapshot.colors).not.toBe(input.colors)
     expect(snapshot.colors[0]).not.toBe(input.colors[0])
@@ -123,7 +123,7 @@ describe('RenderTarget CPU contract', () => {
     Reflect.set(input.colors, 'length', 0)
     Reflect.set(input.depth!, 'format', 'depth24')
 
-    expect(target.descriptor).toEqual(descriptor())
+    expect(target.descriptor).toEqual(normalizedDescriptor())
   })
 
   /** 通过公开 getter 尝试修改，验证冻结不是只存在于 TypeScript 声明中。 */
@@ -135,7 +135,7 @@ describe('RenderTarget CPU contract', () => {
     expect(Reflect.set(snapshot.colors, 'length', 0)).toBe(false)
     expect(Reflect.set(snapshot.colors[0]!, 'format', 'bad')).toBe(false)
     expect(Reflect.set(snapshot.depth!, 'format', 'bad')).toBe(false)
-    expect(target.descriptor).toEqual(descriptor())
+    expect(target.descriptor).toEqual(normalizedDescriptor())
   })
 
   /** MRT 和 NPOT 的设备支持不应被无 context 的 CPU 类擅自否决。 */
@@ -209,7 +209,7 @@ describe('RenderTarget CPU contract', () => {
 
     target.resize(512, 128)
     expect(target.revision).toBe(1)
-    expect(target.descriptor).toEqual({ ...descriptor(), width: 512 })
+    expect(target.descriptor).toEqual({ ...normalizedDescriptor(), width: 512 })
     expect(original.width).toBe(256)
 
     target.resize(512, 128)
@@ -342,3 +342,113 @@ describe('InvalidRenderTargetError', () => {
     expect(Object.isFrozen(error.details)).toBe(true)
   })
 })
+
+/** 独立写出的预期输出，不能调用生产归一化函数来生成自己的测试答案。 */
+function normalizedDescriptor() {
+  return {
+    width: 256,
+    height: 128,
+    colors: [
+      { format: 'rgba8', sampler: { minFilter: 'linear', magFilter: 'linear' } },
+      { format: 'rgba8', sampler: { minFilter: 'linear', magFilter: 'linear' } }
+    ],
+    depth: { format: 'depth16' }
+  }
+}
+
+describe('RenderTarget color attachment sampler', () => {
+  /**
+   * @remarks
+   * [DESIGN-WEIGHT:3][render-target-descriptor-snapshot]
+   * Given 可选 sampler 输入；When 发布描述；Then Backend 总能读到两个完整过滤字段。
+   */
+  it.each([
+    [undefined, { minFilter: 'linear', magFilter: 'linear' }],
+    [{}, { minFilter: 'linear', magFilter: 'linear' }],
+    [
+      { minFilter: undefined, magFilter: undefined },
+      { minFilter: 'linear', magFilter: 'linear' }
+    ],
+    [{ minFilter: 'nearest' }, { minFilter: 'nearest', magFilter: 'linear' }],
+    [{ magFilter: 'nearest' }, { minFilter: 'linear', magFilter: 'nearest' }],
+    [
+      { minFilter: 'nearest', magFilter: 'nearest' },
+      { minFilter: 'nearest', magFilter: 'nearest' }
+    ],
+    [
+      { minFilter: 'linear', magFilter: 'linear' },
+      { minFilter: 'linear', magFilter: 'linear' }
+    ]
+  ] as const)('补齐 sampler 默认值并保留显式过滤 %#', (sampler, expected) => {
+    const target = new RenderTarget(
+      { width: 3, height: 5, colors: [{ format: 'rgba8', sampler }] },
+      { label: 'shadow/sampler' }
+    )
+    expect(target.descriptor.colors[0]!.sampler).toEqual(expected)
+    target.dispose()
+  })
+
+  /** 显式非法值不能被当作缺省值；本批不接受 wrap、mipmap 或设备枚举。 */
+  it.each([
+    null,
+    [],
+    1,
+    'nearest',
+    { wrapS: 'repeat' },
+    { minFilter: null },
+    { magFilter: null },
+    { minFilter: false },
+    { magFilter: 9728 },
+    { minFilter: 'nearest-mipmap-nearest' },
+    { magFilter: 'linear-mipmap-linear' }
+  ])('拒绝非法 sampler %#', (sampler) => {
+    const input = { width: 16, height: 16, colors: [{ format: 'rgba8', sampler }] }
+    expect(
+      () =>
+        new RenderTarget(input as unknown as RenderTargetDescriptor, { label: 'shadow/invalid' })
+    ).toThrow(InvalidRenderTargetError)
+  })
+
+  /**
+   * @remarks
+   * [DESIGN-WEIGHT:3][render-target-descriptor-snapshot]
+   * Given 嵌套可变 sampler；When 修改输入或返回值再 resize；
+   * Then 快照和旧快照仍保持同一采样配置，不能绕过 revision 修改 GPU 配置。
+   */
+  it('逐层复制冻结 sampler，resize 保留过滤、标签和旧快照', () => {
+    const sampler = { minFilter: 'nearest' as const, magFilter: 'nearest' as const }
+    const colors = [{ format: 'rgba8' as const, sampler }]
+    const target = new RenderTarget({ width: 16, height: 16, colors }, { label: 'shadow/hard' })
+    const before = target.descriptor
+    expect(Object.isFrozen(sampler)).toBe(false)
+    expect(before.colors[0]!.sampler).not.toBe(sampler)
+    expect(Object.isFrozen(before.colors[0]!.sampler)).toBe(true)
+    Reflect.set(sampler, 'minFilter', 'linear')
+    Reflect.set(colors[0]!, 'sampler', { minFilter: 'linear', magFilter: 'linear' })
+    expect(Reflect.set(before.colors[0]!.sampler, 'magFilter', 'linear')).toBe(false)
+    expect(before.colors[0]!.sampler).toEqual({ minFilter: 'nearest', magFilter: 'nearest' })
+    target.resize(32, 64)
+    expect(target.descriptor.colors[0]!.sampler).toEqual({
+      minFilter: 'nearest',
+      magFilter: 'nearest'
+    })
+    expect(before.width).toBe(16)
+    expect(target.descriptor.width).toBe(32)
+    expect(target.label).toBe('shadow/hard')
+    expect(target.revision).toBe(1)
+    const after = target.descriptor
+    target.resize(32, 64)
+    expect(target.revision).toBe(1)
+    expect(target.descriptor).toBe(after)
+    target.dispose()
+  })
+})
+
+/** 编译期保证归一化后 sampler 必填且只读；Vitest 不负责检查这些类型断言。 */
+function checkSamplerTypes(target: RenderTarget): void {
+  const filter: 'nearest' | 'linear' = target.descriptor.colors[0]!.sampler.minFilter
+  void filter
+  // @ts-expect-error 冻结快照不提供 sampler setter。
+  target.descriptor.colors[0]!.sampler.minFilter = 'nearest'
+}
+void checkSamplerTypes

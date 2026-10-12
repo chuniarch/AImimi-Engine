@@ -1,7 +1,6 @@
 import {
   IncompleteFramebufferError,
   RenderTargetUnavailableError,
-  ResourceDisposedError,
   UnsupportedRenderFeatureError,
   WebGLBackendDisposedError,
   WebGLContextLostError,
@@ -11,15 +10,15 @@ import { requireNonNull } from '@/rendering/core/requireNonNull'
 import {
   RenderTarget,
   type RenderTargetAttachmentRef,
-  type RenderTargetDescriptor
+  type RenderTargetDescriptorSnapshot
 } from '@/rendering/resources/RenderTarget'
-import type { WebGL1Capabilities } from './WebGL1Capabilities'
+import type { WebGL1Capabilities } from '@/rendering/backend/webgl1/WebGL1Capabilities'
 import {
   assertTextureOperation,
   requireTextureLimit,
   withTextureUploadState,
   type WebGL1TextureManagerHooks
-} from './WebGL1TextureUploadSupport'
+} from '@/rendering/backend/webgl1/WebGL1TextureUploadSupport'
 
 /** 当前 context 的完整 FBO；深度明确是 renderbuffer，不能交给 sampler2D。 */
 export interface WebGL1RenderTargetResource {
@@ -48,7 +47,7 @@ interface Entry {
  *
  * Owner 不得在 surface 作用域中 resize/release/dispose 该作用域仍借用的目标。
  * get() 的绑定检查只识别当前 FBO，不能识别嵌套作用域保存的其他 FBO。
- * 完整的活动 scope 生命周期约束由 Task 15 的 Backend 接线与测试落实。
+ * 完整的活动 scope 生命周期约束由 Backend 与 SurfaceScope 落实。
  */
 export class WebGL1RenderTargetManager {
   private readonly gl: WebGLRenderingContext
@@ -72,13 +71,14 @@ export class WebGL1RenderTargetManager {
   /** 返回与当前 CPU revision 一致的完整资源，不能返回半成品或旧尺寸兜底。 */
   get(target: RenderTarget): WebGL1RenderTargetResource {
     this.assertReady()
-    if (target.disposed) throw new ResourceDisposedError('RenderTarget')
+    target.assertUsable()
 
     const old = this.entries.get(target)
     const revision = target.revision
     if (old?.resource.revision === revision) return old.resource
 
     /**
+     * @remarks
      * [DESIGN-WEIGHT:2][render-target-diagnostic-label]
      * 名称定位逻辑用途，revision 定位本次存储配置；二者仅用于诊断。
      * entries 仍按 target 对象身份缓存，不能因同名而合并不同目标。
@@ -103,7 +103,7 @@ export class WebGL1RenderTargetManager {
       next = this.create(target.descriptor, revision, label)
       assertTextureOperation(this.gl, 'finish render target creation', label)
 
-      if (target.disposed) throw new ResourceDisposedError('RenderTarget')
+      target.assertUsable()
 
       const unsubscribe = old?.unsubscribe ?? target.onDispose(() => this.release(target))
       this.entries.set(target, { resource: next, unsubscribe })
@@ -133,32 +133,62 @@ export class WebGL1RenderTargetManager {
    */
   resolveAttachment(ref: RenderTargetAttachmentRef): WebGLTexture | WebGLRenderbuffer {
     this.assertReady()
+    const address = this.validateAttachment(ref)
+    const resource = this.get(address.target)
+    return address.kind === 'color'
+      ? resource.colorTextures[address.index]!
+      : resource.depthAttachment!
+  }
 
-    if (ref === null || typeof ref !== 'object' || !(ref.target instanceof RenderTarget)) {
+  /**
+   * 为 sampler2D 借用当前颜色附件，不上传像素、不创建第二份纹理。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][render-target-attachment-borrowing]
+   *
+   * 先验证地址，再拒绝 depth16，最后才 get，避免分配不可采样的目标。
+   * ref 不保存 revision：resize 后相同槽位解析为新 handle，旧 handle 不可跨 draw 缓存。
+   * 本函数不验证读写反馈环；调用者须先由 SurfaceScope 检查当前输出目标。
+   * 新建存储不意味着旧内容已恢复，生产者需要重新绘制。
+   */
+  resolveSampledColor(ref: RenderTargetAttachmentRef): WebGLTexture {
+    this.assertReady()
+    const address = this.validateAttachment(ref)
+    if (address.kind === 'depth') {
+      throw new UnsupportedRenderFeatureError(
+        'sample depth attachment ' + address.target.label,
+        'depth16 is a renderbuffer, not a sampleable texture'
+      )
+    }
+    return this.get(address.target).colorTextures[address.index]!
+  }
+
+  /** 捕获并验证地址，不执行 GPU 分配；两个解析入口共享同一组边界判断。 */
+  private validateAttachment(ref: RenderTargetAttachmentRef): RenderTargetAttachmentRef {
+    if (ref === null || typeof ref !== 'object' || Array.isArray(ref)) {
       throw new RenderTargetUnavailableError('attachment', 'invalid target reference')
     }
-
-    const target = ref.target
-    if (target.disposed) throw new ResourceDisposedError('RenderTarget')
+    const { target, kind, index } = ref
+    if (!(target instanceof RenderTarget)) {
+      throw new RenderTargetUnavailableError('attachment', 'invalid target reference')
+    }
+    target.assertUsable()
 
     const descriptor = target.descriptor
-    const validIndex = Number.isSafeInteger(ref.index) && ref.index >= 0
-
     if (
-      !validIndex ||
-      (ref.kind === 'color' && ref.index >= descriptor.colors.length) ||
-      (ref.kind === 'depth' && (ref.index !== 0 || descriptor.depth === undefined)) ||
-      (ref.kind !== 'color' && ref.kind !== 'depth')
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      (kind === 'color' && index >= descriptor.colors.length) ||
+      (kind === 'depth' && (index !== 0 || descriptor.depth === undefined)) ||
+      (kind !== 'color' && kind !== 'depth')
     ) {
-      throw new RenderTargetUnavailableError('attachment', 'invalid kind or attachment index')
+      throw new RenderTargetUnavailableError(target.label, 'invalid kind or attachment index')
     }
-
-    const resource = this.get(target)
-    return ref.kind === 'color' ? resource.colorTextures[ref.index]! : resource.depthAttachment!
+    return { target, kind, index }
   }
 
   /** 能力检查必须先于任何 create*，避免已知不支持的请求产生半成品。 */
-  private validate(descriptor: RenderTargetDescriptor): void {
+  private validate(descriptor: RenderTargetDescriptorSnapshot): void {
     const gl = this.gl
     const maximum = requireTextureLimit(gl, gl.MAX_TEXTURE_SIZE, 'MAX_TEXTURE_SIZE')
     const maximumDepth =
@@ -208,7 +238,7 @@ export class WebGL1RenderTargetManager {
    * 临时绑定结束恢复真实 framebuffer/renderbuffer；viewport 从始至终不修改。
    */
   private create(
-    descriptor: RenderTargetDescriptor,
+    descriptor: RenderTargetDescriptorSnapshot,
     revision: number,
     label: string
   ): WebGL1RenderTargetResource {
@@ -251,8 +281,18 @@ export class WebGL1RenderTargetManager {
             null
           )
 
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+          // CPU Snapshot 已补齐 sampler；硬阴影的打包深度可显式选择 nearest。
+          const sampler = descriptor.colors[index]!.sampler
+          gl.texParameteri(
+            gl.TEXTURE_2D,
+            gl.TEXTURE_MIN_FILTER,
+            sampler.minFilter === 'nearest' ? gl.NEAREST : gl.LINEAR
+          )
+          gl.texParameteri(
+            gl.TEXTURE_2D,
+            gl.TEXTURE_MAG_FILTER,
+            sampler.magFilter === 'nearest' ? gl.NEAREST : gl.LINEAR
+          )
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
 

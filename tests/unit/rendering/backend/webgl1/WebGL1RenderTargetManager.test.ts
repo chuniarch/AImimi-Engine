@@ -356,3 +356,143 @@ describe('WebGL1RenderTargetManager', () => {
     expect(f.deleted).toHaveLength(0)
   })
 })
+
+/**
+ * HW1 附件采样入口：地址指向 owner 的槽位，而不是某次分配的 handle。
+ *
+ * @remarks
+ * [DESIGN-WEIGHT:3][render-target-gpu-replacement]
+ * Given 已写入目标；When 请求采样地址；Then 借到同一颜色纹理。
+ * resize 后必须解析当前 revision；旧存储只能保留作清理，不能作为成功结果返回。
+ */
+describe('WebGL1RenderTargetManager sampled colors', () => {
+  /** 同时检查默认和显式配置；避免 Manager 忽略 CPU sampler。 */
+  it.each([
+    { minFilter: 'linear', magFilter: 'linear', min: 0x2601, mag: 0x2601 },
+    { minFilter: 'nearest', magFilter: 'nearest', min: 0x2600, mag: 0x2600 },
+    { minFilter: 'nearest', magFilter: 'linear', min: 0x2600, mag: 0x2601 },
+    { minFilter: 'linear', magFilter: 'nearest', min: 0x2601, mag: 0x2600 }
+  ] as const)('实际应用附件过滤 %j', ({ minFilter, magFilter, min, mag }) => {
+    const f = setup()
+    const cpu = new RenderTarget(
+      {
+        width: 3,
+        height: 2,
+        colors: [{ format: 'rgba8', sampler: { minFilter, magFilter } }]
+      },
+      { label: 'shadow/packed-depth' }
+    )
+    const ref = cpu.getColorAttachment(0)
+    const handle = f.manager.resolveSampledColor(ref)
+    expect(handle).toBe(f.manager.get(cpu).colorTextures[0])
+    expect(f.api.createTexture).toHaveBeenCalledTimes(1)
+    expect(f.api.texParameteri).toHaveBeenCalledWith(f.gl.TEXTURE_2D, f.gl.TEXTURE_MIN_FILTER, min)
+    expect(f.api.texParameteri).toHaveBeenCalledWith(f.gl.TEXTURE_2D, f.gl.TEXTURE_MAG_FILTER, mag)
+    expect(f.api.texParameteri).toHaveBeenCalledWith(
+      f.gl.TEXTURE_2D,
+      f.gl.TEXTURE_WRAP_S,
+      f.gl.CLAMP_TO_EDGE
+    )
+    expect(f.api.texParameteri).toHaveBeenCalledWith(
+      f.gl.TEXTURE_2D,
+      f.gl.TEXTURE_WRAP_T,
+      f.gl.CLAMP_TO_EDGE
+    )
+    expect(f.api.generateMipmap).not.toHaveBeenCalled()
+  })
+
+  /** 未传 sampler 的旧调用者保持 linear；保留既有 MRT 各槽位身份。 */
+  it('默认 linear，MRT 采样解析与旧解析 API 借用同一槽位', () => {
+    const f = setup(true)
+    const cpu = target(2)
+    const ref = cpu.getColorAttachment(1)
+    const gpu = f.manager.get(cpu)
+    expect(f.manager.resolveSampledColor(ref)).toBe(gpu.colorTextures[1])
+    expect(f.manager.resolveAttachment(ref)).toBe(gpu.colorTextures[1])
+    expect(f.manager.resolveAttachment(cpu.getDepthAttachment()!)).toBe(gpu.depthAttachment)
+    expect(f.api.texImage2D).toHaveBeenCalledTimes(2)
+    expect(f.api.texParameteri).toHaveBeenCalledWith(
+      f.gl.TEXTURE_2D,
+      f.gl.TEXTURE_MIN_FILTER,
+      f.gl.LINEAR
+    )
+    expect(f.api.texParameteri).toHaveBeenCalledWith(
+      f.gl.TEXTURE_2D,
+      f.gl.TEXTURE_MAG_FILTER,
+      f.gl.LINEAR
+    )
+  })
+
+  /** 合法 depth 地址也不是纹理；在 get 之前拒绝，避免分配根本无法采样的存储。 */
+  it('depth16 采样拒绝且零分配，旧 attachment 解析仍支持 renderbuffer', () => {
+    const f = setup()
+    const cpu = target()
+    const ref = cpu.getDepthAttachment()!
+    expect(() => f.manager.resolveSampledColor(ref)).toThrow(UnsupportedRenderFeatureError)
+    expect(f.api.createFramebuffer).not.toHaveBeenCalled()
+    expect(f.api.createTexture).not.toHaveBeenCalled()
+    expect(f.manager.resolveAttachment(ref)).toBe(f.manager.get(cpu).depthAttachment)
+  })
+
+  /**
+   * 非法地址不能落到默认 framebuffer 或数组越界。
+   * 用对象包装每行输入，避免 it.each 把空数组展开成零个参数。
+   */
+  it.each(
+    [
+      null,
+      undefined,
+      [],
+      {},
+      { target: null, kind: 'color', index: 0 },
+      { kind: 'color', index: -1 },
+      { kind: 'color', index: 0.5 },
+      { kind: 'color', index: 1 },
+      { kind: 'color', index: NaN },
+      { kind: 'stencil', index: 0 },
+      { kind: 'depth', index: 1 }
+    ].map((input) => ({ input }))
+  )('拒绝无效采样地址 $input', ({ input }) => {
+    const f = setup()
+    const cpu = target()
+    const ref = input && !Array.isArray(input) ? { target: cpu, ...input } : input
+    expect(() =>
+      f.manager.resolveSampledColor(ref as unknown as RenderTargetAttachmentRef)
+    ).toThrow(RenderTargetUnavailableError)
+    expect(f.api.createFramebuffer).not.toHaveBeenCalled()
+  })
+
+  /** 区分已释放 owner、缺少 depth 和不支持深度采样三类原因。 */
+  it('拒绝已经释放目标和不存在的深度槽位', () => {
+    const f = setup()
+    const cpu = target()
+    const ref = cpu.getColorAttachment(0)
+    cpu.dispose()
+    expect(() => f.manager.resolveSampledColor(ref)).toThrow(ResourceDisposedError)
+    expect(() =>
+      f.manager.resolveSampledColor({
+        target: target(1, false),
+        kind: 'depth',
+        index: 0
+      })
+    ).toThrow(RenderTargetUnavailableError)
+    expect(f.api.createFramebuffer).not.toHaveBeenCalled()
+  })
+
+  /** Given 稳定地址；When resize 的首次分配失败；Then 抛错，重试成功才换 handle。 */
+  it('同一地址跨 resize 解析新存储，失败不回退旧尺寸纹理', () => {
+    const f = setup()
+    const cpu = target()
+    const ref = cpu.getColorAttachment(0)
+    const old = f.manager.resolveSampledColor(ref)
+    cpu.resize(16, 8)
+    f.api.checkFramebufferStatus.mockReturnValueOnce(0x8cd6)
+    expect(() => f.manager.resolveSampledColor(ref)).toThrow(IncompleteFramebufferError)
+    expect(f.deleted).not.toContain(old)
+    const next = f.manager.resolveSampledColor(ref)
+    expect(next).not.toBe(old)
+    expect(next).toBe(f.manager.get(cpu).colorTextures[0])
+    expect(f.manager.get(cpu).width).toBe(16)
+    expect(f.deleted).toContain(old)
+  })
+})
