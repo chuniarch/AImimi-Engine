@@ -14,6 +14,7 @@ import {
   type MaterialParameter,
   type RenderStateInput
 } from '@/rendering/resources/Material'
+import { RenderTarget } from '@/rendering/resources/RenderTarget'
 import { ShaderModule, type WebGLShaderLanguage } from '@/rendering/resources/ShaderModule'
 import { DataTexture2D, ImageTexture2D } from '@/rendering/resources/Texture2D'
 import { Scene } from '@/rendering/scene/Scene'
@@ -485,5 +486,153 @@ describe('InvalidMaterialError', () => {
     })
     expect(error.context).toBe(error.details)
     expect(Object.isFrozen(error.details)).toBe(true)
+  })
+})
+
+describe('Material attachment sampling contract', () => {
+  /** 创建两个槽的真实目标，不依赖尚未实现的 WebGL sampler 绑定。 */
+  function createTarget(): RenderTarget {
+    return new RenderTarget(
+      {
+        width: 16,
+        height: 16,
+        colors: [{ format: 'rgba8' }, { format: 'rgba8' }],
+        depth: { format: 'depth16' }
+      },
+      { label: 'shadow/main' }
+    )
+  }
+
+  /**
+   * @remarks
+   * [DESIGN-WEIGHT:3][material-parameter-copy-boundary]
+   * Given 可变附件包装；When 构造或 setter 后修改输入；Then getter 和 entries 仍给出原地址。
+   * 每次返回新地址包装，但共享同一个 RenderTarget，防止错误的深复制或可变别名。
+   */
+  it('构造、setter、getter 与 entries 隔离附件包装，保留 target 身份', () => {
+    const target = createTarget()
+    const other = createTarget()
+    const input = { target, kind: 'color' as const, index: 0 }
+    const material = new Material({
+      shaderModule: createShader(),
+      parameters: { uMap: { type: 'texture2D', value: input } }
+    })
+    input.target = other
+    input.index = 1
+    const first = material.getParameter('uMap')!
+    const second = material.getParameter('uMap')!
+    expect(first).toEqual({ type: 'texture2D', value: { target, kind: 'color', index: 0 } })
+    expect(first).not.toBe(second)
+    expect(first.value).not.toBe(second.value)
+    expect(Object.isFrozen(first.value)).toBe(true)
+    expect(Reflect.set(first.value as object, 'target', other)).toBe(false)
+
+    const replacement = { target, kind: 'color' as const, index: 1 }
+    material.setParameter('uMap', { type: 'texture2D', value: replacement })
+    replacement.index = 0
+    const entries = material.getParameterEntries()
+    expect(entries).toEqual([
+      ['uMap', { type: 'texture2D', value: { target, kind: 'color', index: 1 } }]
+    ])
+    expect(entries[0]![1].value).not.toBe(material.getParameter('uMap')!.value)
+    expect(Object.isFrozen(entries[0]![1].value)).toBe(true)
+    expect(target.sceneReferenceCount).toBe(0)
+    material.dispose()
+    target.dispose()
+    other.dispose()
+  })
+
+  /** CPU 层只证明地址存在；depth16 是 renderbuffer 的设备限制由后续 Backend 拒绝。 */
+  it('允许保存存在的深度地址，并通过同一地址观察 resize', () => {
+    const target = createTarget()
+    const material = new Material({
+      shaderModule: createShader(),
+      parameters: { uDepth: { type: 'texture2D', value: target.getDepthAttachment()! } }
+    })
+    target.resize(32, 32)
+    expect(material.getParameter('uDepth')!.value).toEqual({ target, kind: 'depth', index: 0 })
+    expect(target.descriptor.width).toBe(32)
+    material.dispose()
+    target.dispose()
+  })
+
+  /**
+   * @remarks
+   * [DESIGN-WEIGHT:3][material-borrowed-resources]
+   * Given Scene 明确持有资源；When Texture2D 与附件互相替换再释放 Material；
+   * Then Material 不增减依赖计数，也不替 owner 释放旧依赖或当前依赖。
+   */
+  it('二维纹理与附件可以互换，替换和 dispose 都不接管目标', () => {
+    const texture = createDataTexture()
+    const target = createTarget()
+    const scene = new Scene()
+    scene.retain(texture)
+    scene.retain(target)
+    const material = new Material({
+      shaderModule: createShader(),
+      parameters: { uMap: { type: 'texture2D', value: texture } }
+    })
+    material.setParameter('uMap', { type: 'texture2D', value: target.getColorAttachment(0) })
+    expect(material.getParameter('uMap')!.value).toEqual({ target, kind: 'color', index: 0 })
+    material.setParameter('uMap', { type: 'texture2D', value: texture })
+    expect(material.getParameter('uMap')!.value).toBe(texture)
+    material.setParameter('uMap', { type: 'texture2D', value: target.getColorAttachment(1) })
+    material.dispose()
+    for (const resource of [texture, target]) {
+      expect(resource.sceneReferenceCount).toBe(1)
+      expect(resource.disposed).toBe(false)
+    }
+    scene.dispose()
+    expect(target.disposed).toBe(true)
+    expect(texture.disposed).toBe(true)
+  })
+
+  /**
+   * @remarks
+   * [DESIGN-WEIGHT:3][material-atomic-parameter-write]
+   * Given 合法旧值；When 新地址越界或已释放；Then 构造报领域错误，setter 保留旧值和顺序。
+   */
+  it('非法或已释放附件的 setter 不破坏旧值和参数顺序', () => {
+    const target = createTarget()
+    const dead = createTarget()
+    const deadRef = dead.getColorAttachment(0)
+    dead.dispose()
+    const shader = createShader()
+    const material = new Material({
+      shaderModule: shader,
+      parameters: {
+        uMap: { type: 'texture2D', value: target.getColorAttachment(0) },
+        uScale: { type: 'float', value: 1 }
+      }
+    })
+    for (const [value, error] of [
+      [{ target, kind: 'color', index: 99 }, InvalidMaterialError],
+      [deadRef, ResourceDisposedError]
+    ] as const) {
+      const parameter: MaterialParameter = { type: 'texture2D', value }
+      expect(() => new Material({ shaderModule: shader, parameters: { uMap: parameter } })).toThrow(
+        error
+      )
+      expect(() => material.setParameter('uMap', parameter)).toThrow(error)
+      expect(material.getParameter('uMap')!.value).toEqual({ target, kind: 'color', index: 0 })
+      expect(material.getParameterEntries().map(([name]) => name)).toEqual(['uMap', 'uScale'])
+    }
+    material.dispose()
+    target.dispose()
+  })
+
+  /** Given 地址曾经有效；When owner 释放目标；Then 两种公开读取 API 都重新检查生命周期。 */
+  it('目标释放后 getter 与 entries 均拒绝继续提供采样值', () => {
+    const target = createTarget()
+    const material = new Material({
+      shaderModule: createShader(),
+      parameters: {
+        uMap: { type: 'texture2D', value: target.getColorAttachment(0) }
+      }
+    })
+    target.dispose()
+    expect(() => material.getParameter('uMap')).toThrow(ResourceDisposedError)
+    expect(() => material.getParameterEntries()).toThrow(ResourceDisposedError)
+    expect(() => material.dispose()).not.toThrow()
   })
 })

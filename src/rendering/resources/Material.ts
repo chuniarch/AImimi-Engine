@@ -1,10 +1,18 @@
 import { assertNever } from '@/errors/helper/helpers'
 import { Resource } from '@/rendering/core/Resource'
-import { InvalidMaterialError, ResourceDisposedError } from '@/rendering/core/errors'
+import { InvalidMaterialError } from '@/rendering/core/errors'
 import type { Vec3Tuple } from '@/rendering/core/math/tuples'
+import {
+  assertNonArrayObject,
+  requireBoolean,
+  requireFiniteNumber
+} from '@/rendering/core/validation'
 import { CubeTexture } from '@/rendering/resources/CubeTexture'
 import { ShaderModule } from '@/rendering/resources/ShaderModule'
-import { Texture2D } from '@/rendering/resources/Texture2D'
+import {
+  copyTexture2DSamplingSource,
+  type Texture2DSamplingSource
+} from '@/rendering/resources/Texture2DSamplingSource'
 
 /** 与 shader 的 vec2/vec4 对应的固定长度数值。 */
 export type Vec2ParameterValue = readonly [number, number]
@@ -18,12 +26,14 @@ export type Vec4ParameterValue = readonly [number, number, number, number]
  *
  * 数值在 CPU 侧保留 JavaScript number，不在这里提前量化为 Float32。
  * 向量和矩阵在写入、读取时复制；纹理保留同一个逻辑 Resource 引用。
+ * 附件则复制并冻结地址包装，但保留其中的 RenderTarget 身份。
+ * 参数值不保存 GPU handle，也不因被 Material 使用而自动增加资源引用数。
  * mat3/mat4 用平坦的列主序数组表示，运行时分别要求恰好 9/16 个有限数值。
  * int 要求有符号 32 位整数；bool 只接受 boolean，不把 0/1 隐式转换为布尔值。
  *
- * TODO(material-render-target-bindings): 在 RenderTarget 提供稳定的逻辑附件引用后，
- * 扩展纹理参数以接收该引用，并同时验证 resize/dispose、反馈采样和 context 恢复；
- * 不把 GPU 派生附件伪装成 DataTexture2D，也不允许 WebGLTexture 或 null 占位。
+ * TODO(material-render-target-bindings): CPU 附件采样契约已定义；后续在 Backend
+ * 接通当前 revision 的 GPU 附件解析、反馈采样拒绝和 context 恢复后的重新生产。
+ * 此处接受逻辑地址，不等于真实 WebGL 采样链已经完成。
  */
 export type MaterialParameter =
   | { readonly type: 'float'; readonly value: number }
@@ -34,7 +44,7 @@ export type MaterialParameter =
   | { readonly type: 'vec4'; readonly value: Vec4ParameterValue }
   | { readonly type: 'mat3'; readonly value: readonly number[] }
   | { readonly type: 'mat4'; readonly value: readonly number[] }
-  | { readonly type: 'texture2D'; readonly value: Texture2D }
+  | { readonly type: 'texture2D'; readonly value: Texture2DSamplingSource }
   | { readonly type: 'cubeTexture'; readonly value: CubeTexture }
 
 const DEPTH_FUNCTIONS = ['less', 'less-equal', 'always'] as const
@@ -92,12 +102,6 @@ const PARAMETER_TYPES: Readonly<Record<MaterialParameter['type'], true>> = {
   cubeTexture: true
 }
 
-/** 拒绝把 null、数组或普通标量当作对象描述。 */
-function assertObject(value: unknown, fieldName: string): void {
-  if (value === null || typeof value !== 'object' || Array.isArray(value))
-    throw new InvalidMaterialError(fieldName, 'must be a non-array object')
-}
-
 /** 枚举值从实际匹配项返回，不靠类型断言把未知字符串变成合法值。 */
 function requireChoice<T extends string>(
   value: unknown,
@@ -125,23 +129,6 @@ function defaultIfUndefined<T>(value: T | undefined, fallback: T): T {
   return value
 }
 
-/** boolean 配置不接受 truthy/falsy 自动转换。 */
-function requireBoolean(value: unknown, fieldName: string): boolean {
-  if (typeof value !== 'boolean') {
-    throw new InvalidMaterialError(fieldName, 'must be a boolean')
-  }
-
-  return value
-}
-
-/** 拒绝 NaN、正负 Infinity 以及字符串形式的数字。 */
-function requireFiniteNumber(value: unknown, fieldName: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value))
-    throw new InvalidMaterialError(fieldName, 'must be a finite number')
-
-  return value
-}
-
 /**
  * 验证固定长度的平坦数组，并复制每个元素。
  *
@@ -157,28 +144,56 @@ function copyNumberArray(value: unknown, length: number, fieldName: string): num
   const copy: number[] = []
 
   for (let index = 0; index < length; index++) {
-    copy.push(requireFiniteNumber(input[index], fieldName + '[' + index + ']'))
+    copy.push(
+      requireFiniteNumber(
+        input[index],
+        () => new InvalidMaterialError(fieldName + '[' + index + ']', 'must be a finite number')
+      )
+    )
   }
 
   return copy
 }
 
-/** 纹理或 shader 被其他所有者提前释放时，在实际借用处明确拒绝使用。 */
-function assertAlive(resource: Resource, resourceType: string): void {
-  if (resource.disposed) {
-    throw new ResourceDisposedError(resourceType)
+/**
+ * 验证 Material 参数借用的 cubemap，并返回原资源。
+ *
+ * @remarks
+ * [DESIGN-WEIGHT:3][material-borrowed-resources]
+ *
+ * 本函数不导出：InvalidMaterialError 与字段路径属于 Material 的参数语义。
+ * 先检查资源类型，再让 CubeTexture 自己验证生命周期，避免非法值触发 TypeError。
+ * 不复制像素、不 retain，也不接管释放责任；参数包装由 copyParameter 创建。
+ *
+ * @param value - 尚未验证的参数资源引用。
+ * @param fieldName - Material 参数的诊断路径。
+ * @returns 原始 CubeTexture 实例。
+ * @throws InvalidMaterialError 输入不是 CubeTexture。
+ * @throws ResourceDisposedError cubemap 已开始或完成释放。
+ */
+function requireCubeTexture(value: unknown, fieldName: string): CubeTexture {
+  if (!(value instanceof CubeTexture)) {
+    throw new InvalidMaterialError(fieldName, 'must reference a CubeTexture resource')
   }
+
+  value.assertUsable()
+
+  return value
 }
 
 /**
  * 复制一个参数；构造、setParameter 和读取副本共用这套类型规则。
  *
  * @remarks
- * texture2D/cubeTexture 复制的只有包装对象，value 始终是原逻辑资源。
+ * CPU 纹理的 value 保留原资源；附件的 value 则是新的冻结地址包装。
+ * 附件包装中的 target 始终是原 RenderTarget，不复制目标资源。
  * 这里不复制纹理像素、不 retain、不 release，也不访问 GPU。
  */
 function copyParameter(parameter: MaterialParameter, fieldName: string): MaterialParameter {
-  assertObject(parameter, fieldName)
+  assertNonArrayObject(
+    parameter,
+    () => new InvalidMaterialError(fieldName, 'must be a non-array object')
+  )
 
   const runtimeType: unknown = parameter.type
 
@@ -189,11 +204,20 @@ function copyParameter(parameter: MaterialParameter, fieldName: string): Materia
 
   switch (parameter.type) {
     case 'float': {
-      return { type: 'float', value: requireFiniteNumber(parameter.value, fieldName) }
+      return {
+        type: 'float',
+        value: requireFiniteNumber(
+          parameter.value,
+          () => new InvalidMaterialError(fieldName, 'must be a finite number')
+        )
+      }
     }
 
     case 'int': {
-      const value = requireFiniteNumber(parameter.value, fieldName)
+      const value = requireFiniteNumber(
+        parameter.value,
+        () => new InvalidMaterialError(fieldName, 'must be a finite number')
+      )
 
       if (!Number.isInteger(value) || value < -2147483648 || value > 2147483647)
         throw new InvalidMaterialError(fieldName, 'must be a signed 32-bit integer')
@@ -202,7 +226,13 @@ function copyParameter(parameter: MaterialParameter, fieldName: string): Materia
     }
 
     case 'bool': {
-      return { type: 'bool', value: requireBoolean(parameter.value, fieldName) }
+      return {
+        type: 'bool',
+        value: requireBoolean(
+          parameter.value,
+          () => new InvalidMaterialError(fieldName, 'must be a boolean')
+        )
+      }
     }
 
     case 'vec2': {
@@ -226,21 +256,14 @@ function copyParameter(parameter: MaterialParameter, fieldName: string): Materia
     case 'mat4':
       return { type: 'mat4', value: copyNumberArray(parameter.value, 16, fieldName) }
 
-    case 'texture2D': {
-      if (!(parameter.value instanceof Texture2D)) {
-        throw new InvalidMaterialError(fieldName, 'must reference a Texture2D resource')
+    case 'texture2D':
+      return {
+        type: 'texture2D',
+        value: copyTexture2DSamplingSource(parameter.value, fieldName)
       }
-      assertAlive(parameter.value, 'Texture2D')
-      return { type: 'texture2D', value: parameter.value }
-    }
 
-    case 'cubeTexture': {
-      if (!(parameter.value instanceof CubeTexture)) {
-        throw new InvalidMaterialError(fieldName, 'must reference a CubeTexture resource')
-      }
-      assertAlive(parameter.value, 'CubeTexture')
-      return { type: 'cubeTexture', value: parameter.value }
-    }
+    case 'cubeTexture':
+      return { type: 'cubeTexture', value: requireCubeTexture(parameter.value, fieldName) }
 
     default:
       assertNever(parameter, 'Unimplemented MaterialParameter copy branch')
@@ -258,7 +281,7 @@ function copyParameter(parameter: MaterialParameter, fieldName: string): Materia
  */
 function createRenderState(input: RenderStateInput | undefined): RenderState {
   const state = defaultIfUndefined(input, {})
-  assertObject(state, 'state')
+  assertNonArrayObject(state, () => new InvalidMaterialError('state', 'must be a non-array object'))
 
   for (const key of Object.keys(state)) {
     if (!['depthTest', 'depthWrite', 'depthFunction', 'cullMode'].includes(key)) {
@@ -267,8 +290,14 @@ function createRenderState(input: RenderStateInput | undefined): RenderState {
   }
 
   return Object.freeze({
-    depthTest: requireBoolean(defaultIfUndefined(state.depthTest, true), 'state.depthTest'),
-    depthWrite: requireBoolean(defaultIfUndefined(state.depthWrite, true), 'state.depthWrite'),
+    depthTest: requireBoolean(
+      defaultIfUndefined(state.depthTest, true),
+      () => new InvalidMaterialError('state.depthTest', 'must be a boolean')
+    ),
+    depthWrite: requireBoolean(
+      defaultIfUndefined(state.depthWrite, true),
+      () => new InvalidMaterialError('state.depthWrite', 'must be a boolean')
+    ),
     depthFunction: requireChoice(
       defaultIfUndefined(state.depthFunction, 'less-equal'),
       DEPTH_FUNCTIONS,
@@ -304,7 +333,7 @@ function prepareParameter(
   parameter: MaterialParameter
 ): MaterialParameter {
   assertValidParameterName(name)
-  assertAlive(shader, 'ShaderModule')
+  shader.assertUsable()
 
   if (Object.values(shader.builtInUniforms).includes(name))
     throw new InvalidMaterialError('parameters.' + name, 'is reserved by builtInUniforms')
@@ -318,7 +347,7 @@ function prepareParameter(
  * @remarks
  * [DESIGN-WEIGHT:3][material-borrowed-resources]
  *
- * Material 只借用 ShaderModule/Texture。构造、替换参数与 dispose 都不改变它们的
+ * Material 只借用 ShaderModule/Texture/RenderTarget。构造、替换参数与 dispose 都不改变它们的
  * sceneReferenceCount，也不级联 dispose。Scene 必须分别 retain 每个实际需要的资源。
  * 同一 ShaderModule/Texture 可以被多个 Material、Scene 和 Backend 使用。
  *
@@ -341,19 +370,22 @@ export class Material extends Resource {
 
   /**
    * @throws InvalidMaterialError 输入描述或参数无效。
-   * @throws ResourceDisposedError shader 或纹理已经释放。
+   * @throws ResourceDisposedError shader、纹理或附件所属目标已经释放。
    */
   constructor(options: MaterialOptions) {
     super()
 
-    assertObject(options, 'options')
+    assertNonArrayObject(
+      options,
+      () => new InvalidMaterialError('options', 'must be a non-array object')
+    )
 
     const shader = options.shaderModule
 
     if (!(shader instanceof ShaderModule))
       throw new InvalidMaterialError('shaderModule', 'must reference a ShaderModule resource')
 
-    assertAlive(shader, 'ShaderModule')
+    shader.assertUsable()
 
     this.shaderModuleValue = shader
     this.queueValue = requireChoice(
@@ -364,7 +396,10 @@ export class Material extends Resource {
     this.stateValue = createRenderState(options.state)
 
     if (options.parameters !== undefined) {
-      assertObject(options.parameters, 'parameters')
+      assertNonArrayObject(
+        options.parameters,
+        () => new InvalidMaterialError('parameters', 'must be a non-array object')
+      )
 
       for (const [name, parameter] of Object.entries(options.parameters)) {
         this.parametersValue.set(name, prepareParameter(shader, name, parameter))
@@ -376,7 +411,7 @@ export class Material extends Resource {
   get shaderModule(): ShaderModule {
     this.assertUsable()
     const shader = this.shaderModuleValue!
-    assertAlive(shader, 'ShaderModule')
+    shader.assertUsable()
     return shader
   }
 
@@ -396,8 +431,9 @@ export class Material extends Resource {
    * 获取独立参数副本，名称不存在时返回 undefined。
    *
    * @remarks
-   * 返回的 wrapper/数值数组是副本；纹理 value 仍是原 Resource。
-   * Material 或取出的纹理已释放时抛 ResourceDisposedError。
+   * 返回的 wrapper/数值数组是副本；CPU 纹理 value 仍是原 Resource。
+   * 附件 value 是新的冻结地址，其中 target 仍为原 RenderTarget。
+   * Material、取出的纹理或附件所属目标已释放时抛 ResourceDisposedError。
    */
   getParameter(name: string): MaterialParameter | undefined {
     this.assertUsable()
