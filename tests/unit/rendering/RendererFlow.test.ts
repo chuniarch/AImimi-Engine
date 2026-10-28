@@ -2,8 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { Renderer } from '@/rendering/Renderer'
 import type { DrawSubmission } from '@/rendering/backend/RenderBackend'
+import { ResourceDisposedError } from '@/rendering/core/errors'
+import { RenderExecutionError } from '@/rendering/core/errors/RenderExecutionError'
 import { RenderListBuilder } from '@/rendering/frame/RenderListBuilder'
 import { ForwardPass } from '@/rendering/passes/ForwardPass'
+import type { RenderPass } from '@/rendering/passes/RenderPass'
 import { RenderPipeline } from '@/rendering/passes/RenderPipeline'
 import { Group } from '@/rendering/scene/Group'
 import { createRenderFixture, RecordingBackend } from './helpers/createRenderFixture'
@@ -12,13 +15,17 @@ import { createRenderFixture, RecordingBackend } from './helpers/createRenderFix
  * 组装真实的上层渲染链；仅替换通向设备的 Backend 边界。
  *
  * 不把 Scene/Camera/Builder/Pipeline/ForwardPass 替换成空 mock。
+ * passes 默认只有 ForwardPass；换 Pipeline 的用例在它前面插入记录型 Pass。
  */
-function createFlow(backend: RecordingBackend = new RecordingBackend()) {
+function createFlow(
+  backend: RecordingBackend = new RecordingBackend(),
+  passes: readonly RenderPass[] = [new ForwardPass()]
+) {
   const fixture = createRenderFixture()
   const builder = new RenderListBuilder()
   const pipeline = new RenderPipeline()
 
-  pipeline.addPass(new ForwardPass())
+  for (const pass of passes) pipeline.addPass(pass)
 
   const renderer = new Renderer(backend, pipeline, builder)
 
@@ -26,7 +33,21 @@ function createFlow(backend: RecordingBackend = new RecordingBackend()) {
     ...fixture,
     backend,
     builder,
+    pipeline,
     renderer
+  }
+}
+
+/** 只记录执行和释放顺序的 Pass；不 draw，所以不改变 Backend 的 scope 计数。 */
+function probe(name: string, events: string[]): RenderPass {
+  return {
+    name,
+    execute: () => {
+      events.push(name + ':execute')
+    },
+    dispose: () => {
+      events.push(name + ':dispose')
+    }
   }
 }
 
@@ -267,5 +288,131 @@ describe('Renderer → Builder → Pipeline → ForwardPass 联合契约', () =>
     ])
 
     f.renderer.dispose()
+  })
+})
+
+describe('Renderer.replacePipeline 与真实链', () => {
+  /**
+   * @remarks
+   * [DESIGN-WEIGHT:3][renderer-pipeline-replacement]
+   *
+   * 换上的 Pipeline 从下一帧开始执行；返回的旧 Pipeline 没被释放，所有权回到调用者。
+   * Renderer.dispose 只释放最后装着的那一条，旧 Pass 不会被释放两次。
+   */
+  it('返回旧 Pipeline 且不释放，下一帧按新顺序执行', () => {
+    const f = createFlow()
+    const events: string[] = []
+    f.scene.add(f.mesh())
+    f.renderer.render(f.view)
+
+    const next = new RenderPipeline()
+    next.addPass(probe('ShadowMapPass', events))
+    next.addPass(new ForwardPass())
+
+    const previous = f.renderer.replacePipeline(next)
+    expect(previous).toBe(f.pipeline)
+
+    // 已释放的 Pipeline 会拒绝 addPass；能加说明旧的仍是 active，等调用者处理。
+    previous.addPass(probe('old-extra', events))
+
+    f.renderer.render(f.view)
+
+    expect(events).toEqual(['ShadowMapPass:execute'])
+    expect(f.backend.scopes).toHaveLength(2)
+    expect(f.backend.submissions).toHaveLength(2)
+
+    previous.dispose()
+    f.renderer.dispose()
+
+    expect(events).toEqual(['ShadowMapPass:execute', 'old-extra:dispose', 'ShadowMapPass:dispose'])
+    expect(f.backend.events.at(-1)).toBe('backend-dispose')
+  })
+
+  /**
+   * 帧中途换 Pipeline 会让同一帧的后半段跑在另一条上；必须拒绝。
+   * 当前帧照常完成，下一帧仍执行原来的 Pipeline，被拒的那条既不执行也不释放。
+   */
+  it('渲染中 replacePipeline 被拒，当前帧与当前 Pipeline 不变', () => {
+    const events: string[] = []
+    const rejected: unknown[] = []
+    const candidate = new RenderPipeline()
+    candidate.addPass(probe('candidate', events))
+
+    // 先建链再登记 Pass，guard 才能引用同一个 Renderer。
+    const f = createFlow(new RecordingBackend(), [])
+    const guard: RenderPass = {
+      name: 'guard',
+      execute: () => {
+        events.push('guard:execute')
+        try {
+          f.renderer.replacePipeline(candidate)
+        } catch (error) {
+          rejected.push(error)
+        }
+      },
+      dispose: () => {}
+    }
+
+    f.pipeline.addPass(guard)
+    f.pipeline.addPass(new ForwardPass())
+    f.scene.add(f.mesh())
+
+    f.renderer.render(f.view)
+
+    expect(rejected).toHaveLength(1)
+    expect(rejected[0]).toBeInstanceOf(RenderExecutionError)
+    expect(f.backend.events).toEqual(['enter', 'draw', 'leave'])
+
+    f.renderer.render(f.view)
+
+    expect(events).toEqual(['guard:execute', 'guard:execute'])
+    expect(f.backend.scopes).toHaveLength(2)
+
+    f.renderer.dispose()
+    expect(events).not.toContain('candidate:dispose')
+    candidate.dispose()
+  })
+
+  /** 传入当前那条：调用者随后释放「旧的」就会拆掉正在用的 Pipeline。 */
+  it('拒绝传入当前 Pipeline，拒绝后照常渲染', () => {
+    const f = createFlow()
+    f.scene.add(f.mesh())
+
+    expect(() => f.renderer.replacePipeline(f.pipeline)).toThrow(RenderExecutionError)
+
+    f.renderer.render(f.view)
+    expect(f.backend.submissions).toHaveLength(1)
+    f.renderer.dispose()
+  })
+
+  /**
+   * closing 只允许重试 dispose：此时换进来的 Pipeline 没人会释放，也会让重试释放错的那条。
+   * 拒绝后重试 dispose 释放的仍是原来那条；disposed 之后同样拒绝。
+   */
+  it('closing 与 disposed 时拒绝，候选 Pipeline 不被接管', () => {
+    const events: string[] = []
+    let fail = true
+    const owned: RenderPass = {
+      name: 'owned',
+      execute: () => {},
+      dispose: () => {
+        events.push('owned:dispose')
+        if (fail) throw new Error('pass cleanup failed')
+      }
+    }
+    const f = createFlow(new RecordingBackend(), [owned])
+    const candidate = new RenderPipeline()
+    candidate.addPass(probe('candidate', events))
+
+    expect(() => f.renderer.dispose()).toThrow('pass cleanup failed')
+    expect(() => f.renderer.replacePipeline(candidate)).toThrow(ResourceDisposedError)
+
+    fail = false
+    f.renderer.dispose()
+    expect(() => f.renderer.replacePipeline(candidate)).toThrow(ResourceDisposedError)
+
+    expect(events).toEqual(['owned:dispose', 'owned:dispose'])
+    candidate.dispose()
+    expect(events).toEqual(['owned:dispose', 'owned:dispose', 'candidate:dispose'])
   })
 })

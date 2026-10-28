@@ -11,11 +11,12 @@ import type { RenderPipeline } from '@/rendering/passes/RenderPipeline'
  * 连接每帧提取与 Pass 编排。
  *
  * 不长期保存 Scene/Camera，也不区分 Backend 种类。
- * 拥有注入的 Pipeline/Backend，Builder 是无资源的提取服务。
+ * 拥有当前 Pipeline 和注入的 Backend，Builder 是无资源的提取服务。
+ * replacePipeline 交还旧 Pipeline 的所有权，Renderer 只释放最后装着的那一条。
  */
 export class Renderer {
   private readonly backend: RenderBackend
-  private readonly pipeline: RenderPipeline
+  private pipeline: RenderPipeline
   private readonly renderListBuilder: RenderListBuilder
 
   private state: 'active' | 'closing' | 'disposed' = 'active'
@@ -77,6 +78,39 @@ export class Renderer {
     } finally {
       this.busy = false
     }
+  }
+
+  /**
+   * 换上下一条 Pipeline，返回旧的那条；不释放它。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][renderer-pipeline-replacement]
+   *
+   * 返回后旧 Pipeline 归调用者释放。不在这里 dispose，是为了让「换」本身
+   * 不会因为旧 Pass 清理失败而半途抛错：Engine 在场景提交之后才调用本方法，
+   * 提交点之后不能再失败，清理失败只能记成诊断。
+   *
+   * 拒绝四种情况，且拒绝时当前 Pipeline 不变：
+   * render/dispose 进行中（busy）、closing、disposed、传入的正是当前这一条。
+   * 不检查 next 是否已释放：RenderPipeline 不公开状态，
+   * 已释放的 Pipeline 会在 execute 时自己抛 ResourceDisposedError。
+   */
+  replacePipeline(next: RenderPipeline): RenderPipeline {
+    // closing 只允许重试 dispose；与 render 一样，先报生命周期，再报重入。
+    if (this.state !== 'active') {
+      throw new ResourceDisposedError('Renderer')
+    }
+
+    this.assertNotBusy('replacePipeline')
+
+    // 同一条既是旧的又是新的：调用者随后释放「旧的」，就会拆掉正在用的 Pipeline。
+    if (next === this.pipeline) {
+      throw new RenderExecutionError('Renderer', 'replacePipeline', 'pipeline is already installed')
+    }
+
+    const previous = this.pipeline
+    this.pipeline = next
+    return previous
   }
 
   /**
