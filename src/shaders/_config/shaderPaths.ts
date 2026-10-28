@@ -21,6 +21,12 @@ export const ShaderPaths = {
   // 两套 fragment
   SHADOW_RGBA_PACK_FRAGMENT: urlJoin(S, 'lighting/shadow/directional/rgbaPack.frag'),
   SHADOW_DEPTH_TEXTURE_FRAGMENT: urlJoin(S, 'lighting/shadow/directional/depthTexture.frag'),
+  /** 新渲染链路：RGBA 深度生产者，不替换旧 ShadowPass 的 shader 路径。 */
+  PACKED_DEPTH_VERTEX: urlJoin(S, 'lighting/shadow/packedDepth/vertex.vert'),
+  PACKED_DEPTH_FRAGMENT: urlJoin(S, 'lighting/shadow/packedDepth/fragment.frag'),
+  /** 硬阴影可见性输出；尚不是完整的 HW1 光照材质。 */
+  HARD_SHADOW_VISIBILITY_VERTEX: urlJoin(S, 'lighting/shadow/hardShadowVisibility/vertex.vert'),
+  HARD_SHADOW_VISIBILITY_FRAGMENT: urlJoin(S, 'lighting/shadow/hardShadowVisibility/fragment.frag'),
   // HW4
   // Cook-Torrance Model
   HW4_COOK_TORRANCE_VERTEX: urlJoin(S, 'lighting/pbr/Cook-Torrance/vertex.vert'),
