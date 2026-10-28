@@ -30,6 +30,7 @@
   },
   "include": ["src/**/*.ts", "src/**/*.d.ts"],
   "exclude": [
+    "src/rendering/docs/courses/webgl1-backend/**",
     "src/debug/**",
     "src/**/deprecated/**",
     "src/**/*-deprecated.ts",

@@ -53,6 +53,9 @@ export default [
       // 历史参考文件
       'reference/**',
 
+      // 发布的经典脚本课程沿用教学写法，由课程发布检查验证依赖。
+      'src/rendering/docs/courses/webgl1-backend/**',
+
       // 当前不进入正式检查链路的调试、废弃实现
       'src/debug/**',
       'src/**/deprecated/**',

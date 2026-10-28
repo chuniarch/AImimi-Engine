@@ -25,15 +25,6 @@
     "prepare": "husky install",
     "commit": "cz"
   },
-  "lint-staged": {
-    "src/**/*.{js,ts}": [
-      "eslint --max-warnings 10",
-      "prettier --check"
-    ],
-    "src/**/*.{json,css,html}": [
-      "prettier --check"
-    ]
-  },
   "keywords": [],
   "author": "",
   "license": "ISC",

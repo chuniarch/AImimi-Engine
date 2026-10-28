@@ -7,6 +7,12 @@ package-lock.json
 pnpm-lock.yaml
 yarn.lock
 
+# 课程正文、交互演示和历史 bundle 保留原排版；Markdown 仍检查。
+src/rendering/docs/courses/webgl1-backend/**/*.html
+src/rendering/docs/courses/webgl1-backend/**/*.js
+src/rendering/docs/courses/webgl1-backend/**/*.ts
+src/rendering/docs/courses/webgl1-backend/**/*.css
+
 # 构建输出
 build/
 coverage/
