@@ -1,7 +1,7 @@
 import { Mesh } from '@/objects/Mesh'
 import { Transform } from '@/objects/utils/Transform'
 import type { AttributeData } from '@/objects/types/Mesh'
-import type { PRTData } from '@/loaders/loadPRTSHTxt'
+import type { PRTData } from '@/loaders/loadPRTSHTxt-old'
 import { MeshValidationError } from '@/errors/EngineError/MeshError/MeshValidationError'
 import type { SHAttributeLayout } from './types/SHAttributeLayout'
 

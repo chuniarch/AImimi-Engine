@@ -1,6 +1,6 @@
 import { logger } from '@/logging/Logger'
 import { loadOBJ } from '@/loaders/loadOBJ'
-import { loadPRTSHTxt } from '@/loaders/loadPRTSHTxt'
+import { loadPRTSHTxt } from '@/loaders/loadPRTSHTxt-old'
 import { createSHMesh } from '@/objects/prt/sphericalHarmonics/createSHMesh'
 import { PRTSHMaterial } from '@/materials/prt/PRTSHMaterial'
 import { Shader } from '@/shaders/Shader'
