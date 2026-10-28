@@ -1,0 +1,943 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 12 课 · Texture 家族与 RenderTarget</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/gl-sandbox.js"></script>
+    <script src="../assets/predict.js"></script>
+    <script src="../assets/rendering-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 详细设计篇 6/12 · 约 85 分钟</p>
+    <h1>resources ③：Texture 家族与 RenderTarget——像素从哪来，结果写到哪去</h1>
+    <p class="lede">
+      纹理回答「像素从哪来、怎样采样」，RenderTarget 回答「画出来的结果写到哪去」。这一课逐个函数读 Texture、两种 Texture2D、CubeTexture 和 RenderTarget，看它们怎样借用外部的图片、复制调用者的像素、在构造时查完跨字段的约束，以及怎样用一个版本号告诉后端「尺寸变了，GPU 上那份该重建了」。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— Task 19 的 HW2 工厂要把六张 JPG 装成背景用的 CubeTexture，还要替它选一个颜色空间（第 8 节）；第 19 课 draw 里的 cubemap 就是 CubeTextureManager 从这里读出来上传的。你以后做 FFT 海面和 IBL 时，离屏的 RenderTarget、它的 revision 和附件引用都会用上。
+    </div>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">设计问题：纹理和目标要回答什么</a></li>
+        <li><a href="#s2">两张图看全</a></li>
+        <li><a href="#s3">Texture 基类</a>：<a href="#s3-1">五项描述</a> <a href="#s3-2">为什么要这五项</a> <a href="#s3-3">快照函数</a> <a href="#s3-4">错误工厂</a></li>
+        <li><a href="#s4">Texture2D 的两种来源</a>：<a href="#s4-1">ImageTexture2D</a> <a href="#s4-2">DataTexture2D 与像素快照</a></li>
+        <li><a href="#s5">CubeTexture</a>：<a href="#s5-1">两种 source</a> <a href="#s5-2">六面尺寸</a> <a href="#s5-3">读取与释放</a></li>
+        <li><a href="#s6">RenderTarget</a>：<a href="#s6-1">为什么不是 Texture</a> <a href="#s6-2">为什么是这四项</a> <a href="#s6-3">描述快照</a> <a href="#s6-4">resize 与 revision</a> <a href="#s6-5">附件引用</a></li>
+        <li><a href="#s7">谁来读：两个 Manager</a></li>
+        <li><a href="#s8">HW2 的例子：背景 cubemap 与颜色空间</a></li>
+        <li><a href="#s9">复制与状态总表</a></li>
+        <li><a href="#s10">卡片：跑真实的项目代码</a></li>
+        <li><a href="#s11">检查题</a></li>
+        <li><a href="#s12">架构视角</a></li>
+        <li><a href="#s13">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2>0. 热身：前几课还记得吗</h2>
+    <div class="quiz" data-quiz="lesson-0012-warmup"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0012-warmup"]'), [
+        {
+          q: '能不能用 Object.freeze 冻结一个有元素的 Float32Array，省掉复制？',
+          opts: ['不能：有元素的 TypedArray 冻结会抛 TypeError，只能复制一份私有的', '能：冻结之后谁也改不了它', '能，但冻结之后 GPU 读不出数据'],
+          answer: 0,
+          why: '第 10 课卡片 B。纹理的像素快照是同一个理由（texturePixelSnapshot.ts:19–21，第 4.2 节）。'
+        },
+        {
+          q: "Material 的 state 写成 { depthWrite: null }，会怎样？",
+          opts: ['被拒：只有 undefined 算没填，null 不算', '当成没填，补默认值 true', '当成 false'],
+          answer: 0,
+          why: '第 11 课卡片 H。这一课的 Texture 对 null 的处理不一样，见卡片 C 和审查视角 1。'
+        },
+        {
+          q: 'Material 里的 texture2D 参数，draw 时 WebGL1Uniforms 怎样处理？（按 10 月 12 日的工作区）',
+          opts: ['交给 resolve2D 换成当前 context 的纹理，分一个纹理单元再绑上', '当成 cubemap 上传', '跳过这个 uniform'],
+          answer: 0,
+          why: '工作区的 WebGL1Uniforms.ts:175–184：和 cubemap 一样，先解析成当前 context 的纹理（Texture2D 交给 Texture2DManager，附件地址交给 RenderTargetManager），upload 时 activeTexture、bindTexture、uniform1i。10 月 12 日以前，这里会抛 UnsupportedRenderFeatureError：那时还没有 Texture2D 的 GPU Manager，后端只做了 cubemap（第 7 节）。'
+        }
+      ])
+    </script>
+
+    <h2 id="s1">1. 设计问题：纹理和目标要回答什么</h2>
+    <p>一张纹理、一个离屏目标，都要把下面几件事说清楚。和前两课一样，第一层只负责「描述」，凡是和具体设备有关的判断都留给后端：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 22%">问题</th><th style="width: 38%">由谁描述（第一层）</th><th>设备相关的部分由谁查（第三层）</th></tr>
+        <tr><td>怎样采样</td><td>Texture 的 sampler（环绕、过滤）和 mipmapPolicy</td><td>CubeTextureManager：NPOT 限制、浮点纹理能不能线性过滤</td></tr>
+        <tr><td>像素怎样存</td><td>Texture 的 storage（通道、标量类型）和 colorSpace</td><td>CubeTextureManager：浮点扩展、EXT_sRGB</td></tr>
+        <tr><td>像素从哪来</td><td>ImageTexture2D 借图片，DataTexture2D 复制数组，CubeTexture 两种都行</td><td>上传时：图片加载完没有、真实尺寸是多少</td></tr>
+        <tr><td>画到哪里</td><td>RenderTarget 的 descriptor：尺寸和附件</td><td>RenderTargetManager：尺寸上限、多目标扩展、FBO 完整性</td></tr>
+        <tr><td>尺寸变了怎么通知</td><td>RenderTarget 的 revision</td><td>Manager 比较 revision，不同就重建</td></tr>
+        <tr><td>怎样指称画出来的结果</td><td>附件引用 (attachment ref)</td><td>RenderTargetManager.resolveAttachment</td></tr>
+      </table>
+    </div>
+    <p>这一课有三样前两课没有的东西：</p>
+    <ul>
+      <li><strong>借用外部对象。</strong>浏览器的图片不能像 TypedArray 那样深拷贝，只能保存引用，而且不负责关闭它（第 4.1 节）。</li>
+      <li><strong>跨字段的约束。</strong>minFilter 要用 mipmap，mipmapPolicy 就必须是 generate，两个字段要一起查（第 3.3 节）。</li>
+      <li><strong>版本号。</strong>纹理是完全静态的，RenderTarget 却能改尺寸。它用 revision 告诉后端「GPU 上那份过期了」（第 6.4 节）。第 4 课「缓存怎样发现输入变了」的三种办法里，这是第二种。</li>
+    </ul>
+
+    <h2 id="s2">2. 两张图看全</h2>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 340" role="img" aria-label="类层次：Resource 下面是 Texture 和 RenderTarget；Texture 下面是 Texture2D 和 CubeTexture；Texture2D 下面是 ImageTexture2D 和 DataTexture2D。ImageTexture2D 借用图片；DataTexture2D 和 CubeTexture 的 data 模式都通过 texturePixelSnapshot 复制像素">
+          <defs>
+            <marker id="e1-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+          </defs>
+          <rect x="310" y="16" width="140" height="36" rx="5" class="box" />
+          <text x="380" y="39" text-anchor="middle">Resource</text>
+          <rect x="130" y="86" width="310" height="58" rx="6" class="box hl" />
+          <text x="144" y="108" class="title">Texture（抽象）</text>
+          <text x="144" y="130" class="small">sampler、storage、colorSpace 等五项</text>
+          <rect x="480" y="86" width="260" height="58" rx="6" class="box hl" />
+          <text x="494" y="108" class="title">RenderTarget</text>
+          <text x="494" y="130" class="small">descriptor 快照 · revision</text>
+          <rect x="30" y="178" width="220" height="58" rx="6" class="box" />
+          <text x="44" y="200" class="title">Texture2D（抽象）</text>
+          <text x="44" y="222" class="small">只是分类，不存来源</text>
+          <rect x="290" y="178" width="220" height="58" rx="6" class="box hl" />
+          <text x="304" y="200" class="title">CubeTexture</text>
+          <text x="304" y="222" class="small">images 或 data，六面</text>
+          <rect x="16" y="270" width="150" height="58" rx="6" class="box" />
+          <text x="28" y="292" class="title">ImageTexture2D</text>
+          <text x="28" y="314" class="small">借用图片引用</text>
+          <rect x="180" y="270" width="150" height="58" rx="6" class="box" />
+          <text x="192" y="292" class="title">DataTexture2D</text>
+          <text x="192" y="314" class="small">像素快照（复制）</text>
+          <rect x="540" y="260" width="200" height="68" rx="6" class="box ok" />
+          <text x="552" y="282" class="title">texturePixelSnapshot</text>
+          <text x="552" y="302" class="small">函数模块：验证、复制</text>
+          <text x="552" y="319" class="small">两处共用</text>
+          <line x1="285" y1="86" x2="355" y2="54" class="line" marker-end="url(#e1-tip)" />
+          <line x1="610" y1="86" x2="415" y2="54" class="line" marker-end="url(#e1-tip)" />
+          <line x1="140" y1="178" x2="220" y2="146" class="line" marker-end="url(#e1-tip)" />
+          <line x1="400" y1="178" x2="330" y2="146" class="line" marker-end="url(#e1-tip)" />
+          <line x1="91" y1="270" x2="110" y2="238" class="line" marker-end="url(#e1-tip)" />
+          <line x1="255" y1="270" x2="190" y2="238" class="line" marker-end="url(#e1-tip)" />
+          <line x1="330" y1="302" x2="538" y2="298" class="line dash" marker-end="url(#e1-tip)" />
+          <line x1="510" y1="226" x2="560" y2="258" class="line dash" marker-end="url(#e1-tip)" />
+          <text x="430" y="296" text-anchor="middle" class="small halo">用</text>
+          <text x="548" y="240" text-anchor="middle" class="small halo">data 模式用</text>
+        </svg>
+      </div>
+      <figcaption>图 1 · 类层次与数据归属。实线箭头指向父类。Texture 集中保存五项描述；Texture2D 只是分类，真正的来源在两个子类里：ImageTexture2D 借用浏览器图片，DataTexture2D 复制像素数组。CubeTexture 两种来源都支持。像素的验证与复制写在 texturePixelSnapshot 这个函数模块里（虚线），它不是另一个类（<a data-src="src/rendering/resources/docs/textures-and-render-targets.zh-CN.md:19">模块说明 :19</a>）。RenderTarget 不继承 Texture（第 6.1 节）。</figcaption>
+    </figure>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 300" role="img" aria-label="时间从左到右。resize 之前，RenderTarget 的 revision 是 0，Manager 为它建了 FBO 1 和纹理 1；resize 之后 revision 变成 1，Manager 在下一次 get 时发现不同，先建好 FBO 2，发布，再删 FBO 1。附件引用始终是同一个地址，前后分别解析到纹理 1 和纹理 2">
+          <defs>
+            <marker id="e2-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+          </defs>
+          <text x="30" y="62" class="small">CPU：RenderTarget</text>
+          <text x="30" y="142" class="small">Manager（这一代）</text>
+          <text x="30" y="246" class="small">附件引用</text>
+          <line x1="460" y1="22" x2="460" y2="200" class="line dash" />
+          <text x="460" y="16" text-anchor="middle" class="small">resize(512, 256)</text>
+          <rect x="220" y="40" width="200" height="40" rx="5" class="box" />
+          <text x="320" y="65" text-anchor="middle" class="small">revision 0 · 256×256</text>
+          <rect x="500" y="40" width="220" height="40" rx="5" class="box hl" />
+          <text x="610" y="65" text-anchor="middle" class="small">revision 1 · 512×256</text>
+          <rect x="220" y="112" width="200" height="56" rx="5" class="box" />
+          <text x="320" y="134" text-anchor="middle" class="small">FBO 1 与纹理 1</text>
+          <text x="320" y="154" text-anchor="middle" class="small">记着 revision 0</text>
+          <rect x="500" y="112" width="220" height="56" rx="5" class="box hl" />
+          <text x="610" y="134" text-anchor="middle" class="small">下一次 get：0 ≠ 1</text>
+          <text x="610" y="154" text-anchor="middle" class="small">建 FBO 2 → 发布 → 删 FBO 1</text>
+          <rect x="220" y="224" width="500" height="36" rx="5" class="box ok" />
+          <text x="470" y="247" text-anchor="middle" class="small">{ target, kind: 'color', index: 0 }：前后是同一个地址</text>
+          <line x1="320" y1="224" x2="320" y2="170" class="line" marker-end="url(#e2-tip)" />
+          <line x1="610" y1="224" x2="610" y2="170" class="line" marker-end="url(#e2-tip)" />
+          <text x="330" y="200" class="small halo">解析到纹理 1</text>
+          <text x="620" y="200" class="small halo">解析到纹理 2</text>
+          <line x1="420" y1="60" x2="498" y2="60" class="line" marker-end="url(#e2-tip)" />
+        </svg>
+      </div>
+      <figcaption>图 2 · revision 与 GPU 替换。CPU 这边，resize 只换一份新的描述快照、revision 加一，不碰 GPU（第 6.4 节）。后端的 Manager 在下一次 get 时比较 revision：相同就复用，不同就先建好完整的新 FBO、发布、再删旧的，失败时不把旧尺寸的对象当新版本返回（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:72">WebGL1RenderTargetManager.ts:72–124</a>）。附件引用只记「哪个目标、哪一类、第几个」，不记 revision，所以 resize 之后它照样有效（第 6.5 节）。</figcaption>
+    </figure>
+
+    <h2 id="s3">3. Texture 基类：所有纹理共有的描述</h2>
+    <p>读下面每一节时，先看代码摘录（行尾注释是我加的；「节选」表示省略了一部分），再看表。</p>
+
+    <h3 id="s3-1">3.1 五项描述</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 18%">字段</th><th style="width: 34%">可选值</th><th style="width: 16%">默认</th><th>说什么</th></tr>
+        <tr><td>sampler</td><td>wrapS、wrapT：clamp-to-edge、repeat、mirrored-repeat；magFilter：nearest、linear；minFilter：再加四种 mipmap 过滤</td><td>clamp-to-edge、linear、linear</td><td>坐标超出 [0, 1] 怎么办、放大缩小怎么取样（<a data-src="src/rendering/resources/Texture.ts:3">Texture.ts:3–16</a>）</td></tr>
+        <tr><td>storage</td><td>format：r、rg、rgb、rgba；type：uint8、float32</td><td>必填</td><td>每个像素几个通道、每个通道什么数值类型（:18–32）</td></tr>
+        <tr><td>colorSpace</td><td>srgb、linear、data</td><td>必填</td><td>数值的意义：sRGB 编码的颜色、线性颜色，还是根本不是颜色（法线、系数）（:34–35）</td></tr>
+        <tr><td>mipmapPolicy</td><td>none、generate</td><td>none</td><td>只有第 0 层，还是上传后由后端生成 mip 链（:37–47）</td></tr>
+        <tr><td>label</td><td>非空白字符串</td><td>必填</td><td>诊断用的名字，不是唯一 ID，也不是缓存的键（:73–79）</td></tr>
+      </table>
+    </div>
+    <p>这些都是逻辑名称，不是 WebGL 枚举：<code>'rgba'</code> 在 WebGL1 上变成 RGBA 还是 SRGB_ALPHA_EXT，由后端根据 colorSpace 决定（第 7 节）。</p>
+
+    <h3 id="s3-2">3.2 为什么要这五项：一块地板的三张贴图</h3>
+    <p>
+      像素数组只回答「每个格子里存了什么数」。上面五项回答的是另外几件事：数字本身答不出来，后端调 GL 时却每一件都要有答案。设想一块平铺的地板要用三张图：颜色贴图、法线贴图，再加一张 GGX 的 E(μ) 查找表 (lookup table)，也就是仓库根目录 <a data-src="lut-gen/Emu_MC.cpp:122">lut-gen/Emu_MC.cpp:122</a> 写出的 GGX_E_MC_LUT.png。三张都是 RGB、每通道 8 位的 PNG，字节格式一模一样，用法却完全不同：
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 15%">描述</th><th style="width: 25%">颜色贴图</th><th style="width: 27%">法线贴图</th><th>E(μ) 查找表</th></tr>
+        <tr><td>这些数是什么</td><td>颜色</td><td>方向：xyz 从 [−1, 1] 映射到 0–255</td><td>能量比例；横向是 μ = cosθ，纵向是粗糙度（<a data-src="lut-gen/Emu_MC.cpp:110">Emu_MC.cpp:110–118</a>）</td></tr>
+        <tr><td>colorSpace</td><td>先不填，留给第 8 节的想一想</td><td>data：不是颜色</td><td>data：不是颜色</td></tr>
+        <tr><td>sampler 的 wrap</td><td>repeat：地板要平铺</td><td>repeat：跟颜色贴图一起平铺</td><td>clamp-to-edge：坐标超过 1 没有意义</td></tr>
+        <tr><td>sampler 的 filter</td><td>linear-mipmap-linear</td><td>linear-mipmap-linear</td><td>linear：表是平滑函数，相邻格子可以插值</td></tr>
+        <tr><td>mipmapPolicy</td><td>generate：远处的地板会缩得很小</td><td>generate</td><td>none：表不会被「缩小着看」</td></tr>
+        <tr><td>storage</td><td>rgb / uint8</td><td>rgb / uint8</td><td>rgb / uint8</td></tr>
+        <tr><td>label（课程起的名字）</td><td>'floor-albedo'</td><td>'floor-normal'</td><td>'ggx-e-lut'</td></tr>
+      </table>
+    </div>
+    <p>
+      storage 三列一样，其余几项各不相同。差别不在字节里，在用途里，而用途只有加载这张图的人知道，所以这些信息必须跟着 Texture 一起交给后端。地板贴图是 2D 纹理，后端目前还没实现（第 7 节），这里只用它来讲描述本身。
+    </p>
+    <p>五项里最隐蔽的是 colorSpace。法线贴图里一个「正朝上」的纹素 (texel) 是 (128, 128, 255)：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 250" role="img" aria-label="同一个法线纹素 128、128、255：按 data 采样，shader 读到 0.502、0.502、1.0，乘 2 减 1 后法线几乎正朝上；按 srgb 采样，采样器先解码，shader 读到 0.216、0.216、1.0，法线倾斜 38.8 度。解码发生在 shader 读到数值之前">
+          <defs>
+            <marker id="e4-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+          </defs>
+          <line x1="362" y1="26" x2="362" y2="222" class="line dash" />
+          <rect x="20" y="95" width="130" height="58" rx="6" class="box" />
+          <text x="85" y="119" text-anchor="middle" class="title">法线纹素</text>
+          <text x="85" y="138" text-anchor="middle" class="small">(128, 128, 255)</text>
+          <rect x="185" y="40" width="160" height="58" rx="6" class="box ok" />
+          <text x="265" y="64" text-anchor="middle" class="title">data：不转换</text>
+          <text x="265" y="83" text-anchor="middle" class="small">采样器原样交出</text>
+          <rect x="380" y="40" width="160" height="58" rx="6" class="box ok" />
+          <text x="460" y="64" text-anchor="middle" class="title">shader 读到</text>
+          <text x="460" y="83" text-anchor="middle" class="small">0.502, 0.502, 1.0</text>
+          <rect x="575" y="40" width="165" height="58" rx="6" class="box ok" />
+          <text x="657" y="64" text-anchor="middle" class="title">法线朝上</text>
+          <text x="657" y="83" text-anchor="middle" class="small">×2−1 后倾斜 0.3°</text>
+          <rect x="185" y="150" width="160" height="58" rx="6" class="box bad" />
+          <text x="265" y="174" text-anchor="middle" class="title">srgb：先解码</text>
+          <text x="265" y="193" text-anchor="middle" class="small">采样器按 sRGB 解码</text>
+          <rect x="380" y="150" width="160" height="58" rx="6" class="box bad" />
+          <text x="460" y="174" text-anchor="middle" class="title">shader 读到</text>
+          <text x="460" y="193" text-anchor="middle" class="small">0.216, 0.216, 1.0</text>
+          <rect x="575" y="150" width="165" height="58" rx="6" class="box bad" />
+          <text x="657" y="174" text-anchor="middle" class="title">法线歪了</text>
+          <text x="657" y="193" text-anchor="middle" class="small">×2−1 后倾斜 38.8°</text>
+          <line x1="150" y1="114" x2="182" y2="76" class="line" marker-end="url(#e4-tip)" />
+          <line x1="150" y1="134" x2="182" y2="172" class="line" marker-end="url(#e4-tip)" />
+          <line x1="345" y1="69" x2="377" y2="69" class="line" marker-end="url(#e4-tip)" />
+          <line x1="345" y1="179" x2="377" y2="179" class="line" marker-end="url(#e4-tip)" />
+          <line x1="540" y1="69" x2="572" y2="69" class="line" marker-end="url(#e4-tip)" />
+          <line x1="540" y1="179" x2="572" y2="179" class="line" marker-end="url(#e4-tip)" />
+          <text x="362" y="240" text-anchor="middle" class="small">shader 只看得到虚线右边的数</text>
+        </svg>
+      </div>
+      <figcaption>图 3 · 同一个法线纹素，colorSpace 不同，shader 拿到的数就不同。标 data 时采样器原样交出，乘 2 减 1 后法线几乎正朝上；误标 srgb 时，采样器先按 sRGB 解码成线性值（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:198">WebGL1CubeTextureManager.ts:198</a>），法线倾斜 38.8°，平整的地板被照得像斜面。解码发生在 shader 读到数值之前，shader 拿到 0.216 时已经无从知道它原本是 128，全程也不报错。数值按 sRGB 解码公式用 Node 算过。</figcaption>
+    </figure>
+    <p><strong>其余几项填错会怎样</strong></p>
+    <ul>
+      <li><strong>wrap：</strong>查找表要是用了 repeat，在 μ 接近 1 的地方采样时，线性过滤会把最后一列和第一列（μ 接近 0，即掠射角）平均起来，正对着看时的能量补偿就混进了掠射角的数据。反过来，地板贴图要是用了 clamp-to-edge，超出 [0, 1] 的部分会被最边上一圈像素拉成长条，铺不满。</li>
+      <li><strong>filter：</strong>能不能插值，取决于数的含义。一张存「材质编号」的图（3 号、5 号……），线性过滤会在交界处插出一个根本不存在的 4 号，这种图要用 nearest。</li>
+      <li><strong>mipmapPolicy：</strong>远处的地板，一个屏幕像素会覆盖几十个纹素。没有 mip 链，就只能在原图上取相邻的 4 个，画面会闪烁、出摩尔纹。只写了 mipmap 过滤器却不生成 mip 链，纹理就不完整，采样结果是黑色 (0, 0, 0, 1)，同样不报错，所以快照函数直接拒绝这种组合（第 3.3 节）。</li>
+      <li><strong>storage：</strong>同样是 16 个字节、宽高 2×2，按 rgba 解释正好一张图，按 rgb 就多出 4 个字节。DataTexture2D 靠它核对数组的类型和长度（<a data-src="src/rendering/resources/texturePixelSnapshot.ts:102">texturePixelSnapshot.ts:102–124</a>）。它还决定后端需要哪些扩展：float32 要 OES_texture_float，用线性过滤还要 OES_texture_float_linear（第 7 节）。</li>
+      <li><strong>label：</strong>场景里有几十张纹理，其中一张上传失败时，错误信息得说出是哪一张。它只给人看：缓存按对象身份区分，「相同 label 的两个 CPU 对象不会合并」（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:79">WebGL1CubeTextureManager.ts:79</a>）。</li>
+    </ul>
+    <p>
+      <strong>为什么有的有默认值，有的必须写。</strong>sampler 和 mipmapPolicy 的默认值 clamp-to-edge、linear、none，是 WebGL1 上对任何尺寸都合法的组合：宽高不是 2 的幂的纹理必须 clamp-to-edge、不带 mipmap（第 7 节）。用默认值最多是不够好看，不会出错。storage、colorSpace、label 没有安全的猜法，colorSpace 猜错就是图 3 那种静默的错，所以必须写，不写快照函数就会抛错（<a data-src="src/rendering/resources/Texture.ts:200">Texture.ts:200–201</a>）。
+    </p>
+
+    <h3 id="s3-3">3.3 createTextureDescriptorSnapshot：先填默认值，再逐项、跨项验证</h3>
+    <pre><code>export function createTextureDescriptorSnapshot(options, createError) {             // Texture.ts:140–231（节选）
+  if (typeof options.label !== 'string' || options.label.trim().length === 0) throw createError('label must be a non-empty string')
+  if (options.sampler !== undefined &amp;&amp; (options.sampler === null || typeof options.sampler !== 'object'))
+    throw createError('sampler must be an object when provided')                    // sampler 整个传 null：拒绝
+  if (options.storage === null || typeof options.storage !== 'object') throw createError('storage must be an object')
+
+  const samplerInput = options.sampler ?? {}
+  const wrapS = samplerInput.wrapS ?? 'clamp-to-edge'                               // ?? 把 null 和 undefined 一样对待
+  const wrapT = samplerInput.wrapT ?? 'clamp-to-edge'
+  const minFilter = samplerInput.minFilter ?? 'linear'
+  const magFilter = samplerInput.magFilter ?? 'linear'
+  const format = options.storage.format, type = options.storage.type
+  const colorSpace = options.colorSpace                                             // 必填：没有默认值
+  const mipmapPolicy = options.mipmapPolicy ?? 'none'
+
+  if (!WRAP_MODES.has(wrapS)) throw createError(`unsupported wrapS ${String(wrapS)}`)   // :176–206 每一项查允许集合
+  …（wrapT、minFilter、magFilter、format、type、colorSpace、mipmapPolicy 同理）
+  if (mipmapPolicy === 'none' &amp;&amp; MIPMAP_MIN_FILTERS.has(minFilter))                 // :208–210 跨字段约束
+    throw createError(`minFilter ${minFilter} requires mipmapPolicy "generate"`)
+
+  const sampler = Object.freeze({ wrapS, wrapT, minFilter, magFilter })              // 新对象，冻结
+  const storage = Object.freeze({ format, type })
+  return Object.freeze({ label: options.label, sampler, storage, colorSpace, mipmapPolicy })
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>把调用者的描述验证一遍，复制成几个冻结的新对象。Texture 的构造函数拿到结果后，把五项存成 public readonly 字段（<a data-src="src/rendering/resources/Texture.ts:260">Texture.ts:260–270</a>）。</td></tr>
+      <tr><th>顺序</th><td>先查三个外层结构（label、sampler、storage），再填默认值，然后逐项查允许集合，最后查跨字段约束。允许集合是运行时的 Set（:107–133），挡的是 JavaScript 和错误的类型断言。</td></tr>
+      <tr><th>跨字段约束</th><td>mipmapPolicy 是 none 时不许用 mipmap 过滤（卡片 B）。这不是风格偏好：ES 2.0 规范 3.8.2 节规定，缩小过滤要 mipmap、纹理又没有完整的 mip 链时，采样结果是 (0, 0, 0, 1)，也就是黑色，而且不报任何错。这个错不需要设备就能发现，所以构造时就拒绝。</td></tr>
+      <tr><th>null 的含义</th><td>sampler 里的字段用 <code>??</code> 补默认值，<code>??</code> 对 null 和 undefined 一视同仁：<code>{ wrapS: null }</code> 被当成没填（卡片 C）。第 11 课的 Material 正好相反，null 会被拒（审查视角 1）。colorSpace 没有默认值，传 null 会在允许集合那一步被拒。</td></tr>
+      <tr><th>为什么冻结两层</th><td>sampler 和 storage 是嵌套对象，只冻结外层的话，<code>texture.sampler.wrapS = 'repeat'</code> 仍然能改。这里三个对象都是新建的，各自冻结（测试 <a data-src="tests/unit/rendering/resources/Texture2D.test.ts:88">Texture2D.test.ts:88</a>）。</td></tr>
+      <tr><th>没有检查的</th><td>WebGL1 的限制：NPOT 纹理只能 clamp-to-edge、不能要 mipmap，浮点纹理要扩展。这些由后端上传时查（<a data-src="src/rendering/resources/Texture.ts:239">:239–240</a>），同一个 Texture 交给 WebGL2 的后端，限制就不一样了。</td></tr>
+    </table></div>
+
+    <h3 id="s3-4">3.4 protected 构造与错误工厂</h3>
+    <pre><code>export type TextureValidationErrorFactory = (reason: string) =&gt; Error               // Texture.ts:96
+
+protected constructor(options: TextureOptions, createError: TextureValidationErrorFactory) {   // :260–270
+  super()
+  const descriptor = createTextureDescriptorSnapshot(options, createError)          // 共同的验证写在基类
+  this.label = descriptor.label                                                     // 五项都是 public readonly
+  …
+}
+
+// 子类：CubeTexture.ts:276–282
+constructor(options: CubeTextureOptions) {
+  const textureLabel = getCubeDiagnosticLabel(options.label)                         // super 之前先备好报错用的名字
+  super(options, (reason) =&gt; new InvalidCubeTextureError(textureLabel, reason))     // 由子类决定错误类型
+  this.sourceValue = createCubeSourceSnapshot(this.label, options.source, this.storage)
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>为什么 protected</th><td>不许直接 new 一个「没有来源」的纹理（<a data-src="src/rendering/resources/docs/textures-and-render-targets.zh-CN.md:7">模块说明 :7</a>）。Texture 是抽象类，Texture2D 也是（<a data-src="src/rendering/resources/Texture2D.ts:49">Texture2D.ts:49</a>），能 new 的只有三个具体类。</td></tr>
+      <tr><th>为什么要错误工厂</th><td>验证逻辑是共同的，错误类型却该随具体资源走：Texture2D 家族抛 InvalidTextureSourceError，CubeTexture 抛 InvalidCubeTextureError（<a data-src="src/rendering/resources/Texture.ts:87">Texture.ts:87–96</a>）。基类只说「哪里错了」，子类说「这是谁的错」。</td></tr>
+      <tr><th>super 之前的那一行</th><td>JavaScript 规定 super() 之前不能用 this。报错信息要带名字，于是先用一个不依赖 this 的函数算出诊断名（label 不合法时是 <code>&lt;unnamed&gt;</code>），交给工厂闭包；super 之后再用已验证的 this.label。第 11 课 ShaderModule 的 getShaderDiagnosticLabel 是同一个做法。</td></tr>
+    </table></div>
+
+    <h2 id="s4">4. Texture2D 的两种来源</h2>
+
+    <h3 id="s4-1">4.1 ImageTexture2D：借用浏览器图片</h3>
+    <pre><code>export type TextureImageSource = HTMLImageElement | ImageBitmap                     // Texture2D.ts:20
+
+constructor(options: ImageTexture2DOptions) {                                        // :73–85
+  const textureLabel = getTextureDiagnosticLabel(options.label)
+  super(options, (reason) =&gt; new InvalidTextureSourceError(textureLabel, reason))
+  if (options.source === null || typeof options.source !== 'object')                 // 只查「是不是对象」
+    throw new InvalidTextureSourceError(this.label, 'image source must be an object')
+  this.sourceValue = options.source                                                  // 保存引用，不复制
+}
+get source(): TextureImageSource { this.assertUsable(); return this.sourceValue! }   // :88–92 借出同一个对象
+protected override disposeCPUData(): void { this.sourceValue = null }                // :97–99 只断开，不 close</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>为什么只存引用</th><td>「HTMLImageElement/ImageBitmap 不能像 TypedArray 一样通用地深拷贝」（<a data-src="src/rendering/resources/Texture2D.ts:61">Texture2D.ts:61–63</a>）。要复制，得先画到 canvas 再读回来，那就变成另一种来源了。</td></tr>
+      <tr><th>借用意味着什么</th><td>图片的寿命归创建它的人：dispose 只断开引用，不调 <code>ImageBitmap.close()</code>。同一张 ImageBitmap 可能还被别的纹理用着。</td></tr>
+      <tr><th>为什么只查是不是对象</th><td>图片加载完没有、能不能交给 texImage2D，都要等上传时由后端查（:65–66，卡片 I）。资源层不依赖 DOM 类型，单元测试可以在 Node 里跑；后端在浏览器里运行，才用 <code>instanceof HTMLImageElement</code> 去认它。</td></tr>
+      <tr><th>状态</th><td>构造后不再变；读取都先 assertUsable（测试 <a data-src="tests/unit/rendering/resources/Texture2D.test.ts:238">Texture2D.test.ts:238</a>）。</td></tr>
+    </table></div>
+
+    <h3 id="s4-2">4.2 DataTexture2D 与 texturePixelSnapshot：复制进来，复制出去</h3>
+    <pre><code>export function createTexturePixelSnapshot2D(source, storage, createError) {        // texturePixelSnapshot.ts:82–133
+  if (source === null || typeof source !== 'object') throw createError('pixel source must be an object')
+  if (!Number.isInteger(source.width) || source.width &lt;= 0 || !Number.isInteger(source.height) || source.height &lt;= 0)
+    throw createError(`width and height must be positive integers; …`)
+  if (!(source.data instanceof Uint8Array || source.data instanceof Float32Array))   // 只认这两种
+    throw createError('data must be a Uint8Array or Float32Array')
+  if (storage.type === 'uint8' &amp;&amp; !(source.data instanceof Uint8Array)) throw …      // 数组类型要和 storage.type 对上
+  if (storage.type === 'float32' &amp;&amp; !(source.data instanceof Float32Array)) throw …
+  const expectedLength = source.width * source.height * getChannelCount(storage.format)   // 宽 × 高 × 通道数
+  if (!Number.isSafeInteger(expectedLength)) throw …                                 // 乘法不能超出安全整数
+  if (source.data.length !== expectedLength) throw createError(`data length … does not match expected length …`)
+  return Object.freeze({ data: copyTexturePixelArray(source.data), width: source.width, height: source.height })   // 复制数组，冻结外壳
+}
+
+copySource(): TexturePixelSource2D {                                                 // Texture2D.ts:145–149
+  this.assertUsable()
+  return copyTexturePixelSnapshot2D(this.sourceValue!)                               // 每次一份新数组
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>验证一份二维像素，存一份调用者碰不到的快照。DataTexture2D 用它（<a data-src="src/rendering/resources/Texture2D.ts:119">Texture2D.ts:119–123</a>），CubeTexture 的 data 模式对六面各用一次。</td></tr>
+      <tr><th>校验</th><td>宽高是正整数；数组是 Uint8Array 或 Float32Array，而且和 storage.type 一致；长度正好等于宽 × 高 × 通道数（rgba 是 4，<a data-src="src/rendering/resources/texturePixelSnapshot.ts:38">:38–47</a>）。canvas 的 <code>getImageData().data</code> 是 Uint8ClampedArray，它不是 Uint8Array，会被拒（卡片 A）。</td></tr>
+      <tr><th>为什么进出都复制</th><td>注释说得很准：「readonly 只能阻止重新赋值 data 属性，不能阻止修改 TypedArray 的元素」（<a data-src="src/rendering/resources/texturePixelSnapshot.ts:19">:19–21</a>）。有元素的 TypedArray 又冻结不了（热身第 1 题），所以只能进来复制一份、出去再复制一份。</td></tr>
+      <tr><th>「复制」要复制到哪一层</th><td><code>new Uint8Array(existing)</code> 逐个复制元素，得到新的底层内存；<code>new Uint8Array(existing.buffer)</code> 只是同一块内存的另一个视图（<a data-src="src/rendering/resources/docs/textures-and-render-targets.zh-CN.md:21">模块说明 :21</a>）。卡片 A 里调用者交进来的就是视图，纹理仍不受影响，因为纹理自己又复制了一次。</td></tr>
+      <tr><th>copy 为什么不再验证</th><td>它只接收内部已经验证过的快照；「重新验证既不能增加边界安全性」，还会把读取和构造混在一起（<a data-src="src/rendering/resources/texturePixelSnapshot.ts:141">:141–143</a>）。</td></tr>
+      <tr><th>没有检查的</th><td>数组里的值是否合理（float32 里的 NaN、Infinity 照收）；尺寸是否超过设备上限，由后端上传时查。</td></tr>
+    </table></div>
+
+    <h2 id="s5">5. CubeTexture：六个面</h2>
+
+    <h3 id="s5-1">5.1 两种 source，按 kind 分支</h3>
+    <pre><code>export type CubeFaces&lt;T&gt; = readonly [T, T, T, T, T, T]                            // CubeTexture.ts:23 顺序：+X −X +Y −Y +Z −Z
+export type CubeTextureSource =
+  | { readonly kind: 'images'; readonly faces: CubeFaces&lt;TextureImageSource&gt; }       // :26–29 六张图片
+  | { readonly kind: 'data'; readonly faces: CubeFaces&lt;TexturePixelSource2D&gt; }      // :32–35 六份像素
+
+function createCubeSourceSnapshot(label, source, storage) {                         // :225–248
+  if (source === null || typeof source !== 'object') throw new InvalidCubeTextureError(label, 'source must be an object')
+  const sourceKind: unknown = (source as { readonly kind?: unknown }).kind            // 又一次「当成 unknown」
+  switch (sourceKind) {
+    case 'images': return createCubeImageSnapshot(label, source as CubeImageSource)
+    case 'data': return createCubeDataSnapshot(label, source as CubeDataSource, storage)
+    default: throw new InvalidCubeTextureError(label, `unsupported source kind ${String(sourceKind)}`, { sourceKind })
+  }
+}
+
+function createCubeImageSnapshot(label, source) {                                   // :89–129（节选）
+  const rawFaces: unknown = source.faces
+  if (!Array.isArray(rawFaces) || rawFaces.length !== 6) throw …('image source must contain exactly 6 faces; …')
+  for (…) if (face === null || typeof face !== 'object') throw …(`image face ${faceIndex} must be an object`)
+  return Object.freeze({ kind: 'images', faces: copyCubeFaces(faces) })              // 复制并冻结容器，图片仍是借用
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>按 kind 选一条路：images 借用六张图片，data 复制六份像素。</td></tr>
+      <tr><th>为什么 tuple 之外还要查长度</th><td>tuple 只约束 TypeScript 调用者；「JSON、JavaScript 或 as never 仍可绕过编译期约束」（<a data-src="src/rendering/resources/CubeTexture.ts:222">:222–223</a>）。和第 11 课的 language、第 10 课的 topology 是同一类问题；这里 default 直接抛 InvalidCubeTextureError，没有落到 ExhaustiveMatchError。</td></tr>
+      <tr><th>images 模式查得很少</th><td>只查六个元素、每个都是对象（卡片 D）。「图片是否已经加载、是否确实可以传给 texImage2D、六面是否同尺寸以及 WebGL1 NPOT 限制」都留给上传（<a data-src="src/rendering/resources/CubeTexture.ts:85">:85–87</a>）。</td></tr>
+      <tr><th>「复制容器」是什么意思</th><td>faces 数组是新建并冻结的（<a data-src="src/rendering/resources/CubeTexture.ts:66">copyCubeFaces，:66–70</a>），调用者之后改自己的数组（比如换掉第 3 张图）影响不到它；数组里的图片对象仍是同一批（测试 <a data-src="tests/unit/rendering/resources/CubeTexture.test.ts:52">CubeTexture.test.ts:52</a>）。</td></tr>
+    </table></div>
+
+    <h3 id="s5-2">5.2 六面尺寸：同一条规则，两个检查时机</h3>
+    <pre><code>export function assertValidCubeFaceDimensions(faces, createError) {                 // assertValidCubeFaceDimensions.ts:52–104（节选）
+  for (const [faceIndex, face] of faces.entries()) {
+    if (!(Number.isSafeInteger(face.width) &amp;&amp; face.width &gt; 0 &amp;&amp; Number.isSafeInteger(face.height) &amp;&amp; face.height &gt; 0)) throw …
+    if (face.width !== face.height) throw createError(`face ${faceIndex} must be square; …`)   // 每一面是正方形
+  }
+  for (const [offset, face] of faces.slice(1).entries())                             // 其余五面和第 0 面同尺寸
+    if (face.width !== faces[0].width || face.height !== faces[0].height) throw createError(`face ${offset + 1} dimensions … do not match face 0 …`)
+}</code></pre>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 22%">来源</th><th style="width: 22%">什么时候查</th><th style="width: 30%">在哪里调用</th><th>报什么错</th></tr>
+        <tr><td>data 六面</td><td>构造时</td><td><a data-src="src/rendering/resources/CubeTexture.ts:207">CubeTexture.ts:207–210</a></td><td>InvalidCubeTextureError</td></tr>
+        <tr><td>images 六面</td><td>第一次上传时</td><td><a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:106">WebGL1CubeTextureManager.ts:106–109</a>，先用 naturalWidth 等读出真实尺寸（:40–53）</td><td>InvalidTextureSourceError</td></tr>
+      </table>
+    </div>
+    <p>
+      「正方形、六面同尺寸」不依赖任何后端（<a data-src="src/rendering/resources/assertValidCubeFaceDimensions.ts:42">:42–48</a>），所以写成一个独立函数，错误类型由调用方的工厂决定。数据面的尺寸构造时就知道，立刻查；图片的真实尺寸要等它加载完，只能在上传时查。规则只写了一份，检查时机按「什么时候知道」来定。这和第 10 课「能早查的尽量早查」是同一个原则。
+    </p>
+    <p>
+      注意 NPOT 不在这里：一个 3×3 的 data cubemap 配 repeat 能构造成功（测试 <a data-src="tests/unit/rendering/resources/CubeTexture.test.ts:221">CubeTexture.test.ts:221</a>）。ES 2.0 规范 3.8.2 节规定，NPOT 的 cubemap 只要不是 clamp-to-edge、或者要 mipmap，采样就得到黑色；这条限制属于 WebGL1，由 Manager 在上传前拒绝（第 7 节）。
+    </p>
+
+    <h3 id="s5-3">5.3 读取与释放</h3>
+    <pre><code>get sourceKind(): CubeTextureSource['kind'] { this.assertUsable(); return this.sourceValue!.kind }   // CubeTexture.ts:290–294
+copySource(): CubeTextureSource {                                                    // :305–333
+  …images：{ kind: 'images', faces: copyCubeFaces(source.faces) }                    // 新容器，同一批图片
+  …data：六面各 copyTexturePixelSnapshot2D                                           // 新容器、新包装、新数组
+}
+protected override disposeCPUData(): void { this.sourceValue = null }                // :342–344 不 close 借来的 ImageBitmap</code></pre>
+    <p>CubeTextureManager 上传前调一次 copySource，拿到的是一份独立的副本（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:91">WebGL1CubeTextureManager.ts:91</a>）。释放的顺序和前两课一样：Resource 先通知 Manager 删掉每个 context 的 GPU 纹理（订阅在 :176），最后才断开这份 CPU 快照。</p>
+
+    <h2 id="s6">6. RenderTarget：描述写到哪里，不描述画什么</h2>
+
+    <h3 id="s6-1">6.1 为什么不继承 Texture</h3>
+    <p>
+      RenderTarget 继承 Resource，而不是 Texture：「没有可重新上传的 CPU 图片或像素源」，context 恢复之后，GPU 里画出来的内容要由它的所有者重新执行生产它的 Pass（<a data-src="src/rendering/resources/RenderTarget.ts:405">RenderTarget.ts:405–408</a>）。Texture 的五项描述也大多不适用：它的颜色附件固定是 rgba8，采样方式由 Manager 定死（第 7 节）。它的所有者一般是某个 Pass 或功能模块，而不是 Scene（第 5 课第 2 节）。
+    </p>
+
+    <h3 id="s6-2">6.2 为什么是这四项：一帧里的三块画布</h3>
+    <p>
+      拿 Texture 对比着看：Texture 描述一份已经存在的数据，讲它怎么存、怎么取、代表什么；RenderTarget 描述一块要交给 GPU 去写的空画布，讲它多大、有几层颜色、每层什么格式、要不要一层深度。所以它只有 width、height、colors、depth 四项，而且都是后端建 FBO 之前必须知道的。FBO 建好就定型了，尺寸一变只能整套重建，所以才需要第 6.4 节的 resize 和 revision。画什么、清成什么、之后谁怎么读，都不归它管。
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 15%"></th><th style="width: 30%">阴影贴图</th><th style="width: 22%">后处理目标</th><th>GBuffer（HW3 的延迟渲染）</th></tr>
+        <tr><td>谁往里写</td><td>从光源看场景的 shadow pass</td><td>一个铺满屏幕的矩形</td><td>几何 pass，一次写五样</td></tr>
+        <tr><td>width、height</td><td>1024×1024，固定。分辨率是画质选择，和画布无关（旧引擎的默认值，<a data-src="src/renderers/passes/shadow/types/shadow.d.ts:10">shadow.d.ts:10</a>）</td><td>跟画布一样大，画布一变就 resize</td><td>跟画布一样大</td></tr>
+        <tr><td>colors</td><td>1 个 rgba8，存打包 (pack) 进 RGBA 的深度</td><td>1 个 rgba8</td><td>5 个：kd、深度、法线、阴影、世界坐标（<a data-src="src/shaders/deferred/gbuffer/fragment.frag:389">gbuffer/fragment.frag:389–409</a>）</td></tr>
+        <tr><td>depth</td><td>depth16：靠深度测试留下离光源最近的表面</td><td>不要：画一个全屏矩形用不着深度测试</td><td>depth16</td></tr>
+      </table>
+    </div>
+    <p>阴影贴图这一列，就是旧引擎 ShadowMapFBO 在设备没有 WEBGL_depth_texture 时用的布局（<a data-src="src/framebuffers/ShadowMapFBO.ts:41">ShadowMapFBO.ts:41–52</a>）。三块画布用的是同一个 RenderTarget 类型，后端建出来的 FBO 却各不相同：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 300" role="img" aria-label="三块画布对应的 FBO：阴影贴图 1024 乘 1024，一个 rgba8 颜色附件存打包后的深度，加一个 depth16 renderbuffer，属于 WebGL 1.0 规范保证一定完整的组合；后处理目标跟画布一样大，只有一个 rgba8 颜色附件、不要深度，同样保证完整；GBuffer 有五个颜色槽，需要 WEBGL_draw_buffers，世界坐标和深度需要浮点格式，rgba8 存不下，现在还描述不了">
+          <rect x="20" y="16" width="230" height="272" rx="8" class="line dash" />
+          <text x="135" y="40" text-anchor="middle" class="title">阴影贴图</text>
+          <text x="135" y="58" text-anchor="middle" class="small">1024 × 1024，固定</text>
+          <rect x="40" y="74" width="190" height="52" rx="6" class="box ok" />
+          <text x="135" y="96" text-anchor="middle" class="title">COLOR0 · rgba8</text>
+          <text x="135" y="114" text-anchor="middle" class="small">存 pack 后的深度</text>
+          <rect x="40" y="136" width="190" height="52" rx="6" class="box ok" />
+          <text x="135" y="158" text-anchor="middle" class="title">DEPTH · depth16</text>
+          <text x="135" y="176" text-anchor="middle" class="small">只做深度测试，shader 读不到</text>
+          <text x="135" y="272" text-anchor="middle" class="small ok">规范保证一定完整</text>
+          <rect x="265" y="16" width="230" height="272" rx="8" class="line dash" />
+          <text x="380" y="40" text-anchor="middle" class="title">后处理目标</text>
+          <text x="380" y="58" text-anchor="middle" class="small">跟画布一样大</text>
+          <rect x="285" y="74" width="190" height="52" rx="6" class="box ok" />
+          <text x="380" y="96" text-anchor="middle" class="title">COLOR0 · rgba8</text>
+          <text x="380" y="114" text-anchor="middle" class="small">存这一步的颜色</text>
+          <rect x="285" y="136" width="190" height="52" rx="6" class="line dash" />
+          <text x="380" y="166" text-anchor="middle" class="small">不要深度</text>
+          <text x="380" y="272" text-anchor="middle" class="small ok">规范保证一定完整</text>
+          <rect x="510" y="16" width="230" height="272" rx="8" class="line dash" />
+          <text x="625" y="40" text-anchor="middle" class="title">GBuffer（HW3）</text>
+          <text x="625" y="58" text-anchor="middle" class="small">跟画布一样大</text>
+          <rect x="530" y="74" width="190" height="52" rx="6" class="box hl" />
+          <text x="625" y="96" text-anchor="middle" class="title">COLOR0–4 · 5 个槽</text>
+          <text x="625" y="114" text-anchor="middle" class="small">要 WEBGL_draw_buffers</text>
+          <rect x="530" y="136" width="190" height="52" rx="6" class="box bad" />
+          <text x="625" y="158" text-anchor="middle" class="title">位置、深度要浮点</text>
+          <text x="625" y="176" text-anchor="middle" class="small">rgba8 会夹到 [0, 1]</text>
+          <rect x="530" y="198" width="190" height="52" rx="6" class="box ok" />
+          <text x="625" y="220" text-anchor="middle" class="title">DEPTH · depth16</text>
+          <text x="625" y="238" text-anchor="middle" class="small">只做深度测试，shader 读不到</text>
+          <text x="625" y="272" text-anchor="middle" class="small bad">现在还描述不了</text>
+        </svg>
+      </div>
+      <figcaption>图 4 · 三块画布，三种 FBO 结构。绿框的组合是 WebGL 1.0 规范保证在任何设备上都完整的（「Framebuffer Object Attachments」一节）；蓝框要靠 WEBGL_draw_buffers 扩展；红框是现在的描述表达不了的：旧引擎的 GBuffer 五个附件全用 FLOAT（<a data-src="src/framebuffers/GBufferFBO.ts:13">GBufferFBO.ts:13</a>、:42），而 colors 目前只允许 rgba8（<a data-src="src/rendering/resources/RenderTarget.ts:13">RenderTarget.ts:13</a>）。</figcaption>
+    </figure>
+    <p><strong>每一项不写或写错会怎样</strong></p>
+    <ul>
+      <li><strong>width、height：</strong>分配存储要用：每个颜色纹理的 texImage2D 和深度的 renderbufferStorage 都要宽高（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:272">WebGL1RenderTargetManager.ts:272–282</a>、:316）；进入 scope 时，viewport 也设成目标的宽高（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:207">WebGL1State.ts:207–216</a>）。宽高属于整块画布，不属于单个附件：ES 2.0.25 第 4.4.5 节要求「All attached images have the same width and height」，做不到 FBO 就不完整（FRAMEBUFFER_INCOMPLETE_DIMENSIONS），所以描述里只有一组宽高。</li>
+      <li><strong>colors 的个数：</strong>决定片元着色器能同时写几个输出。每个槽对应一张纹理，挂在 COLOR_ATTACHMENT0 + i 上（:299–301），shader 往 gl_FragData[i] 写。多于 1 个就需要 WEBGL_draw_buffers，而且不能超过 MAX_COLOR_ATTACHMENTS_WEBGL 和 MAX_DRAW_BUFFERS_WEBGL（:206–227）。这些检查、要建几张纹理、drawBuffersWEBGL 的槽位列表，都得在建 FBO 之前知道个数。</li>
+      <li><strong>colors 的格式：</strong>决定每个像素能存什么值。rgba8 每通道 8 位，写进去的值会被夹到 [0, 1]。GBuffer 的世界坐标和深度远远超出这个范围，所以旧引擎全用 FLOAT。新的描述目前只允许 rgba8，GBuffer 因此还描述不了；浮点格式写在 TODO 里（<a data-src="src/rendering/resources/RenderTarget.ts:56">RenderTarget.ts:56–58</a>），注释特意说明不把尚未支持的 HDR 字段当作「无效占位参数」。</li>
+      <li><strong>depth：</strong>需要却没给时，ES 2.0.25 第 4.1.5 节规定「If there is no depth buffer, it is as if the depth buffer test always passes」。Material 开着深度测试也没用：后画的三角形直接盖住先画的，阴影贴图里存下的是最后画的表面而不是最近的，阴影全错，而且不报错。不需要就别要：后处理可以省掉一张「宽 × 高 × 2 字节」的 renderbuffer。depth16 在后端是 renderbuffer，只能做深度测试、不能采样（第 6.5 节），所以阴影贴图得把深度另外 pack 进颜色附件，这正是旧引擎的做法。</li>
+    </ul>
+    <p>
+      <strong>为什么格式只有 rgba8 和 depth16。</strong>WebGL 1.0 规范「Framebuffer Object Attachments」一节只保证这几种组合在任何设备上一定完整：COLOR_ATTACHMENT0 = RGBA/UNSIGNED_BYTE 纹理；它加上 DEPTH_ATTACHMENT = DEPTH_COMPONENT16 renderbuffer；它加上 DEPTH_STENCIL_ATTACHMENT = DEPTH_STENCIL renderbuffer。同一节还规定，挂在 DEPTH_ATTACHMENT 上的 renderbuffer 必须是 DEPTH_COMPONENT16。「rgba8 加可选的 depth16」正好落在前两种里（<a data-src="src/rendering/resources/RenderTarget.ts:13">RenderTarget.ts:13–16</a>）；描述要求至少有一个颜色附件（:52），也和这几种组合一致。多个附件、浮点格式、可采样的深度都要靠扩展，所以交给后端按设备能力判断。
+    </p>
+    <p><strong>它故意不描述的</strong></p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 22%">不在描述里</th><th style="width: 32%">归谁管</th><th>为什么不放进 RenderTarget</th></tr>
+        <tr><td>画哪些物体、用哪台相机</td><td>Pass，以及每帧的 RenderView</td><td>同一块画布可以被不同的 Pass 写</td></tr>
+        <tr><td>开始时清成什么</td><td>进入 scope 时的 clear（<a data-src="src/rendering/backend/RenderSurface.ts:37">RenderSurface.ts:37–39</a>）</td><td>清不清、清成什么，是这一次使用的决定：阴影 pass 每次把深度清成 1，逐帧累加的效果就不能清</td></tr>
+        <tr><td>被采样时怎么过滤（10 月 12 日起放进了描述）</td><td>以前由 Manager 写死为 LINEAR、CLAMP_TO_EDGE（第 7 节）。现在每个颜色附件可以带 <code>sampler: { minFilter, magFilter }</code>，取值 'linear' 或 'nearest'，缺省是 linear（<a data-src="src/rendering/resources/RenderTarget.ts:30">RenderTarget.ts:30–46</a>）；wrap 仍固定 CLAMP_TO_EDGE，也没有 mipmap</td><td>阴影贴图做 PCF 要先逐个比较、再平均比较结果，不该在比较之前就让采样器把相邻的深度平均掉；旧引擎的注释说这里用 NEAREST「都合适」（<a data-src="src/framebuffers/ShadowMapFBO.ts:50">ShadowMapFBO.ts:50</a>）。新注释写的就是这件事：「RGBA 打包深度用于硬阴影时应显式选择 nearest」（RenderTarget.ts:38）。第 27 课讲它在 GPU 上变成了什么</td></tr>
+        <tr><td>颜色空间</td><td>不做任何转换</td><td>rgba8「只规定存储格式，不自动执行 sRGB/线性颜色转换」（RenderTarget.ts:53）</td></tr>
+      </table>
+    </div>
+    <p>
+      <strong>想一想：</strong>RenderTarget 没有 label。FBO 不完整时，错误信息是「Framebuffer RenderTarget revision 0 is incomplete with status 36054」，诊断名来自 <a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:86">WebGL1RenderTargetManager.ts:86</a>；光看这条信息，分不清出问题的是阴影贴图还是 GBuffer。可 Texture 却把 label 设成了必填项（第 3.1 节）。RenderTarget 该不该也加一个 label？如果加，是放进 descriptor（resize 的浅展开会把它一起保留），还是作为构造函数的另一个参数？
+    </p>
+    <aside class="note"><strong>10 月 10 日更新</strong>：你已经用代码回答了这一问（提交 0f0861c）。label 成了必填项，放在构造函数的第二个参数里，不放进 descriptor：<code>new RenderTarget(descriptor, { label: 'shadow/main' })</code>，空白字符串会被拒（<a data-src="src/rendering/resources/RenderTarget.ts:434">RenderTarget.ts:434–447</a>）。现在 FBO 不完整时，诊断名是「shadow/main (RenderTarget revision 0)」（WebGL1RenderTargetManager.ts:86）。放在 options 里，resize 换描述时碰不到它，它也不参与 revision；释放之后 label 还留着，方便事后看是谁出的错（:413–422）。下面的卡片用的还是 10 月 1 日打的包，构造时不传 label 也能过。</aside>
+
+    <h3 id="s6-3">6.3 createDescriptorSnapshot：逐层验证，逐层冻结</h3>
+    <pre><code>type UnvalidatedFields&lt;T extends object&gt; = { readonly [K in keyof T]?: unknown }    // RenderTarget.ts:115–117 字段名有提示，值一概 unknown
+
+function createDescriptorSnapshot(value: unknown): RenderTargetDescriptorSnapshot { // :332–397（节选）
+  const input: UnvalidatedFields&lt;RenderTargetDescriptor&gt; = requireRecord(value, 'descriptor')   // ① 外层是非数组对象
+  requireKnownFields&lt;RenderTargetDescriptor&gt;(input, ['width', 'height', 'colors', 'depth'], 'descriptor')   // ② 不认识的字段直接拒
+  const width = requireDimension(input.width, 'width')                              // ③ 正安全整数，不转换字符串
+  const height = requireDimension(input.height, 'height')
+  if (!Array.isArray(rawColors) || rawColors.length === 0) throw …('must be a non-empty array')
+  for (let index = 0; index &lt; entries.length; index++) {                            // ④ 按下标走：空洞也会被查到
+    const fieldName = 'colors[' + index + ']'
+    const color = requireRecord(entries[index], fieldName)
+    requireKnownFields&lt;RenderTargetDescriptor['colors'][number]&gt;(color, ['format', 'sampler'], fieldName)
+    const format = requireAttachmentFormat(color.format, COLOR_ATTACHMENT_FORMATS, fieldName + '.format')
+    const sampler = createColorAttachmentSampler(color.sampler, fieldName + '.sampler')   // 10 月 12 日新增：缺的字段补 linear，再冻结
+    colors.push(Object.freeze({ format, sampler }))
+  }
+  if (input.depth !== undefined) { …同样三步… depth = Object.freeze({ format }) }   // ⑤ 可选的深度附件
+  return Object.freeze({ width, height, colors: Object.freeze(colors), ...(depth === undefined ? {} : { depth }) })   // ⑥ 逐层冻结
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>验证尺寸和附件布局，建一份每一层都冻结的新描述。所有检查通过之前，什么都不发布（:321）。</td></tr>
+      <tr><th>UnvalidatedFields 是干什么的</th><td>一个小技巧：它把每个字段都变成可选的 unknown。这样写 <code>input.width</code> 时编辑器还能提示字段名、拼错会报错，但类型系统不会假装值已经可信，逼着每个值都过一遍验证函数（<a data-src="src/rendering/resources/RenderTarget.ts:104">:104–117</a>）。</td></tr>
+      <tr><th>拒绝未知字段</th><td>和第 11 课的 RenderState 一样：多写一个 <code>stencil: true</code> 会被拒，不会被悄悄忽略（卡片 H）。每个附件对象也各查一遍自己的字段名。</td></tr>
+      <tr><th>格式列表</th><td>颜色只有 rgba8，深度只有 depth16，类型从列表推出来（<a data-src="src/rendering/resources/RenderTarget.ts:13">:13–22</a>），和第 11 课 builtInUniforms 的名单是同一个做法。rgba8「只规定存储格式，不自动执行 sRGB/线性颜色转换」（:53）。</td></tr>
+      <tr><th>为什么冻结每一层</th><td>colors 数组和每个附件对象都冻结，调用者拿到描述后没法改数组、换格式，只能通过 resize 这一个受控入口改尺寸（:382–393）。调用者传进来的对象不被冻结，这里冻结的都是自己新建的（测试 <a data-src="tests/unit/rendering/resources/RenderTarget.test.ts:107">RenderTarget.test.ts:107–139</a>）。</td></tr>
+      <tr><th>允许的</th><td>NPOT 尺寸、多个颜色附件、不要深度（<a data-src="tests/unit/rendering/resources/RenderTarget.test.ts:142">RenderTarget.test.ts:142</a>）。多个附件要不要扩展、尺寸超不超上限，都由后端判断（:54）。</td></tr>
+      <tr><th>留着没做的</th><td>浮点格式、写 cubemap 某一面或某一层 mip 的视图，都在 TODO 里（<a data-src="src/rendering/resources/RenderTarget.ts:56">:56–58</a>），而且明确「不把尚未支持的 face、mip、HDR 字段作为无效占位参数」。</td></tr>
+    </table></div>
+
+    <h3 id="s6-4">6.4 resize 与 revision</h3>
+    <pre><code>resize(width: number, height: number): void {                                       // RenderTarget.ts:475–493
+  this.assertUsable()
+  const nextWidth = requireDimension(width, 'width')                                 // 两个尺寸都先验证
+  const nextHeight = requireDimension(height, 'height')
+  const current = this.descriptorValue!
+  if (current.width === nextWidth &amp;&amp; current.height === nextHeight) return          // 没变：什么都不做，revision 不加
+  const next = Object.freeze({ ...current, width, height })                          // 浅展开：colors、depth 沿用已冻结的对象
+  this.descriptorValue = next                                                        // 提交
+  this.revisionValue++                                                               // 版本加一
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>只改尺寸，附件的数量和格式不变。</td></tr>
+      <tr><th>原子性</th><td>两个尺寸都验证通过才提交；<code>resize(512, 1.5)</code> 里宽度虽然合法，也不会单独生效（卡片 F，测试 <a data-src="tests/unit/rendering/resources/RenderTarget.test.ts:228">RenderTarget.test.ts:228</a>）。</td></tr>
+      <tr><th>revision 记的是什么</th><td>「描述版本，不是 GPU 已完成创建的证明，也不是撤销历史」（<a data-src="src/rendering/resources/RenderTarget.ts:426">:426</a>）。尺寸没变不加；A → B → A 是两次修改，加两次，不会退回去（:469，卡片 E）。Manager 只需要比较「我建的时候是第几版」和「现在是第几版」。</td></tr>
+      <tr><th>为什么不直接比尺寸</th><td>比尺寸也能发现「变了」。但 revision 把「变了没有」收成一个整数，Manager 缓存一个数就够；将来如果还能改别的（比如附件格式），比较方式也不用改。这正是第 4 课说的第二种办法：输入自带版本号，缓存记下「我基于哪一版」。</td></tr>
+      <tr><th>旧快照</th><td>先前拿到的 descriptor 不会跟着变：resize 换的是一个新对象（:449）。浅展开让新旧两份共用同一个已冻结的 colors 数组，这是安全的，因为它本来就不能改（<a data-src="src/rendering/resources/docs/textures-and-render-targets.zh-CN.md:51">模块说明 :51</a>）。</td></tr>
+    </table></div>
+
+    <h3 id="s6-5">6.5 附件引用：一个逻辑地址</h3>
+    <pre><code>export interface RenderTargetAttachmentRef {                                         // RenderTarget.ts:131–135
+  readonly target: RenderTarget                                                      // 哪个目标（对象身份）
+  readonly kind: 'color' | 'depth'                                                   // 哪一类
+  readonly index: number                                                             // 第几个槽；depth 固定为 0
+}
+getColorAttachment(index: number): RenderTargetAttachmentRef {                      // :501–513
+  this.assertUsable()
+  if (!Number.isSafeInteger(index) || index &lt; 0 || index &gt;= colors.length) throw …('must name an existing slot')
+  return Object.freeze({ target: this, kind: 'color', index })                       // 每次一个新的冻结包装
+}
+getDepthAttachment(): RenderTargetAttachmentRef | null {                             // :519–524
+  this.assertUsable()
+  if (this.descriptorValue!.depth === undefined) return null                         // null 只表示「没有深度附件」
+  return Object.freeze({ target: this, kind: 'depth', index: 0 })
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>它是什么</th><td>「附件的逻辑地址，不是像素副本或 GPU handle」（<a data-src="src/rendering/resources/RenderTarget.ts:120">:120–129</a>）。<code>{ target, kind: 'color', index: 0 }</code> 的意思是「这个目标的第 0 个颜色槽」，不是「这一代的某个 WebGLTexture」。index 是槽号，不是像素下标、纹理单元号或 cubemap 的面号（<a data-src="src/rendering/resources/docs/textures-and-render-targets.zh-CN.md:47">模块说明 :47</a>）。</td></tr>
+      <tr><th>为什么不存 revision</th><td>resize 之后，GPU 上的纹理换了一张，槽位却还是那个槽位。引用只记地址，由 Manager 解析成当前版本的纹理（图 2）。消费者不用握着一个会过期的句柄。</td></tr>
+      <tr><th>不 retain</th><td>拿着引用不会给目标加引用数，也挡不住它的所有者释放它（:128）；目标释放之后，旧引用也不能让它复活（测试 <a data-src="tests/unit/rendering/resources/RenderTarget.test.ts:287">RenderTarget.test.ts:287</a>）。</td></tr>
+      <tr><th>每次新包装</th><td>两次 <code>getColorAttachment(1)</code> 得到两个不同的对象，字段相同（卡片 G）。所以比较引用要比三个字段，不能比对象身份（审查视角 3）。</td></tr>
+      <tr><th>深度的特殊之处</th><td>depth16 在后端是 renderbuffer，不是纹理，「在本阶段不能作为纹理采样」（:127）。null 的意思被刻意限定：「绝不表示默认 framebuffer」（:517），默认 framebuffer 由 RenderSurface 的 <code>kind: 'default-framebuffer'</code> 表示（第 6 课）。</td></tr>
+      <tr><th>谁在用</th><td>写这课时只有 RenderTargetManager.resolveAttachment（第 7 节），Material 的纹理参数还不能接它。10 月 12 日起，Material 的 texture2D 参数也能放颜色附件的地址（提交 b54b581；第 11 课 4.3 节、第 29 课第 7 节），深度附件仍被拒绝。当时 Material.ts 里的 TODO 列了三件后端的事：解析当前 revision 的附件、拒绝「采样正在写的目标」、context 恢复后重新生产。10 月 19 日这段注释随参数类型搬进了 <a data-src="src/rendering/resources/materialParameters.ts:35">materialParameters.ts:35–39</a>：前两件 Backend 已经做了，注释里直接写明；TODO 剩下可采样的深度附件、face/mip/layer 子资源视图，以及恢复后由生产者重画附件内容（第 27 课 4.2 节）。</td></tr>
+      <tr><th>TypeScript 接口不是凭证</th><td>「Backend 消费时仍须验证 target/kind/index」（:129）：任何人都能手写一个长得一样的对象。</td></tr>
+    </table></div>
+
+    <h2 id="s7">7. 谁来读：两个 Manager 从这些资源里取了什么</h2>
+    <p>这两个 Manager 的完整流程是第 17 课的内容。这里只看它们从 CPU 资源这一侧读了什么、查了什么：</p>
+    <pre><code>// WebGL1CubeTextureManager.ts:80–110、203–262（节选）
+if (texture.disposed) throw new ResourceDisposedError('CubeTexture')                 // 借用方在使用时检查
+const source = texture.copySource()                                                  // 独立副本
+const dimensionAt = (i) =&gt; source.kind === 'images' ? imageDimensions(source.faces[i], texture.label) : source.faces[i]
+assertValidCubeFaceDimensions(faces, (reason) =&gt; new InvalidTextureSourceError(texture.label, reason))   // 图片的尺寸在这里才查
+const format = this.validateStorage(texture, source.kind, size)                      // WebGL1 的限制：
+  // NPOT 必须 clamp-to-edge、不要 mipmap（:217–225）；r、rg 还不支持；float32 要 OES_texture_float，线性过滤还要 _linear；
+  // colorSpace 是 srgb 就要 EXT_sRGB，否则拒绝，不悄悄退回线性（:247–259）
+… texParameteri 用 texture.sampler 的四项；mipmapPolicy 是 generate 才 generateMipmap（:148–161）
+
+// WebGL1RenderTargetManager.ts:72–124（节选）
+const old = this.entries.get(target)
+const revision = target.revision
+if (old?.resource.revision === revision) return old.resource                          // 同一版：直接复用
+… 不能重建当前正绑定着的 FBO（:92–100）
+this.validate(target.descriptor)                                                     // 尺寸上限、多附件要 WEBGL_draw_buffers
+next = this.create(target.descriptor, revision, label)                               // 颜色：RGBA 纹理，过滤按 sampler、CLAMP_TO_EDGE；深度：DEPTH_COMPONENT16 renderbuffer
+this.entries.set(target, { resource: next, unsubscribe })                            // 先发布新的
+if (old !== undefined) this.deleteResource(old.resource)                              // 再删旧的</code></pre>
+    <ul>
+      <li><strong>颜色附件为什么能是任意尺寸。</strong>RenderTarget 允许 NPOT，因为 Manager 给颜色纹理固定设了 CLAMP_TO_EDGE、不要 mipmap（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:284">WebGL1RenderTargetManager.ts:284–297</a>），正好满足 WebGL1 里 NPOT 纹理完整的条件。过滤方式 10 月 12 日以前固定是 LINEAR，现在按描述里的 sampler 选 LINEAR 或 NEAREST；两种都不用 mipmap，所以不影响 NPOT。</li>
+      <li><strong>附件引用在这里被解析。</strong>resolveAttachment 先在运行时查 target、kind、index，再调 get（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:134">:134–188</a>）：「非法地址不能顺便分配 GPU 存储」。</li>
+      <li><strong>Texture2D 的后端（10 月 12 日补上）。</strong>写这课时，ImageTexture2D、DataTexture2D 在 CPU 层已经齐全，但 Task 15 只做了 cubemap，Material 里放 texture2D 参数，draw 时会被 Uniforms 拒绝；计划里的 Mary 场景只用得到 cubemap，所以这不挡 HW2。现在工作区里有了 WebGL1Texture2DManager（第 29 课），Uniforms 也接通了 sampler2D（热身第 3 题、第 27 课 4.2 节）。</li>
+    </ul>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 250" role="img" aria-label="三个检查时机：构造时检查描述、数据像素和 RenderTarget 字段；第一次上传时检查图片加载与尺寸、NPOT、扩展、尺寸上限、多附件和 FBO 完整性；每次使用时检查资源没有释放、revision 是否变化、附件引用是否合法">
+          <defs>
+            <marker id="e3-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+          </defs>
+          <rect x="30" y="16" width="520" height="66" rx="6" class="box" />
+          <text x="44" y="37" class="title">构造时（第一层，不要设备）</text>
+          <text x="44" y="56" class="small">Texture 描述：枚举、mipmap 过滤要 generate · 像素：尺寸、数组类型、长度</text>
+          <text x="44" y="73" class="small">cube data 六面同尺寸 · RenderTarget：未知字段、尺寸、格式</text>
+          <rect x="30" y="94" width="520" height="66" rx="6" class="box hl" />
+          <text x="44" y="115" class="title">第一次上传时（Manager）</text>
+          <text x="44" y="134" class="small">图片加载完、真实尺寸 · NPOT 限制 · float、sRGB 扩展</text>
+          <text x="44" y="151" class="small">尺寸上限 · 多附件要 WEBGL_draw_buffers · FBO 完整性</text>
+          <rect x="30" y="172" width="520" height="66" rx="6" class="box hl" />
+          <text x="44" y="193" class="title">每次使用时（Manager）</text>
+          <text x="44" y="212" class="small">资源没有释放 · revision 变了就重建</text>
+          <text x="44" y="229" class="small">附件引用的 target、kind、index 合法</text>
+          <line x1="585" y1="24" x2="585" y2="232" class="line" marker-end="url(#e3-tip)" />
+          <text x="605" y="52" class="small">构造时</text>
+          <text x="605" y="130" class="small">第一次 draw</text>
+          <text x="605" y="208" class="small">每次 draw</text>
+          <text x="605" y="244" class="small">（越往下越晚）</text>
+        </svg>
+      </div>
+      <figcaption>图 5 · 纹理和目标的三个检查时机。第一层只查不需要设备就能判断的事；图片的真实尺寸要等它加载完才知道，所以和 WebGL1 的限制一起放在第一次上传时。这和第 10 课图 4、第 11 课图 3 是同一个原则。</figcaption>
+    </figure>
+
+    <h2 id="s8">8. HW2 的例子：背景 cubemap 与颜色空间</h2>
+    <p>
+      HW2 的四组环境贴图都是六张 JPG，文件名 posx、negx、posy、negy、posz、negz，正好对应 CubeFaces 的顺序；我量过尺寸：Indoor 512×512，CornellBox 128×128，GraceCathedral 和 Skybox 256×256，全是 2 的幂的正方形，所以 WebGL1 的 NPOT 限制碰不到它们。旧引擎把它们以 RGBA 原样上传（<a data-src="src/textures/CubeMapTexture.ts:87">src/textures/CubeMapTexture.ts:87–94</a>），背景 shader 原样输出采样结果（<a data-src="src/shaders/environment/cubemapBackground/fragment.frag:10">cubemapBackground/fragment.frag:10</a>）。按新架构，工厂大致会这样写：
+    </p>
+    <pre><code>// 示意（课程写的）：Indoor 背景，loadImage 是假设的图片加载函数
+const names = ['posx', 'negx', 'posy', 'negy', 'posz', 'negz']                       // +X −X +Y −Y +Z −Z
+const faces = await Promise.all(names.map((name) =&gt; loadImage(dir + name + '.jpg')))
+const sky = scene.retain(new CubeTexture({
+  label: 'hw2-indoor',
+  source: { kind: 'images', faces: [faces[0], faces[1], faces[2], faces[3], faces[4], faces[5]] },   // 借用六张图
+  storage: { format: 'rgb', type: 'uint8' },                                          // JPG 没有 alpha
+  colorSpace: ???                                                                     // 见下面的「想一想」
+}))                                                                                    // sampler、mipmapPolicy 用默认：clamp-to-edge、linear、none</code></pre>
+    <p><strong>想一想：colorSpace 填什么？</strong>先把三条事实摆出来：</p>
+    <ol>
+      <li><strong>选 'srgb'：</strong>后端要求 EXT_sRGB，没有就抛错，「no implicit color-space fallback」（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:247">WebGL1CubeTextureManager.ts:247–259</a>）；有的话，采样时会把 sRGB 编码的值解码成线性（:198）。</li>
+      <li><strong>写回屏幕时没人替你编码。</strong>ES 2.0 规范 3.8.2 节说片元输出只被夹到 [0, 1] 再转成定点数。WebGL 规范对 drawingBufferColorSpace 的定义是「the color space used to interpret the drawing buffer's content values」，只规定怎样解释缓冲里的值，不做转换。旧引擎 engine.ts（提交 4b500f9 的 :170）的注释说设成 'srgb' 能让输出「走 sRGB 编码」，这个说法不准确；何况 'srgb' 本来就是默认值。10 月工作区里的 engine.ts 已经删掉了这句注释，只剩赋值（<a data-src="src/engine.ts:99">engine.ts:99</a>）。</li>
+      <li><strong>旧引擎为什么看起来是对的：</strong>它采样时没解码，输出时也没编码，两边都是 sRGB 编码的值，原样显示正好就是图片本来的样子。</li>
+    </ol>
+    <p>问题：选 'srgb' 而不改 shader，背景会变亮还是变暗？选 'linear' 或 'data' 呢？哪一个在语义上才是对的？想两全其美，管线里还缺哪一步？（CubeTextureManager 的注释也说了，输出到屏幕的颜色编码「属于后续 shader/pipeline」，:199。）</p>
+
+    <h2 id="s9">9. 复制与状态总表</h2>
+    <p><strong>哪里复制了什么：</strong></p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 30%">位置</th><th style="width: 34%">复制什么</th><th>为什么</th></tr>
+        <tr><td>Texture 构造</td><td>sampler、storage、整份描述 → 新对象，逐层冻结</td><td>调用者之后改自己的 options 无效；读的一方可以直接共享</td></tr>
+        <tr><td>DataTexture2D 构造</td><td>像素数组 → 新数组；外壳冻结</td><td>TypedArray 冻结不了，只能复制</td></tr>
+        <tr><td>DataTexture2D.copySource</td><td>每次新外壳、新数组</td><td>调用者改返回值，影响不到纹理</td></tr>
+        <tr><td>ImageTexture2D</td><td>不复制，保存图片引用</td><td>图片不能通用地深拷贝；借用</td></tr>
+        <tr><td>CubeTexture images</td><td>faces 容器 → 新数组并冻结；图片仍是借用</td><td>调用者换掉自己数组里的某张图，影响不到它</td></tr>
+        <tr><td>CubeTexture data</td><td>容器、六个外壳、六个数组全部复制</td><td>同 DataTexture2D</td></tr>
+        <tr><td>RenderTarget 构造</td><td>描述 → 新对象，colors 数组和每个附件都冻结</td><td>只能经 resize 改</td></tr>
+        <tr><td>RenderTarget.resize</td><td>新外层对象；colors、depth 沿用</td><td>嵌套部分本来就冻结、不能改，共用安全</td></tr>
+        <tr><td>getColorAttachment</td><td>每次新的冻结包装</td><td>只是地址；比较要比字段</td></tr>
+      </table>
+    </div>
+    <p><strong>谁改了什么、怎样结束：</strong></p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 30%">对象或函数</th><th style="width: 36%">改了什么</th><th>生命周期</th></tr>
+        <tr><td>三种纹理的构造</td><td>建立五项描述和来源快照（或图片引用）</td><td>Resource：由 Scene 登记；CubeTexture 由每个 context 的 Manager 各上传一份，收到释放通知时删掉</td></tr>
+        <tr><td>RenderTarget 构造</td><td>建立描述，revision 为 0</td><td>Resource：通常由 Pass 或功能模块拥有；每个 context 的 Manager 各建一套 FBO</td></tr>
+        <tr><td>resize</td><td>成功且尺寸变了：换描述、revision 加一；否则不变</td><td>不碰 GPU；Manager 下次 get 时重建</td></tr>
+        <tr><td>所有 getter、copySource、get*Attachment</td><td>无</td><td>释放后一律抛 ResourceDisposedError</td></tr>
+        <tr><td>disposeCPUData</td><td>断开来源快照（或图片引用、描述）</td><td>只在 finalizeDisposal 最后一步调用；不 close 借来的 ImageBitmap；GPU 内容由 Manager 删</td></tr>
+      </table>
+    </div>
+
+    <h2 id="s10">10. 先预测、再运行：跑真实的项目代码</h2>
+    <p>准备代码里的 <code>RGBA8</code>、<code>pixel</code> 是课程写的小工具，项目里没有它们；其余都是项目的真实类。这一课的卡片都不涉及 GPU，不显示画布。</p>
+    <details>
+      <summary>每张卡片之前都会先运行的准备代码</summary>
+      <pre><code id="prelude-view"></code></pre>
+    </details>
+    <div id="predict-0012"></div>
+    <script>
+      ;(function () {
+        const prelude = [
+          'const R = window.RTeachRendering                      // 打包进来的真实项目代码',
+          '// 以下两个是课程写的小工具',
+          "const RGBA8 = { format: 'rgba', type: 'uint8' }        // 每个像素 4 个 uint8",
+          "const pixel = (extra = {}) => new R.DataTexture2D({ label: 'demo', source: { data: new Uint8Array([255, 0, 0, 255]), width: 1, height: 1 }, storage: RGBA8, colorSpace: 'srgb', ...extra })"
+        ].join('\n')
+        document.getElementById('prelude-view').textContent = prelude
+
+        if (!window.RTeachRendering || !window.RTeachRendering.ImageTexture2D || !window.RTeachRendering.RenderTarget) {
+          document.getElementById('predict-0012').textContent =
+            '没有加载到 assets/rendering-bundle.js（或它太旧，缺 ImageTexture2D），卡片无法运行。按 MAINTENANCE.md「真实代码打包」重新构建一次。'
+          return
+        }
+
+        RTeach.predict({
+          mount: document.getElementById('predict-0012'),
+          storageKey: 'lesson-0012',
+          canvas: false,
+          prelude,
+          items: [
+            {
+              title: 'A · 把 canvas 读出来的 Uint8ClampedArray 交给 DataTexture2D 会怎样？换成同一块内存上的 Uint8Array 视图呢，之后改原数组，纹理变不变？',
+              code: [
+                'const clamped = new Uint8ClampedArray([255, 0, 0, 255])        // canvas 的 getImageData().data 就是这种数组',
+                "try { new R.DataTexture2D({ label: 'canvas', source: { data: clamped, width: 1, height: 1 }, storage: RGBA8, colorSpace: 'srgb' }) }",
+                "catch (error) { log('直接交 Uint8ClampedArray：', error.message) }",
+                'const view = new Uint8Array(clamped.buffer)                   // 同一块内存，换成 Uint8Array 视图',
+                "const texture = new R.DataTexture2D({ label: 'view', source: { data: view, width: 1, height: 1 }, storage: RGBA8, colorSpace: 'srgb' })",
+                'clamped[0] = 0                                                 // 之后改原来那块内存',
+                "log('view[0] =', view[0], '；纹理里的 r =', texture.copySource().data[0])"
+              ].join('\n'),
+              choices: ['Uint8ClampedArray 被拒；视图能通过，而且纹理里仍是 255', 'Uint8ClampedArray 能通过：它也是 8 位无符号', '视图能通过，但纹理里变成了 0：视图和纹理共用内存'],
+              answer: 0,
+              explain: '像素数组只认 Uint8Array 和 Float32Array（<a data-src="src/rendering/resources/texturePixelSnapshot.ts:102">texturePixelSnapshot.ts:102–106</a>），Uint8ClampedArray 不是 Uint8Array 的子类，被拒。<code>new Uint8Array(clamped.buffer)</code> 是同一块内存的另一个视图，所以改 clamped，view 跟着变；但纹理构造时又复制了一次（:129），和这块内存再也没有关系（第 4.2 节）。'
+            },
+            {
+              title: "B · 只把 minFilter 改成 'linear-mipmap-linear'，mipmapPolicy 不写，会怎样？再加上 mipmapPolicy: 'generate' 呢？",
+              code: [
+                "try { pixel({ sampler: { minFilter: 'linear-mipmap-linear' } }) } catch (error) { log('只改过滤器：', error.message) }",
+                "const ok = pixel({ sampler: { minFilter: 'linear-mipmap-linear' }, mipmapPolicy: 'generate' })",
+                "log('再加 generate：', ok.sampler.minFilter, ok.mipmapPolicy)"
+              ].join('\n'),
+              choices: ['只改过滤器被拒；加上 generate 才接受', '都接受：mipmap 会由 GPU 自动补上', '都被拒：1×1 的纹理不能有 mipmap'],
+              answer: 0,
+              explain: 'mipmapPolicy 默认是 none，而 mipmap 过滤器要读 mip 链（<a data-src="src/rendering/resources/Texture.ts:208">Texture.ts:208–210</a>）。WebGL1 不会自动补：ES 2.0 规范 3.8.2 节规定，这种纹理采样得到 (0, 0, 0, 1)，屏幕上是一片黑，而且不报错。构造时就拒绝，错误才看得见（测试 <a data-src="tests/unit/rendering/resources/Texture2D.test.ts:126">Texture2D.test.ts:126</a>）。'
+            },
+            {
+              title: "C · sampler 写 { wrapS: null }，会怎样？colorSpace 写 null 呢？（第 11 课的 Material 遇到 null 是拒绝。）",
+              code: [
+                'const texture = pixel({ sampler: { wrapS: null } })',
+                "log('wrapS 传 null →', texture.sampler.wrapS)",
+                "try { pixel({ colorSpace: null }) } catch (error) { log('colorSpace 传 null：', error.message) }"
+              ].join('\n'),
+              choices: ['wrapS 的 null 被当成没填，得到 clamp-to-edge；colorSpace 的 null 被拒', '两个 null 都被拒，和 Material 一样', '两个 null 都被当成没填'],
+              answer: 0,
+              explain: '<code>samplerInput.wrapS ?? \'clamp-to-edge\'</code>：<code>??</code> 对 null 和 undefined 一视同仁（<a data-src="src/rendering/resources/Texture.ts:161">Texture.ts:161</a>）。colorSpace 没有默认值，null 原样进了允许集合的检查，被拒（:200–202）。第 11 课的 Material 用 defaultIfUndefined，只把 undefined 当没填，null 会被拒。同一个项目，两个资源类对 null 的解释不同，见审查视角 1。'
+            },
+            {
+              title: 'D · data cubemap 的第 6 面是 4×4、其余是 2×2：构造会怎样？images cubemap 传六个空对象 {} 呢？',
+              code: [
+                'const face = (size) => ({ data: new Uint8Array(size * size * 4), width: size, height: size })',
+                'try {',
+                "  new R.CubeTexture({ label: 'sky', source: { kind: 'data', faces: [face(2), face(2), face(2), face(2), face(2), face(4)] }, storage: RGBA8, colorSpace: 'linear' })",
+                "} catch (error) { log('data：', error.message) }",
+                "const images = new R.CubeTexture({ label: 'img', source: { kind: 'images', faces: [{}, {}, {}, {}, {}, {}] }, storage: RGBA8, colorSpace: 'srgb' })",
+                "log('images：构造成功，sourceKind =', images.sourceKind)"
+              ].join('\n'),
+              choices: ['data 在构造时被拒；images 的六个空对象能构造成功，要到上传时才查', '两个都在构造时被拒', '两个都能构造成功，都要到上传时才查'],
+              answer: 0,
+              explain: 'data 六面的尺寸构造时就知道，立刻用 assertValidCubeFaceDimensions 查（<a data-src="src/rendering/resources/CubeTexture.ts:207">CubeTexture.ts:207–210</a>）。images 模式只查「六个元素、每个都是对象」（:115–123）；图片加载完没有、真实尺寸是多少，要到 CubeTextureManager 第一次上传时才查，用的是同一个尺寸函数（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:106">WebGL1CubeTextureManager.ts:106–109</a>）。规则一份，时机按「什么时候知道」来定（第 5.2 节）。'
+            },
+            {
+              title: 'E · 256×256 的目标：同尺寸 resize、改成 512×256、再改回 256×256，revision 依次是多少？一开始拿到的 descriptor 会跟着变吗？',
+              code: [
+                "const target = new R.RenderTarget({ width: 256, height: 256, colors: [{ format: 'rgba8' }] })",
+                'const before = target.descriptor',
+                "target.resize(256, 256); log('同尺寸：revision =', target.revision)",
+                "target.resize(512, 256); log('改成 512×256：revision =', target.revision)",
+                "target.resize(256, 256); log('再改回 256×256：revision =', target.revision)",
+                "log('一开始拿到的快照宽度 =', before.width, '；colors 数组还是同一个吗？', before.colors === target.descriptor.colors)"
+              ].join('\n'),
+              choices: ['0、1、2；旧快照仍是 256；colors 数组是同一个', '1、2、1：改回原尺寸，revision 也退回去', '0、1、2；旧快照跟着变成了最新的尺寸'],
+              answer: 0,
+              explain: '尺寸没变就直接返回（<a data-src="src/rendering/resources/RenderTarget.ts:483">RenderTarget.ts:483</a>）；变了才换新快照、revision 加一（:485–492）。A → B → A 是两次修改，revision 只增不减（:469）。旧快照不变，因为 resize 换的是新对象；新旧两份共用同一个已冻结的 colors 数组（第 6.4 节，测试 <a data-src="tests/unit/rendering/resources/RenderTarget.test.ts:202">RenderTarget.test.ts:202</a>）。'
+            },
+            {
+              title: "F · 依次 resize('512', 256)、resize(512, 1.5)、resize(512, 0)：哪些会生效？",
+              code: [
+                "const target = new R.RenderTarget({ width: 256, height: 256, colors: [{ format: 'rgba8' }] })",
+                "for (const [w, h] of [['512', 256], [512, 1.5], [512, 0]]) {",
+                "  try { target.resize(w, h) } catch (error) { log('resize(' + JSON.stringify(w) + ', ' + h + ')：', error.message) }",
+                '}',
+                "log('之后：', target.descriptor.width + '×' + target.descriptor.height, '，revision =', target.revision)"
+              ].join('\n'),
+              choices: ['三次都被拒；尺寸和 revision 都没变', "字符串 '512' 被转成数字，第一次生效了", '第二次把宽度改成了 512，只有高度被拒'],
+              answer: 0,
+              explain: 'requireDimension 不把字符串转成数字，也不取整（<a data-src="src/rendering/resources/RenderTarget.ts:214">RenderTarget.ts:214</a>、:223–230）。resize 先验证两个尺寸，都通过才提交（:478–492）：第二次宽度合法、高度不合法，宽度也不会单独生效（测试 <a data-src="tests/unit/rendering/resources/RenderTarget.test.ts:228">RenderTarget.test.ts:228</a>）。'
+            },
+            {
+              title: 'G · 两次 getColorAttachment(1) 拿到的是同一个对象吗？resize 之后，旧引用还指向这个目标吗？没有配置 depth 时 getDepthAttachment() 返回什么？',
+              code: [
+                "const target = new R.RenderTarget({ width: 4, height: 4, colors: [{ format: 'rgba8' }, { format: 'rgba8' }] })",
+                'const a = target.getColorAttachment(1)',
+                'const b = target.getColorAttachment(1)',
+                "log('同一个对象吗？', a === b, '；三个字段都相同吗？', a.target === b.target && a.kind === b.kind && a.index === b.index)",
+                'target.resize(8, 8)',
+                "log('resize 之后 a 还指向它吗？', a.target === target, '；a 的字段：', Object.keys(a).join(', '))",
+                "log('getDepthAttachment() =', target.getDepthAttachment(), '；目标的 Scene 引用数 =', target.sceneReferenceCount)"
+              ].join('\n'),
+              choices: ['不是同一个对象，但字段相同；resize 后仍指向它；没有 depth 时是 null', '是同一个对象：一个槽位只有一份引用', '不是同一个对象；而且 resize 之后旧引用失效了'],
+              answer: 0,
+              explain: '每次调用都返回一个新的冻结包装（<a data-src="src/rendering/resources/RenderTarget.ts:512">RenderTarget.ts:512</a>），所以比较引用要比三个字段。引用里只有 target、kind、index，没有尺寸和 revision，resize 之后仍是同一个地址，由 Manager 解析到新的纹理（图 2）。没有深度附件时返回 null（:521），拿着引用也不会增加引用数（:128）。'
+            },
+            {
+              title: 'H · 三份有问题的描述：多写一个 stencil、colors 的第 0 格是空洞、depth 写成 depth24。各会怎样？',
+              code: [
+                'const inputs = [',
+                "  ['多写 stencil', { width: 4, height: 4, colors: [{ format: 'rgba8' }], stencil: true }],",
+                "  ['colors 第 0 格是空洞', { width: 4, height: 4, colors: [, { format: 'rgba8' }] }],",
+                "  ['depth 写成 depth24', { width: 4, height: 4, colors: [{ format: 'rgba8' }], depth: { format: 'depth24' } }]",
+                ']',
+                'for (const [label, descriptor] of inputs) {',
+                "  try { new R.RenderTarget(descriptor); log(label, '→ 接受') } catch (error) { log(label, '→', error.message) }",
+                '}'
+              ].join('\n'),
+              choices: ['三个都被拒，错误信息指出了具体字段', '多写的 stencil 被忽略，另外两个被拒', '空洞被跳过，只剩一个颜色附件，构造成功'],
+              answer: 0,
+              explain: 'requireKnownFields 拒绝不认识的字段（<a data-src="src/rendering/resources/RenderTarget.ts:190">RenderTarget.ts:190–202</a>）；colors 按下标逐个检查，空洞读出来是 undefined，过不了 requireRecord（:352–354）；深度格式只允许 depth16（:16、:375）。报错时字段路径写得很具体，比如 <code>descriptor.stencil</code>、<code>colors[0]</code>（第 6.3 节）。'
+            },
+            {
+              title: 'I · 给 ImageTexture2D 传一个普通对象 { width: 1, height: 1 } 当图片：构造会成功吗？source 是不是同一个对象？',
+              code: [
+                'const image = { width: 1, height: 1 }                          // 一个假的「图片」：只是普通对象',
+                "const texture = new R.ImageTexture2D({ label: 'photo', source: image, storage: RGBA8, colorSpace: 'srgb' })",
+                "log('构造成功；source 是同一个对象吗？', texture.source === image)",
+                'texture.dispose()',
+                "try { texture.source } catch (error) { log('释放之后读 source：', error.name) }"
+              ].join('\n'),
+              note: '{ width: 1, height: 1 } 是课程故意构造的假图片，用来检验构造函数查了什么。',
+              choices: ['构造成功，source 是同一个对象；释放后读取抛 ResourceDisposedError', '构造时就被拒：它不是 HTMLImageElement', '构造成功，但 source 是一份复制'],
+              answer: 0,
+              explain: 'ImageTexture2D 只查 source 是不是对象（<a data-src="src/rendering/resources/Texture2D.ts:80">Texture2D.ts:80–82</a>），保存的是引用（:84）：图片不能通用地深拷贝，只能借用。它是不是真的图片、加载完没有，要等上传时由后端判断（:65–66）。释放只断开引用，不会替你关闭图片（:97–99）。'
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <h2 id="s11">11. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0012"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0012"]'), [
+        {
+          q: 'mipmapPolicy 是 none 时，为什么不允许 linear-mipmap-linear？',
+          opts: ['没有 mip 链却用 mipmap 过滤，WebGL 采样得到黑色且不报错；这个错不需要设备就能发现，所以构造时拒绝', '为了省显存', 'WebGL1 不支持 mipmap'],
+          answer: 0,
+          why: '第 3.3 节、卡片 B（ES 2.0 规范 3.8.2 节）。'
+        },
+        {
+          q: 'ImageTexture2D 为什么只保存图片的引用？',
+          opts: ['浏览器图片对象不能像 TypedArray 那样通用地深拷贝；它借用，也不负责关闭', '为了省内存，其实可以复制', '因为图片是只读的，复制没有意义'],
+          answer: 0,
+          why: '第 4.1 节、卡片 I（Texture2D.ts:61–63）。'
+        },
+        {
+          q: 'cubemap 六面的尺寸，data 来源和 images 来源分别在什么时候检查？',
+          opts: ['data 在构造时；images 在第一次上传时，那时才知道图片的真实尺寸', '都在构造时', '都在第一次上传时'],
+          answer: 0,
+          why: '第 5.2 节、卡片 D。'
+        },
+        {
+          q: 'RenderTarget 为什么不继承 Texture？',
+          opts: ['它没有可以重新上传的 CPU 像素；内容由 Pass 画出来，context 恢复后要重新画', '因为它不能被采样', '因为 WebGL1 不支持渲染到纹理'],
+          answer: 0,
+          why: '第 6.1 节（RenderTarget.ts:405–408）。'
+        },
+        {
+          q: 'resize 把尺寸改回原来的值，revision 会怎样？',
+          opts: ['再加一：它记的是改了几次，不是尺寸本身', '退回原来的值', '不变'],
+          answer: 0,
+          why: '第 6.4 节、卡片 E。'
+        },
+        {
+          q: '附件引用里为什么不存 revision？',
+          opts: ['它是逻辑地址：resize 之后仍指同一个槽位，由 Manager 解析成当前版本的纹理', '忘了存', '因为 revision 会被 GPU 自动维护'],
+          answer: 0,
+          why: '第 6.5 节、图 2。'
+        },
+        {
+          q: 'depth16 的深度附件，能在 shader 里当纹理采样吗？',
+          opts: ['现在不能：Manager 把它建成 renderbuffer（DEPTH_COMPONENT16），不是纹理', '能，和颜色附件一样', '能，但只能用 nearest 过滤'],
+          answer: 0,
+          why: '第 6.5、7 节（WebGL1RenderTargetManager.ts:316）。'
+        },
+        {
+          q: 'CubeTexture 的 NPOT 限制在哪里检查？',
+          opts: ['后端 CubeTextureManager 上传前；CPU 资源不写死 WebGL1 的限制', 'CubeTexture 构造时', '不检查，交给 GL'],
+          answer: 0,
+          why: '第 5.2、7 节（测试 CubeTexture.test.ts:221）。'
+        }
+      ])
+    </script>
+
+    <h2 id="s12">12. 架构视角</h2>
+    <h3>12.1 对照 three.js 的 Texture 与 RenderTarget</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 16%"></th><th style="width: 44%">three.js</th><th>本项目</th></tr>
+        <tr><td>像素</td><td>texture 直接引用你给的来源（<a data-src="node_modules/three/src/textures/Texture.js:92">Texture.js:92</a>）；DataTexture 的 image 是 <code>{ data, width, height }</code>，data 不复制（<a data-src="node_modules/three/src/textures/DataTexture.js:50">DataTexture.js:50</a>）</td><td>DataTexture2D 和 cube data 进出都复制；只有图片是借用</td></tr>
+        <tr><td>改了之后</td><td>改完设 <code>needsUpdate = true</code>，version 加一，渲染器下次重新上传（<a data-src="node_modules/three/src/textures/Texture.js:742">Texture.js:742–747</a>）</td><td>纹理完全静态；只有 RenderTarget 能改尺寸，靠 revision</td></tr>
+        <tr><td>默认采样</td><td>minFilter 是 LinearMipmapLinear，generateMipmaps 为 true（<a data-src="node_modules/three/src/textures/Texture.js:47">Texture.js:47</a>、:256）</td><td>linear，mipmapPolicy 是 none；要 mipmap 必须两个字段都写</td></tr>
+        <tr><td>颜色空间</td><td>colorSpace 属性，默认 NoColorSpace（:47、:298）</td><td>colorSpace 必填：srgb、linear、data 三选一</td></tr>
+        <tr><td>谁定 colorSpace</td><td>加载器按贴图用途设：GLTFLoader 给 baseColor、emissive 设 SRGBColorSpace（<a data-src="node_modules/three/examples/jsm/loaders/GLTFLoader.js:3658">GLTFLoader.js:3658</a>、:3750），法线、metalness/roughness、AO 不设（:3715、:3667–3668、:3731）</td><td>创建 Texture 的人必须写（第 3.2 节的三张贴图）</td></tr>
+        <tr><td>RenderTarget 改尺寸</td><td>setSize 改完尺寸直接 <code>this.dispose()</code>，下次用到时重新分配（<a data-src="node_modules/three/src/core/RenderTarget.js:284">core/RenderTarget.js:284–301</a>）</td><td>revision 加一；Manager 先建好新的、发布、再删旧的；CPU 对象一直活着</td></tr>
+        <tr><td>深度</td><td>可以挂一个 depthTexture 用来采样（<a data-src="node_modules/three/src/core/RenderTarget.js:183">:183</a>）</td><td>depth16 是 renderbuffer，暂时不能采样</td></tr>
+        <tr><td>RenderTarget 的默认附件</td><td>depthBuffer 默认 true，多个颜色附件用 count（<a data-src="node_modules/three/src/core/RenderTarget.js:57">core/RenderTarget.js:57</a>、:63）</td><td>depth 省略就是不要；colors 写几个就是几个（第 6.2 节的三块画布）</td></tr>
+      </table>
+    </div>
+    <p>
+      和前两课一样，three.js 选的是灵活：共享你的数组，改完打个标记，渲染器自己去重传。本项目初版选的是「数据不变，GPU 副本就不会过期」，唯一会变的 RenderTarget 用一个只增不减的版本号收口。setSize 的写法差别也值得注意：three.js 让「释放」兼任「失效」，本项目把两件事分开了，resize 只让版本过期，对象本身和它的引用都还有效。
+    </p>
+
+    <h3>12.2 审查视角：三处值得讨论，一道找茬题</h3>
+    <ol>
+      <li><strong>null 的含义不一致。</strong>Texture 的 sampler 字段用 <code>??</code>，null 当作没填（<a data-src="src/rendering/resources/Texture.ts:161">Texture.ts:161–174</a>）；第 11 课的 Material 用 defaultIfUndefined，null 被拒（<a data-src="src/rendering/resources/Material.ts:85">Material.ts:85–95</a>）。<strong>想一想：</strong>哪一种更好？如果要统一，应该改哪边、放在哪一层（比如 core 里一个共用的函数）？</li>
+      <li><strong>图片来源的检查全部推迟到上传。</strong>CubeTexture 的 images 模式和 ImageTexture2D 只查「是不是对象」（<a data-src="src/rendering/resources/CubeTexture.ts:85">CubeTexture.ts:85–87</a>）。好处是资源层不依赖 DOM；代价是尺寸不对、图片没加载完，要到第一次 draw 才报错，离出错的地方很远。<strong>想一想：</strong>哪些检查可以提前、应该放在哪里（资源类、loader，还是工厂）？</li>
+      <li><strong>附件引用没有稳定的身份。</strong>每次 getColorAttachment 都返回新包装（<a data-src="src/rendering/resources/RenderTarget.ts:496">RenderTarget.ts:496</a>）。写这课时只有 resolveAttachment 用它，没问题；10 月 12 日 Material 的纹理参数也接上了它（第 11 课 4.3 节），如果有人拿引用当 Map 或 WeakMap 的键，同一个槽位就会变成好几个键。（Material 存的也是复制出来的新包装，copyTexture2DSamplingSource 每次都新建一个。）<strong>想一想：</strong>是该缓存每个槽位的引用对象，还是在文档里写明「只能按字段比较」？</li>
+      <li><strong>找茬题：</strong>Texture.ts 的构造函数附近，有一处一模一样的东西出现了两次。找到了告诉我。</li>
+    </ol>
+
+    <h2 id="s13">13. 延伸阅读</h2>
+    <p>
+      <strong>首选（一手来源，约 10 分钟）：</strong>模块说明 <a data-src="src/rendering/resources/docs/textures-and-render-targets.zh-CN.md:1">textures-and-render-targets.zh-CN.md</a>（短，把这一课的要点串成一页），再读 HW2 设计的 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:776">§12 CubeTexture</a> 和 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1045">§17 RenderTarget</a>。对照着看：§12 原来设想的是一个只装六张图片、只有两个过滤字段的窄类，并写明「首次加入 Texture2D 时，再提取」出 Texture 基类（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:822">设计 :822–828</a>）；实现已经走到了这一步，还多了 data 来源、storage 和 colorSpace。§17 的 RenderTarget 则和实现几乎一致。
+    </p>
+    <p>
+      补充：实施计划的 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-28-hw2-complete-webgl1-architecture-implementation-plan.md:633">Task 6</a>（当时写的是「实现窄 CubeTexture；不创建通用 Texture 基类」）和 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-28-hw2-complete-webgl1-architecture-implementation-plan.md:670">Task 9</a>；行为清单见 <a data-src="tests/unit/rendering/resources/Texture2D.test.ts:25">Texture2D.test.ts</a>、<a data-src="tests/unit/rendering/resources/CubeTexture.test.ts:48">CubeTexture.test.ts</a>、<a data-src="tests/unit/rendering/resources/RenderTarget.test.ts:45">RenderTarget.test.ts</a>。
+    </p>
+
+    <aside class="ask">
+      做完告诉我：热身题和检查题各错了哪几题、九张卡片猜对了几张；第 8 节的颜色空间和 12.2 的三个「想一想」可以直接在对话里回答，找茬题找到了也告诉我。哪一步没讲清楚，直接指出来，我在对话里接着讲。
+    </aside>
+
+    <div class="nav">
+      <a href="0011-shader-module-and-material.html">← 第 11 课：ShaderModule 与 Material</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0020-model-files-prt-data-async.html">第 20 课（提前）：模型文件、PRT 数据与异步加载 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 12 课 · 2026-09-29</footer>
+  </body>
+</html>

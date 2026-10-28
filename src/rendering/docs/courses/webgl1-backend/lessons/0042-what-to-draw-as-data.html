@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 42 课 · 画什么写成数据</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/code-view.js"></script>
+    <script src="../assets/shadow-raw.js"></script>
+    <script src="../assets/shadow-41.js"></script>
+    <script src="../assets/shadow-42.js"></script>
+  </head>
+  <body>
+    <p class="kicker">系列「带阴影的三角形：从一个函数到 src/rendering」3/7 · 约 25 分钟</p>
+    <h1>画什么写成数据：resources/ 与 scene/</h1>
+    <p class="lede">
+      第 41 课的描述对象是谁都能改的普通对象，「有哪些物体」也还写死在每帧的函数里。这一课把它们做成类：<code>resources/</code> 里的 Geometry、ShaderModule、Material、RenderTarget 回答「是什么」，并向 Manager 保证自己不会悄悄变；<code>scene/</code> 里的 Mesh、Scene 和灯回答「有哪些、在哪」。每帧的函数变成遍历场景，后端只读这些数据。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW1 要地面、遮挡物、一盏灯和它的阴影设置；HW2 要 Mary、背景盒和相机。写成数据以后，换一个作业只是换一份数据，画的代码一行不改。10 月 16 日定下的「阴影设置挂在灯上」，这一课第一次出现在代码里。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 第 41 课：Manager 按描述对象查表、<code>release</code>、第 5 节末尾的两条要求（一直是同一个对象、建过以后内容不再变）；② JavaScript 的 <code>class</code> 和 <code>extends</code>。这一课用到两个可能没见过的写法：<code>#positions</code> 这种带 <code>#</code> 的是<strong>私有字段</strong>，只有类自己的方法能读写，类外面连读都读不到（相当于 TypeScript 的 <code>private</code>，但运行时也真的拿不到）；<code>Object.freeze(obj)</code> 冻结对象，之后给它的属性赋值，在严格模式下抛 TypeError。<br />
+      <strong>这一课讲的</strong>：第 41 课还剩的四处疼；Mesh 和 Scene；数据的三种变法和后端怎样知道；资源被丢弃时自己通知；构造时就检查；阴影设置挂在灯上；对照 <code>src/rendering</code>。<br />
+      <strong>在一帧里的位置和寿命</strong>：这些对象由应用建、应用拿着，活得比任何一帧都长，也比 context 的一代长（context 丢失不影响它们）。每帧只被读，不被后端改。<br />
+      <strong>页面会用到你的显卡</strong>：两块 480 × 300 的画布，外加检查卡片里临时建的一块。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">第 41 课还剩四处疼</a></li>
+        <li><a href="#s2">有哪些物体：Mesh 和 Scene</a></li>
+        <li><a href="#s3">数据变了，表里的副本怎么办</a></li>
+        <li><a href="#s4">谁来调用 release：资源自己通知</a></li>
+        <li><a href="#s5">构造时就检查</a></li>
+        <li><a href="#s6">灯也是数据：阴影设置挂在灯上</a></li>
+        <li><a href="#s7">对照 src/rendering</a></li>
+        <li><a href="#s8">检查题</a></li>
+        <li><a href="#s9">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 第 41 课还剩四处疼</h2>
+    <ol>
+      <li><strong>「有哪些物体」还写死着。</strong>drawWithManagers 里第一遍画地面、画三角形，第二遍又画地面、画三角形。再加一个三角形，要加一个描述、一行 <code>geometries.get</code>，再在两遍里各加一段 draw，一共四处。</li>
+      <li><strong>描述对象谁都能改，改了表里的副本也不知道。</strong>下面这块画布跑的是第 41 课的第二版，原样没动。点「直接改描述里的数组」：把三角形三个顶点的高度从 1.2 改成 2.0。画面不变——表里那个 buffer 是照改之前的数上传的，Manager 只认「是不是同一个对象」，发现不了。再点「模拟 context 丢失再恢复」：表重建了，照的是改过的数，三角形这才跳到 2.0 的高度。<strong>同一份数据，画成什么样，取决于副本是哪一刻建的。</strong>（第 31 课第 2 节用两个 context 演示过同一件事。）</li>
+      <li><strong>release 要页面自己调用。</strong>第 41 课第 6 节：只有数据的主人知道它不用了，可是主人不知道它在几个 context 里有几份副本。</li>
+      <li><strong>坏数据不报错。</strong>第 5 节的第一张检查卡片：给第 41 课的引擎一个 4 个顶点的三角形描述，它不抛错，<code>getError</code> 是 0，第 4 个顶点被悄悄丢掉。</li>
+    </ol>
+    <div class="gl-stage">
+      <canvas width="480" height="300" id="f-canvas"></canvas>
+      <div class="gl-controls">
+        <button type="button" id="f-mutate">直接改描述里的数组（高度 1.2 → 2.0）</button>
+        <button type="button" id="f-lose">模拟 context 丢失再恢复</button>
+        <button type="button" id="f-reset">重新开始</button>
+      </div>
+      <p class="gl-readout" id="f-readout"></p>
+    </div>
+    <p class="lab-note">这块画布用的是第 41 课的 drawWithManagers（assets/shadow-41.js），只是三角形的描述换成了自己的一份数组副本，免得改动影响页面上别的画布。读数里的像素 (240, 162) 是三角形在 1.2 高度时的中间。</p>
+
+    <h2 id="s2">2. 有哪些物体：Mesh 和 Scene</h2>
+    <p>先治第 1 处。把「一个物体」写成一个对象：<strong>Mesh</strong> 借用一个几何、一个材质，再加上自己的位置；<strong>Scene</strong> 是物体和灯的列表。每帧的函数不再点名，而是遍历 <code>scene.meshes</code>。</p>
+    <p>应用这一侧——第 40 课的场景写成数据，就是下面这个函数。注意它不碰任何 GL，也不知道有几个 context：</p>
+    <div id="cv-app"></div>
+    <p>后端这一侧，<code>drawScene</code> 两遍各一个循环。第一遍所有物体用同一个画深度的 shader（它属于「画阴影图」这件事，不属于哪个物体，第 44 课把它放进 ShadowMapPass）；第二遍每个物体用自己材质的 shader，<code>uColor</code> 从材质里取：</p>
+    <div id="cv-draw"></div>
+    <p>为了让同一个几何能摆在不同位置，shader 多了一个 <code>uModel</code>（物体自己的平移矩阵）；这是整个系列到这里 GLSL 唯一的改动。默认场景里两个物体的 <code>uModel</code> 都是单位矩阵，画面和第 40 课逐像素相同（备课实测，144000 个像素全同）。</p>
+    <div class="gl-stage">
+      <canvas width="480" height="300" id="e-canvas"></canvas>
+      <div class="gl-controls">
+        <label>灯 <input type="range" min="-60" max="60" value="35" id="e-angle" /></label>
+        <span id="e-angle-text">35°</span>
+        <button type="button" id="e-add">加一个蓝色三角形</button>
+        <button type="button" id="e-remove">移除蓝色三角形</button>
+      </div>
+      <div class="gl-controls">
+        <button type="button" id="e-color">三角形变绿 / 变回橙色</button>
+        <button type="button" id="e-resize">阴影图 512 ↔ 1024</button>
+        <button type="button" id="e-shape">三角形换形状（新 Geometry）</button>
+        <button type="button" id="e-lose">模拟 context 丢失再恢复</button>
+      </div>
+      <p class="gl-readout" id="e-readout"></p>
+    </div>
+    <p>点「加一个蓝色三角形」。页面做的是这两行：</p>
+<pre>const blue = new Material({
+  shaderModule: app.lit,
+  parameters: { uColor: [0.25, 0.55, 0.95] }
+})
+app.scene.add(new Mesh(app.triangle.geometry, blue, [1.5, 0, 1.0]))</pre>
+    <p>drawScene 一个字没改，下一帧两遍都多画了一个物体，影子也有了。读数里「这一次新建」是 <strong>0 个</strong>：蓝色三角形借用的是橙色三角形的那个 Geometry，表里早有它的 buffer；蓝色材质和橙色材质引用的是同一个 ShaderModule，表里早有它的 program。实测每帧 GL 命令从 48 条变成 66 条，多出来的 18 条就是两遍各多画一个物体。第 40、41 课同样的需求都要改四处，这里是建材质加上 <code>scene.add</code> 两行。</p>
+
+    <h2 id="s3">3. 数据变了，表里的副本怎么办</h2>
+    <p>再治第 2 处。数据不是不能变，而是每一种数据都要说清楚<strong>怎么变</strong>，好让后端知道副本什么时候过时。小引擎里有三种：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>数据</th><th>怎么变</th><th>后端怎样知道</th><th>为什么这样选</th></tr>
+        <tr><td>Geometry、ShaderModule</td><td><strong>不能变。</strong>构造时复制，之后没有任何改的入口。要新形状，就建一个新的 Geometry</td><td>不需要知道：同一个对象，内容永远不变；新对象在表里查不到，自然会建</td><td>顶点多、上传贵，又很少变</td></tr>
+        <tr><td>RenderTarget</td><td><code>resize(size)</code>：尺寸变了，<code>revision</code> 加 1</td><td>Manager 每次 get 比一比 revision，不一样就照新尺寸建一份、删掉旧的</td><td>阴影图会随设置改尺寸，但对象身份要留着（材质、灯都引用它）</td></tr>
+        <tr><td>材质参数、物体位置、灯的方向</td><td>随时改：<code>setParameter</code>、<code>mesh.position</code>、<code>light.toLight</code></td><td>不需要知道：后端根本不缓存它们，每次 draw 时现读、现设 uniform</td><td>只有几个数，每帧设一遍几乎不花时间</td></tr>
+      </table>
+    </div>
+    <p>在上面的画布上试三种：</p>
+    <ul>
+      <li><strong>三角形变绿</strong>：页面调用 <code>material.setParameter('uColor', [0.2, 0.8, 0.3])</code>。下一帧就是绿的，新建 0 个、删除 0 个。</li>
+      <li><strong>阴影图 512 ↔ 1024</strong>：页面调用 <code>light.shadow.target.resize(1024)</code>。下一帧 RenderTargetManager 发现 revision 从 0 变成 1：新建纹理、深度缓冲、framebuffer 各 1 个，再删掉旧的 3 个；表里还是 1 条。再下一帧什么都不建。影子边缘的锯齿变细了（备课时在只有两个物体的场景里实测，1666 个像素有变化）。</li>
+      <li><strong>三角形换形状</strong>：Geometry 改不了，所以页面建一个新的 Geometry 和一个新的 Mesh 换上去，再把旧的 Geometry 丢弃（第 4 节）。新建 buffer 1 个，删除 buffer 1 个。</li>
+    </ul>
+    <p>资源类是怎样做到「不能变」的，看代码里的「复制」「冻结」「私有字段」三个按钮：</p>
+    <div id="cv-resources"></div>
+    <p><strong>架构视角</strong>：three.js 走的是另一条路——顶点数组可以原地改，改完要自己写 <code>attribute.needsUpdate = true</code>，它让 <code>version</code> 加 1（<a data-src="node_modules/three/src/core/BufferAttribute.js:152">BufferAttribute.js:152</a>），渲染器比较 version 决定要不要重新上传（<a data-src="node_modules/three/src/renderers/webgl/WebGLAttributes.js:206">WebGLAttributes.js:206</a>）。好处是改几个顶点不用建新对象；代价是忘了写 needsUpdate 就是上面那块画布的样子。本项目的 Geometry 选了「不能变」，只有 RenderTarget 用和 three.js 一样的版本号。第 31 课第 9 节比较过两种做法。</p>
+
+    <h2 id="s4">4. 谁来调用 release：资源自己通知</h2>
+    <p>治第 3 处。所有资源继承同一个基类 <code>Resource</code>：它记着一组「我被丢弃时叫你」的回调。Manager 第一次为某个资源建 GPU 副本时，顺手登记一个回调：「它被丢弃时，叫我 release 它」。于是：</p>
+    <ul>
+      <li>数据的主人只管调用 <code>geometry.dispose()</code>，不用知道有几个 context、几张表里有它的副本；</li>
+      <li>每张表在 dispose 那一刻同步删掉自己那份 GPU 副本；</li>
+      <li>Manager 自己先关掉（或者 context 丢失）时，用登记时拿到的 <code>unsubscribe</code> 取消回调，免得资源以后叫一个已经不存在的 Manager。</li>
+    </ul>
+    <div id="cv-backend"></div>
+    <p>在上面的画布上点「三角形换形状」，页面运行的是下面这个函数（课程写的）。它在最后一步丢弃旧 Geometry 之前，先看场景里还有没有别的物体在用它——如果你刚才加了蓝色三角形，它借用的就是同一个旧 Geometry，这时旧的不能丢，读数会写「还有物体在用，没有丢弃」：</p>
+    <pre id="replace-code"></pre>
+    <p>如果不看就丢呢？第 5 节最后一张检查卡片：Geometry 已经丢弃、场景里的 Mesh 还拿着它，下一帧 <code>geometries.get</code> 开头的 <code>assertUsable</code> 直接抛「Geometry 已经释放」——一个看得见的错误，而不是去画一个已经删掉的 buffer。真实代码把「还有谁在用」做成了计数：场景用 <code>scene.retain(resource)</code> 登记（<a data-src="src/rendering/scene/Scene.ts:77">Scene.ts:77</a>），还有场景持有时 <code>dispose()</code> 抛 ResourceHasSceneReferencesError（<a data-src="src/rendering/core/Resource.ts:182">Resource.ts:182–190</a>），最后一个场景释放时自动丢弃（<a data-src="src/rendering/core/Resource.ts:139">Resource.ts:139–146</a>）。</p>
+
+    <h2 id="s5">5. 构造时就检查</h2>
+    <p>治第 4 处。资源在构造函数里检查自己：顶点数对不对、尺寸是不是正整数、参数是不是有限的数、引用的资源还活着没有。检查不过就抛错，对象根本建不出来。四张卡片，先猜再点：</p>
+    <div id="cards"></div>
+    <aside class="note">
+      <strong>这里的检查</strong>（校验三层里的第 ① 层「构造时」）：只看对象自己——顶点数、尺寸、参数的值、引用的资源是否存活。<strong>之后可以放心</strong>：对象自洽，内容是它自己的副本，外面改原数组影响不到它。<strong>这时还不知道</strong>：它会和哪个 shader 配、shader 里有没有 <code>uColor</code>、设备支不支持这个尺寸——留给第 ③ 层，也就是第 41 课的 Manager 和 setUniforms。见 <a href="../reference/validation-map.html">校验地图</a> 里 <code>resources/</code> 开头的几行。
+    </aside>
+
+    <h2 id="s6">6. 灯也是数据：阴影设置挂在灯上</h2>
+    <p>第 40 课 ① 里的 <code>toLight</code>、<code>shadowBias</code>、阴影图尺寸、正交范围 4.5，都变成了灯上的数据。照 10 月 16 日的决定（和 three.js 一样）：灯有 <code>castShadow</code> 和 <code>shadow</code> 两个字段；<code>shadow</code> 是一份阴影设置，拥有自己的阴影图（一个 RenderTarget）和 bias。</p>
+    <div id="cv-scene"></div>
+    <p>所以「阴影图 512 ↔ 1024」按钮改的是 <code>light.shadow.target</code>：阴影图属于这盏灯，不属于哪个 Pass，也不属于 drawScene。拖滑块改的是 <code>light.toLight</code>，和材质颜色一样每次 draw 现读。</p>
+    <p><code>src/rendering</code> 里现在还没有灯。这里的两个类对应 HW1 阴影设计文档里的提案（<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:156">设计 §3.4 灯</a>、<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:176">§3.5 DirectionalLightShadow</a>）；提案里 DirectionalLightShadow 还是一个 Resource，并且拥有一个参数块——那是第 45 课的事。</p>
+    <p>留一个问题给第 43 课：drawScene 在第一遍和第二遍里各读了一次 <code>light.toLight</code>、<code>mesh.position</code>。如果两遍之间有人改了它们，阴影图和画面就是照两个不同的场景画的。</p>
+
+    <h2 id="s7">7. 对照 src/rendering</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th>小引擎</th><th>真实代码</th><th>真实代码多了什么</th></tr>
+        <tr><td><code>Resource</code></td><td><a data-src="src/rendering/core/Resource.ts:27">core/Resource.ts:27</a>（onDispose :104，dispose :182，先标记再通知 :204–216）</td><td>场景引用计数（:124–146）、<code>tryDispose</code></td></tr>
+        <tr><td><code>Geometry</code></td><td><a data-src="src/rendering/resources/Geometry.ts:137">resources/Geometry.ts:137</a>，复制在 <a data-src="src/rendering/resources/VertexAttribute.ts:100">VertexAttribute.ts:100</a></td><td>多个属性（position、normal、uv）、索引、图元类型；顶点数检查在 :58–71、:244</td></tr>
+        <tr><td><code>ShaderModule</code></td><td><a data-src="src/rendering/resources/ShaderModule.ts:179">resources/ShaderModule.ts:179</a></td><td>着色语言（GLSL ES 1.00 / 3.00）、内建 uniform 映射（第 45 课）</td></tr>
+        <tr><td><code>Material</code></td><td><a data-src="src/rendering/resources/Material.ts:181">resources/Material.ts:181</a>（setParameter :342）</td><td>参数带类型（vec3、mat4、texture2D……）、渲染状态、队列；不许占内建 uniform 的名字</td></tr>
+        <tr><td><code>RenderTarget</code></td><td><a data-src="src/rendering/resources/RenderTarget.ts:416">resources/RenderTarget.ts:416</a>（resize :481，revision 加 1 在 :498）</td><td>宽高分开、多个颜色附件、格式和过滤、label 必填</td></tr>
+        <tr><td><code>Mesh</code></td><td><a data-src="src/rendering/scene/Mesh.ts:22">scene/Mesh.ts:22</a></td><td>继承 SceneNode：Transform（位置、旋转、缩放）和父子层级；model 矩阵就是世界矩阵</td></tr>
+        <tr><td><code>Scene</code></td><td><a data-src="src/rendering/scene/Scene.ts:22">scene/Scene.ts:22</a></td><td>树形（Group）；<code>retain</code>/<code>release</code> 登记资源</td></tr>
+        <tr><td><code>DirectionalLight</code>、<code>DirectionalLightShadow</code></td><td>还没有（第 6 节的设计提案）</td><td>提案里阴影设置是 Resource，拥有阴影图和参数块</td></tr>
+        <tr><td>Manager 第一次 get 时订阅释放</td><td><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:180">ProgramManager.ts:180</a>、<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:185">GeometryManager.ts:185</a>、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:114">RenderTargetManager.ts:114</a></td><td>—</td></tr>
+        <tr><td>RenderTargetManager 比较 revision</td><td><a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:82">RenderTargetManager.ts:82–84</a>，新的建好才删旧的 :127</td><td>正在被绑定的目标不许重建（:98–106）</td></tr>
+        <tr><td><code>drawScene</code></td><td>没有一一对应：第 43 课把「每帧读场景」拆成 RenderListBuilder，第 44 课把两遍拆成两个 Pass</td><td>—</td></tr>
+      </table>
+    </div>
+    <p><strong>架构视角</strong>：three.js 的 <code>Mesh(geometry, material)</code> 和这里一样借用两个资源；BufferGeometry、Material、Texture 的 <code>dispose()</code> 发出一个 <code>dispose</code> 事件，渲染器在第一次见到它们时订阅了这个事件（第 41 课提过的 <a data-src="node_modules/three/src/renderers/webgl/WebGLGeometries.js:56">WebGLGeometries.js:56</a>）——和 Resource.onDispose 是同一个想法。不同的是 three.js 的数据可以原地改（第 3 节），本项目的 Geometry 不行。</p>
+
+    <h2 id="s8">8. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0042"></div>
+
+    <h2 id="s9">9. 延伸阅读</h2>
+    <ul>
+      <li><strong>首选（约 10 分钟）</strong>：<a href="https://threejs.org/manual/#en/how-to-dispose-of-objects">three.js manual · How to dispose of objects</a>：哪些对象要手动 dispose、dispose 以后渲染器做什么。对照第 4 节读：three.js 也是「资源被丢弃时通知渲染器」，只是没有场景引用计数。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Classes/Private_properties">MDN · Private properties</a>：<code>#x</code> 私有字段的规则。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object/freeze">MDN · Object.freeze()</a>：冻结只管一层；严格模式下赋值抛 TypeError。</li>
+      <li><a href="0031-frame-overview.html">第 31 课</a>第 2、9 节：没有复制时两个 context 画出不同的东西；needsUpdate 和「不能变」两种做法。</li>
+      <li><a href="../reference/validation-map.html">校验地图</a>：<code>resources/</code> 和 <code>scene/</code> 每一处检查什么、之后放心什么。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：检查题错了哪几题；第 1 节那块画布和四张卡片里，有没有哪一个结果和你猜的不一样。看不懂的代码，把行号贴给我。下一课从第 6 节末尾那个问题开始：两遍读到的场景要是同一个。
+    </aside>
+
+    <div class="nav">
+      <a href="0041-build-once-lookup-by-object.html">← 第 41 课：只做一次与每帧做</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0043-snapshot-each-frame.html">第 43 课：每帧先抄一份 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 42 课 · 2026-10-16</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+        const S = RTeach.shadow42
+        const S41 = RTeach.shadow41
+        const { Geometry, Material, Mesh } = S
+
+        function dedent(text) {
+          const lines = text.split('\n')
+          const indents = lines.slice(1).filter((l) => l.trim()).map((l) => l.match(/^ */)[0].length)
+          const cut = indents.length ? Math.min(...indents) : 0
+          return [lines[0], ...lines.slice(1).map((l) => l.slice(Math.min(cut, l.match(/^ */)[0].length)))].join('\n')
+        }
+        const show = (...parts) => parts.map((p) => dedent(p.toString())).join('\n\n')
+        const ERRORS = { 0: '0（没有错误）', 1280: 'INVALID_ENUM', 1281: 'INVALID_VALUE', 1282: 'INVALID_OPERATION' }
+
+        // ---------------- 代码视图 ----------------
+        window.__cv42 = {}
+        window.__cv42.app = RTeach.codeView({
+          mount: document.getElementById('cv-app'),
+          caption: 'assets/shadow-42.js 里的 createShadowScene：应用这一侧，只建数据。',
+          code: show(S.createShadowScene),
+          groups: [
+            { label: '资源（resources/）', test: (line) => /new (ShaderModule|Geometry|Material)\(/.test(line), note: '「是什么」：形状、shader、颜色' },
+            { label: '场景（scene/）', test: (line) => /new (Scene|Mesh|DirectionalLight|DirectionalLightShadow)\(|scene\.add/.test(line), note: '「有哪些、在哪」' },
+            { label: '共用同一个 shader', test: (line) => /shaderModule: lit|const lit/.test(line), note: '两个材质引用同一个 ShaderModule，表里只有一个 program' }
+          ]
+        })
+        window.__cv42.draw = RTeach.codeView({
+          mount: document.getElementById('cv-draw'),
+          caption: 'drawScene：后端这一侧，每帧遍历场景。',
+          code: show(S.drawScene),
+          groups: [
+            { label: '遍历场景', test: (line) => /scene\.(meshes|lights)/.test(line), note: '不再点名「地面」「三角形」' },
+            { label: '向 Manager 要东西', test: (line) => /(programs|geometries|renderTargets)\.get\(/.test(line), note: 'key 是资源对象本身' },
+            { label: '每次 draw 现读', test: (line) => /modelMatrix\(\)|light\.toLight|shadow\.bias|getParameters\(\)/.test(line), note: '这些值不缓存，改了下一帧就生效' },
+            { label: '画到哪', test: (line) => /bindFramebuffer|viewport\(|clearColor|gl\.clear\(/.test(line), note: '第 44 课' }
+          ]
+        })
+        window.__cv42.resources = RTeach.codeView({
+          mount: document.getElementById('cv-resources'),
+          caption: 'resources/ 这一层：Resource、Geometry、ShaderModule、Material、RenderTarget（assets/shadow-42.js）。',
+          code: show(S.Resource, S.Geometry, S.ShaderModule, S.Material, S.RenderTarget),
+          groups: [
+            { label: '复制', test: (line) => /\.slice\(\)|\[\.\.\.value\]|Object\.fromEntries/.test(line), note: '进来时复制一份，出去时再给一份副本' },
+            { label: '冻结', test: (line) => /Object\.freeze/.test(line), note: '构造完以后，公开的字段不能再赋值' },
+            { label: '私有字段', test: (line) => /#\w+/.test(line), note: '类外面读写不到' },
+            { label: '可以改的入口', test: (line) => /^\s*(setParameter|resize)\(/.test(line), note: '只有这两个；Geometry、ShaderModule 一个都没有' },
+            { label: '构造时检查', test: (line) => /throw new Error/.test(line), note: '第 5 节' },
+            { label: '丢弃时通知', test: (line) => /onDispose|#listeners|listener\(\)/.test(line), note: '第 4 节' }
+          ]
+        })
+        window.__cv42.backend = RTeach.codeView({
+          mount: document.getElementById('cv-backend'),
+          caption: '第 42 课版本的 GeometryManager 和 RenderTargetManager（ProgramManager 同理）。和第 41 课比，多了下面三个按钮标出的行。',
+          code: show(S.GeometryManager, S.RenderTargetManager),
+          groups: [
+            { label: '订阅丢弃', test: (line) => /onDispose|unsubscribe/.test(line), note: '第一次建副本时登记；release 时取消' },
+            { label: '比较 revision', test: (line) => /revision/.test(line), note: '尺寸改过就重建，新的建好才删旧的' },
+            { label: '资源还活着吗', test: (line) => /assertUsable/.test(line), note: '已经丢弃的资源，直接拒绝' }
+          ]
+        })
+        window.__cv42.scene = RTeach.codeView({
+          mount: document.getElementById('cv-scene'),
+          caption: 'scene/ 这一层：Mesh、DirectionalLightShadow、DirectionalLight、Scene（assets/shadow-42.js）。',
+          code: show(S.Mesh, S.DirectionalLightShadow, S.DirectionalLight, S.Scene),
+          groups: [
+            { label: '借用资源', test: (line) => /this\.(geometry|material) =|new RenderTarget/.test(line), note: 'Mesh 借用几何和材质；阴影设置拥有自己的阴影图' },
+            { label: '阴影设置挂在灯上', test: (line) => /castShadow|shadow|bias|halfExtent/.test(line) },
+            { label: '每次 draw 现读', test: (line) => /this\.position|toLight/.test(line) }
+          ]
+        })
+
+        // ---------------- 课程写的计数 ----------------
+        function instrument(gl) {
+          const rawGetError = gl.getError.bind(gl)
+          const total = { create: {}, del: {} }
+          const frame = { cmd: 0, query: 0 }
+          for (const name of Object.getOwnPropertyNames(WebGLRenderingContext.prototype)) {
+            const desc = Object.getOwnPropertyDescriptor(WebGLRenderingContext.prototype, name)
+            if (typeof desc.value !== 'function' || name === 'getError' || name === 'isContextLost' || name === 'getExtension') continue
+            const original = gl[name].bind(gl)
+            gl[name] = (...args) => {
+              if (/^(get|is|check)/.test(name)) frame.query++
+              else frame.cmd++
+              if (name.startsWith('create')) total.create[name.slice(6)] = (total.create[name.slice(6)] || 0) + 1
+              if (name.startsWith('delete')) total.del[name.slice(6)] = (total.del[name.slice(6)] || 0) + 1
+              return original(...args)
+            }
+          }
+          return { total, frame, startFrame() { frame.cmd = 0; frame.query = 0 }, error: () => ERRORS[rawGetError()] || String(rawGetError()) }
+        }
+        const NAMES = { Program: 'program', Texture: '纹理', Renderbuffer: '深度缓冲', Framebuffer: 'framebuffer', Buffer: 'buffer', Shader: 'shader' }
+        const list = (record) => Object.keys(NAMES).filter((k) => record[k]).map((k) => NAMES[k] + ' ' + record[k]).join('、') || '0 个'
+        const minus = (a, b) => Object.fromEntries(Object.keys(a).map((k) => [k, a[k] - (b[k] || 0)]).filter(([, v]) => v))
+        function loseAndRestore(gl, canvas, onRestored) {
+          const ext = gl.getExtension('WEBGL_lose_context')
+          if (!ext) return false
+          canvas.addEventListener('webglcontextlost', (event) => event.preventDefault(), { once: true })
+          canvas.addEventListener('webglcontextrestored', onRestored, { once: true })
+          ext.loseContext()
+          setTimeout(() => ext.restoreContext(), 50)
+          return true
+        }
+        const pixel = (gl, x, y) => {
+          const p = new Uint8Array(4)
+          gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p)
+          return Array.from(p.slice(0, 3))
+        }
+
+        // ---------------- 画布 F：第 41 课的引擎，改了数据表不知道 ----------------
+        {
+          let canvas = document.getElementById('f-canvas')
+          let gl
+          let managers
+          let d
+          let note
+          const readout = document.getElementById('f-readout')
+          function start() {
+            if (gl) {
+              const lose = gl.getExtension('WEBGL_lose_context')
+              if (lose) lose.loseContext()
+              const fresh = document.createElement('canvas')
+              fresh.width = 480
+              fresh.height = 300
+              fresh.id = 'f-canvas'
+              canvas.replaceWith(fresh)
+              canvas = fresh
+            }
+            gl = canvas.getContext('webgl', { preserveDrawingBuffer: true })
+            managers = S41.createManagers(gl)
+            d = S41.createDescriptions()
+            d.triangleGeometry = { name: 'triangle', positions: S41.SCENE.trianglePositions.slice() }
+            note = '第 1 帧：表里的 buffer 照描述上传。'
+            draw()
+          }
+          function draw() {
+            S41.drawWithManagers(gl, managers, d, 35)
+            const p = pixel(gl, 240, 162)
+            const orange = p[0] > 150 && p[2] < 60
+            readout.textContent =
+              note + '\n描述里三角形的高度：' + d.triangleGeometry.positions[1].toFixed(1) +
+              '。像素 (240, 162)：(' + p.join(', ') + ')，' + (orange ? '三角形还在 1.2 的高度。' : '那里已经是地面，三角形不在 1.2 的高度了。')
+          }
+          document.getElementById('f-mutate').addEventListener('click', () => {
+            const positions = d.triangleGeometry.positions
+            for (let i = 1; i < positions.length; i += 3) positions[i] = 2.0
+            note = '直接改了描述里的数组，然后画了一帧（表里还是旧的 buffer）。'
+            draw()
+          })
+          document.getElementById('f-lose').addEventListener('click', () => {
+            loseAndRestore(gl, canvas, () => {
+              managers = S41.createManagers(gl)
+              note = 'context 恢复，换了一套空表，照描述重建了 buffer。'
+              draw()
+            })
+          })
+          document.getElementById('f-reset').addEventListener('click', start)
+          start()
+          window.__stageF = { draw: () => draw(), get d() { return d } }
+        }
+
+        // ---------------- 画布 E：第 42 课的小引擎 ----------------
+        /** 课程写的：换一个形状。Geometry 改不了，就换一个新的 */
+        function replaceTriangleShape(app, positions) {
+          const old = app.triangle
+          const geometry = new Geometry({ positions })
+          const next = new Mesh(geometry, old.material, old.position)
+          app.triangle = app.scene.add(next)
+          app.scene.remove(old)
+          // 场景里没有别的物体再用旧几何，才丢弃它
+          //（真实代码用 Scene 的引用计数做这件事）
+          const stillUsed = app.scene.meshes.some(
+            (mesh) => mesh.geometry === old.geometry)
+          if (!stillUsed) old.geometry.dispose()
+          return stillUsed
+        }
+        document.getElementById('replace-code').textContent = dedent(replaceTriangleShape.toString())
+        {
+          const canvas = document.getElementById('e-canvas')
+          const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true })
+          const count = instrument(gl)
+          const angle = document.getElementById('e-angle')
+          const readout = document.getElementById('e-readout')
+          const app = S.createShadowScene(35)
+          let managers = S.createManagers(gl)
+          let generation = 1
+          let frames = 0
+          let blueMesh = null
+          let green = false
+          let big = false
+          function setLight() {
+            const a = (Number(angle.value) * Math.PI) / 180
+            app.light.toLight = RTeach.shadowRaw.M.normalize([Math.sin(a), Math.cos(a), 0.35])
+          }
+          function draw(note, before) {
+            before = before || { create: { ...count.total.create }, del: { ...count.total.del } }
+            count.startFrame()
+            S.drawScene(gl, managers, app.scene, app.camera)
+            frames++
+            const sizes = [managers.programs.entries.size, managers.geometries.entries.size, managers.renderTargets.entries.size]
+            const target = app.light.shadow.target
+            readout.textContent =
+              (note ? note + '\n' : '') +
+              '第 ' + generation + ' 代 context，已画 ' + frames + ' 帧。场景：' + app.scene.meshes.length + ' 个物体、' + app.scene.lights.length + ' 盏灯；阴影图 ' + target.size + ' × ' + target.size + '，revision ' + target.revision + '。\n' +
+              '表里条目 program / 几何 / 目标：' + sizes.join(' / ') + '。\n' +
+              '这一次新建：' + list(minus(count.total.create, before.create)) + '；这一次删除：' + list(minus(count.total.del, before.del)) + '。\n' +
+              '这一帧 GL 命令 ' + count.frame.cmd + ' 条、查询 ' + count.frame.query + ' 次。getError：' + count.error()
+          }
+          angle.addEventListener('input', () => {
+            document.getElementById('e-angle-text').textContent = angle.value + '°'
+            setLight()
+            draw()
+          })
+          document.getElementById('e-add').addEventListener('click', () => {
+            if (blueMesh) return draw('蓝色三角形已经在场景里了。')
+            const blue = new Material({ shaderModule: app.lit, parameters: { uColor: [0.25, 0.55, 0.95] } })
+            blueMesh = app.scene.add(new Mesh(app.triangle.geometry, blue, [1.5, 0, 1.0]))
+            draw('加了一个 Mesh：借用橙色三角形现在的 Geometry，新材质引用同一个 ShaderModule。')
+          })
+          document.getElementById('e-remove').addEventListener('click', () => {
+            if (!blueMesh) return draw('场景里没有蓝色三角形。')
+            app.scene.remove(blueMesh)
+            blueMesh.material.dispose()
+            const geometry = blueMesh.geometry
+            blueMesh = null
+            const stillUsed = app.scene.meshes.some((mesh) => mesh.geometry === geometry)
+            const before = { create: { ...count.total.create }, del: { ...count.total.del } }
+            if (!stillUsed && !geometry.disposed) geometry.dispose()
+            draw('移除了蓝色三角形，丢弃了它的材质；它借用的 Geometry ' + (stillUsed ? '还有物体在用，没有丢弃。' : '已经没人用，丢弃了。'), before)
+          })
+          document.getElementById('e-color').addEventListener('click', () => {
+            green = !green
+            app.triangle.material.setParameter('uColor', green ? [0.2, 0.8, 0.3] : S41.SCENE.triangleColor)
+            draw('调用了 material.setParameter(\'uColor\', …)。')
+          })
+          document.getElementById('e-resize').addEventListener('click', () => {
+            const target = app.light.shadow.target
+            target.resize(target.size === 512 ? 1024 : 512)
+            draw('调用了 light.shadow.target.resize(' + target.size + ')。')
+          })
+          document.getElementById('e-shape').addEventListener('click', () => {
+            big = !big
+            const before = { create: { ...count.total.create }, del: { ...count.total.del } }
+            const stillUsed = replaceTriangleShape(app, big ? S41.SCENE.bigTrianglePositions : S41.SCENE.trianglePositions)
+            draw('换成了' + (big ? '大' : '小') + '三角形：新 Geometry、新 Mesh；旧 Geometry ' + (stillUsed ? '还有物体在用，没有丢弃。' : '已经丢弃。'), before)
+          })
+          document.getElementById('e-lose').addEventListener('click', () => {
+            loseAndRestore(gl, canvas, () => {
+              managers = S.createManagers(gl)
+              generation++
+              draw('context 恢复了：换了一套空的 Manager，场景一点没动，照它重建。')
+            })
+          })
+          draw('第 1 帧。')
+          window.__stageE = { app, draw, get managers() { return managers }, count, gl }
+        }
+
+        // ---------------- 检查卡片 ----------------
+        const fourVertices = new Float32Array([...S41.SCENE.trianglePositions, 0, 1.2, -1.5])
+        RTeach.traceLab.cards({
+          mount: document.getElementById('cards'),
+          storageKey: 'lesson-0042',
+          cards: [
+            {
+              title: '卡片 A：第 41 课的引擎，4 个顶点的三角形',
+              desc: "d.triangleGeometry = { name: 'triangle', positions: 4 个顶点（12 个数） }，然后 drawWithManagers 画一帧。",
+              note: 'drawWithManagers 是第 41 课课程写的小引擎（assets/shadow-41.js），不是项目源码。',
+              question: '会发生什么？',
+              choices: ['不抛错，getError 为 0，第 4 个顶点被悄悄丢掉', '构造描述对象时就抛错，说顶点数不对', 'drawArrays 报 INVALID_OPERATION，什么也不画'],
+              answer: 0,
+              explain: '描述对象是普通对象，没有人检查它。<code>drawArrays(TRIANGLES, 0, 4)</code> 画完一个三角形后，剩下 1 个顶点凑不成三角形，GL 规定直接忽略，不算错误。画面和 3 个顶点时逐像素相同。',
+              run: async () => {
+                const canvas = document.createElement('canvas')
+                canvas.width = 480
+                canvas.height = 300
+                const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true })
+                const d = S41.createDescriptions()
+                d.triangleGeometry = { name: 'triangle', positions: fourVertices }
+                let threw = '没有抛错'
+                try {
+                  S41.drawWithManagers(gl, S41.createManagers(gl), d, 35)
+                } catch (error) {
+                  threw = '抛错：' + error.message
+                }
+                const error = ERRORS[gl.getError()]
+                const p = pixel(gl, 240, 162)
+                const lose = gl.getExtension('WEBGL_lose_context')
+                if (lose) lose.loseContext()
+                return { lines: [{ text: threw }, { text: 'getError：' + error }, { text: '像素 (240, 162)：(' + p.join(', ') + ')，三角形照常画出来了' }] }
+              }
+            },
+            {
+              title: '卡片 B：第 42 课的 Geometry，同样 4 个顶点',
+              desc: 'new Geometry({ positions: 同样那 12 个数 })',
+              note: 'Geometry 是课程写的小引擎（assets/shadow-42.js）；真实 Geometry 的同一条检查在 Geometry.ts:58–71。',
+              question: '会发生什么？',
+              choices: ['构造时就抛错，说顶点数不是 3 的倍数', '不抛错，等第一次画的时候再报错', '不抛错，第 4 个顶点同样被悄悄丢掉'],
+              answer: 0,
+              explain: '构造函数先检查再保存，检查不过对象就建不出来，后面的代码根本拿不到一个坏的 Geometry。真实代码的报错是「triangles require at least 3 draw elements and a count divisible by 3; received 4」。',
+              run: async () => {
+                try {
+                  new Geometry({ positions: fourVertices })
+                  return { lines: [{ text: '没有抛错' }] }
+                } catch (error) {
+                  return { lines: [{ text: '抛错：' + error.message, kind: 'abort' }] }
+                }
+              }
+            },
+            {
+              title: '卡片 C：建好以后改原数组',
+              desc: 'const source = new Float32Array(三角形的 9 个数); const g = new Geometry({ positions: source }); source[1] = 2.0; 然后读 g.copyPositions()[1]',
+              note: 'Geometry 是课程写的小引擎（assets/shadow-42.js）。',
+              question: '读到的是多少？',
+              choices: ['还是 1.2（Float32 存成 1.2000000476837158）', '2.0：Geometry 和 source 是同一块内存', '抛错：Geometry 建好以后不许再读'],
+              answer: 0,
+              explain: '构造函数里 <code>positions.slice()</code> 复制了一份存进私有字段，source 之后怎么改都碰不到它；<code>copyPositions()</code> 出去时又复制一份。真实代码在 <a data-src="src/rendering/resources/VertexAttribute.ts:100">VertexAttribute.ts:100</a> 复制。',
+              run: async () => {
+                const source = S41.SCENE.trianglePositions.slice()
+                const g = new Geometry({ positions: source })
+                source[1] = 2.0
+                return { lines: [{ text: 'source[1] = ' + source[1] }, { text: 'g.copyPositions()[1] = ' + g.copyPositions()[1] }] }
+              }
+            },
+            {
+              title: '卡片 D：丢弃了，场景里却还有人用',
+              desc: '加一个借用小三角形 Geometry 的 Mesh，然后对这个 Geometry 调用 dispose()，再 drawScene 一帧。',
+              note: 'Geometry、Mesh、drawScene 都是课程写的小引擎（assets/shadow-42.js），在一个临时画布上跑，不影响上面的画布。',
+              question: '这一帧会怎样？',
+              choices: ['抛错：Geometry 已经释放', '照常画，用的是表里剩下的 buffer', '跳过这个物体，其余照常画'],
+              answer: 0,
+              explain: 'dispose 时 GeometryManager 已经收到通知、删掉了 buffer；下一帧 <code>geometries.get</code> 开头的 <code>assertUsable</code> 发现它已经丢弃，直接抛错。真实代码更早一步：场景 retain 着的资源，<code>dispose()</code> 本身就会抛 ResourceHasSceneReferencesError（<a data-src="src/rendering/core/Resource.ts:182">Resource.ts:182</a>）。',
+              run: async () => {
+                const canvas = document.createElement('canvas')
+                canvas.width = 480
+                canvas.height = 300
+                const gl = canvas.getContext('webgl')
+                const app = S.createShadowScene(35)
+                const managers = S.createManagers(gl)
+                S.drawScene(gl, managers, app.scene, app.camera)
+                const lines = [{ text: '先画一帧：几何表里 ' + managers.geometries.entries.size + ' 条' }]
+                app.triangleGeometry.dispose()
+                lines.push({ text: 'dispose 之后：几何表里 ' + managers.geometries.entries.size + ' 条（Manager 收到通知，删了 buffer）' })
+                try {
+                  S.drawScene(gl, managers, app.scene, app.camera)
+                  lines.push({ text: '没有抛错' })
+                } catch (error) {
+                  lines.push({ text: '下一帧抛错：' + error.message, kind: 'abort' })
+                }
+                const lose = gl.getExtension('WEBGL_lose_context')
+                if (lose) lose.loseContext()
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0042"]'), [
+          {
+            q: '加一个蓝色三角形（同一个 Geometry、新 Material、同一个 ShaderModule），这一帧新建几个 GPU 对象？',
+            opts: ['0 个：几何和 program 表里都有', '1 个：为新材质编译一个 program', '1 个：为新物体再上传一个 buffer'],
+            answer: 0,
+            why: '表的 key 是资源对象本身：Geometry 和 ShaderModule 都是原来那两个对象，查表命中（第 2 节读数）。'
+          },
+          {
+            q: '第 41 课的引擎里直接改描述对象的顶点数组，画面会怎样？',
+            opts: ['不变，等 context 丢失重建后才变', '下一帧就变，Manager 会重新上传', '抛错：描述对象建好以后不许改'],
+            answer: 0,
+            why: 'Manager 只认「是不是同一个对象」，看不出内容变了；副本什么时候建，画面就是什么时候的数（第 1 节画布）。'
+          },
+          {
+            q: '在第 42 课的小引擎里想把三角形换成大的，正确做法是：',
+            opts: ['建一个新 Geometry，旧的没人用就丢弃', '改旧 Geometry 的顶点数组再画一帧', '调用 geometry.resize 改成新的顶点数'],
+            answer: 0,
+            why: 'Geometry 没有任何改的入口；新对象在表里查不到，自然会上传；旧的丢弃时 Manager 收到通知删 buffer（第 3、4 节）。'
+          },
+          {
+            q: 'light.shadow.target.resize(1024) 之后的第一帧，RenderTargetManager 做什么？',
+            opts: ['建一套新的阴影图，再删掉旧的', '什么也不做，继续用 512 的那张', '抛错：改尺寸之前必须先 dispose'],
+            answer: 0,
+            why: 'resize 让 revision 加 1；get 发现表里那份的 revision 不一样，照新尺寸建好以后才删旧的（第 3 节，真实代码 RenderTargetManager.ts:82–84、:127）。'
+          },
+          {
+            q: '为什么材质颜色可以随时改，Geometry 的顶点却设计成不能改？',
+            opts: ['颜色每次 draw 现读，顶点有 GPU 副本', '颜色只有三个数，复制起来比较快', 'Material 没有 dispose，不怕被释放'],
+            answer: 0,
+            why: '后端不缓存颜色，每次 draw 现设 uniform；顶点上传成了 buffer，改了原数据副本就过时（第 3 节的表）。'
+          },
+          {
+            q: '阴影图的尺寸和 bias 放在哪里？',
+            opts: ['灯上：light.shadow 拥有阴影图和 bias', '材质上：每个接收阴影的材质各存一份', 'drawScene 里：写成函数里的常量'],
+            answer: 0,
+            why: '10 月 16 日的决定，和 three.js 一样：castShadow、shadow 挂在灯上（第 6 节）。值怎样送进材质的 shader 是第 45 课的事。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

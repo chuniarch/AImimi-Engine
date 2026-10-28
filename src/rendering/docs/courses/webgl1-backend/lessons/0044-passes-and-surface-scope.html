@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 44 课 · 两遍变成两个 Pass</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/code-view.js"></script>
+    <script src="../assets/shadow-raw.js"></script>
+    <script src="../assets/shadow-41.js"></script>
+    <script src="../assets/shadow-42.js"></script>
+    <script src="../assets/shadow-43.js"></script>
+    <script src="../assets/shadow-44.js"></script>
+  </head>
+  <body>
+    <p class="kicker">系列「带阴影的三角形：从一个函数到 src/rendering」5/7 · 约 25 分钟</p>
+    <h1>两遍变成两个 Pass：画到哪是进门出门，画几遍由场景说了算</h1>
+    <p class="lede">
+      第 43 课的 <code>renderFrame</code> 写死了「先画阴影图，再画屏幕」。可是 HW2 没有阴影，FFT 要画十几遍。这一课把每一遍做成一个 Pass 对象，按顺序装进 Pipeline，由场景交出自己要的那一组。顺手解决两件手写时容易出错的事：「画到哪」变成进门、出门，出错也一定换回来；每次 draw 自己设好要的状态，不靠前一遍留下。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW1 设计里的 <code>ShadowMapPass</code>、<code>Engine.setScene({ scene, camera, passes })</code> 就是这一课的两样东西。真实代码现在还在 Engine 里写死了一个 ForwardPass（<a data-src="src/engine.ts:404">engine.ts:404–405</a>），HW1 要加阴影，第一步就是让场景交出 Pass。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 第 43 课的 buildFrame、shadowPass、mainPass、renderFrame；② 第 27 课：framebuffer 绑定以后，之后的 draw 和 clear 都写进它，直到换绑；③ 第 39 课：进门时要问两次 GL（framebuffer 和 viewport）。<br />
+      <strong>这一课讲的</strong>：一遍一个对象；手写「画到哪」的两个坑和进门出门；只有第一遍开了深度测试的坑和「每次 draw 自己设状态」；场景交出 Pass、引擎照单安装；对照 <code>src/rendering</code> 和 three.js。<br />
+      <strong>在一帧里的位置和寿命</strong>：Pass 对象由场景建、交给引擎以后归 Pipeline 所有，活到下一次换场景；每帧被调用一次 <code>execute</code>，只读快照和后端。进门出门只活一个回调那么长。<br />
+      <strong>页面会用到你的显卡</strong>：一块 480 × 300 的画布，外加检查卡片里临时建的几块。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">renderFrame 写死了画几遍</a></li>
+        <li><a href="#s2">一遍一个对象</a></li>
+        <li><a href="#s3">画到哪：进门、出门</a></li>
+        <li><a href="#s4">画一个物体：状态自己设</a></li>
+        <li><a href="#s5">场景交出自己要的 Pass</a></li>
+        <li><a href="#s6">对照 src/rendering</a></li>
+        <li><a href="#s7">检查题</a></li>
+        <li><a href="#s8">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. renderFrame 写死了画几遍</h2>
+    <p>第 43 课一帧是这样的：</p>
+<pre>function renderFrame(gl, managers, scene, camera) {
+  const frame = buildFrame(scene, camera, aspect)
+  shadowPass(gl, managers, frame)
+  mainPass(gl, managers, frame)
+}</pre>
+    <p>需求：同一个程序还要显示一个没有阴影的场景（HW2 那样：一个 shader、只画一遍）。按这个写法只有两条路：再写一个 <code>renderFrameWithoutShadow</code>；或者在 renderFrame 里加 <code>if (有阴影) shadowPass(…)</code>，mainPass 里再加「有阴影才绑阴影图」。FFT 来了又要再加十几个 if。<strong>「这个场景要画哪几遍」是场景的事，却写在了每帧的代码里。</strong></p>
+    <p>要把它交出去，每一遍得先变成一个能放进列表的东西：一个对象，有名字、能执行、能释放自己拥有的资源。</p>
+
+    <h2 id="s2">2. 一遍一个对象</h2>
+    <p>每个 Pass 只有三样：<code>name</code>、<code>execute(context)</code>、<code>dispose()</code>。<code>context</code> 是这一帧的快照加一个后端：<code>{ frame, backend }</code>。Pass 拿不到 <code>gl</code>，也拿不到 Manager——它只能对后端说两句话：「我要画到哪」（<code>withRenderSurface</code>）和「画这个物体」（<code>draw</code>）。</p>
+    <div id="cv-passes"></div>
+    <p>几处要点：</p>
+    <ul>
+      <li><strong>ShadowMapPass 拥有自己画深度的 shader</strong>，<code>dispose</code> 时释放它；ForwardPass 什么都不拥有。Pipeline 拥有这组 Pass：Pipeline 释放时，挨个调用它们的 <code>dispose</code>。</li>
+      <li><strong>ShadowMapPass 遍历 <code>frame.lights</code></strong>：哪盏灯有阴影设置就画哪盏的阴影图。第 43 课的 shadowPass 只看第一盏灯。</li>
+      <li><strong>ForwardPass 里还有三行和阴影有关</strong>（点「ForwardPass 里的阴影」）：它得知道阴影图在哪、灯的矩阵是多少、bias 是多少。画屏幕的那一遍为什么要懂阴影？这是第 45 课的问题。</li>
+    </ul>
+
+    <h2 id="s3">3. 画到哪：进门、出门</h2>
+    <p>第 43 课每一遍开头都手写四行：<code>bindFramebuffer</code>、<code>viewport</code>、<code>clearColor</code>、<code>clear</code>。手写有两个坑，两张卡片各演示一个：</p>
+    <div id="cards-surface"></div>
+    <p>把这四行收进后端的 <code>withRenderSurface(目的地, 回调)</code>：</p>
+    <ol>
+      <li><strong>进门</strong>：先记下现在绑的 framebuffer 和 viewport（两次 GL 查询，就是第 39 课数过的那两次）；再绑目的地，<strong>viewport 照目的地的尺寸设</strong>，按描述清屏。</li>
+      <li><strong>回调</strong>：Pass 在里面调用 <code>draw</code>。</li>
+      <li><strong>出门</strong>：在 <code>finally</code> 里把 framebuffer 和 viewport 换回进门前的样子——回调正常结束要换，抛错也要换。</li>
+    </ol>
+    <div id="cv-backend"></div>
+    <p>写 Pass 的人只说「画进这盏灯的阴影图、先清成白色」，不再碰 viewport，卡片 A 的错就写不出来；出门一定换回来，卡片 B 的事也不会发生。进门出门可以套：在屏幕的门里再进阴影图的门，出来以后自动回到屏幕和 480 × 300 的 viewport（备课时实测：里面 512 × 512，出来 480 × 300，绑定回到屏幕）。FFT 一层套一层地切换目标，靠的就是这一点。</p>
+    <p>后端还顺手挡住了一种错：在写阴影图的门里，又拿这张阴影图当纹理去采样。GPU 不能同时读写同一张纹理，<code>draw</code> 会直接抛「uShadowMap：不能采样正在写的目标 shadow map」。</p>
+    <aside class="note">
+      <strong>这里的检查</strong>（第 ③ 层，每次进门）：目的地还在、读的不是正在写的目标、draw 一定在某扇门里。<strong>之后可以放心</strong>：出门时一定绑回进门前的目标和 viewport。见 <a href="../reference/validation-map.html">校验地图</a>「WebGL1SurfaceScope」一行。
+    </aside>
+    <p>代价：每帧多了 4 次 GL 查询（两扇门各问两次）。实测第 43 课每帧 48 条命令、0 次查询，这一课 58 条、4 次——多出的 10 条命令是出门的换绑和每次 draw 设深度测试（下一节）。</p>
+
+    <h2 id="s4">4. 画一个物体：状态自己设</h2>
+    <p>回头看第 43 课：<code>gl.enable(gl.DEPTH_TEST)</code> 只在 shadowPass 里出现过一次，mainPass 一直沾着它的光。两遍总是一起跑，所以从来没出过问题。现在场景可以只要 ForwardPass 了：</p>
+    <div id="cards-state"></div>
+    <p>办法不是让 ForwardPass 也去开一下深度测试——那只是把依赖换了个方向。办法是：<strong>每次 draw 自己设好这次要的状态</strong>（小引擎的 <code>Backend.draw</code> 里那一行 <code>gl.enable(gl.DEPTH_TEST)</code>）。于是 GL 状态分成两类，各有各的规矩：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>哪类状态</th><th>例子</th><th>谁管</th><th>规矩</th></tr>
+        <tr><td>画到哪</td><td>framebuffer 绑定、viewport</td><td>进门出门</td><td>进门时换，出门时换回来</td></tr>
+        <tr><td>怎么画</td><td>深度测试、深度写入、剔除</td><td>每次 draw</td><td>每次 draw 照自己的需要设，不管之前是什么</td></tr>
+      </table>
+    </div>
+    <p>真实代码也是这样分的：SurfaceScope 只存、只恢复 framebuffer 和 viewport（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:160">WebGL1SurfaceScope.ts:160–163</a>）；深度、剔除这些由每个 Material 的 <code>state</code> 描述，Backend 每次 draw 照它设（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:215">WebGL1Backend.ts:215</a> 的 <code>applyDrawState</code>），WebGL1State 记住当前值，没变就不重发（第 14 课）。</p>
+
+    <h2 id="s5">5. 场景交出自己要的 Pass</h2>
+    <p>现在一帧变成：先抄一份，再把同一个 <code>context</code> 依次交给 Pipeline 里的每个 Pass。Pipeline 里装什么，由场景交给引擎：<code>engine.setScene({ scene, camera, passes })</code>。</p>
+    <div id="cv-engine"></div>
+    <p><code>setScene</code> 分三段，这个顺序是 HW1 设计文档 §3.9 定的（<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:283">设计 §3.9</a>）：</p>
+    <ol>
+      <li><strong>准备</strong>：会失败的检查都放在这里（passes 不能为空、每个都要有 execute 和 dispose、同一个对象不能出现两次）。这一段抛错时，什么都没换，Pass 仍归调用者。</li>
+      <li><strong>提交</strong>：换上新的 Pipeline，记下新场景。从这一行起，新的场景和 Pass 归引擎。</li>
+      <li><strong>清理旧的</strong>：释放旧 Pipeline 和旧场景的资源。新场景已经装好了，这里失败只记进 <code>diagnostics</code>，不能再对调用者说「安装失败」。</li>
+    </ol>
+    <div class="gl-stage">
+      <canvas width="480" height="300" id="h-canvas"></canvas>
+      <div class="gl-controls">
+        <button type="button" id="h-shadow">安装：带阴影的三角形（ShadowMapPass、ForwardPass）</button>
+        <button type="button" id="h-plain">安装：没有阴影的场景（ForwardPass）</button>
+        <button type="button" id="h-bad">安装：passes 是空数组</button>
+      </div>
+      <div class="gl-controls">
+        <label>灯 <input type="range" min="-60" max="60" value="35" id="h-angle" /></label>
+        <span id="h-angle-text">35°</span>
+      </div>
+      <p class="gl-readout" id="h-readout"></p>
+    </div>
+    <p>备课时实测的一轮：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>操作</th><th>这一次新建</th><th>这一次删除</th><th>表里条目<br />program / 几何 / 目标</th><th>之后每帧<br />命令 / 查询</th></tr>
+        <tr><td>安装带阴影的场景，画第 1 帧</td><td>program 2、buffer 2、阴影图一套（纹理、深度缓冲、framebuffer）</td><td>shader 4（挂上后标记删除）</td><td>2 / 2 / 1</td><td>58 / 4；画面和第 40 课逐像素相同</td></tr>
+        <tr><td>换成没有阴影的场景</td><td>program 1、buffer 2（第 1 帧；另有 shader 2，挂上后标记删除）</td><td>program 2（深度的来自 ShadowMapPass.dispose，另一个来自旧场景）、buffer 2、阴影图一套</td><td>换的那一刻 0 / 0 / 0，画完 1 / 2 / 0</td><td>26 / 2</td></tr>
+        <tr><td>换回带阴影的场景</td><td>和第一行一样</td><td>program 1、buffer 2</td><td>2 / 2 / 1</td><td>58 / 4</td></tr>
+        <tr><td>passes 是空数组</td><td>0</td><td>0</td><td>不变</td><td>抛「passes 不能为空」，Pipeline 还是原来那组</td></tr>
+      </table>
+    </div>
+    <p>引擎里没有一行代码认识 ShadowMapPass 或 ForwardPass。换场景时它只做三件事：检查、换上、清理旧的。HW1、HW2、FFT 各自决定要哪几遍。</p>
+
+    <h2 id="s6">6. 对照 src/rendering</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th>小引擎</th><th>真实代码</th><th>真实代码多了什么</th></tr>
+        <tr><td>Pass 的三样：name、execute、dispose</td><td><a data-src="src/rendering/passes/RenderPass.ts:4">RenderPass.ts:4–17</a></td><td>execute 必须同步完成，不能返回 Promise</td></tr>
+        <tr><td><code>context = { frame, backend }</code></td><td><a data-src="src/rendering/passes/RenderPassContext.ts:10">RenderPassContext.ts:10–15</a></td><td>帧号时间、ViewState、RenderList 分开放</td></tr>
+        <tr><td><code>ShadowMapPass</code></td><td>还没有：<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:260">设计 §3.8</a></td><td>借用深度 shader、自己拥有深度 Material；只画 castShadow 的物体；灯这一帧没有阴影时发布「无阴影」（第 45 课）</td></tr>
+        <tr><td><code>ForwardPass</code></td><td><a data-src="src/rendering/passes/ForwardPass.ts:15">ForwardPass.ts:15–49</a></td><td>先画 background 队列再画 opaque；不知道阴影（第 45 课）</td></tr>
+        <tr><td><code>RenderPipeline</code></td><td><a data-src="src/rendering/passes/RenderPipeline.ts:19">RenderPipeline.ts:19</a>（execute :90–102）</td><td>addPass 转入所有权、拒绝同一个 Pass 加两次；执行中不许重入；dispose 失败可以重试</td></tr>
+        <tr><td><code>withRenderSurface</code></td><td><a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:191">WebGL1SurfaceScope.run</a>：先记下 :208，再解析目标 :215，绑定并设 viewport :218（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:207">WebGL1State.ts:207–217</a>），清屏 :219，finally 恢复 :230–241</td><td>目的地是显式的「屏幕」或「某个 RenderTarget」，null 不算屏幕；门里不许改尺寸、不许释放；恢复也失败时两个错误一起报（AggregateError）</td></tr>
+        <tr><td>不能采样正在写的目标</td><td><a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:276">WebGL1SurfaceScope.ts:276–288</a> assertCanSample</td><td>—</td></tr>
+        <tr><td><code>Backend.draw</code> 自己设状态</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:193">WebGL1Backend.draw</a>（:193–230）</td><td>状态来自 Material.state，经 State 缓存</td></tr>
+        <tr><td><code>Engine.setScene({ scene, camera, passes })</code></td><td>现在是 <code>setScene(scene, camera)</code>（<a data-src="src/engine.ts:181">engine.ts:181</a>），Pipeline 在建会话时写死 ForwardPass（:404–405）；改法见 <a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:283">设计 §3.9</a></td><td>首次建会话先给空 Pipeline；Renderer.replacePipeline；旧场景交给 EngineSceneSlot 清理</td></tr>
+      </table>
+    </div>
+    <p><strong>架构视角</strong>：three.js r177 的 <code>render</code> 自己就是固定的几遍——先 <code>shadowMap.render</code>（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1607">WebGLRenderer.js:1607</a>），再按不透明、透射、透明的顺序画（:1836–1837）。阴影图那一遍在进门前记下当前目标（<a data-src="node_modules/three/src/renderers/webgl/WebGLShadowMap.js:79">WebGLShadowMap.js:79</a>），最后换回来（:199），但没有 try/finally，中途抛错就换不回去。想多加几遍，要在渲染器外面用附带的 <code>EffectComposer</code>：它也是一个按顺序执行的 Pass 列表（<a data-src="node_modules/three/examples/jsm/postprocessing/EffectComposer.js:149">EffectComposer.js:149</a> addPass，:228–235 依次调用每个 pass 的 render）。本项目把阴影图也做成列表里的一个普通 Pass，核心渲染器里不再有「固定先画阴影」这件事。</p>
+
+    <h2 id="s7">7. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0044"></div>
+
+    <h2 id="s8">8. 延伸阅读</h2>
+    <ul>
+      <li><strong>首选（约 10 分钟）</strong>：<a href="https://learnopengl.com/Advanced-OpenGL/Framebuffers">LearnOpenGL · Framebuffers</a> 里「绑回 0 才能画到窗口」「画进别的尺寸的纹理之前要重新调用 glViewport」这两段，再看 <a href="https://learnopengl.com/Advanced-Lighting/Shadows/Shadow-Mapping">Shadow Mapping</a> 里讲 glViewport 的那一段（「忘了改 viewport，深度图会不完整或太小」，正是卡片 A）。读完你会发现，进门出门就是把这两段要你「记得做」的事，变成不可能忘的结构。</li>
+      <li><a href="0039-why-fft-queries-so-often.html">第 39 课</a>：进门为什么要问 GL、FFT 为什么一帧进几百次门。</li>
+      <li><a href="0014-webgl1-state.html">第 14 课</a>：WebGL1State 怎样记住状态、没变就不重发。</li>
+      <li><a href="../reference/validation-map.html">校验地图</a>：SurfaceScope、Backend.draw 各检查什么。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：检查题错了哪几题；四张卡片里哪个结果和你猜的不一样。看不懂的代码，把行号贴给我。下一课是这个系列的目的：ForwardPass 里那三行阴影值，用四种办法送到 shader，比一比为什么选参数块。
+    </aside>
+
+    <div class="nav">
+      <a href="0043-snapshot-each-frame.html">← 第 43 课：每帧先抄一份</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0045-values-into-shader.html">第 45 课：阴影值怎样送进 shader →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 44 课 · 2026-10-17</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+        const S = RTeach.shadow44
+        const S43 = RTeach.shadow43
+        const S42 = RTeach.shadow42
+        const S41 = RTeach.shadow41
+
+        function dedent(text) {
+          const lines = text.split('\n')
+          const indents = lines.slice(1).filter((l) => l.trim()).map((l) => l.match(/^ */)[0].length)
+          const cut = indents.length ? Math.min(...indents) : 0
+          return [lines[0], ...lines.slice(1).map((l) => l.slice(Math.min(cut, l.match(/^ */)[0].length)))].join('\n')
+        }
+        const show = (...parts) => parts.map((p) => dedent(p.toString())).join('\n\n')
+        const ERRORS = { 0: '0（没有错误）', 1280: 'INVALID_ENUM', 1281: 'INVALID_VALUE', 1282: 'INVALID_OPERATION' }
+        const pixel = (gl, x, y) => {
+          const p = new Uint8Array(4)
+          gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p)
+          return Array.from(p.slice(0, 3))
+        }
+        const describe = (p) => '(' + p.join(', ') + ')'
+
+        // ---------------- 代码视图 ----------------
+        window.__cv44 = {}
+        window.__cv44.passes = RTeach.codeView({
+          mount: document.getElementById('cv-passes'),
+          caption: 'assets/shadow-44.js：ShadowMapPass、ForwardPass、RenderPipeline。',
+          code: show(S.ShadowMapPass, S.ForwardPass, S.RenderPipeline),
+          groups: [
+            { label: '对后端说的话', test: (line) => /backend\.(withRenderSurface|draw)/.test(line), note: 'Pass 只能说这两句：画到哪、画这个' },
+            { label: '只读快照', test: (line) => /frame\./.test(line) },
+            { label: '拥有和释放', test: (line) => /dispose|new ShaderModule|自己拥有|拥有它们/.test(line) },
+            { label: 'ForwardPass 里的阴影', test: (line) => /shadowValues|uLightVP: lightViewProjection|uShadowBias|uShadowMap|light\.shadow === null \? \{\}/.test(line), note: '画屏幕的那一遍为什么要懂阴影？第 45 课' }
+          ]
+        })
+        window.__cv44.backend = RTeach.codeView({
+          mount: document.getElementById('cv-backend'),
+          caption: 'assets/shadow-44.js：Backend。withRenderSurface 是进门出门，draw 画一个物体。',
+          code: show(S.Backend),
+          groups: [
+            { label: '进门：记下', test: (line) => /previous|getParameter/.test(line) && !/bindFramebuffer\(gl\.FRAMEBUFFER, previous|viewport\(\.\.\.previous/.test(line), note: '两次 GL 查询（第 39 课）' },
+            { label: '进门：换过去', test: (line) => /bindFramebuffer\(gl\.FRAMEBUFFER, resource|gl\.viewport\(0, 0,|resource \? resource\.(width|height)|gl\.drawingBuffer|clearColor|gl\.clear\(/.test(line), note: 'viewport 照目的地的尺寸' },
+            { label: '出门：换回来', test: (line) => /finally|stack\.pop|bindFramebuffer\(gl\.FRAMEBUFFER, previous|viewport\(\.\.\.previous/.test(line), note: '在 finally 里：出错也换回来' },
+            { label: '检查', test: (line) => /throw new Error/.test(line) },
+            { label: '每次 draw 自己设状态', test: (line) => /DEPTH_TEST/.test(line), note: '第 4 节' }
+          ]
+        })
+        window.__cv44.engine = RTeach.codeView({
+          mount: document.getElementById('cv-engine'),
+          caption: 'assets/shadow-44.js：Renderer、Engine 和两个场景交出的 setup。',
+          code: show(S.Renderer, S.Engine, S.createShadowSetup, S.createPlainSetup),
+          groups: [
+            { label: '① 准备', test: (line) => /setScene：|new RenderPipeline\(passes\)|const passes|Array\.isArray|typeof pass/.test(line) },
+            { label: '② 提交', test: (line) => /replacePipeline\(next\)|this\.current = \{|const oldScene/.test(line) },
+            { label: '③ 清理旧的', test: (line) => /oldPipeline\.dispose|disposeScene\(oldScene\)|diagnostics\.push/.test(line) },
+            { label: '场景交出的 Pass', test: (line) => /passes: \[/.test(line), note: '引擎不认识任何具体的 Pass' }
+          ]
+        })
+
+        // ---------------- 课程写的计数 ----------------
+        function instrument(gl) {
+          const total = { create: {}, del: {} }
+          const frame = { cmd: 0, query: 0 }
+          for (const name of Object.getOwnPropertyNames(WebGLRenderingContext.prototype)) {
+            const desc = Object.getOwnPropertyDescriptor(WebGLRenderingContext.prototype, name)
+            if (typeof desc.value !== 'function' || ['getError', 'isContextLost', 'getExtension'].includes(name)) continue
+            const original = gl[name].bind(gl)
+            gl[name] = (...args) => {
+              if (/^(get|is|check)/.test(name)) frame.query++
+              else frame.cmd++
+              if (name.startsWith('create')) total.create[name.slice(6)] = (total.create[name.slice(6)] || 0) + 1
+              if (name.startsWith('delete')) total.del[name.slice(6)] = (total.del[name.slice(6)] || 0) + 1
+              return original(...args)
+            }
+          }
+          return { total, frame, reset() { frame.cmd = 0; frame.query = 0 } }
+        }
+        const NAMES = { Program: 'program', Texture: '纹理', Renderbuffer: '深度缓冲', Framebuffer: 'framebuffer', Buffer: 'buffer', Shader: 'shader' }
+        const list = (record) => Object.keys(NAMES).filter((k) => record[k]).map((k) => NAMES[k] + ' ' + record[k]).join('、') || '0 个'
+        const minus = (a, b) => Object.fromEntries(Object.keys(a).map((k) => [k, a[k] - (b[k] || 0)]).filter(([, v]) => v))
+
+        // ---------------- 画布 H：引擎换场景 ----------------
+        {
+          const canvas = document.getElementById('h-canvas')
+          const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true })
+          const count = instrument(gl)
+          const engine = new S.Engine(gl)
+          const angle = document.getElementById('h-angle')
+          const readout = document.getElementById('h-readout')
+          let setup = null
+          function snapshot() {
+            return { create: { ...count.total.create }, del: { ...count.total.del } }
+          }
+          function show(note, before) {
+            const m = engine.renderer.backend.managers
+            const sizes = [m.programs.entries.size, m.geometries.entries.size, m.renderTargets.entries.size]
+            readout.textContent =
+              (note ? note + '\n' : '') +
+              'Pipeline：' + (engine.renderer.pipeline.passes.map((p) => p.name).join(' → ') || '（空）') + '；场景里 ' + (engine.current ? engine.current.scene.meshes.length : 0) + ' 个物体。\n' +
+              '表里条目 program / 几何 / 目标：' + sizes.join(' / ') + '。\n' +
+              '这一次新建：' + list(minus(count.total.create, before.create)) + '；这一次删除：' + list(minus(count.total.del, before.del)) + '。\n' +
+              '最后一帧 GL 命令 ' + count.frame.cmd + ' 条、查询 ' + count.frame.query + ' 次。清理失败记录：' + engine.diagnostics.length + ' 条。getError：' + ERRORS[gl.getError()]
+          }
+          function frame() {
+            count.reset()
+            engine.frame()
+          }
+          function install(make, label) {
+            const before = snapshot()
+            const next = make(Number(angle.value))
+            engine.setScene(next)
+            setup = next
+            frame()
+            show('安装了「' + label + '」，然后画了一帧。', before)
+          }
+          document.getElementById('h-shadow').addEventListener('click', () => install(S.createShadowSetup, '带阴影的三角形'))
+          document.getElementById('h-plain').addEventListener('click', () => install(S.createPlainSetup, '没有阴影的场景'))
+          document.getElementById('h-bad').addEventListener('click', () => {
+            const before = snapshot()
+            try {
+              engine.setScene({ scene: null, camera: null, passes: [] })
+              show('没有抛错。', before)
+            } catch (error) {
+              show('setScene 抛错：' + error.message + '。什么都没换，下面还是原来的 Pipeline。', before)
+            }
+          })
+          angle.addEventListener('input', () => {
+            document.getElementById('h-angle-text').textContent = angle.value + '°'
+            if (!setup) return
+            const a = (Number(angle.value) * Math.PI) / 180
+            setup.light.toLight = RTeach.shadowRaw.M.normalize([Math.sin(a), Math.cos(a), 0.35])
+            const before = snapshot()
+            frame()
+            show('', before)
+          })
+          install(S.createShadowSetup, '带阴影的三角形')
+          window.__stageH = { engine, count }
+        }
+
+        // ---------------- 检查卡片 ----------------
+        function tempGL() {
+          const canvas = document.createElement('canvas')
+          canvas.width = 480
+          canvas.height = 300
+          return canvas.getContext('webgl', { preserveDrawingBuffer: true })
+        }
+        function done(gl) {
+          const lose = gl.getExtension('WEBGL_lose_context')
+          if (lose) lose.loseContext()
+        }
+        const wrongViewportLine = 'gl.viewport(0, 0, shadowMap.width, shadowMap.height)'
+        const shadowSource = S43.shadowPass.toString()
+        if (!shadowSource.includes(wrongViewportLine)) throw new Error('卡片 A 要替换的那一行在第 43 课的 shadowPass 里找不到')
+        RTeach.traceLab.cards({
+          mount: document.getElementById('cards-surface'),
+          storageKey: 'lesson-0044-surface',
+          cards: [
+            {
+              title: '卡片 A：viewport 抄错了一行',
+              desc: '第 43 课的 shadowPass，只把 gl.viewport(0, 0, shadowMap.width, shadowMap.height) 换成从 mainPass 抄来的 gl.viewport(0, 0, gl.canvas.width, gl.canvas.height)，其余不变，再跑 mainPass。',
+              note: '替换用 new Function 改第 43 课 shadowPass 的源码（assets/shadow-43.js）；只改这一处。',
+              question: '画面会怎样？',
+              choices: ['影子整个消失，不报错', '影子照常，只是边缘更粗糙', 'GL 报 INVALID_VALUE，什么都不画'],
+              answer: 0,
+              explain: '阴影图是 512 × 512，viewport 却是 480 × 300：灯眼里的场景被压扁画进左下角那一块，其余部分还是清屏的白色（最远）。第二遍按 512 × 512 去查，查到的位置已经不对，备课时影子落在的那片区域查到的全是白色，影子就没了。LearnOpenGL 的 Shadow Mapping 一页专门提醒过这一行：忘了改 viewport，深度图会不完整或太小。',
+              run: async () => {
+                const wrong = new Function('lightViewProjection', 'depthShader', 'setUniforms', 'drawPositions',
+                  'return ' + shadowSource.replace(wrongViewportLine, 'gl.viewport(0, 0, gl.canvas.width, gl.canvas.height)'))(
+                  S43.lightViewProjection, S42.depthShader, S41.setUniforms, S41.drawPositions)
+                const gl = tempGL()
+                const managers = S42.createManagers(gl)
+                const app = S42.createShadowScene(35)
+                const frame = S43.buildFrame(app.scene, app.camera, 1.6)
+                wrong(gl, managers, frame)
+                S43.mainPass(gl, managers, frame)
+                const lines = [
+                  { text: '原本在影子里的地面 (204, 150)：' + describe(pixel(gl, 204, 150)) + '（正确是 (48, 48, 48)）' },
+                  { text: '亮的地面 (349, 88)：' + describe(pixel(gl, 349, 88)) },
+                  { text: 'getError：' + ERRORS[gl.getError()] }
+                ]
+                done(gl)
+                return { lines }
+              }
+            },
+            {
+              title: '卡片 B：第一遍中途抛错（第 43 课的写法）',
+              desc: '先正常画一帧。然后让三角形的 Geometry 已经释放，再画：shadowPass 绑好阴影图以后，画到三角形时抛错。页面接住错误，想把画面清成红色提示「出错了」。',
+              note: '「接住错误、清成红色」是课程写的；shadowPass、mainPass、renderFrame 是第 43 课的小引擎。',
+              question: '画布上看到的是：',
+              choices: ['还是上一帧的画面，没有变红', '整块画布变成了红色', '画布全黑，什么也没有'],
+              answer: 0,
+              explain: '抛错时阴影图的 framebuffer 还绑着，viewport 还是 512 × 512。红色清屏写进了阴影图，画布上什么都没变，提示用户的那一下也丢了。',
+              run: async () => {
+                const gl = tempGL()
+                const managers = S42.createManagers(gl)
+                const app = S42.createShadowScene(35)
+                S43.renderFrame(gl, managers, app.scene, app.camera)
+                const frame = S43.buildFrame(app.scene, app.camera, 1.6)
+                app.scene.meshes[1].geometry.dispose()
+                let message = '没有抛错'
+                try {
+                  S43.shadowPass(gl, managers, frame)
+                  S43.mainPass(gl, managers, frame)
+                } catch (error) {
+                  message = '抛错：' + error.message
+                  gl.clearColor(0.6, 0, 0, 1)
+                  gl.clear(gl.COLOR_BUFFER_BIT)
+                }
+                const bound = gl.getParameter(gl.FRAMEBUFFER_BINDING) !== null
+                const viewport = Array.from(gl.getParameter(gl.VIEWPORT)).join(', ')
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null) // 读画布本身
+                const lines = [
+                  { text: message },
+                  { text: '清屏时绑着的是：' + (bound ? '阴影图的 framebuffer' : '屏幕') + '；viewport (' + viewport + ')' },
+                  { text: '画布左上 (10, 10)：' + describe(pixel(gl, 10, 10)) + '；亮的地面 (349, 88)：' + describe(pixel(gl, 349, 88)) }
+                ]
+                done(gl)
+                return { lines }
+              }
+            },
+            {
+              title: '卡片 C：同样抛错，换成进门出门',
+              desc: '第 44 课的引擎，同样的场景，同样先画一帧、再释放三角形的 Geometry、再画一帧；页面同样接住错误、清成红色。',
+              note: 'Engine、ShadowMapPass、Backend 是 assets/shadow-44.js 的小引擎；「接住错误、清成红色」是课程写的。',
+              question: '画布上看到的是：',
+              choices: ['整块画布变成了红色', '还是上一帧的画面，没有变红', '画布全黑，什么也没有'],
+              answer: 0,
+              explain: '错误从 draw 抛出，穿过 withRenderSurface 的 finally：出门时已经绑回屏幕、viewport 换回 480 × 300。页面再清屏，清的就是画布。',
+              run: async () => {
+                const gl = tempGL()
+                const engine = new S.Engine(gl)
+                const setup = S.createShadowSetup(35)
+                engine.setScene(setup)
+                engine.frame()
+                setup.scene.meshes[1].geometry.dispose()
+                let message = '没有抛错'
+                try {
+                  engine.frame()
+                } catch (error) {
+                  message = '抛错：' + error.message
+                  gl.clearColor(0.6, 0, 0, 1)
+                  gl.clear(gl.COLOR_BUFFER_BIT)
+                }
+                const bound = gl.getParameter(gl.FRAMEBUFFER_BINDING) !== null
+                const viewport = Array.from(gl.getParameter(gl.VIEWPORT)).join(', ')
+                const lines = [
+                  { text: message },
+                  { text: '清屏时绑着的是：' + (bound ? '阴影图的 framebuffer' : '屏幕') + '；viewport (' + viewport + ')' },
+                  { text: '画布左上 (10, 10)：' + describe(pixel(gl, 10, 10)) + '；亮的地面 (349, 88)：' + describe(pixel(gl, 349, 88)) }
+                ]
+                done(gl)
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        function forwardOnly43(gl, managers, frame) {
+          // 照第 43 课 mainPass 的写法，只去掉和阴影有关的几行
+          const light = frame.lights[0]
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+          gl.viewport(0, 0, gl.canvas.width, gl.canvas.height)
+          gl.clearColor(0.08, 0.09, 0.12, 1)
+          gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+          for (const item of frame.items) {
+            const program = managers.programs.get(item.material.shaderModule)
+            const geometry = managers.geometries.get(item.geometry)
+            gl.useProgram(program.program)
+            S41.setUniforms(gl, program, {
+              uCameraVP: frame.view.cameraVP,
+              uModel: item.modelMatrix,
+              uToLight: light.toLight,
+              ...item.material.getParameters()
+            })
+            S41.drawPositions(gl, program.position, geometry.buffer, geometry.count)
+          }
+        }
+        RTeach.traceLab.cards({
+          mount: document.getElementById('cards-state'),
+          storageKey: 'lesson-0044-state',
+          cards: [
+            {
+              title: '卡片 D：第 43 课的写法，只剩一遍',
+              desc: '没有阴影的场景（物体顺序：先三角形、后地面），只跑一遍：照第 43 课 mainPass 的写法，去掉和阴影有关的几行。这块画布是新建的，之前没有任何一遍跑过。',
+              note: 'forwardOnly43 是课程写的（照第 43 课 mainPass 删掉阴影几行）；场景来自 assets/shadow-44.js 的 createPlainSetup。',
+              question: '三角形所在的像素 (240, 162) 是什么颜色？',
+              choices: ['地面的蓝灰色：三角形被地面盖住', '三角形的绿色：照常画在地面上方', '背景色：两个物体都没画出来'],
+              answer: 0,
+              explain: '新 context 的深度测试默认是关的，第 43 课里替 mainPass 打开它的是 shadowPass。没有它，后画的地面直接盖住先画的三角形，getError 照样是 0。换成第 44 课的引擎（每次 draw 自己开深度测试），同一个场景这个像素是三角形的绿色 (63, 159, 95)——第 5 节的画布装上「没有阴影的场景」就能看到。',
+              run: async () => {
+                const gl = tempGL()
+                const setup = S.createPlainSetup(35)
+                const frame = S43.buildFrame(setup.scene, setup.camera, 1.6)
+                forwardOnly43(gl, S42.createManagers(gl), frame)
+                const lines = [
+                  { text: '深度测试开着吗：' + (gl.isEnabled(gl.DEPTH_TEST) ? '开着' : '关着') },
+                  { text: '像素 (240, 162)：' + describe(pixel(gl, 240, 162)) },
+                  { text: 'getError：' + ERRORS[gl.getError()] }
+                ]
+                done(gl)
+                return { lines }
+              }
+            }
+          ]
+        })
+        const forwardCode = document.createElement('pre')
+        forwardCode.textContent = dedent(forwardOnly43.toString())
+        document.getElementById('cards-state').before(forwardCode)
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0044"]'), [
+          {
+            q: '「这个场景要画哪几遍」由谁决定？',
+            opts: ['场景：setScene 时交出 passes', '引擎：Engine 里写死的那一组', '后端：按 GPU 支持的功能决定'],
+            answer: 0,
+            why: '引擎里没有一行代码认识具体的 Pass；HW1 交出两个，HW2 交出一个（第 1、5 节）。'
+          },
+          {
+            q: '在 withRenderSurface 里，viewport 是谁设的？',
+            opts: ['后端照目的地的尺寸设', '写 Pass 的人在回调里设', '浏览器按画布尺寸自动设'],
+            answer: 0,
+            why: '进门时按目标尺寸设（阴影图 512 × 512，屏幕 480 × 300），Pass 没机会写错（卡片 A）。'
+          },
+          {
+            q: 'ShadowMapPass 里的 draw 抛错，出门时会怎样？',
+            opts: ['finally 照样绑回进门前的目标和 viewport', '不恢复，留给下一个 Pass 自己换', '自动重试一次 draw，再恢复绑定'],
+            answer: 0,
+            why: '恢复写在 finally 里，正常结束和抛错都执行（卡片 C）。'
+          },
+          {
+            q: '为什么深度测试由每次 draw 自己设，而不是在第一遍开一次？',
+            opts: ['场景可能只有一遍，不能靠别人开', '开一次以后 GL 会在下一帧自动关掉', '每个 Pass 的 framebuffer 状态互不相通'],
+            answer: 0,
+            why: '第 43 课里 mainPass 一直靠 shadowPass 开；只剩一遍时就没人开了（卡片 D）。'
+          },
+          {
+            q: '换成没有阴影的场景时，深度 shader 的 program 为什么被删了？',
+            opts: ['旧 Pipeline 释放 ShadowMapPass，它释放了自己的 shader', '引擎检查到新场景不用阴影，专门删了它', '每次换场景，后端会清空所有 Manager 的表'],
+            answer: 0,
+            why: 'ShadowMapPass 拥有深度 shader；setScene 第三段释放旧 Pipeline → Pass.dispose → shader.dispose → ProgramManager 收到通知删 program（第 42 课第 4 节）。'
+          },
+          {
+            q: 'setScene 的第三段（清理旧的）失败了，应该怎样？',
+            opts: ['记进 diagnostics，新场景照常使用', '抛「安装失败」，让调用者重新安装', '把旧场景装回去，撤销这次安装'],
+            answer: 0,
+            why: '提交已经发生，新场景和 Pass 已归引擎；这时再说「安装失败」会让调用者以为 Pass 还归自己（设计 §3.9）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

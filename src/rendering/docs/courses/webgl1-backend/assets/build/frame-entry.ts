@@ -1,0 +1,23 @@
+// 第 30 课用：帧编排（frame/、passes/、Renderer）和它用到的场景、资源、WebGL1Backend。
+// frame/、passes/、Renderer.ts 已提交；WebGL1Backend.ts 等有未提交改动（2026-10-13 工作区版本）。
+// course 下面是课程写的第 1 版、第 2 版（frame-course.ts），项目源码里没有。
+export { Renderer } from '@/rendering/Renderer'
+export { RenderListBuilder } from '@/rendering/frame/RenderListBuilder'
+export { RenderList } from '@/rendering/frame/RenderList'
+export { copyMat4Snapshot } from '@/rendering/frame/copyMat4Snapshot'
+export { RenderPipeline } from '@/rendering/passes/RenderPipeline'
+export { ForwardPass } from '@/rendering/passes/ForwardPass'
+export { Scene } from '@/rendering/scene/Scene'
+export { Group } from '@/rendering/scene/Group'
+export { Mesh } from '@/rendering/scene/Mesh'
+export { PerspectiveCamera } from '@/rendering/scene/cameras/PerspectiveCamera'
+export { Geometry } from '@/rendering/resources/Geometry'
+export { VertexAttribute } from '@/rendering/resources/VertexAttribute'
+export { VertexAttributeSemantic } from '@/rendering/resources/VertexAttributeSemantic'
+export { ShaderModule } from '@/rendering/resources/ShaderModule'
+export { Material } from '@/rendering/resources/Material'
+export { WebGL1Backend } from '@/rendering/backend/webgl1/WebGL1Backend'
+export * from '@/rendering/core/errors'
+export { RenderExecutionError } from '@/rendering/core/errors/RenderExecutionError'
+export { InvalidRenderViewError } from '@/rendering/core/errors/InvalidRenderViewError'
+export * as course from './frame-course'

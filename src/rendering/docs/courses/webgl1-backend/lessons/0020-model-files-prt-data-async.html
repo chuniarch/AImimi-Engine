@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 20 课 · 模型文件、PRT 数据与异步加载</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 综合篇 2 · Task 19 预备 · 约 110 分钟</p>
+    <h1>Task 19 预备：加载函数读的到底是什么——模型文件、PRT 数据与异步加载</h1>
+    <p class="lede">
+      第 21 课讲 loadHW2OBJ、loadPRTSHTxt 怎样读文件，可那一课默认你已经认识这些文件。这一课把前提补上：先打开文件，一行一行看里面写了什么（OBJ、MTL、light.txt、transport 文件），再看 PRT 数据是哪个程序、怎样算出来的，最后讲把文件读进程序要用到的四样工具：three.js 的 OBJLoader、fetch、Promise.all 和 AbortController。读完这一课，再去读第 21 课。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 你在做 Task 19。第 21 课里的每一项检查，比如只收三角面、按面展开、核对 30522 行、入口和 await 之后查取消，都建立在这一课讲的事实上。这一课不讲 Task 19 的代码，只讲它读的数据和它用的工具。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>（前面的课讲过，或者你写过）：第 10 课的 VertexAttribute、Geometry 和索引 (index)；第 8 课的 Float32；shader 里的 attribute 和 varying（你在旧引擎里写过 aVertexPosition、vNormal）；JavaScript 的数组、函数、对象和 TypeScript 的类型标注。<br />
+      <strong>这一课从零讲的</strong>：模型文件、OBJ 与 MTL、PRT 的两种 txt、预计算工具 prt/、OBJLoader、fetch、Promise、Promise.all、AbortController。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">一个模型由什么组成</a></li>
+        <li><a href="#s2">读一份完整的 OBJ：16 行的地板</a></li>
+        <li><a href="#s3">MTL、o、s：建模软件留下的信息</a></li>
+        <li><a href="#s4">mary.obj 的全貌</a></li>
+        <li><a href="#s5">GPU 的一个顶点 = 一种组合</a></li>
+        <li><a href="#s6">预计算工具 prt/：它是谁、做了什么</a></li>
+        <li><a href="#s7">light.txt 与 transport 文件</a></li>
+        <li><a href="#s8">three.js 的 OBJLoader 怎样解析</a></li>
+        <li><a href="#s9">fetch、Promise 与 await</a></li>
+        <li><a href="#s10">Promise.all 与 AbortController</a></li>
+        <li><a href="#s11">这些知识在第 21 课哪里用到</a></li>
+        <li><a href="#s12">检查题</a></li>
+        <li><a href="#s13">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2>0. 热身：前几课还记得吗</h2>
+    <div class="quiz" data-quiz="lesson-0020-warmup"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0020-warmup"]'), [
+        {
+          q: '一个正方形由两个三角形组成。用索引画（第 10 课），最少要几个顶点、几个索引？',
+          opts: ['4 个顶点、6 个索引：对角线上的两个顶点被两个三角形共用', '6 个顶点、6 个索引', '4 个顶点、4 个索引'],
+          answer: 0,
+          why: '每个三角形 3 个索引，两个三角形 6 个；不同的点只有 4 个。这一课第 1、5 节会反复用到这个「共用」。'
+        },
+        {
+          q: 'vertex shader 里写 attribute vec3 aVertexPosition;，每次执行拿到的是什么？',
+          opts: ['当前这一个顶点的位置', '所有顶点位置组成的数组', '第一个顶点的位置'],
+          answer: 0,
+          why: 'vertex shader 对每个顶点各执行一次，attribute 每次给的是当前顶点的那一份数据。第 5 节讲的「一个 GPU 顶点」就是这一份数据。'
+        },
+        {
+          q: 'gl.drawArrays(gl.TRIANGLES, 0, 6) 画几个三角形？',
+          opts: ['2 个：每 3 个顶点一个三角形', '6 个', '4 个'],
+          answer: 0,
+          why: 'TRIANGLES 拓扑每 3 个顶点组成一个三角形（第 10 课）。第 5 节的「按面展开」就是用这种不带索引的画法。'
+        }
+      ])
+    </script>
+
+    <h2 id="s1">1. 一个模型由什么组成</h2>
+    <p>
+      屏幕上的 3D 模型，是由很多三角形拼出来的表面。mary 就是 10174 个小三角形。每个三角形有 3 个角 (corner)，画一个角，GPU 需要知道三样东西：
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 16%">数据</th><th style="width: 20%">英文</th><th style="width: 10%">几个数</th><th style="width: 20%">例子</th><th>用来做什么</th></tr>
+        <tr><td>位置</td><td>position</td><td>3：x y z</td><td>(−27.9, 0, 27.9)</td><td>这个角在空间里的哪里</td></tr>
+        <tr><td>纹理坐标</td><td>texture coordinate，常叫 UV</td><td>2：u v</td><td>(0, 0)</td><td>贴图上取哪个点的颜色。u 是横向、v 是纵向，各从 0 到 1，覆盖整张贴图</td></tr>
+        <tr><td>法线</td><td>normal</td><td>3：x y z</td><td>(0, 1, 0)</td><td>表面在这里朝哪边，算光照时要用（比如 n·l）</td></tr>
+      </table>
+    </div>
+    <p>
+      一个角上的这三样合起来，就是 vertex shader 每次执行拿到的那一份 attribute：位置进 aVertexPosition，UV 进纹理坐标那个 attribute，法线进法线那个 attribute。
+    </p>
+    <p>
+      <strong>相邻的三角形共用角。</strong>一块正方形地板是 2 个三角形、6 个角，可不同的点只有 4 个，对角线上的两个点被两个三角形同时用到。所以模型文件不会把每个角的坐标都写一遍，而是先列出所有的点、给它们编号，三角形只写「我用几号点」。这就是热身第 1 题的索引，模型文件也用同一个办法。
+    </p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 320" role="img" aria-label="从正上方看 floor.obj 的地板：1 号点在左下、2 号在右下、4 号在右上、3 号在左上；对角线 1 到 4 把四边形分成两个三角形 1 2 4 和 1 4 3；四个角都用 1 号法线，朝上">
+          <polygon points="80,280 320,280 320,40" class="box hl" />
+          <polygon points="80,280 320,40 80,40" class="box ok" />
+          <circle cx="80" cy="280" r="5" class="box" />
+          <circle cx="320" cy="280" r="5" class="box" />
+          <circle cx="320" cy="40" r="5" class="box" />
+          <circle cx="80" cy="40" r="5" class="box" />
+          <text x="80" y="306" text-anchor="middle">1 号 · uv (0, 0)</text>
+          <text x="320" y="306" text-anchor="middle">2 号 · uv (1, 0)</text>
+          <text x="320" y="24" text-anchor="middle">4 号 · uv (1, 1)</text>
+          <text x="80" y="24" text-anchor="middle">3 号 · uv (0, 1)</text>
+          <text x="258" y="212" text-anchor="middle" class="title">第一个三角形</text>
+          <text x="258" y="232" text-anchor="middle" class="small">1 → 2 → 4</text>
+          <text x="142" y="98" text-anchor="middle" class="title">第二个三角形</text>
+          <text x="142" y="118" text-anchor="middle" class="small">1 → 4 → 3</text>
+          <text x="380" y="62" class="title">f 1/1/1 2/2/1 4/3/1 3/4/1</text>
+          <text x="380" y="92" class="small">四个角依次用 1、2、4、3 号点</text>
+          <text x="380" y="118" class="small">GPU 只画三角形：切成 (1, 2, 4) 和 (1, 4, 3)</text>
+          <text x="380" y="144" class="small">6 个角，只有 4 个不同的点</text>
+          <text x="380" y="170" class="small">对角线上的 1 号、4 号被两个三角形共用</text>
+          <text x="380" y="212" class="title">vn 0 1 0（1 号法线）</text>
+          <text x="380" y="240" class="small">四个角都用它：地板是平的，处处朝上</text>
+          <text x="380" y="264" class="small">从上往下看时，它垂直纸面指向你</text>
+        </svg>
+      </div>
+      <figcaption>图 1 · 从正上方看 floor.obj 的地板（x 向右，z 向下）。v 行给出 4 个点（1–4 号），f 行用编号把它们连成一个四边形，再切成两个三角形。对角线 1–4 上的两个点被两个三角形共用，所以 6 个角只需要存 4 个点。uv 是每个角在贴图上的坐标。</figcaption>
+    </figure>
+
+    <h2 id="s2">2. 读一份完整的 OBJ：16 行的地板</h2>
+    <p>
+      OBJ（Wavefront OBJ）是最常见的模型文件格式之一。它是纯文本，用记事本就能打开。建模软件（这里是 Blender）把模型导出成一行一行的文字：每行开头一个关键字 (keyword)，说明这一行是什么，后面跟着用空格隔开的数。
+    </p>
+    <p>
+      仓库里正好有一份完整的小 OBJ：HW1 的地板 <a data-src="public/assets/models/hw1/floor/floor.obj:1">floor.obj</a>，一共 16 行。下面是全文，行尾的说明是我加的：
+    </p>
+    <pre><code> 1  # Blender v2.91.0 OBJ File: ''            ← # 开头：注释，程序跳过
+ 2  # www.blender.org                         ← 注释
+ 3  mtllib floor.mtl                          ← 材质写在 floor.mtl 这个文件里（第 3 节）
+ 4  o Plane                                   ← 开始一个物体，名叫 Plane（第 3 节）
+ 5  v -27.924055 0.000000 27.924055           ← 1 号位置
+ 6  v 27.924055 0.000000 27.924055            ← 2 号位置
+ 7  v -27.924055 0.000000 -27.924055          ← 3 号位置
+ 8  v 27.924055 0.000000 -27.924055           ← 4 号位置
+ 9  vt 0.000000 0.000000                      ← 1 号纹理坐标
+10  vt 1.000000 0.000000                      ← 2 号纹理坐标
+11  vt 1.000000 1.000000                      ← 3 号纹理坐标
+12  vt 0.000000 1.000000                      ← 4 号纹理坐标
+13  vn 0.0000 1.0000 0.0000                   ← 1 号法线：朝上
+14  usemtl None                               ← 下面的面用名叫 None 的材质（第 3 节）
+15  s off                                     ← 不做平滑（第 3 节）
+16  f 1/1/1 2/2/1 4/3/1 3/4/1                 ← 一个面，4 个角</code></pre>
+    <p>读法只有四条规则：</p>
+    <ol>
+      <li><strong>每行第一个词是关键字</strong>，决定这一行的意思。v 是位置 (vertex)，vt 是纹理坐标 (vertex texture)，vn 是法线 (vertex normal)，f 是面 (face)。</li>
+      <li><strong>v、vt、vn 各是一张清单</strong>，各自按出现的先后从 1 开始编号（不是从 0）。第 5 行是 1 号位置，第 9 行是 1 号纹理坐标，第 13 行是 1 号法线。三张清单互不相干：1 号位置和 1 号纹理坐标之间没有任何关系。</li>
+      <li><strong>f 行不写坐标，只写编号。</strong>空格隔开的每一段是一个角，写成「位置号/纹理坐标号/法线号」。</li>
+      <li><strong>一个面可以有 3 个以上的角。</strong>第 16 行有 4 个角，是一个四边形。GPU 只画三角形，所以读的程序要把它切成两个三角形（第 8 节看 OBJLoader 怎么切）。</li>
+    </ol>
+    <p>把第 16 行拆开：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 8%">角</th><th style="width: 12%">写法</th><th style="width: 28%">位置</th><th style="width: 22%">纹理坐标</th><th>法线</th></tr>
+        <tr><td>A</td><td><code>1/1/1</code></td><td>1 号 (−27.9, 0, 27.9)</td><td>1 号 (0, 0)</td><td>1 号 (0, 1, 0)</td></tr>
+        <tr><td>B</td><td><code>2/2/1</code></td><td>2 号 (27.9, 0, 27.9)</td><td>2 号 (1, 0)</td><td>1 号</td></tr>
+        <tr><td>C</td><td><code>4/3/1</code></td><td>4 号 (27.9, 0, −27.9)</td><td>3 号 (1, 1)</td><td>1 号</td></tr>
+        <tr><td>D</td><td><code>3/4/1</code></td><td>3 号 (−27.9, 0, −27.9)</td><td>4 号 (0, 1)</td><td>1 号</td></tr>
+      </table>
+    </div>
+    <p>
+      注意 C 角写的是 <code>4/3/1</code>：位置用 4 号，纹理坐标用 3 号，法线用 1 号，三个编号可以各不相同。四个角都用 1 号法线，因为地板是平的，处处朝上，一个法线就够了。这也是为什么 vn 的行数可以比 v 少。
+    </p>
+    <p>
+      角的先后顺序也有意义。这份文件里，从法线所指的那一侧（上方）看，A、B、C、D 是逆时针排的（我用叉积算过：(B−A)×(C−A) 指向 +y，和法线同向）。渲染器靠这个顺序分辨正面和背面，第 11 课的剔除 (cull) 用的就是它。
+    </p>
+    <p>角还有另外几种写法，读 OBJ 的程序都要认识：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 26%">写法</th><th>意思</th></tr>
+        <tr><td><code>f 1 2 3</code></td><td>只有位置，没有纹理坐标和法线</td></tr>
+        <tr><td><code>f 1/1 2/2 3/3</code></td><td>位置/纹理坐标，没有法线</td></tr>
+        <tr><td><code>f 1//1 2//1 3//1</code></td><td>位置//法线，中间空着表示没有纹理坐标（第 5 节的立方体就这样写）</td></tr>
+        <tr><td><code>f -3 -2 -1</code></td><td>负数编号：从目前为止最后一个往回数，−1 是最近定义的那一个（第 8 节的 parseVertexIndex 处理它）</td></tr>
+      </table>
+    </div>
+
+    <h2 id="s3">3. MTL、o、s：建模软件留下的信息</h2>
+    <p>
+      floor.obj 里还剩几种行没讲：mtllib、usemtl、o、s。它们是建模软件里的概念，导出时顺便写进了文件。PRT 一个都用不上，但读文件的程序得知道怎么对待它们。
+    </p>
+    <h3>3.1 材质：mtllib 与 usemtl</h3>
+    <p>
+      材质 (material) 是表面的外观参数：底色是什么、高光多强、用哪张贴图。OBJ 自己不写这些参数，只写材质的名字；参数放在另一个 .mtl 文件里。
+    </p>
+    <ul>
+      <li><code>mtllib floor.mtl</code>：材质库 (material library) 是 floor.mtl 这个文件。</li>
+      <li><code>usemtl None</code>：从这一行开始，后面的面都用名叫 None 的材质，直到遇到下一个 usemtl。</li>
+    </ul>
+    <p>
+      HW1 的 <a data-src="public/assets/models/hw1/mary/Marry.mtl:4">Marry.mtl</a> 定义了 mary 用到的两个材质，节选如下：
+    </p>
+    <pre><code>newmtl MC003_Kozakura_Mari            ← 定义一个材质，名字是 MC003_Kozakura_Mari
+Kd 0.800000 0.800000 0.800000         ← 漫反射颜色 (diffuse color)：RGB
+Ks 0.000000 0.000000 0.000000         ← 高光颜色 (specular color)
+Ns 900.000000                         ← 高光指数 (shininess)
+d 1.000000                            ← 不透明度 (dissolve)，1 是完全不透明
+map_Kd MC003_Kozakura_Mari.png        ← 漫反射贴图：底色从这张图里取
+
+newmtl 材质                           ← 第二个材质，名字就叫「材质」
+Kd 0.270588 0.552941 0.874510         ← 偏蓝的底色，没有贴图</code></pre>
+    <p>
+      HW2 的 mary.obj 第 3 行写着 <code>mtllib Marry.mtl</code>，可 hw2/mary/ 文件夹里只有 mary.obj，这个 .mtl 在 hw1/mary/ 下面。这不影响 HW2：PRT 的亮度全靠预计算的系数，反照率当成 1，根本不需要材质，所以 HW2 的加载器不去读 .mtl。
+    </p>
+    <h3>3.2 物体与组：o 和 g</h3>
+    <p>
+      在 Blender 里，一个场景由多个物体 (object) 组成，比如身体、头发、裙子可以各是一个物体。导出 OBJ 时，每个物体前面写一行 <code>o 名字</code>。<code>g 名字</code> 是分组 (group)，作用类似，把面分成有名字的几组。
+    </p>
+    <p>
+      floor.obj 只有一个 <code>o Plane</code>，mary.obj 也只有一个 o。这件事在第 8 节很重要：three.js 的 OBJLoader 给每个 o 或 g 建一个独立的 Mesh。文件里要是有多个物体，位置就会分散到多个 Mesh 里。
+    </p>
+    <h3>3.3 平滑组：s</h3>
+    <p>
+      <code>s 1</code> 表示后面的面属于 1 号平滑组 (smoothing group)，<code>s off</code> 表示不属于任何平滑组。它是写给「需要自己算法线的程序」看的：同一组里相邻的面在共用的角上可以共用法线，看起来光滑；不在组里的面各用各的法线，棱角分明。文件已经写了 vn 时，法线以 vn 为准。three.js 只拿 s 决定材质要不要用平面着色 (flatShading)：第 8 节实测，floor 的 <code>s off</code> 让材质的 flatShading 变成 true。PRT 不用 s。
+    </p>
+
+    <h2 id="s4">4. mary.obj 的全貌</h2>
+    <p>
+      有了上面的规则，就能看懂 HW2 的 <a data-src="public/assets/models/hw2/mary/mary.obj:1">mary.obj</a> 了。它一共 31280 行，结构和地板一样，只是清单长得多。从上到下是这样排的：
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 15%">行号</th><th style="width: 37%">例子</th><th style="width: 9%">行数</th><th>意思</th></tr>
+        <tr><td>1–2</td><td><code># Blender v2.91.0 OBJ File: ''</code></td><td>2</td><td>注释</td></tr>
+        <tr><td>3</td><td><code>mtllib Marry.mtl</code></td><td>1</td><td>材质库（文件不在这个文件夹里，见 3.1）</td></tr>
+        <tr><td>4</td><td><code>o Body_MC003_Kozakura_Mari_face</code></td><td>1</td><td>唯一的一个物体</td></tr>
+        <tr><td>5–7423</td><td><code>v 0.067417 3.050314 0.165910</code></td><td>7419</td><td>位置清单</td></tr>
+        <tr><td>7424–14842</td><td><code>vt 0.042575 0.471054</code></td><td>7419</td><td>纹理坐标清单</td></tr>
+        <tr><td>14843–21102</td><td><code>vn 0.2510 -0.7130 0.6547</code></td><td>6260</td><td>法线清单</td></tr>
+        <tr><td>21103</td><td><code>usemtl MC003_Kozakura_Mari</code></td><td>1</td><td>下面的面用带贴图的那个材质</td></tr>
+        <tr><td>21104</td><td><code>s 1</code></td><td>1</td><td>平滑组 1</td></tr>
+        <tr><td>21105–31008</td><td><a data-src="public/assets/models/hw2/mary/mary.obj:21105"><code>f 1/1/1 2/2/2 3/3/3</code></a></td><td>9904</td><td>面，每行一个三角形</td></tr>
+        <tr><td>31009</td><td><code>usemtl 材质</code></td><td>1</td><td>换成偏蓝的那个材质</td></tr>
+        <tr><td>31010</td><td><code>s off</code></td><td>1</td><td>关掉平滑组</td></tr>
+        <tr><td>31011–31280</td><td><code>f …</code></td><td>270</td><td>面</td></tr>
+      </table>
+    </div>
+    <p>
+      三张清单在前，面在后。10174 个 f 行每行恰好 3 个角，全是三角形，一共 30522 个角。前 3 个 f 行用到的位置：
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 46%">f 行</th><th>三个角用的位置号</th></tr>
+        <tr><td><code>f 1/1/1 2/2/2 3/3/3</code></td><td>1, 2, 3</td></tr>
+        <tr><td><code>f 4/4/4 3/3/3 2/2/2</code></td><td>4, 3, 2：3 号和 2 号又用了一次</td></tr>
+        <tr><td><code>f 3/3/3 5/5/5 1/1/1</code></td><td>3, 5, 1：3 号和 1 号再用一次</td></tr>
+      </table>
+    </div>
+    <p>
+      这 3 个三角形挤在一起，共用顶点，所以 7419 个位置能拼出 10174 个三角形。PRT 只需要每个角的位置：读的时候只看 v 和 f，vt、vn、usemtl、s 都用不上。
+    </p>
+
+    <h2 id="s5">5. GPU 的一个顶点 = 一种组合</h2>
+    <p>
+      OBJ 让一个角对三张清单分别编号：位置号、纹理坐标号、法线号可以各不相同，比如地板的 C 角写成 <code>4/3/1</code>。GPU 不行。WebGL 的 drawElements 只有一份索引，一个索引号同时从 position、uv、normal 三个 buffer 里取同一个位置的元素（第 10 课）。
+    </p>
+    <p>
+      所以把 OBJ 交给 GPU 时，<strong>「位置号/纹理坐标号/法线号」这三个数的每一种新组合，都要在 GPU 上占一个顶点</strong>。最典型的例子是立方体：
+    </p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 300" role="img" aria-label="立方体的一个角，7 号位置，同时属于前面、右面、顶面三个面。三个面在这个角上的法线不同，OBJ 写成 7//2、7//3、7//5：位置号相同，法线号不同。GPU 只有一份索引，所以这一个角要变成 3 个顶点；整个立方体 8 个角，每个变 3 个，一共 24 个 GPU 顶点">
+          <defs>
+            <marker id="c2-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip accent" /></marker>
+          </defs>
+          <polygon points="120,130 250,130 300,80 170,80" class="box" />
+          <polygon points="250,130 300,80 300,210 250,260" class="box ok" />
+          <rect x="120" y="130" width="130" height="130" class="box hl" />
+          <text x="150" y="232" class="small">前面</text>
+          <text x="262" y="196" class="small">右面</text>
+          <text x="186" y="112" class="small">顶面</text>
+          <line x1="250" y1="130" x2="250" y2="40" class="line accent" marker-end="url(#c2-tip)" />
+          <line x1="250" y1="130" x2="350" y2="130" class="line accent" marker-end="url(#c2-tip)" />
+          <line x1="250" y1="130" x2="196" y2="184" class="line accent" marker-end="url(#c2-tip)" />
+          <circle cx="250" cy="130" r="6" class="box bad" />
+          <text x="258" y="44" class="small accent">顶面法线 (0, 1, 0)</text>
+          <text x="356" y="134" class="small accent">右面法线 (1, 0, 0)</text>
+          <text x="130" y="200" class="small accent">前面法线 (0, 0, 1)</text>
+          <text x="262" y="150" class="small bad">7 号位置</text>
+          <text x="480" y="44" class="title">OBJ：一个位置号，三种写法</text>
+          <text x="480" y="70" class="small">前面 7//2 · 右面 7//3 · 顶面 7//5</text>
+          <text x="480" y="94" class="small">位置都是 7 号 (1, 1, 1)，法线号不同</text>
+          <text x="480" y="140" class="title">GPU：三个顶点</text>
+          <text x="480" y="166" class="small">(7 号位置, 2 号法线)</text>
+          <text x="480" y="188" class="small">(7 号位置, 3 号法线)</text>
+          <text x="480" y="210" class="small">(7 号位置, 5 号法线)</text>
+          <text x="480" y="256" class="title">整个立方体</text>
+          <text x="480" y="280" class="small">8 个角 × 每角 3 个面 = 24 个 GPU 顶点</text>
+        </svg>
+      </div>
+      <figcaption>图 2 · 立方体的一个角（7 号位置）同时属于前、右、顶三个面。三个面在这个角上的法线不同，OBJ 写成 7//2、7//3、7//5：位置号相同，法线号不同。GPU 只有一份索引，所以这一个角要变成 3 个顶点。8 个角各变 3 个，整个立方体是 24 个 GPU 顶点（Node 实测，见下表）。</figcaption>
+    </figure>
+    <p>我写了一个只有位置和法线的立方体 OBJ，和地板、mary 一起数了一遍（Node 实测）：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 22%">模型</th><th>位置 v</th><th>纹理坐标 vt</th><th>法线 vn</th><th>三角形的角</th><th>不同的组合</th></tr>
+        <tr><td>floor</td><td>4</td><td>4</td><td>1</td><td>6</td><td>4</td></tr>
+        <tr><td>立方体</td><td>8</td><td>0</td><td>6</td><td>36</td><td>24</td></tr>
+        <tr><td>mary</td><td>7419</td><td>7419</td><td>6260</td><td>30522</td><td>7905</td></tr>
+      </table>
+    </div>
+    <p>于是把模型交给 GPU 有两种办法：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 18%">办法</th><th style="width: 34%">怎么做</th><th style="width: 22%">mary 要多少</th><th>适合</th></tr>
+        <tr><td>索引画法</td><td>每种组合建一个顶点，再给一份索引说明每个三角形用哪三个</td><td>7905 个顶点 + 30522 个索引</td><td>省显存；顶点数据和角一一对应时要先建映射</td></tr>
+        <tr><td>按面展开 (face-expanded)</td><td>不去重，按 f 行的顺序每个角一个顶点，不要索引</td><td>30522 个顶点</td><td>最简单：第 k 个顶点就是第 k 个角</td></tr>
+      </table>
+    </div>
+    <p>
+      拿 PRT 每个顶点要的数据算显存：位置 3 个 float 加传输系数 9 个 float，一共 12 个，每个 4 字节。索引画法是 7905 × 12 × 4 + 30522 × 2（Uint16 索引）≈ 430 KiB；按面展开是 30522 × 12 × 4 ≈ 1.40 MiB，大约 3.3 倍。HW2 选的是按面展开，原因在第 7 节：transport 文件本来就是按角写的，展开以后「第 k 个顶点配 transport 第 k 行」，不用再算谁和谁是同一种组合。多出的 1 MiB 左右，在 mary 这个规模上可以接受。
+    </p>
+    <p>
+      表里 mary 的 7905 是「不同组合的个数」，第 21 课里那个神秘的 transport 文件头 7905 就是它，下一节会看到原因。
+    </p>
+
+    <h2 id="s6">6. 预计算工具 prt/：它是谁、做了什么</h2>
+    <h3>6.1 它是谁</h3>
+    <p>
+      仓库里的 <code>prt/</code> 目录是一个 C++ 程序，基于 EPFL 的教学用光线追踪器 Nori（<a data-src="prt/README.md:1">prt/README.md</a>）。GAMES202 作业 2 在 Nori 里加了一个名叫 prt 的积分器 (integrator)，代码在 <a data-src="prt/src/prt.cpp:134">prt/src/prt.cpp</a>。编译好的程序是 <code>prt/build/nori</code>，在这台 Mac 上是 arm64 的可执行文件。
+    </p>
+    <p>
+      prt.cpp 里有一些 <code>// Edit Start</code> 和 <code>// Edit End</code> 包起来的代码：环境光的投影、传输项的计算、除以 π。这些是作业 2 里要你自己补的部分。PRT 的数学这门课不展开：后面两节只关心文件里的数怎样排、怎样一一对上。
+    </p>
+    <h3>6.2 怎么运行</h3>
+    <p>
+      在终端里运行 <code>nori 场景文件.xml</code>（不带参数时，程序会打印用法 <code>Syntax: nori &lt;scene.xml&gt;</code>，<a data-src="prt/src/main.cpp:164">main.cpp:164</a>）。场景文件 <a data-src="prt/scenes/prt.xml:8">prt/scenes/prt.xml</a> 写着这一次要算什么：
+    </p>
+    <pre><code>&lt;integrator type="prt"&gt;                                   ← 用作业 2 的 prt 积分器
+    &lt;string name="type" value="interreflection" /&gt;        ← 传输类型：unshadowed / shadowed / interreflection 三选一
+    &lt;integer name="bounce" value="1" /&gt;                   ← interreflection 算几次反弹
+    &lt;integer name="PRTSampleCount" value="100" /&gt;         ← 每个顶点采样 100 个方向
+    &lt;string name="cubemap" value="cubemap/CornellBox" /&gt;  ← 用哪个环境的 6 张图
+&lt;/integrator&gt;
+&lt;mesh type="obj"&gt;
+    &lt;string name="filename" value="mary.obj"/&gt;            ← 用哪个模型（和 public 下的 mary.obj 逐字节相同）
+    &lt;bsdf type="diffuse"/&gt;                                ← 漫反射表面
+&lt;/mesh&gt;                                                     （节选，prt.xml:8–21）</code></pre>
+    <p>
+      想要另一个环境、另一种类型的数据，就改这两行，再运行一次。4 个环境 × 3 种类型，就是 HW2 用到的 12 个 transport 文件。
+    </p>
+    <h3>6.3 它做了什么</h3>
+    <p>主要工作都在 PRTIntegrator 的 preprocess 里（<a data-src="prt/src/prt.cpp:221">prt.cpp:221–343</a>），按顺序是：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 6%">步</th><th style="width: 40%">做什么</th><th>代码</th></tr>
+        <tr><td>1</td><td>读环境的 6 张 jpg。stbi_loadf 把像素读成浮点，顺便按 gamma 2.2 解码成线性值（上一次答疑讲的 pow(2.2) 就在这里做了）</td><td><a data-src="prt/src/prt.cpp:16">prt.cpp:16–41</a></td></tr>
+        <tr><td>2</td><td>环境光投影：6 张图上的每个像素代表一个方向，把「颜色 × 这个方向上的基函数值 × 这个像素占的立体角」累加到 9 个系数上，写进 light.txt</td><td><a data-src="prt/src/prt.cpp:81">prt.cpp:81–131</a>、:253–257</td></tr>
+        <tr><td>3</td><td>读 mary.obj。Nori 自己的 OBJ 读取器把「位置号/纹理坐标号/法线号」相同的角合并成一个顶点，得到 7905 个顶点、10174 个三角形，每个三角形记 3 个顶点编号</td><td><a data-src="prt/src/obj.cpp:92">obj.cpp:92–103</a></td></tr>
+        <tr><td>4</td><td>对 7905 个顶点逐个算传输系数：从顶点出发朝 100 个方向采样，每个方向算 max(0, n·ω)；shadowed 还要沿这个方向发一条射线，被模型自己挡住就记 0。把这个函数投影到 9 个系数，再除以 π。interreflection 再加上反弹回来的光</td><td><a data-src="prt/src/prt.cpp:263">prt.cpp:263–296</a>、:302–322</td></tr>
+        <tr><td>5</td><td>写 transport 文件：先写顶点数 7905，再逐个三角形，按它的 3 个顶点编号各写一行 9 个系数，一共 30522 行</td><td><a data-src="prt/src/prt.cpp:262">prt.cpp:262</a>、<a data-src="prt/src/prt.cpp:325">:325–340</a></td></tr>
+        <tr><td>6</td><td>之后照常渲染一张预览图（prt.png）。WebGL 用不到这一步</td><td>Nori 的渲染流程</td></tr>
+      </table>
+    </div>
+    <p>
+      第 3 步就是第 5 节说的「每种组合一个顶点」。传输系数和法线有关，同一个位置上法线不同的两个角，系数就不同，所以 Nori 按组合算，一共算 7905 次。第 5 步再按角写出来，方便 WebGL 那边按面展开、直接对齐。
+    </p>
+    <p>
+      输出写在 cubemap 文件夹里，和那 6 张图放在一起（prt/scenes/cubemap/Indoor/ 等）。仓库 public/assets/data/prt/hw2/ 下 4 个环境的 light.txt 和 transport 文件，和这里的同名文件逐字节相同（我用 cmp 核对过），是从这里拷过去的。浏览器只读这些现成的 txt，从来不运行 nori。
+    </p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 300" role="img" aria-label="预计算工具的输入和输出：场景文件、模型和 6 张环境图进入 build/nori，nori 读图投影成 9 个系数、读 OBJ 去重成 7905 个顶点、每个顶点算 9 个传输系数、写出 light.txt 和 transport 文件；文件拷到 public 下，浏览器的 loadPRTSHTxt 读取">
+          <defs>
+            <marker id="c3-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+          </defs>
+          <rect x="20" y="30" width="200" height="50" rx="6" class="box" />
+          <text x="32" y="51" class="title">scenes/prt.xml</text>
+          <text x="32" y="70" class="small">类型、样本数、用哪个环境</text>
+          <rect x="20" y="100" width="200" height="50" rx="6" class="box" />
+          <text x="32" y="121" class="title">scenes/mary.obj</text>
+          <text x="32" y="140" class="small">模型</text>
+          <rect x="20" y="170" width="200" height="50" rx="6" class="box" />
+          <text x="32" y="191" class="title">cubemap/Indoor/</text>
+          <text x="32" y="210" class="small">6 张 jpg：posx … negz</text>
+          <rect x="270" y="40" width="210" height="180" rx="6" class="box hl" />
+          <text x="375" y="64" text-anchor="middle" class="title">build/nori</text>
+          <text x="282" y="94" class="small">1 读 6 张图 → 9 个系数</text>
+          <text x="282" y="120" class="small">2 读 OBJ，去重成 7905 个顶点</text>
+          <text x="282" y="146" class="small">3 每个顶点算 9 个传输系数</text>
+          <text x="282" y="172" class="small">4 写出两个 txt</text>
+          <text x="282" y="200" class="small">（preprocess，prt.cpp:221）</text>
+          <rect x="530" y="40" width="210" height="50" rx="6" class="box ok" />
+          <text x="542" y="61" class="title">light.txt</text>
+          <text x="542" y="80" class="small">9 行 × RGB</text>
+          <rect x="530" y="110" width="210" height="50" rx="6" class="box ok" />
+          <text x="542" y="131" class="title">transport_mary_*.txt</text>
+          <text x="542" y="150" class="small">文件头 + 30522 行 × 9</text>
+          <rect x="530" y="210" width="210" height="60" rx="6" class="box" />
+          <text x="542" y="233" class="title">public/…/hw2/Indoor/</text>
+          <text x="542" y="254" class="small">逐字节相同（cmp 核对）</text>
+          <rect x="270" y="240" width="210" height="44" rx="6" class="box" />
+          <text x="282" y="267" class="title">浏览器：loadPRTSHTxt</text>
+          <line x1="220" y1="55" x2="268" y2="90" class="line" marker-end="url(#c3-tip)" />
+          <line x1="220" y1="125" x2="268" y2="128" class="line" marker-end="url(#c3-tip)" />
+          <line x1="220" y1="195" x2="268" y2="168" class="line" marker-end="url(#c3-tip)" />
+          <line x1="480" y1="90" x2="528" y2="66" class="line" marker-end="url(#c3-tip)" />
+          <line x1="480" y1="140" x2="528" y2="136" class="line" marker-end="url(#c3-tip)" />
+          <line x1="635" y1="160" x2="635" y2="208" class="line dash" marker-end="url(#c3-tip)" />
+          <text x="644" y="190" class="small">拷贝</text>
+          <line x1="530" y1="252" x2="482" y2="260" class="line" marker-end="url(#c3-tip)" />
+        </svg>
+      </div>
+      <figcaption>图 3 · 预计算工具的输入和输出。nori 读场景文件、模型和 6 张环境图，在 preprocess 里算好系数，把两个 txt 写进 cubemap 文件夹；仓库把它们拷到 public 下（虚线），浏览器只读这两个现成的文件。</figcaption>
+    </figure>
+
+    <h2 id="s7">7. light.txt 与 transport 文件</h2>
+    <h3>7.1 light.txt：9 行，每行 3 个数</h3>
+    <p><a data-src="public/assets/data/prt/hw2/Indoor/light.txt:1">Indoor 的 light.txt</a> 全文：</p>
+    <pre><code>0.518558 0.510921 0.498186          ← 第 0 个系数（l = 0）的 R G B
+-0.0139227 -0.0198673 -0.0233177    ← 第 1 个（l = 1, m = −1）
+-0.0229861 -0.0361469 -0.0237983    ← 第 2 个（l = 1, m = 0）
+0.0263383 0.0681837 0.0585552       ← 第 3 个（l = 1, m = 1）
+-0.0508792 -0.0607283 -0.0570984    ← 第 4 个（l = 2, m = −2）
+0.0515054 0.035726 0.0207611        ← 第 5 个
+0.0147266 0.0112063 -0.026747       ← 第 6 个
+0.00411617 0.0257427 0.0428588      ← 第 7 个
+0.0642155 0.0399902 0.0190308       ← 第 8 个（l = 2, m = 2）</code></pre>
+    <p>
+      这是环境光投影到 9 个球谐基函数上得到的系数，也就是 PRT 里描述「环境光」的那一半。每行一个系数，三列是 R、G、B 三个颜色通道。行的顺序按 GetIndex(l, m) = l(l+1) + m 排（<a data-src="prt/ext/spherical-harmonics/sh/spherical_harmonics.h:65">spherical_harmonics.h:65</a>）：第 0 行是 l = 0，第 1–3 行是 l = 1，第 4–8 行是 l = 2。第 0 行三个数都接近 0.5，是环境光的平均亮度，偏一点点灰白；后面 8 行描述不同方向上的明暗变化，有正有负。
+    </p>
+    <p>
+      shader 要的排法和文件相反：每个颜色一组、每组 9 个数（uLightSH_R、uLightSH_G、uLightSH_B）。所以读进来以后要转置：R 组是 [0.518558, −0.0139227, −0.0229861, …]，G、B 同理。
+    </p>
+    <h3>7.2 transport 文件：第 1 行一个整数，后面每行 9 个数</h3>
+    <pre><code>7905                                                       ← 文件头：Nori 去重后的顶点数
+0.229094 0.171057 0.222889 -0.0822219 -0.0534803 …（9 个）  ← 第 1 行
+0.228107 0.126797 0.221403 -0.13388 -0.0460983 …            ← 第 2 行
+…                                                            （一共 30522 行）</code></pre>
+    <p>
+      每一行是<strong>一个三角形的一个角</strong>上的 9 个传输系数，也就是 PRT 里描述「这个点怎样接收光」的那一半，shader 把它和 light 的系数逐项相乘再相加（第 21 课图 5）。行的顺序就是 f 行里角的顺序（第 6 节第 5 步）。拿 mary 的前 3 个 f 行对一下：
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 15%">transport 行</th><th style="width: 28%">对应哪个角</th><th style="width: 12%">位置号</th><th>前 3 个数</th></tr>
+        <tr><td>1</td><td>第 1 个 f 的第 1 个角</td><td>1</td><td>0.229094 0.171057 0.222889</td></tr>
+        <tr><td>2</td><td>第 1 个 f 的第 2 个角</td><td>2</td><td>0.228107 0.126797 0.221403</td></tr>
+        <tr><td>3</td><td>第 1 个 f 的第 3 个角</td><td>3</td><td>0.195815 0.145699 0.177189</td></tr>
+        <tr><td>4</td><td>第 2 个 f 的第 1 个角</td><td>4</td><td>0.207132 0.146977 0.190677</td></tr>
+        <tr><td>5</td><td>第 2 个 f 的第 2 个角</td><td>3</td><td>和第 3 行一模一样</td></tr>
+        <tr><td>6</td><td>第 2 个 f 的第 3 个角</td><td>2</td><td>和第 2 行一模一样</td></tr>
+        <tr><td>7</td><td>第 3 个 f 的第 1 个角</td><td>3</td><td>又和第 3 行一样</td></tr>
+        <tr><td>8</td><td>第 3 个 f 的第 2 个角</td><td>5</td><td>0.191057 0.154691 0.193557</td></tr>
+        <tr><td>9</td><td>第 3 个 f 的第 3 个角</td><td>1</td><td>和第 1 行一样</td></tr>
+      </table>
+    </div>
+    <p>
+      同一个顶点出现几次，它的系数就重复写几次。第 3、5、7 行完全相同，因为它们是 3 号顶点（3/3/3 这种组合）的三个角。
+    </p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 230" role="img" aria-label="三份数据靠顺序对齐：f 行里第 k 个角，展开后是第 k 个位置，在 transport 里是第 k 行。3 号顶点出现在第 3、5、7 个角，transport 第 3、5、7 行的系数也相同">
+          <text x="240" y="38" text-anchor="middle" class="small">第 1 个面</text>
+          <text x="444" y="38" text-anchor="middle" class="small">第 2 个面</text>
+          <text x="648" y="38" text-anchor="middle" class="small">第 3 个面</text>
+          <line x1="342" y1="44" x2="342" y2="212" class="line dash" />
+          <line x1="546" y1="44" x2="546" y2="212" class="line dash" />
+          <text x="20" y="73" class="title">f 行的角</text>
+          <text x="20" y="133" class="title">展开的位置</text>
+          <text x="20" y="193" class="title">transport 行</text>
+          <rect x="140" y="50" width="64" height="36" class="box" /><text x="172" y="73" text-anchor="middle">1/1/1</text>
+          <rect x="208" y="50" width="64" height="36" class="box" /><text x="240" y="73" text-anchor="middle">2/2/2</text>
+          <rect x="276" y="50" width="64" height="36" class="box hl" /><text x="308" y="73" text-anchor="middle">3/3/3</text>
+          <rect x="344" y="50" width="64" height="36" class="box" /><text x="376" y="73" text-anchor="middle">4/4/4</text>
+          <rect x="412" y="50" width="64" height="36" class="box hl" /><text x="444" y="73" text-anchor="middle">3/3/3</text>
+          <rect x="480" y="50" width="64" height="36" class="box" /><text x="512" y="73" text-anchor="middle">2/2/2</text>
+          <rect x="548" y="50" width="64" height="36" class="box hl" /><text x="580" y="73" text-anchor="middle">3/3/3</text>
+          <rect x="616" y="50" width="64" height="36" class="box" /><text x="648" y="73" text-anchor="middle">5/5/5</text>
+          <rect x="684" y="50" width="64" height="36" class="box" /><text x="716" y="73" text-anchor="middle">1/1/1</text>
+          <rect x="140" y="110" width="64" height="36" class="box" /><text x="172" y="133" text-anchor="middle">1 号</text>
+          <rect x="208" y="110" width="64" height="36" class="box" /><text x="240" y="133" text-anchor="middle">2 号</text>
+          <rect x="276" y="110" width="64" height="36" class="box hl" /><text x="308" y="133" text-anchor="middle">3 号</text>
+          <rect x="344" y="110" width="64" height="36" class="box" /><text x="376" y="133" text-anchor="middle">4 号</text>
+          <rect x="412" y="110" width="64" height="36" class="box hl" /><text x="444" y="133" text-anchor="middle">3 号</text>
+          <rect x="480" y="110" width="64" height="36" class="box" /><text x="512" y="133" text-anchor="middle">2 号</text>
+          <rect x="548" y="110" width="64" height="36" class="box hl" /><text x="580" y="133" text-anchor="middle">3 号</text>
+          <rect x="616" y="110" width="64" height="36" class="box" /><text x="648" y="133" text-anchor="middle">5 号</text>
+          <rect x="684" y="110" width="64" height="36" class="box" /><text x="716" y="133" text-anchor="middle">1 号</text>
+          <rect x="140" y="170" width="64" height="36" class="box" /><text x="172" y="185" text-anchor="middle" class="small">第 1 行</text><text x="172" y="200" text-anchor="middle" class="small">0.2291</text>
+          <rect x="208" y="170" width="64" height="36" class="box" /><text x="240" y="185" text-anchor="middle" class="small">第 2 行</text><text x="240" y="200" text-anchor="middle" class="small">0.2281</text>
+          <rect x="276" y="170" width="64" height="36" class="box hl" /><text x="308" y="185" text-anchor="middle" class="small">第 3 行</text><text x="308" y="200" text-anchor="middle" class="small">0.1958</text>
+          <rect x="344" y="170" width="64" height="36" class="box" /><text x="376" y="185" text-anchor="middle" class="small">第 4 行</text><text x="376" y="200" text-anchor="middle" class="small">0.2071</text>
+          <rect x="412" y="170" width="64" height="36" class="box hl" /><text x="444" y="185" text-anchor="middle" class="small">第 5 行</text><text x="444" y="200" text-anchor="middle" class="small">0.1958</text>
+          <rect x="480" y="170" width="64" height="36" class="box" /><text x="512" y="185" text-anchor="middle" class="small">第 6 行</text><text x="512" y="200" text-anchor="middle" class="small">0.2281</text>
+          <rect x="548" y="170" width="64" height="36" class="box hl" /><text x="580" y="185" text-anchor="middle" class="small">第 7 行</text><text x="580" y="200" text-anchor="middle" class="small">0.1958</text>
+          <rect x="616" y="170" width="64" height="36" class="box" /><text x="648" y="185" text-anchor="middle" class="small">第 8 行</text><text x="648" y="200" text-anchor="middle" class="small">0.1911</text>
+          <rect x="684" y="170" width="64" height="36" class="box" /><text x="716" y="185" text-anchor="middle" class="small">第 9 行</text><text x="716" y="200" text-anchor="middle" class="small">0.2291</text>
+        </svg>
+      </div>
+      <figcaption>图 4 · 三份数据靠顺序对齐。f 行里第 k 个角，按面展开后是第 k 个位置，在 transport 里是第 k 行。3 号顶点出现在第 3、5、7 个角（蓝色），transport 第 3、5、7 行的系数也一模一样（每行只列了第一个数）。两份文件之间没有任何字段把它们连起来，全靠「顺序一样、个数一样」，所以第 21 课要核对两边都是 30522。</figcaption>
+    </figure>
+    <p><strong>几个容易误会的地方：</strong></p>
+    <ul>
+      <li><strong>文件头 7905 不是行数。</strong>它是第 6 节第 3 步 Nori 去重后的顶点数，也就是第 5 节表里的「不同的组合」。真正的行数是 30522。</li>
+      <li><strong>三种类型是三个文件。</strong>transport_mary_unshadowed、_shadowed、_interreflection 的排法完全一样，只是数值不同。</li>
+      <li><strong>每个环境文件夹里的 transport 数值有一点不同。</strong>传输系数只和模型、类型有关，和环境无关；可 4 个文件夹里的同名文件是分别运行 nori 得到的，而投影用随机采样（<a data-src="prt/ext/spherical-harmonics/sh/spherical_harmonics.cc:631">spherical_harmonics.cc:631–633</a>），每个顶点只有 100 个样本，所以每次的结果带着不同的噪声。比如第 1 行第一个数，Indoor 是 0.229094，CornellBox 是 0.236425。</li>
+    </ul>
+
+    <h2 id="s8">8. three.js 的 OBJLoader 怎样解析</h2>
+    <p>
+      OBJLoader 是 three.js 自带的 OBJ 读取器（<a data-src="node_modules/three/examples/jsm/loaders/OBJLoader.js:537">OBJLoader.js</a>，r177，955 行）。它有两个入口：<code>load(url)</code> 自己下载再解析，<code>parse(text)</code> 只解析一段已经拿到手的文字。HW2 只用 parse，原因在第 21 课 2.3 节：load 内部的下载取消不了。
+    </p>
+    <h3>8.1 parse 的三个阶段</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 14%">阶段</th><th style="width: 52%">做什么</th><th>代码</th></tr>
+        <tr><td>预处理</td><td>把 Windows 的换行 \r\n 换成 \n；行尾的反斜杠 \ 表示续行，和下一行拼起来；然后按 \n 切成行</td><td>:541–555</td></tr>
+        <tr><td>逐行处理</td><td>看每行开头是什么，分别处理（下表）。v、vt、vn 只记进清单；遇到 f 才生成三角形</td><td>:558–764</td></tr>
+        <tr><td>收尾</td><td>每个物体建一个 BufferGeometry，放 position、normal、uv（还有 color）属性，不建索引；包成 Mesh；全部放进一个 Group 返回</td><td>:766–949</td></tr>
+      </table>
+    </div>
+    <p>逐行处理时，各种行的去向：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 18%">行</th><th style="width: 56%">OBJLoader 怎么做</th><th>代码</th></tr>
+        <tr><td>空行、<code>#</code></td><td>跳过</td><td><a data-src="node_modules/three/examples/jsm/loaders/OBJLoader.js:567">:567</a></td></tr>
+        <tr><td><code>v</code>、<code>vt</code>、<code>vn</code></td><td>把数推进三个总清单 state.vertices、state.uvs、state.normals。这时只是记下来，还不生成任何三角形</td><td>:569–615</td></tr>
+        <tr><td><code>f</code></td><td>按空格切出角，每个角按 / 切成三个编号。n 个角就扇形切成 n − 2 个三角形：第 1 个角分别和（第 2、3 个）、（第 3、4 个）……组成三角形。每个三角形调用一次 addFace</td><td><a data-src="node_modules/three/examples/jsm/loaders/OBJLoader.js:638">:617–653</a></td></tr>
+        <tr><td><code>o</code>、<code>g</code></td><td>startObject：开一个新物体，之后的三角形都进这个物体</td><td>:687–697</td></tr>
+        <tr><td><code>usemtl</code></td><td>在当前物体里开一个新的材质区间</td><td>:699–703</td></tr>
+        <tr><td><code>mtllib</code></td><td>只把文件名记进 materialLibraries，不去读那个文件</td><td>:705–709</td></tr>
+        <tr><td><code>s</code></td><td>记下当前物体要不要平滑</td><td>:718–753</td></tr>
+        <tr><td>其他</td><td>打一条警告「Unexpected line」，继续往下读</td><td>:760</td></tr>
+      </table>
+    </div>
+    <h3>8.2 按面展开发生在 addFace 里</h3>
+    <pre><code>parseVertexIndex: function ( value, len ) {                   // :213–218：编号 → 数组下标
+  const index = parseInt( value, 10 );
+  return ( index &gt;= 0 ? index - 1 : index + len / 3 ) * 3;      // 1 号 → 下标 0；负数编号从末尾往回数
+},
+addVertex: function ( a, b, c ) {                             // :234–242
+  const src = this.vertices;                                  // 总清单
+  const dst = this.object.geometry.vertices;                  // 当前物体的数组
+  dst.push( src[ a + 0 ], src[ a + 1 ], src[ a + 2 ] );       // 把三个角的坐标依次抄到末尾
+  dst.push( src[ b + 0 ], src[ b + 1 ], src[ b + 2 ] );
+  dst.push( src[ c + 0 ], src[ c + 1 ], src[ c + 2 ] );
+},</code></pre>
+    <p>
+      addFace（:336）先用 parseVertexIndex 把 OBJ 的编号换成清单里的下标，再调用 addVertex 把坐标抄过去，纹理坐标和法线也这样抄（没有 vn 时，它会自己算一个面法线）。<strong>它只管抄，不管这个点是不是已经抄过</strong>，所以 OBJLoader 的输出永远是按面展开的。
+    </p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 260" role="img" aria-label="OBJLoader 按面展开的过程：v 行先进清单 state.vertices，四个点 1 到 4 号；f 行四个角扇形切成三角形 1 2 4 和 1 4 3；addFace 按编号把坐标抄进当前物体的数组，得到 1 2 4 1 4 3 号共 6 个坐标">
+          <defs>
+            <marker id="c5-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+          </defs>
+          <rect x="20" y="40" width="230" height="180" rx="6" class="box" />
+          <text x="34" y="64" class="title">清单 state.vertices</text>
+          <text x="34" y="98" class="small">1 号 (−27.9, 0, 27.9)</text>
+          <text x="34" y="126" class="small">2 号 (27.9, 0, 27.9)</text>
+          <text x="34" y="154" class="small">3 号 (−27.9, 0, −27.9)</text>
+          <text x="34" y="182" class="small">4 号 (27.9, 0, −27.9)</text>
+          <rect x="275" y="40" width="210" height="180" rx="6" class="box hl" />
+          <text x="289" y="64" class="title">f 行：4 个角</text>
+          <text x="289" y="98" class="small">1/1/1 2/2/1 4/3/1 3/4/1</text>
+          <text x="289" y="130" class="small">扇形切分（:638）</text>
+          <text x="289" y="158" class="small">第一个三角形：1, 2, 4</text>
+          <text x="289" y="186" class="small">第二个三角形：1, 4, 3</text>
+          <rect x="510" y="40" width="230" height="180" rx="6" class="box ok" />
+          <text x="524" y="62" class="title">geometry.vertices（6 个）</text>
+          <text x="524" y="86" class="small">1 号 (−27.9, 0, 27.9)</text>
+          <text x="524" y="108" class="small">2 号 (27.9, 0, 27.9)</text>
+          <text x="524" y="130" class="small">4 号 (27.9, 0, −27.9)</text>
+          <text x="524" y="152" class="small">1 号 (−27.9, 0, 27.9)</text>
+          <text x="524" y="174" class="small">4 号 (27.9, 0, −27.9)</text>
+          <text x="524" y="196" class="small">3 号 (−27.9, 0, −27.9)</text>
+          <line x1="250" y1="130" x2="273" y2="130" class="line" marker-end="url(#c5-tip)" />
+          <line x1="485" y1="130" x2="508" y2="130" class="line" marker-end="url(#c5-tip)" />
+          <text x="135" y="244" text-anchor="middle" class="small">v 行：先记清单（:569）</text>
+          <text x="625" y="244" text-anchor="middle" class="small">addFace 按编号抄坐标（:234）</text>
+        </svg>
+      </div>
+      <figcaption>图 5 · OBJLoader 按面展开的真实过程（floor.obj）。v 行先进清单；遇到 f 行，四个角扇形切成两个三角形，addFace 按编号把坐标一份份抄进当前物体的数组，1 号和 4 号各被抄了两次。最后这个数组直接变成 BufferGeometry 的 position，不建索引。</figcaption>
+    </figure>
+    <h3>8.3 实测：parse(floor.obj) 交出了什么</h3>
+    <p>我在 Node 里直接调用仓库里 three r177 的 OBJLoader，解析 floor.obj 的全文：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 26%">输出</th><th>值</th></tr>
+        <tr><td>返回值</td><td>一个 Group，1 个子节点（因为只有一个 <code>o Plane</code>）</td></tr>
+        <tr><td>子节点</td><td>Mesh，name 是 Plane</td></tr>
+        <tr><td>geometry.index</td><td>null：没有索引</td></tr>
+        <tr><td>position</td><td>6 个顶点：1 号、2 号、4 号、1 号、4 号、3 号的坐标（和图 5 一样）</td></tr>
+        <tr><td>uv</td><td>(0,0) (1,0) (1,1) (0,0) (1,1) (0,1)</td></tr>
+        <tr><td>normal</td><td>6 个 (0, 1, 0)</td></tr>
+        <tr><td>materialLibraries</td><td>['floor.mtl']：只记了名字</td></tr>
+        <tr><td>材质</td><td>占位的 MeshPhongMaterial，name 是 None，flatShading 是 true（因为 <code>s off</code>，:856–861）</td></tr>
+      </table>
+    </div>
+    <p>
+      四边形 A B C D 被切成 (A, B, C) 和 (A, C, D)，也就是位置 1, 2, 4 和 1, 4, 3。第 5 节的立方体交给它，position 是 36 个、没有索引：OBJLoader 从不去重。
+    </p>
+    <p>
+      HW2 的 loadHW2OBJ 只要这个 position。它不直接相信 OBJLoader 的结果，还要做几件事：先自己扫一遍原始 f 行，确认全是三角形（OBJLoader 会把多边形悄悄扇形切开，而 Nori 的切法不一样，见 obj.cpp:85–91）；再要求只有一个 Mesh、没有索引、角数对得上。这些都在第 21 课第 2 节。
+    </p>
+
+    <h2 id="s9">9. fetch、Promise 与 await</h2>
+    <h3>9.1 读文件要发网络请求</h3>
+    <p>
+      浏览器里的程序不能像 C++ 那样直接打开硬盘上的文件，mary.obj、light.txt 都要通过网络请求从服务器取回来。发请求的函数是 <code>fetch(url)</code>。网络要花时间，从几毫秒到几秒不等，可 JavaScript 不会停下来干等，fetch 会马上返回一个 <strong>Promise</strong>：一个「结果以后才有」的占位对象。
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 22%">Promise 的状态</th><th>意思</th></tr>
+        <tr><td>等待中 (pending)</td><td>结果还没出来</td></tr>
+        <tr><td>成功 (fulfilled)</td><td>有了一个值，比如 fetch 拿到的 Response</td></tr>
+        <tr><td>失败 (rejected)</td><td>有了一个失败原因，通常是一个 Error</td></tr>
+      </table>
+    </div>
+    <p>一个 Promise 只会从「等待中」变一次，变成成功或失败以后就不再变。</p>
+    <h3>9.2 await：在这里等结果</h3>
+    <pre><code>async function loadText(url: string): Promise&lt;string&gt; {
+  const response = await fetch(url)        // ① 暂停，等到服务器的响应头 (headers) 到了，拿到 Response
+  if (!response.ok) {                      // ② 404、500 这类 HTTP 错误不会让 fetch 失败，要自己查
+    throw new Error('HTTP ' + response.status)
+  }
+  return await response.text()             // ③ 再暂停，等正文 (body) 全部到达，拿到字符串
+}</code></pre>
+    <p>
+      在 async 函数里写 <code>await 某个 Promise</code>：函数在这一行暂停，Promise 成功就拿到值、接着往下走；失败就像 throw 一样把原因抛出来，可以用 try/catch 接住。
+    </p>
+    <p>
+      <strong>暂停期间，浏览器会去做别的事</strong>：处理用户的点击、运行别的回调。所以 await 前后，外面的世界可能已经变了，比如用户在等待时换了场景。第 21 课「每个 await 之后都要再查一次取消」，根源就在这里。
+    </p>
+    <h3>9.3 实测：fetch 什么时候成功、什么时候失败</h3>
+    <p>我在 Node 里起了一个本地服务器，用真实的 fetch 试了三种情况：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 34%">情况</th><th>结果</th></tr>
+        <tr><td>文件存在</td><td>fetch 成功，ok = true，status = 200，text() 拿到文件内容</td></tr>
+        <tr><td>文件不存在（404）</td><td><strong>fetch 照样成功</strong>，只是 ok = false，status = 404。不检查 ok，就会把一个错误页面当成数据</td></tr>
+        <tr><td>服务器根本连不上</td><td>fetch 失败，抛出 TypeError</td></tr>
+      </table>
+    </div>
+    <p>
+      项目里的 <a data-src="src/network/fetchText.ts:9">fetchTextWithTimeout</a> 就是 9.2 那三步的加强版：404 时抛 HttpError，连不上时抛 NetworkError，超时抛 NetworkTimeoutError（<a data-src="src/network/http.ts:102">http.ts</a>）。第 21 课 2.7 节的错误分类表，讲的就是这几种错误分别从哪里来。
+    </p>
+
+    <h2 id="s10">10. Promise.all 与 AbortController</h2>
+    <h3>10.1 Promise.all：同时等好几个</h3>
+    <pre><code>const [lightText, transportText] = await Promise.all([   // 两个请求同时发出去
+  fetchTextWithTimeout(lightPath),
+  fetchTextWithTimeout(transportPath)
+])                                                        // 全部成功：结果按输入顺序排成数组</code></pre>
+    <p>
+      Promise.all 接收一组 Promise：全部成功，它才成功，结果按<strong>输入的顺序</strong>排好，不是按谁先完成；任何一个失败，它立刻失败，原因就是那个失败的原因。但是，<strong>它不会让其余的请求停下来</strong>。Promise 本身没有「取消」这回事，Promise.all 只是不再等其余的结果。
+    </p>
+    <h3>10.2 AbortController：取消的遥控器</h3>
+    <p>要真正停下一个请求，得用 AbortController：</p>
+    <pre><code>const controller = new AbortController()     // 遥控器
+const signal = controller.signal             // 信号 (AbortSignal)：交给要能被取消的操作
+fetch(url, { signal })                       // fetch 会一直盯着这个信号
+controller.abort(new Error('换场景了'))      // 按下取消：signal.aborted 变成 true，
+                                             //   signal.reason 就是这个 Error，fetch 立刻以它失败
+signal.throwIfAborted()                      // 已经取消就抛出 signal.reason，没取消什么都不做</code></pre>
+    <p>我在 Node 里把它的几条规矩都试了一遍：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 40%">操作</th><th>结果</th></tr>
+        <tr><td>abort 之前</td><td>signal.aborted = false，signal.reason = undefined</td></tr>
+        <tr><td><code>controller.abort()</code>，不给原因</td><td>aborted = true；reason 是一个名叫 AbortError 的 DOMException；之前挂上的 abort 监听触发了 1 次</td></tr>
+        <tr><td>abort 之后才 <code>addEventListener('abort', …)</code></td><td><strong>永远不会被调用</strong>：abort 事件已经发生过了</td></tr>
+        <tr><td>再 abort 一次，换一个原因</td><td>没有效果，reason 还是第一次的那个：一个信号只取消一次</td></tr>
+        <tr><td><code>controller.abort(自己的 Error)</code></td><td>reason 就是你传的那个对象</td></tr>
+        <tr><td>请求进行到一半时 abort(原因)</td><td>fetch 立刻失败，抛出的正是你传的原因</td></tr>
+      </table>
+    </div>
+    <p>这几条在第 21 课里分别对应：</p>
+    <ul>
+      <li><strong>「abort 之后才挂监听，永远收不到」</strong>：所以要先 throwIfAborted 再开始干活。项目的 fetchWithTimeout 只挂监听、不先检查，已经取消的 signal 交给它，请求照样发出去（旧版 http.ts:20–22，第 21 课 2.6 节）。10 月 7 日你按第 23 课重写了 fetchWithTimeout（提交 d2e6cdf），现在它进门先 <code>callerSignal?.throwIfAborted()</code>（<a data-src="src/network/http.ts:111">http.ts:111</a>）。</li>
+      <li><strong>超时也是用遥控器做的</strong>：fetchWithTimeout 自己建一个 controller，setTimeout 到 6 秒就按一下（http.ts:115–120）。</li>
+      <li><strong>一个信号只取消一次</strong>：所以每次加载都要新建 controller，不能复用旧的。</li>
+    </ul>
+    <h3>10.3 子 controller：自己失败时取消兄弟请求</h3>
+    <p>
+      把 10.1 和 10.2 合起来，就是 HW2 工厂的写法：调用者给一个 signal；工厂自己再建一个「子 controller」，把它的 signal 交给所有请求。
+    </p>
+    <pre><code>const controller = new AbortController()                         // 子 controller
+const forwardAbort = () =&gt; controller.abort(signal.reason)       // 调用者取消 → 转给子 controller
+signal.addEventListener('abort', forwardAbort, { once: true })
+try {
+  await Promise.all([ …每个请求都拿 controller.signal… ])
+} catch (error) {
+  controller.abort(error)                                        // 自己有一个请求失败 → 取消兄弟请求
+  throw error
+} finally {
+  signal.removeEventListener('abort', forwardAbort)              // 用完解除转发
+}                                                                // （简化自 createHW2Scene.ts:251–253、:388、:394）</code></pre>
+    <p>
+      这样分两层，是因为「我的一个请求失败了」和「调用者不要这次结果了」是两件事：前者只该取消这一次构建的兄弟请求，不该把调用者的 signal 改成已取消。所以取消只往下传（调用者 → 子 controller），不往上传。<a data-src="src/scenes/games202/hw2/internal/loadHW2CubeImages.ts:122">loadHW2CubeImages</a> 对自己的六张图也是这么做的。
+    </p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 270" role="img" aria-label="Node 实测时间线：只用 Promise.all 时，light.txt 在 101 毫秒失败，Promise.all 同时拒绝，transport.txt 却一直跑到 302 毫秒才完成；拒绝后立刻 abort 子 controller 时，transport.txt 在 102 毫秒被取消">
+          <text x="20" y="26" class="title">只用 Promise.all</text>
+          <text x="20" y="58" class="small">light.txt</text>
+          <text x="20" y="90" class="small">transport.txt</text>
+          <line x1="180" y1="54" x2="360" y2="54" class="line bad" />
+          <text x="368" y="58" class="small bad">101 ms 失败</text>
+          <line x1="180" y1="86" x2="720" y2="86" class="line" />
+          <text x="716" y="76" text-anchor="end" class="small">302 ms 才完成，结果没人要</text>
+          <line x1="360" y1="38" x2="360" y2="102" class="line dash accent" />
+          <text x="368" y="112" class="small accent">101 ms Promise.all 拒绝</text>
+          <text x="20" y="152" class="title">拒绝后 abort 子 controller</text>
+          <text x="20" y="184" class="small">light.txt</text>
+          <text x="20" y="216" class="small">transport.txt</text>
+          <line x1="180" y1="180" x2="360" y2="180" class="line bad" />
+          <text x="368" y="184" class="small bad">102 ms 失败</text>
+          <line x1="180" y1="212" x2="360" y2="212" class="line" />
+          <text x="360" y="217" text-anchor="middle" class="title bad halo">×</text>
+          <text x="374" y="216" class="small bad">102 ms 被取消</text>
+          <line x1="180" y1="232" x2="720" y2="232" class="line dash" />
+          <text x="180" y="252" text-anchor="middle" class="small">0</text>
+          <text x="360" y="252" text-anchor="middle" class="small">100 ms</text>
+          <text x="540" y="252" text-anchor="middle" class="small">200 ms</text>
+          <text x="720" y="252" text-anchor="middle" class="small">300 ms</text>
+        </svg>
+      </div>
+      <figcaption>图 6 · Node 实测的时间线（两个假请求：light.txt 100 ms 后失败，transport.txt 要 300 ms）。上：Promise.all 在 101 ms 就拒绝了，transport 却一直跑到 302 ms，白白占着网络。下：拒绝后立刻 abort 子 controller，transport 在 102 ms 被取消。</figcaption>
+    </figure>
+
+    <h2 id="s11">11. 这些知识在第 21 课哪里用到</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 42%">这一课</th><th>第 21 课</th></tr>
+        <tr><td>第 2 节：f 的写法、编号从 1 开始、一个面可以多于 3 个角</td><td>2.2 requireTriangleFaces 扫描原始 f 行，只收三角面</td></tr>
+        <tr><td>第 6、8 节：Nori 和 OBJLoader 切四边形的方式不同</td><td>2.2 图 2：两边第二个三角形的角对不上</td></tr>
+        <tr><td>第 3、8 节：每个 o/g 一个 Mesh；usemtl 只是区间</td><td>2.3：usemtl 变成 groups 里的一段；2.4：恰好一个 Mesh，多个 usemtl 可以接受</td></tr>
+        <tr><td>第 5、8 节：按面展开；OBJLoader 不建索引</td><td>2.1 最小例子的返回值；2.3：交出的 position 和 index；2.4：没有索引</td></tr>
+        <tr><td>第 6 节：Nori 按组合去重，得到 7905</td><td>3.3：文件头不是行数（最小例子里是 4 对 6）</td></tr>
+        <tr><td>第 7 节：transport 按角写，30522 行</td><td>3.3：行数是 3 的倍数；5.1：核对 6 个顶点 = 6 行</td></tr>
+        <tr><td>第 7 节：light.txt 要转置</td><td>3.1：转置成每个颜色一组</td></tr>
+        <tr><td>第 8 节：只用 parse，不读 MTL</td><td>2.3：只用 parse，只发一次请求</td></tr>
+        <tr><td>第 8 节：parse 的三个阶段、addFace</td><td>2.3：ParserState 的每个函数、中间数据、交出的对象和每个字段的类型</td></tr>
+        <tr><td>第 9 节：404 不会让 fetch 失败；await 前后世界会变</td><td>2.7 错误分类；2.6 await 之后再查取消</td></tr>
+        <tr><td>第 10 节：Promise.all 不取消；先查再挂监听；子 controller</td><td>2.6 三道取消检查；第 6 节、8.3、图 6、图 8；审查视角第 2、3 条</td></tr>
+      </table>
+    </div>
+
+    <h2 id="s12">12. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0020"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0020"]'), [
+        {
+          q: 'OBJ 里一个角写成 4/3/1，意思是？',
+          opts: ['用 4 号位置、3 号纹理坐标、1 号法线', '第 4 个面的第 3 个角，属于 1 号物体', '坐标是 (4, 3, 1)'],
+          answer: 0,
+          why: '第 2 节：f 行只写编号，三段分别查 v、vt、vn 三张清单。'
+        },
+        {
+          q: 'OBJ 里 v、vt、vn 的编号从几开始？',
+          opts: ['从 1 开始，三张清单各自编号', '从 0 开始', '三张清单共用一套编号'],
+          answer: 0,
+          why: '第 2 节。OBJLoader 的 parseVertexIndex 用「编号 − 1」换成数组下标（:213–218）。'
+        },
+        {
+          q: 'floor.obj 的 4 个角都用 1 号法线，为什么可以？',
+          opts: ['地板是平的，四个角朝向一样，一个法线就够', 'OBJ 规定每个面只能有一个法线', '法线不重要，随便填一个'],
+          answer: 0,
+          why: '第 2 节。所以 vn 的个数可以比 v 少：mary 有 7419 个位置，只有 6260 个法线。'
+        },
+        {
+          q: '一个有 5 个角的面，OBJLoader 会切成几个三角形？',
+          opts: ['3 个：扇形切分，n 个角切成 n − 2 个', '5 个', '直接拒绝'],
+          answer: 0,
+          why: '第 8 节（:638）。第 1 个角分别和（2,3）、（3,4）、（4,5）组成三角形。'
+        },
+        {
+          q: '只有位置和法线的立方体：8 个位置、6 个法线。用索引画，至少要几个 GPU 顶点？',
+          opts: ['24 个：每个角属于 3 个面，法线不同，要拆成 3 个顶点', '8 个', '36 个'],
+          answer: 0,
+          why: '第 5 节、图 2。GPU 只有一份索引，「位置号/法线号」的每种组合占一个顶点。按面展开才是 36 个。'
+        },
+        {
+          q: 'transport 文件头的 7905 是什么？',
+          opts: ['mary 里「位置号/纹理坐标号/法线号」不同组合的个数，也是 Nori 去重后的顶点数', '后面的行数', 'mary.obj 里 v 行的个数'],
+          answer: 0,
+          why: '第 5、6 节。行数是 30522，v 行是 7419，三个数各不相同。'
+        },
+        {
+          q: 'mary 的 transport 第 5 行为什么和第 3 行一模一样？',
+          opts: ['两行是同一个顶点（3 号，3/3/3）的两个角', '文件写重复了', '巧合'],
+          answer: 0,
+          why: '第 7 节、图 4。transport 按 f 行里角的顺序写，同一个顶点出现几次就写几次。'
+        },
+        {
+          q: 'light.txt 第 i 行的三个数是什么？',
+          opts: ['第 i 个球谐系数在 R、G、B 三个通道上的值', '第 i 个顶点的颜色', '第 i 张 cubemap 图的平均颜色'],
+          answer: 0,
+          why: '第 7 节。shader 要的是「每个颜色一组 9 个」，所以读进来要转置。'
+        },
+        {
+          q: 'mtllib 指向的 .mtl 文件不存在，OBJLoader.parse 会怎样？',
+          opts: ['照常解析，只把文件名记进 materialLibraries', '抛错', '去网上下载这个文件'],
+          answer: 0,
+          why: '第 8 节（:705–709）、实测。parse 从不读 .mtl。'
+        },
+        {
+          q: '请求的文件不存在，服务器回 404。await fetch(url) 会怎样？',
+          opts: ['正常返回 Response，只是 ok 为 false、status 为 404', '抛出 TypeError', '一直等下去'],
+          answer: 0,
+          why: '第 9 节实测。只有连不上服务器这类网络错误，fetch 才会失败。所以 fetchTextWithTimeout 要自己检查 ok。'
+        },
+        {
+          q: 'Promise.all 里一个请求失败了，另一个请求会怎样？',
+          opts: ['继续跑到结束，除非你用 AbortController 取消它', '自动停下', '立刻重试'],
+          answer: 0,
+          why: '第 10 节、图 6。Promise.all 只是不再等其余的结果。'
+        },
+        {
+          q: 'controller.abort() 之后，才给 signal 挂 abort 监听。这个监听会怎样？',
+          opts: ['永远不会被调用：abort 事件已经发生过', '马上被调用一次', '下一次 abort 时被调用'],
+          answer: 0,
+          why: '第 10 节实测。所以要先 throwIfAborted，再开始工作；fetchWithTimeout 漏掉的正是这一步。'
+        }
+      ])
+    </script>
+
+    <h2 id="s13">13. 延伸阅读</h2>
+    <p>
+      <strong>首选（约 15 分钟）：</strong>OBJLoader.parse 的逐行处理部分，<a data-src="node_modules/three/examples/jsm/loaders/OBJLoader.js:537">OBJLoader.js:537–766</a>。拿 floor.obj 在脑子里走一遍，看每一行进了哪个数组。
+    </p>
+    <p>
+      补充：
+    </p>
+    <ul>
+      <li>OBJ 格式的原始说明，Paul Bourke 整理的版本：<a href="http://paulbourke.net/dataformats/obj/">paulbourke.net/dataformats/obj</a>（OBJLoader 的注释里也引了它，:732）。</li>
+      <li>Nori 的 OBJ 读取器，看「按组合去重」怎么写：<a data-src="prt/src/obj.cpp:30">obj.cpp:30–117</a>。</li>
+      <li>MDN 上的 <a href="https://developer.mozilla.org/zh-CN/docs/Web/API/Fetch_API/Using_Fetch">使用 Fetch</a>、<a href="https://developer.mozilla.org/zh-CN/docs/Web/JavaScript/Reference/Global_Objects/Promise/all">Promise.all()</a>、<a href="https://developer.mozilla.org/zh-CN/docs/Web/API/AbortController">AbortController</a>。</li>
+    </ul>
+
+    <aside class="ask">
+      做完告诉我：热身题和检查题各错了哪几题；哪一节、哪一句还看不懂，直接贴给我。这一课看懂以后，再去读第 21 课。
+    </aside>
+
+    <div class="nav">
+      <a href="0012-textures-and-render-targets.html">← 第 12 课：Texture 家族与 RenderTarget</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0021-task19-hw2-loaders.html">第 21 课：HW2 的 OBJ 与 PRT 加载 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 20 课 · 2026-10-03</footer>
+  </body>
+</html>

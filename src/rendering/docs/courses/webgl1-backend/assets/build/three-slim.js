@@ -1,0 +1,15 @@
+// 第 25 课打包用的 three 精简入口：OrbitControls 只从 'three' 导入这十个名字。
+// esbuild 用 --alias:three=<本文件> 把 'three' 指到这里，避免把整个 three.module.js（约 670 KB）打进课程页。
+export { Controls } from 'three/src/extras/Controls.js'
+export { MOUSE, TOUCH } from 'three/src/constants.js'
+export { Quaternion } from 'three/src/math/Quaternion.js'
+export { Spherical } from 'three/src/math/Spherical.js'
+export { Vector2 } from 'three/src/math/Vector2.js'
+export { Vector3 } from 'three/src/math/Vector3.js'
+export { Plane } from 'three/src/math/Plane.js'
+export { Ray } from 'three/src/math/Ray.js'
+export * as MathUtils from 'three/src/math/MathUtils.js'
+export { PerspectiveCamera } from 'three/src/cameras/PerspectiveCamera.js'
+export { Euler } from 'three/src/math/Euler.js'
+export { Matrix4 } from 'three/src/math/Matrix4.js'
+export { Object3D } from 'three/src/core/Object3D.js'

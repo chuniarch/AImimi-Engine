@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 40 课 · 一个函数画完阴影</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/code-view.js"></script>
+    <script src="../assets/shadow-raw.js"></script>
+  </head>
+  <body>
+    <p class="kicker">系列「带阴影的三角形：从一个函数到 src/rendering」1/7 · 约 20 分钟</p>
+    <h1>一个函数画完：地面上一个带阴影的三角形</h1>
+    <p class="lede">
+      这个系列只用一个场景：地面上悬着一个三角形，一盏方向光，三角形在地面上投下影子。这一课用最直接的写法把它画出来——一个函数，从拿 context 到最后一次 draw，没有任何工程结构。后面六课每课只改一处：先找出这一版在某个需求下哪里疼，再把那一处拆出去，直到拆出来的样子就是 <code>src/rendering</code>。走到第 45 课，阴影参数为什么用参数块（C）而不照搬 three.js，会在这个小场景里自己显出来。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW1 就是阴影。你说现在看不清 <code>src/rendering</code> 里谁调用谁，这个系列从反方向走：先看没有结构时代码长什么样、哪里疼，再看每一个目录是为了治哪一种疼才长出来的。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 第 1、2 课手写过的那些 GL 调用：<code>createBuffer</code>、<code>bufferData</code>、<code>vertexAttribPointer</code>、<code>useProgram</code>、<code>uniform*</code>、<code>drawArrays</code>；② 第 27 课：framebuffer、颜色附件、深度附件、<code>checkFramebufferStatus</code>，以及把深度打包进 RGBA 的原因；③ 第 25、32 课：视图矩阵和投影矩阵是什么（这一课只调用，不推导）。如果其中哪一条其实没懂，告诉我，我先补那一块。<br />
+      <strong>这一课讲的</strong>：阴影图的两遍绘制；不分层的完整写法；拖动滑块时它在做什么；这段代码混着哪六种东西；改需求时要动哪几行；系列路线图。<br />
+      <strong>校验怎么讲</strong>：这个系列不讲校验规则的细节，只说「这里要检查、检查完可以放心什么」。全部位置汇总在 <a href="../reference/validation-map.html">校验地图</a>。<br />
+      <strong>页面会用到你的显卡</strong>：两块 480 × 300 的画布。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">阴影图：画两遍</a></li>
+        <li><a href="#s2">一个函数写完</a></li>
+        <li><a href="#s3">拖一拖滑块：每次都从头建一遍</a></li>
+        <li><a href="#s4">名字拼错一个字母</a></li>
+        <li><a href="#s5">这段代码混着六种东西</a></li>
+        <li><a href="#s6">改需求时要动哪里</a></li>
+        <li><a href="#s7">系列路线图</a></li>
+        <li><a href="#s8">检查题</a></li>
+        <li><a href="#s9">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 阴影图：画两遍</h2>
+    <p>判断地面上一个点在不在阴影里，问的是：<strong>从这个点往灯的方向看，中间有没有别的东西挡着？</strong>GPU 不能沿光线一路检查，所以分两遍画：</p>
+    <ol>
+      <li><strong>第一遍，站在灯的位置看。</strong>把整个场景画一次，但不画颜色，只记下每个方向上<strong>离灯最近</strong>的东西有多远（深度）。这张「深度照片」叫阴影图 (shadow map)。</li>
+      <li><strong>第二遍，站在相机的位置看</strong>，正常画到屏幕上。每个像素多做一件事：算出自己在灯眼里的位置和深度，去阴影图同一位置查「离灯最近的是多远」。自己比那个更远，说明中间有东西挡着——在阴影里。</li>
+    </ol>
+    <p>用下面这个场景里真实算出来的数（灯偏 35°，脚本在页面里跑出来的）：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 600 290" role="img" aria-label="侧视图。地面在下方，三角形悬在 1.2 高处，灯在右上方。地面上的点 P 往灯的方向连一条线，正好穿过三角形上的点 C。C 离灯的深度 0.336 被存进阴影图；P 自己离灯的深度是 0.440，比 0.336 加上偏移 0.005 还远，所以 P 在阴影里。三角形在地面上的影子画成一段深色。">
+          <defs>
+            <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <path d="M60 250 L540 250" class="line" />
+          <text x="540" y="268" text-anchor="end" class="small">地面 y = 0</text>
+          <path d="M161 250 L305 250" stroke="currentColor" stroke-width="7" opacity="0.35" />
+          <text x="233" y="276" text-anchor="middle" class="small">影子</text>
+          <path d="M228 154 L372 154" stroke="#e08a2c" stroke-width="5" />
+          <text x="380" y="150" class="small">三角形 y = 1.2</text>
+          <path d="M233 250 L401 14" class="line accent dash" marker-end="url(#f1a)" />
+          <text x="410" y="22" class="small accent">往灯的方向</text>
+          <circle cx="300" cy="154" r="5" class="box hl" />
+          <text x="312" y="176" class="small">C：离灯最近，深度 0.336</text>
+          <text x="312" y="190" class="small">（第一遍存进阴影图）</text>
+          <circle cx="233" cy="250" r="5" class="box bad" />
+          <text x="40" y="205" class="small">P：自己的深度 0.440</text>
+          <text x="40" y="220" class="small">0.440 − 0.005 &gt; 0.336</text>
+          <text x="40" y="235" class="small">→ 被挡住，在阴影里</text>
+        </svg>
+      </div>
+      <figcaption>图 1　侧视图（看不到 z 方向）。地面点 P = (−0.84, 0, −0.613) 和三角形上的 C 落在阴影图的同一个位置 (0.509, 0.589)。0.005 是偏移 (bias)：避免平面和自己比较时因为精度误差把自己判成阴影。</figcaption>
+    </figure>
+
+    <h2 id="s2">2. 一个函数写完</h2>
+    <p>下面是完整代码，一共七段，注释里用 ①–⑦ 标开。点上面的按钮可以高亮某一段；「uniform 名字」和「检查」两个按钮后面几节会用到。矩阵小工具 <code>M.lookAt</code>、<code>M.ortho</code>、<code>M.perspective</code>、<code>M.multiply</code> 是第 25、32 课的公式，放在页面最后的折叠块里。</p>
+    <div class="gl-stage" id="stage">
+      <canvas width="480" height="300" id="canvas"></canvas>
+      <div class="gl-controls">
+        <label>灯偏离正上方的角度 <input type="range" min="-60" max="60" value="35" id="angle" /></label>
+        <span id="angle-text">35°</span>
+        <button type="button" id="burst">连续调用 60 次（相当于拖 1 秒）</button>
+        <button type="button" id="reset">重新开始</button>
+      </div>
+      <p class="gl-readout" id="readout"></p>
+    </div>
+    <div id="code"></div>
+    <p>七段各做什么：</p>
+    <ol>
+      <li><strong>① 场景数据</strong>：地面两个三角形、悬空的三角形、两种颜色、灯的方向、相机的位置、bias。</li>
+      <li><strong>② 编译 program</strong>：深度 program 只输出打包后的深度；主 program 算光照，再去阴影图里查自己有没有被挡。</li>
+      <li><strong>③ 建阴影图</strong>：一张 512 × 512 的颜色纹理、一个深度缓冲、一个把它们挂在一起的 framebuffer。</li>
+      <li><strong>④ 上传顶点</strong>：两个物体各一个 buffer。</li>
+      <li><strong>⑤ 算矩阵</strong>：灯的「视图 × 正交投影」、相机的「视图 × 透视投影」。</li>
+      <li><strong>⑥ 第一遍</strong>：绑阴影图的 framebuffer，清成白色（白 = 最远），用深度 program 把两个物体各画一次。</li>
+      <li><strong>⑦ 第二遍</strong>：绑回屏幕，用主 program 设好矩阵、灯、bias、阴影图，再把两个物体各画一次。</li>
+    </ol>
+    <aside class="note">
+      <strong>这一版的检查</strong>（点「检查」按钮）：只有两处——② 里 shader 编译、program 链接成功没有；③ 里 framebuffer 完整没有。检查完可以放心：program 能用、往阴影图里画不会报错。其余都没检查：名字对不对得上、矩阵是不是有限的数、两遍的顺序对不对，全靠写的人自己小心。真实代码里这些检查分别在哪，见 <a href="../reference/validation-map.html">校验地图</a>。
+    </aside>
+
+    <h2 id="s3">3. 拖一拖滑块：每次都从头建一遍</h2>
+    <p>拖动上面的滑块，灯会转，影子跟着动。再看画布下面的计数：函数每调用一次，就新建 2 个 program、4 个 shader、1 张纹理、1 个深度缓冲、1 个 framebuffer、2 个 buffer，<strong>一个都不删</strong>。备课时在无界面 Chrome 里调用 10 次，数到的是 20 个 program、40 个 shader、10 张纹理、10 个 framebuffer、20 个 buffer，删除 0 个。</p>
+    <p>点「连续调用 60 次」看看显存估计：每张 512 × 512 的 RGBA 纹理 1 MiB，每个 16 位深度缓冲 0.5 MiB，拖 1 秒就多占 90 MiB，而且永远不还。</p>
+    <p>可是灯转的时候，真正需要重新做的只有 ⑤⑥⑦：矩阵变了，两遍要重画。① 的数据、② 的 program、③ 的阴影图、④ 的顶点一样都没变。这就是第 41 课要拆的第一刀：<strong>只做一次的事</strong>和<strong>每帧做的事</strong>分开。</p>
+
+    <h2 id="s4">4. 名字拼错一个字母</h2>
+    <p>点「uniform 名字」按钮，看 <code>uLightVP</code> 出现在哪：深度 program 的 GLSL 里声明一次，主 program 的 GLSL 里声明一次，⑥ 和 ⑦ 里各用字符串 <code>'uLightVP'</code> 查一次位置，一共四处。四处必须一字不差，可是没有任何东西帮你核对。</p>
+    <p>下面这块画布运行的是同一个函数，只改了一处：⑦ 里 <code>getUniformLocation(mainProgram, 'uLightVP')</code> 写成了 <code>'uLigthVP'</code>（h 和 t 换了位置）。课程用 <code>new Function</code> 把函数源码里这一处替换掉再运行，别的一个字都没动。</p>
+    <div class="gl-stage">
+      <canvas width="480" height="300" id="typo-canvas"></canvas>
+      <p class="gl-readout" id="typo-readout"></p>
+    </div>
+    <p>拼错的名字查不到位置，<code>getUniformLocation</code> 返回 null；给 null 设值，WebGL 规定什么也不做、也不报错。于是主 program 里的 <code>uLightVP</code> 一直是链接时的初值——全零矩阵，每个像素在灯眼里的坐标都成了 0 除以 0。备课时在无界面 Chrome（软件渲染 SwiftShader）里，这些比较全判成「被挡住」，整个画面变暗，亮处的地面从 159 变成 48。GLSL ES 1.00 没有规定 0 除以 0 得什么，换一块显卡也可能是阴影整个消失；上面的读数是你这台机器的结果。无论哪种，画面都错了，而 <code>getError</code> 照样是 0。</p>
+    <p>名字的约定分散在 GLSL 和 JS 两边，这是第 45 课的主题：哪些值由谁提供、名字由谁定、在哪里核对。three.js 的灯光协议和我们选的参数块，对这个问题给出了不同的答案。</p>
+
+    <h2 id="s5">5. 这段代码混着六种东西</h2>
+    <p>把七段代码按「它是什么」重新归类，会得到六种东西。它们变化的时机不同、该由不同的人负责，以后各自变成 <code>src/rendering</code> 里的一个地方：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>种类</th><th>在哪几段</th><th>什么时候需要重新执行</th><th>以后在 src/rendering 的哪里</th><th>哪一课拆</th></tr>
+        <tr><td>场景数据：画什么、在哪、什么颜色、灯在哪</td><td>①</td><td>场景换了，或者物体、灯被改了</td><td><code>resources/</code>（Geometry、Material、ShaderModule）、<code>scene/</code>（Mesh、Scene、相机、灯）</td><td>42</td></tr>
+        <tr><td>GPU 上的建造：program、纹理、framebuffer、buffer</td><td>②③④</td><td>只在第一次用到时；context 丢失后重建一次</td><td><code>backend/webgl1/</code> 的各个 Manager，按 CPU 对象查表缓存</td><td>41</td></tr>
+        <tr><td>每帧的计算：矩阵</td><td>⑤</td><td>每帧</td><td><code>frame/</code>（RenderListBuilder 抄出 ViewState、灯光快照）、<code>shadows/</code> 的阴影视图</td><td>43</td></tr>
+        <tr><td>画到哪、按什么顺序画</td><td>⑥⑦ 开头的 bindFramebuffer、viewport、clear</td><td>每帧</td><td><code>passes/</code>（ShadowMapPass、ForwardPass、RenderPipeline）和 SurfaceScope</td><td>44</td></tr>
+        <tr><td>每次 draw 的绑定和调用</td><td>⑥⑦ 里的 useProgram、bindBuffer、uniform、drawArrays</td><td>每帧每个物体</td><td><code>WebGL1Backend.draw</code>、Uniforms、顶点输入</td><td>41、44</td></tr>
+        <tr><td>名字的约定：哪个值叫什么、由谁提供</td><td>②的 GLSL 声明和 ⑥⑦ 的字符串</td><td>写 shader 的时候</td><td>ShaderModule 的内建映射、Material 参数、参数块</td><td>45</td></tr>
+      </table>
+    </div>
+    <p>第 31 课从「gl 调用要哪些参数」推出过五个目录；这里是同一件事的另一个方向：从一段写好的代码里，把混在一起的东西一样一样拆出去。</p>
+
+    <h2 id="s6">6. 改需求时要动哪里</h2>
+    <p>HW1、HW2、FFT 会提的需求，放到这一版上：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>需求</th><th>这一版要怎么改</th><th>疼在哪</th><th>哪一课解决</th></tr>
+        <tr><td>灯每帧都在转</td><td>每帧调用一次函数</td><td>每帧重建 ②③④，显存一直涨（第 3 节）</td><td>41</td></tr>
+        <tr><td>地面上再放一个三角形</td><td>① 加数据、④ 加上传、⑥ 加一段 draw、⑦ 再加一段 draw，共四处</td><td>「有哪些物体」散在四个地方，漏一处就少画一遍</td><td>42</td></tr>
+        <tr><td>同一个程序还要能显示 HW2（Mary 和背景，没有阴影）</td><td>另写一个函数，或者在这个函数里到处加 if</td><td>「这个场景要画几遍、每遍画什么」写死在函数里</td><td>44</td></tr>
+        <tr><td>地面换成带贴图的材质，三角形不变</td><td>⑦ 里给两个物体分别 useProgram、分别设 uniform</td><td>阴影的那几个值要送到两个不同的 program，名字要在两份 shader 里都对上</td><td>45</td></tr>
+        <tr><td>浏览器把 context 收回又还回来（context lost）</td><td>没法改：所有 handle 都失效，函数却不知道</td><td>没有人记得「哪些东西要重建」</td><td>46</td></tr>
+      </table>
+    </div>
+
+    <h2 id="s7">7. 系列路线图</h2>
+    <p>每课都在这个场景上改一刀，每课结束时画面和这一课一模一样，变的只是代码的形状。每一步的代码都是课程写的「小引擎」，命名和真实代码一致，最后一课对照 <code>src/rendering</code> 逐个指认。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>课</th><th>这一刀</th><th>长出来的是</th></tr>
+        <tr><td>40</td><td>一个函数写完（本课）</td><td>—</td></tr>
+        <tr><td>41</td><td>分开「只做一次」和「每帧做」；GPU 对象按 CPU 对象查表缓存</td><td>backend 的 Manager</td></tr>
+        <tr><td>42</td><td>把「画什么」写成数据：几何、材质、物体、灯、场景；后端只读数据</td><td>resources/、scene/</td></tr>
+        <tr><td>43</td><td>每帧先抄一份：物体列表、相机矩阵、灯光快照</td><td>frame/</td></tr>
+        <tr><td>44</td><td>两遍变成两个 Pass；「画到哪」变成进门出门；场景交出自己要的 Pass</td><td>passes/、SurfaceScope、Engine 安装</td></tr>
+        <tr><td>45</td><td>值怎样送到 shader：内建、材质参数、阴影参数；把 A、B、three.js 协议、参数块 C 在这个小引擎里各写一遍，比较</td><td>参数块</td></tr>
+        <tr><td>46</td><td>不正常的时候：校验分三层、context 丢失；对照 src/rendering 逐个指认</td><td>Lifecycle、校验地图</td></tr>
+      </table>
+    </div>
+
+    <h2 id="s8">8. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0040"></div>
+
+    <h2 id="s9">9. 延伸阅读</h2>
+    <ul>
+      <li><a href="https://learnopengl.com/Advanced-Lighting/Shadows/Shadow-Mapping">LearnOpenGL：Shadow Mapping</a>：两遍绘制、bias、阴影痤疮 (shadow acne) 的图解。这一课的第 1 节对应它的前半篇。</li>
+      <li><a href="https://sites.cs.ucsb.edu/~lingqi/teaching/games202.html">GAMES202 课程主页</a>：第 3 讲讲 shadow mapping，后面的 PCF、PCSS 也从这里来。</li>
+      <li><a href="../reference/validation-map.html">校验地图</a>：这个系列里所有「这里要检查」的汇总。</li>
+      <li><a href="0031-frame-overview.html">第 31 课</a>：从 gl 参数推出五个目录，和本课第 5 节互相对照。</li>
+    </ul>
+
+    <details>
+      <summary>矩阵小工具（第 25、32 课的公式）</summary>
+      <pre id="math"></pre>
+    </details>
+
+    <aside class="note">
+      做完告诉我：检查题错了哪几题；拖滑块、拼错名字这两个实验里，有没有哪一步的结果和你预想的不一样。哪一段代码看不懂，把行号贴给我。下一课从第 3 节那一刀开始。
+    </aside>
+
+    <div class="nav">
+      <a href="0039-why-fft-queries-so-often.html">← 第 39 课：FFT 为什么频繁查询</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0041-build-once-lookup-by-object.html">第 41 课：只做一次与每帧做 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 40 课 · 2026-10-16</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+        const { M, drawShadowedTriangle } = RTeach.shadowRaw
+
+        // ---------------- 代码视图 ----------------
+        const source = drawShadowedTriangle.toString()
+        const sec = RTeach.codeView.section
+        window.__codeView40 = RTeach.codeView({
+          mount: document.getElementById('code'),
+          caption: 'assets/shadow-raw.js 里的 drawShadowedTriangle，页面直接显示它的源码（toString），所以这就是上面画布正在运行的代码。',
+          code: source,
+          groups: [
+            { label: '① 场景数据', test: sec('①') },
+            { label: '② 编译', test: sec('②') },
+            { label: '③ 阴影图', test: sec('③') },
+            { label: '④ 上传', test: sec('④') },
+            { label: '⑤ 矩阵', test: sec('⑤') },
+            { label: '⑥ 第一遍', test: sec('⑥') },
+            { label: '⑦ 第二遍', test: sec('⑦') },
+            { label: 'uniform 名字', test: (line) => /\bu(LightVP|CameraVP|ToLight|Color|ShadowBias|ShadowMap)\b/.test(line), note: '同一个名字在 GLSL 声明和 JS 字符串里各出现一次以上，必须一字不差' },
+            { label: 'uLightVP 一个名字', test: (line) => /\buLightVP\b/.test(line), note: '两份 GLSL 各声明一次、各使用一次，JS 里两次按字符串查位置；必须一字不差的是两处声明和两处字符串' },
+            { label: '检查', test: (line) => /COMPILE_STATUS|LINK_STATUS|checkFramebufferStatus|throw new Error/.test(line), note: '这一版只检查这两件事' },
+            { label: '画到哪', test: (line) => /bindFramebuffer|viewport\(|clearColor|gl\.clear\(/.test(line), note: '第 44 课会把这些变成进门、出门' }
+          ]
+        })
+        document.getElementById('math').textContent = Object.entries(M)
+          .map(([name, fn]) => {
+            const text = fn.toString()
+            return text.startsWith(name + '(') ? text : name + ': ' + text
+          })
+          .join('\n\n')
+
+        // ---------------- 画布 1：真实调用，记账 ----------------
+        let canvas = document.getElementById('canvas')
+        let counts
+        let calls
+        function setup() {
+          // 课程写的记账：先用同样的参数拿到 context，再给 create*/delete* 套一层计数
+          // （之后函数里的 canvas.getContext('webgl') 拿到的是同一个 context）
+          const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true })
+          counts = {}
+          calls = 0
+          for (const name of Object.getOwnPropertyNames(WebGLRenderingContext.prototype)) {
+            if (!/^(create|delete)/.test(name)) continue
+            const original = gl[name].bind(gl)
+            gl[name] = (...args) => {
+              counts[name] = (counts[name] || 0) + 1
+              return original(...args)
+            }
+          }
+          return gl
+        }
+        let gl = setup()
+        const readout = document.getElementById('readout')
+        const angle = document.getElementById('angle')
+        function draw() {
+          drawShadowedTriangle(canvas, Number(angle.value))
+          calls += 1
+          const c = (k) => counts[k] || 0
+          const deleted = Object.keys(counts).filter((k) => k.startsWith('delete')).reduce((s, k) => s + counts[k], 0)
+          const mib = c('createTexture') * 1 + c('createRenderbuffer') * 0.5
+          readout.textContent =
+            '调用 ' + calls + ' 次；累计新建 program ' + c('createProgram') + '、shader ' + c('createShader') +
+            '、纹理 ' + c('createTexture') + '、深度缓冲 ' + c('createRenderbuffer') + '、framebuffer ' + c('createFramebuffer') +
+            '、buffer ' + c('createBuffer') + '；删除 ' + deleted + ' 个。\n阴影图占的显存估计：' + mib.toFixed(1) +
+            ' MiB（每张纹理 1 MiB、每个深度缓冲 0.5 MiB）。getError：' + gl.getError()
+        }
+        angle.addEventListener('input', () => {
+          document.getElementById('angle-text').textContent = angle.value + '°'
+          draw()
+        })
+        document.getElementById('burst').addEventListener('click', () => {
+          for (let i = 0; i < 60; i++) draw()
+        })
+        document.getElementById('reset').addEventListener('click', () => {
+          const lose = gl.getExtension('WEBGL_lose_context')
+          if (lose) lose.loseContext()
+          const fresh = document.createElement('canvas')
+          fresh.width = 480
+          fresh.height = 300
+          fresh.id = 'canvas'
+          canvas.replaceWith(fresh)
+          canvas = fresh
+          gl = setup()
+          draw()
+        })
+        draw()
+
+        // ---------------- 画布 2：拼错一个名字 ----------------
+        const wrong = "getUniformLocation(mainProgram, 'uLightVP')"
+        if (!source.includes(wrong)) throw new Error('第 4 节要替换的那一处在源码里找不到')
+        const typoSource = source.replace(wrong, "getUniformLocation(mainProgram, 'uLigthVP')")
+        const typoFunction = new Function('M', 'return ' + typoSource)(M)
+        const typoCanvas = document.getElementById('typo-canvas')
+        const typoGL = typoCanvas.getContext('webgl', { preserveDrawingBuffer: true })
+        typoFunction(typoCanvas, 35)
+        const pixel = (x, y) => {
+          const p = new Uint8Array(4)
+          typoGL.readPixels(x, y, 1, 1, typoGL.RGBA, typoGL.UNSIGNED_BYTE, p)
+          return '(' + Array.from(p.slice(0, 3)).join(', ') + ')'
+        }
+        window.__typo40 = { lit: pixel(349, 88), shadow: pixel(204, 150), error: typoGL.getError() }
+        document.getElementById('typo-readout').textContent =
+          '灯偏 35°。原本亮的地面 (349, 88) 读到 ' + window.__typo40.lit + '（正确版本是 (159, 159, 159)）；' +
+          '原本在阴影里的 (204, 150) 读到 ' + window.__typo40.shadow + '。getError：' + window.__typo40.error
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0040"]'), [
+          {
+            q: '把滑块拖动 10 次（函数被调用 10 次），一共新建了多少个 program？',
+            opts: ['20 个，一个都没删', '2 个，后面都复用了', '10 个，旧的被浏览器回收了'],
+            answer: 0,
+            why: '每次调用都执行 ② 的两次 makeProgram，没有任何地方 deleteProgram（第 3 节的计数）。'
+          },
+          {
+            q: '在地面上再放一个三角形，这一版要改几处？',
+            opts: ['四处：①、④、⑥、⑦ 各一处', '一处：只在 ① 加顶点数据', '两处：只在 ⑥、⑦ 各加一段'],
+            answer: 0,
+            why: '数据、上传、第一遍的 draw、第二遍的 draw 各写了一份；「有哪些物体」散在四个地方（第 6 节）。'
+          },
+          {
+            q: '⑦ 开头为什么要 bindFramebuffer(null) 并重设 viewport？',
+            opts: ['第一遍把目标换成了阴影图，不换回来就画进阴影图', '每一遍开头都必须调用一次，否则 draw 会报错', '为了清掉阴影图里第一遍留下的深度'],
+            answer: 0,
+            why: '绑定的 framebuffer 和 viewport 会一直保持到下次修改；第 44 课把这种「换过去、再换回来」做成进门出门。'
+          },
+          {
+            q: '把 JS 里查位置的 \'uLightVP\' 拼错，会发生什么？',
+            opts: ['画面整体变暗，getError 仍是 0', '编译 program 时报错，函数抛出异常', 'getError 返回 INVALID_OPERATION'],
+            answer: 0,
+            why: 'getUniformLocation 返回 null，给 null 设值什么也不做；uLightVP 保持全零，比较全部判成被挡（第 4 节的画布）。'
+          },
+          {
+            q: '灯转动时，哪几段其实不需要重新执行？',
+            opts: ['①②③④：数据和 GPU 上的建造都没变', '⑤⑥⑦：矩阵和两遍绘制都没变', '全部都要：灯变了，什么都得重来'],
+            answer: 0,
+            why: '变的只有灯的方向，所以只有矩阵和两遍绘制要重来；这就是第 41 课的第一刀。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

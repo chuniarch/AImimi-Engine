@@ -1,0 +1,1294 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 26 课 · 轨道控制</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/camera-bundle.js"></script>
+    <script src="../assets/orbit-lab.js"></script>
+  </head>
+  <body>
+    <p class="kicker">插课下篇 · 接在第 25 课之后 · 约 35 分钟</p>
+    <h1>轨道控制：拖动怎样变成相机的新位置</h1>
+    <p class="lede">
+      第 25 课推出了相机的三样东西：world 矩阵 C（四列是右、上、后和位置 eye）、V = C⁻¹、投影矩阵 P，还推出了用方位角 az、仰角 el 记下朝向的写法 rotation = [−el, az, 0]。轨道控制要做的，就是每次拖动以后算出新的 eye 和新的 [−el, az, 0]。这一课先和 three.js 的 OrbitControls 并排拖一拖，再一版一版写出 <code>mountOrbitCameraInput</code>：控制器怎样记状态、两极怎样处理、滚轮怎样缩放、浏览器事件怎样接、谁来重画。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW2 换到新渲染路径以后，three.js 的 OrbitControls 就被关掉了（<a data-src="src/engine.ts:205">engine.ts:205</a>），转动视角全靠这个文件。FFT 海面要绕着看，也会用它；以后要加阻尼，就是在这里改（右键平移已经在课后加上了，见 3.6 节）。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：第 25 课的 C、V、P，offset = eye − target，az = atan2(dx, dz)、el = atan2(dy, horizontal) 和 rotation = [−el, az, 0]；第 8 课 Transform 的 version；第 23 课讲过，removeEventListener 要传同一个函数对象。<br />
+      <strong>这一课从零讲的</strong>：球坐标的读和写；控制器为什么不能自己记角度；两极为什么要留余量、为什么留 0.001；滚轮为什么用乘法；pointer 事件、pointer capture、touch-action、passive；「当前相机」与拖到一半换相机；挂载前先验证、幂等卸载；为什么不需要 OrbitControls 那样的 update()。<br />
+      <strong>页面不用显卡</strong>：线框是 2D canvas 画的。卡片和画布里的相机、Transform、轨道输入，都是打包进来的项目真实代码；three.js 部分是 node_modules 里的 r177 原版。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol start="0">
+        <li><a href="#s0">先拖一拖</a></li>
+        <li><a href="#s1">需求</a>：<a href="#s1-1">要的效果</a> <a href="#s1-2">three.js 的写法</a> <a href="#s1-3">一块画布，两套控制</a></li>
+        <li><a href="#s2">一次拖动怎样变成新位置</a>：<a href="#s2-1">球坐标</a> <a href="#s2-2">第 1 版</a> <a href="#s2-3">第 2 版</a> <a href="#s2-4">第 3 版</a> <a href="#s2-5">真实代码</a> <a href="#s2-6">速度和方向</a> <a href="#s2-7">滚轮</a></li>
+        <li><a href="#s3">输入事件</a></li>
+        <li><a href="#s4">谁来重画：为什么没有 update()</a></li>
+        <li><a href="#s5">架构视角：对照 three.js</a></li>
+        <li><a href="#s6">审查视角</a></li>
+        <li><a href="#s7">检查题</a></li>
+        <li><a href="#s8">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s0">0. 先拖一拖</h2>
+    <p>
+      左边是项目代码，右边是 three.js r177 原版。两边的初始位置都是 HW2 的 [0, 20, 50]，都绕 [0, 10, 0] 转，距离都限制在 1～300（左边的配置抄自 <a data-src="src/gui/games202/setup.ts:124">setup.ts:124–128</a>）。按住左键拖动，或者滚动滚轮；下面的按钮会给两边发同样的事件。
+    </p>
+    <div id="viewer"></div>
+    <p>先留意三件事，后面几节逐一解释：</p>
+    <ol>
+      <li>同样拖，两边的 position 读数一样（第 2 节）。</li>
+      <li>滚一格，两边的距离不一样（2.7 节）。</li>
+      <li>两边的 rotation 读数完全不同，画面却一样（第 25 课 5.2 节）。</li>
+    </ol>
+    <p class="small">
+      按钮发的是合成事件。合成事件没有真实的指针，所以发事件的那一瞬间，把 canvas 的 setPointerCapture 换成只记账的版本，发完就恢复。用鼠标拖的时候，用的是浏览器真实的 pointer capture。勾上「打开阻尼」以后，在右边拖一下再松手，画面还会接着滑一会儿：OrbitControls 在每帧的 update() 里把剩下的角度一点点用完（第 4 节）。左边没有这个功能。
+    </p>
+
+    <h2 id="s1">1. 需求</h2>
+
+    <h3 id="s1-1">1.1 在 HW2 页面上要的效果</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>你做的动作</th><th>期望的效果</th><th>换成数字（canvas 高 600 CSS px）</th></tr></thead>
+      <tbody>
+        <tr><td>左右拖</td><td>相机绕目标水平转，目标一直在画面正中</td><td>向右拖 150 px 转 90°：[0, 20, 50] → [−50, 20, 0]</td></tr>
+        <tr><td>上下拖</td><td>相机升高或降低，仍然看着目标，不会翻过头顶</td><td>仰角从 11.31° 开始，最高 89.94°，最低 −89.94°</td></tr>
+        <tr><td>滚轮</td><td>拉远、拉近，不会穿过目标</td><td>deltaY = +100 一格，距离 ×1.105；距离限制在 1～300</td></tr>
+        <tr><td>拖出画布，在外面松手</td><td>照常转动，照常结束</td><td>—</td></tr>
+        <tr><td>手机上拖；在画布上滚轮</td><td>页面不跟着滚动</td><td>—</td></tr>
+        <tr><td>切换预设（换了一台新相机）</td><td>接着拖新相机，画面不跳</td><td>拖 1 px，新相机只转 0.6°</td></tr>
+        <tr><td>离开 HW2</td><td>拖动不再改任何相机，监听全部摘掉</td><td>canvas 上 7 个监听，window 上 1 个</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3 id="s1-2">1.2 three.js 用户的写法</h3>
+    <p>旧路径（HW1、HW3、HW4，以及改造之前的 HW2）是这样建相机和控制器的：</p>
+    <pre><code>// 旧路径的写法（engine.ts:106–116，注释是课程加的）。HEAD 版的 HW2 用同样的几行，
+// 只是位置改成 (0, 20, 50)、target 改成 (0, 10, 0)。
+// 第一个参数是视角，单位是「度」
+const camera = new LegacyPerspectiveCamera(50, canvas.width / canvas.height, 0.1, 2000)
+camera.position.set(0, 0, 100) // 只给位置，不给朝向
+const controls = new OrbitControls(camera, canvas) // 相机在这里绑定，之后一直是这一台
+controls.minDistance = 0.1
+controls.maxDistance = 1000
+controls.zoomSpeed = 1
+controls.rotateSpeed = 0.3 // 拖满一个画布高 = 0.3 圈 = 108°
+controls.panSpeed = 0.8 // 右键拖动平移：新代码在课后也加上了，HW2 同样用 0.8（3.6 节）
+controls.target.set(0, 0, 0)
+controls.update() // 这一步才让相机转头看向 target（内部调用 camera.lookAt）
+
+// 之后每一帧（engine.ts:533，那里写作 this.cameraControls.update()）：
+controls.update() // 打开阻尼或自动旋转时必须每帧调用</code></pre>
+    <p>
+      这几行背后，three.js 替你做了三件事：相机怎样交出 view 和 projection 矩阵（PerspectiveCamera）；怎样转头看向一个点（lookAt）；怎样把拖动换算成新的位置（OrbitControls.update）。项目把这三件事放在了下面这些地方：
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>要做的事</th><th>three.js r177</th><th>本项目</th></tr></thead>
+      <tbody>
+        <tr><td>保存相机的位置和朝向</td><td>Object3D 的 position、quaternion</td><td>Transform 的 position 和 rotation（欧拉角，单位弧度；第 8 课）</td></tr>
+        <tr><td>交出 view 矩阵</td><td>camera.matrixWorldInverse（<a data-src="node_modules/three/src/cameras/Camera.js:92">Camera.js:92–97</a>）</td><td>Builder 每帧求一次逆（<a data-src="src/rendering/frame/RenderListBuilder.ts:84">RenderListBuilder.ts:84</a>）</td></tr>
+        <tr><td>交出 projection 矩阵</td><td>改完字段后调用 updateProjectionMatrix()（<a data-src="node_modules/three/src/cameras/PerspectiveCamera.js:353">PerspectiveCamera.js:353</a>）</td><td>setPerspective()（第 9 课）</td></tr>
+        <tr><td>看向目标</td><td>lookAt(target)（<a data-src="node_modules/three/src/core/Object3D.js:668">Object3D.js:668</a>）</td><td>算出两个角，再 setRotation([−仰角, 方位角, 0])（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:163">mountOrbitCameraInput.ts:163</a>）</td></tr>
+        <tr><td>把拖动换算成新位置</td><td>OrbitControls.update()（<a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:597">OrbitControls.js:597</a>）</td><td>applyOrbit（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:132">:132–164</a>）</td></tr>
+        <tr><td>监听浏览器输入</td><td>connect / disconnect（<a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:465">:465–498</a>）</td><td>挂载函数，以及它交回的卸载函数（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:308">:308–334</a>）</td></tr>
+      </tbody>
+    </table></div>
+    <p>前四行的数学在第 25 课（第 3～6 节）；这一课讲后两行。</p>
+
+    <h3 id="s1-3">1.3 一块画布，两套控制</h3>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 292" role="img" aria-label="同一块 canvas 上挂着两套控制：旧路径的 OrbitControls 在 HW2 时被关掉，HW2 由 mountOrbitCameraInput 改项目相机的 Transform，下一帧由 Builder 读出">
+          <defs>
+            <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+            <marker id="f1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <text x="180" y="20" class="small">旧路径（HW1、HW3、HW4）</text>
+          <rect x="16" y="110" width="118" height="70" rx="4" class="box" />
+          <text x="75" y="140" text-anchor="middle" class="title">canvas</text>
+          <text x="75" y="160" text-anchor="middle" class="small">pointer · wheel</text>
+
+          <rect x="180" y="30" width="170" height="62" rx="4" class="box" />
+          <text x="265" y="56" text-anchor="middle">OrbitControls</text>
+          <text x="265" y="76" text-anchor="middle" class="small">HW2 时 enabled = false</text>
+          <rect x="410" y="30" width="160" height="62" rx="4" class="box" />
+          <text x="490" y="56" text-anchor="middle">旧相机（three）</text>
+          <text x="490" y="76" text-anchor="middle" class="small">position · quaternion</text>
+          <rect x="616" y="30" width="128" height="62" rx="4" class="box" />
+          <text x="680" y="56" text-anchor="middle">旧渲染器</text>
+          <text x="680" y="76" text-anchor="middle" class="small">每帧先 update()</text>
+
+          <rect x="180" y="198" width="170" height="62" rx="4" class="box hl" />
+          <text x="265" y="224" text-anchor="middle">mountOrbitCameraInput</text>
+          <text x="265" y="244" text-anchor="middle" class="small">进入 HW2 时挂上</text>
+          <rect x="410" y="198" width="160" height="62" rx="4" class="box hl" />
+          <text x="490" y="224" text-anchor="middle">当前 HW2 相机</text>
+          <text x="490" y="244" text-anchor="middle" class="small">改它的 Transform</text>
+          <rect x="616" y="198" width="128" height="62" rx="4" class="box hl" />
+          <text x="680" y="224" text-anchor="middle">下一帧 Builder</text>
+          <text x="680" y="244" text-anchor="middle" class="small">world 求逆得 view</text>
+          <text x="180" y="282" class="small accent">新路径（HW2）</text>
+
+          <path d="M134 128 L157 128 L157 61 L176 61" class="line dash" marker-end="url(#f1a)" />
+          <path d="M134 162 L157 162 L157 229 L176 229" class="line accent" marker-end="url(#f1b)" />
+          <path d="M350 61 L406 61" class="line dash" marker-end="url(#f1a)" />
+          <text x="378" y="53" text-anchor="middle" class="small">lookAt</text>
+          <path d="M570 61 L612 61" class="line dash" marker-end="url(#f1a)" />
+          <path d="M350 229 L406 229" class="line accent" marker-end="url(#f1b)" />
+          <text x="378" y="221" text-anchor="middle" class="small accent">写入</text>
+          <path d="M570 229 L612 229" class="line accent" marker-end="url(#f1b)" />
+          <text x="591" y="221" text-anchor="middle" class="small accent">读</text>
+        </svg>
+      </div>
+      <figcaption>图 1　HW2 页面的同一块 canvas 上挂着两套控制。OrbitControls 在 Engine 创建时装上（<a data-src="src/engine.ts:108">engine.ts:108</a>），进入 HW2 时关掉（:205），回到旧路径再打开（:256）。关掉的 OrbitControls 监听还挂着，可每个处理函数一开头都先看 enabled（<a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:1455">OrbitControls.js:1455</a>、:1666），所以不会和新控制抢事件。mountOrbitCameraInput 不碰相机以外的东西，也不碰 WebGL。</figcaption>
+    </figure>
+
+    <h2 id="s2">2. 一次拖动怎样变成新位置</h2>
+
+    <h3 id="s2-1">2.1 球坐标：三个数描述「绕着目标的哪里」</h3>
+    <p>
+      相机位置 eye = target + offset。offset 可以用三个数描述：距离 distance、方位角 az、仰角 el。第 25 课 5.2 节用 az、el 算出了相机的 rotation；轨道控制还要反过来，由三个数算出 eye。两个方向的换算：
+    </p>
+    <pre><code>// 例：HW2 初始，偏移 = [0, 20, 50] − [0, 10, 0] = [0, 10, 50]
+
+// 直角 → 球（读）
+horizontal = Math.hypot(x, z)               // 50：水平面上离目标多远
+distance = Math.hypot(horizontal, y)        // 50.99
+az = Math.atan2(x, z)                       // 0
+el = Math.atan2(y, horizontal)              // 0.1974 rad = 11.31°
+
+// 球 → 直角（写）
+ring = distance * Math.cos(el)              // 水平那一圈的半径
+x = ring * Math.sin(az), y = distance * Math.sin(el), z = ring * Math.cos(az)</code></pre>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 312" role="img" aria-label="左图侧面看：相机比目标高 25.49、水平距离 44.16，仰角 el 等于 30 度；右图俯视：相机偏移 x 等于 38.24、z 等于 22.08，方位角 az 从 +Z 往 +X 量，等于 60 度">
+          <defs>
+            <marker id="f2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <text x="20" y="22" class="title">侧面：相机和目标所在的竖直平面</text>
+          <line x1="30" y1="210" x2="350" y2="210" class="line dash" />
+          <line x1="310" y1="210" x2="310" y2="72" class="line dash" />
+          <line x1="70" y1="210" x2="310" y2="72" class="line" />
+          <circle cx="70" cy="210" r="4" class="tip" />
+          <text x="70" y="232" text-anchor="middle" class="small">目标 [0, 10, 0]</text>
+          <circle cx="310" cy="72" r="5" class="tip accent" />
+          <text x="318" y="62" class="accent">相机</text>
+          <path d="M310 72 L268 96" class="line accent" marker-end="url(#f2a)" />
+          <text x="236" y="80" text-anchor="end" class="small accent">−Z 朝目标</text>
+          <path d="M110 210 A40 40 0 0 0 104.6 190" class="line" />
+          <text x="116" y="203">el = 30°</text>
+          <text x="180" y="132" text-anchor="end">r = 50.99</text>
+          <text x="200" y="228" text-anchor="middle" class="small">horizontal = 44.16</text>
+          <text x="302" y="145" text-anchor="end">y = 25.49</text>
+          <text x="20" y="280" class="small">el = atan2(y, horizontal) = atan2(25.49, 44.16) = 30°</text>
+          <text x="20" y="300" class="small">rotation.x = −el：绕 X 轴低头 30°</text>
+
+          <line x1="380" y1="10" x2="380" y2="304" class="line dash" />
+
+          <text x="410" y="22" class="title">俯视：从 +Y 往下看</text>
+          <line x1="575" y1="160" x2="735" y2="160" class="line" />
+          <text x="740" y="164">+X</text>
+          <line x1="575" y1="160" x2="575" y2="252" class="line" />
+          <text x="582" y="254">+Z</text>
+          <circle cx="575" cy="160" r="4" class="tip" />
+          <text x="566" y="150" text-anchor="end" class="small">目标</text>
+          <line x1="575" y1="160" x2="690" y2="226" class="line" />
+          <line x1="690" y1="226" x2="690" y2="160" class="line dash" />
+          <text x="632" y="152" text-anchor="middle" class="small">x = 38.24</text>
+          <text x="696" y="196" class="small">z = 22.08</text>
+          <circle cx="690" cy="226" r="5" class="tip accent" />
+          <text x="698" y="244" class="accent">相机</text>
+          <path d="M690 226 L648 202" class="line accent" marker-end="url(#f2a)" />
+          <path d="M575 200 A40 40 0 0 0 609.6 180" class="line" />
+          <text x="590" y="222">az = 60°</text>
+          <text x="410" y="280" class="small">az = atan2(x, z) = atan2(38.24, 22.08) = 60°</text>
+          <text x="410" y="300" class="small">rotation.y = az：绕 Y 轴转身 60°</text>
+        </svg>
+      </div>
+      <figcaption>图 2　同一台相机的两个视图：方位角 az = 60°、仰角 el = 30°、距离 50.99（和第 25 课 5.2 节的卡片是同一个朝向），相机在 [38.24, 35.49, 22.08]。x、y、z 都是「相机位置 − 目标」。方位角从 +Z 往 +X 量，仰角从水平面往上量。</figcaption>
+    </figure>
+    <p>
+      拖动只是在 az、el 上加减，滚轮只是把 distance 乘上一个倍数。three.js 的 Spherical 也用这三个数，只是竖直方向量的是 phi：从 +Y 往下量，phi = 90° − el；theta = atan2(x, z)，和这里的方位角一样（<a data-src="node_modules/three/src/math/Spherical.js:114">Spherical.js:114–126</a>）。
+    </p>
+
+    <h3 id="s2-2">2.2 第 1 版：控制器自己记住三个角</h3>
+    <p>最直接的写法：挂载时把相机位置换成三个角，以后每次拖动就在角上加减，再换回位置。</p>
+    <pre><code>// 第 1 版：控制器自己记住三个数，每次拖动在这三个数上加减，然后改相机的位置
+function createOrbitV1(target: Vec3Tuple, firstCamera: OrbitCamera): OrbitVersion {
+  // 挂载时读一次相机位置，换成球坐标。HW2 的初始相机在 [0, 20, 50]，目标是 [0, 10, 0]：
+  const p = firstCamera.transform.position
+  const x = p[0] - target[0] // 0
+  const y = p[1] - target[1] // 10
+  const z = p[2] - target[2] // 50
+  const radius = Math.hypot(x, y, z) // 50.99：到目标的距离
+  let azimuth = Math.atan2(x, z) // 0：水平面上，从 +Z 方向转过的角（方位角）
+  let elevation = Math.atan2(y, Math.hypot(x, z)) // 0.1974 rad = 11.31°：高出水平面的角（仰角）
+
+  return {
+    drag(camera, dx, dy, canvasHeight) {
+      // 拖满一个 canvas 高度 = 转一整圈 2π；600 px 高的 canvas，拖 150 px 转 90°
+      const radiansPerPixel = (2 * Math.PI) / canvasHeight
+      azimuth -= dx * radiansPerPixel // 向右拖：方位角变小
+      elevation += dy * radiansPerPixel // 向下拖：仰角变大，相机升高
+
+      // 球坐标 → 直角坐标：高度是 r·sin(仰角)；水平那一圈的半径是 r·cos(仰角)，
+      // 再按方位角分到 x（sin）和 z（cos）上
+      const ring = radius * Math.cos(elevation)
+      camera.transform.setPosition([
+        target[0] + ring * Math.sin(azimuth),
+        target[1] + radius * Math.sin(elevation),
+        target[2] + ring * Math.cos(azimuth)
+      ])
+      // 只改了位置，相机的朝向 rotation 还是挂载前的样子
+    }
+  }
+}</code></pre>
+    <div id="lab-v1"></div>
+
+    <h3 id="s2-3">2.3 第 2 版：再让相机转头</h3>
+    <p>按第 25 课 5.2 节，补上一行 setRotation。目标回到了画面中央。可 HW2 还有一个情况：切换预设时，HW2SceneController 会建一个新 Scene、一台新 Camera（<a data-src="src/scenes/games202/hw2/createHW2Scene.ts:373">createHW2Scene.ts:373–382</a>），位置又是 [0, 20, 50]。</p>
+    <pre><code>// 第 2 版：在第 1 版上加一行，让相机转头看向目标
+function createOrbitV2(target: Vec3Tuple, firstCamera: OrbitCamera): OrbitVersion {
+  const p = firstCamera.transform.position
+  const x = p[0] - target[0]
+  const y = p[1] - target[1]
+  const z = p[2] - target[2]
+  const radius = Math.hypot(x, y, z)
+  let azimuth = Math.atan2(x, z) // 只在挂载时从 firstCamera 读这一次
+  let elevation = Math.atan2(y, Math.hypot(x, z))
+
+  return {
+    drag(camera, dx, dy, canvasHeight) {
+      const radiansPerPixel = (2 * Math.PI) / canvasHeight
+      azimuth -= dx * radiansPerPixel
+      elevation += dy * radiansPerPixel
+      const ring = radius * Math.cos(elevation)
+      camera.transform.setPosition([
+        target[0] + ring * Math.sin(azimuth),
+        target[1] + radius * Math.sin(elevation),
+        target[2] + ring * Math.cos(azimuth)
+      ])
+      // 新增：先绕 X 低头 elevation，再绕 Y 转 azimuth（第 25 课 5.2 节）
+      camera.transform.setRotation([-elevation, azimuth, 0])
+    }
+  }
+}</code></pre>
+    <div id="lab-v2"></div>
+
+    <h3 id="s2-4">2.4 第 3 版：每次都从相机现在的位置重新算</h3>
+    <p>
+      问题出在控制器自己存了一份角度，而相机的真实位置会被别人改：换预设、工厂设初始取景、以后还可能有动画。第 3 版不存角度，每次拖动都先读相机现在的位置。three.js 也是这样做的：update() 一开头就从 camera.position 重新算出 spherical（<a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:597">OrbitControls.js:597–607</a>），所以它的文档说，手动改过相机位置以后调用一次 update() 就行（<a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:71">:71–73</a>）。
+    </p>
+    <pre><code>// 第 3 版：控制器不记角度。每次拖动都从相机「现在」的位置重新算
+function createOrbitV3(target: Vec3Tuple): OrbitVersion {
+  return {
+    drag(camera, dx, dy, canvasHeight) {
+      // 现在的位置：也许刚换了一台新相机，也许被别的代码改过，都以它为准
+      const p = camera.transform.position
+      const x = p[0] - target[0]
+      const y = p[1] - target[1]
+      const z = p[2] - target[2]
+      const horizontal = Math.hypot(x, z) // 在水平面上离目标多远
+      const radius = Math.hypot(horizontal, y)
+
+      const radiansPerPixel = (2 * Math.PI) / canvasHeight
+      const azimuth = Math.atan2(x, z) - dx * radiansPerPixel
+      const elevation = Math.atan2(y, horizontal) + dy * radiansPerPixel // 还没有上下限
+
+      const ring = radius * Math.cos(elevation)
+      camera.transform.setPosition([
+        target[0] + ring * Math.sin(azimuth),
+        target[1] + radius * Math.sin(elevation),
+        target[2] + ring * Math.cos(azimuth)
+      ])
+      camera.transform.setRotation([-elevation, azimuth, 0])
+    }
+  }
+}</code></pre>
+    <div id="lab-v3"></div>
+
+    <h3 id="s2-5">2.5 真实代码：再加上下限和两道检查</h3>
+    <p>真实的 applyOrbit 比第 3 版多了三样：仰角有上下限；相机正好在目标上时有退路；写进 Transform 之前查一次 Float32。滚轮也用它（参数 zoom）。</p>
+    <pre><code>// mountOrbitCameraInput.ts:36–38、:132–164（注释是课程加的）
+// minDistance、maxDistance 是挂载时从 options 复制的（:67–68）
+const TWO_PI = 2 * Math.PI
+// 仰角的上下限：离正上方、正下方各留 0.001 rad（约 0.057°）
+const MAX_ELEVATION = Math.PI / 2 - 0.001
+
+function applyOrbit(
+  camera: Camera,
+  azimuthDelta: number, // 这一次加多少方位角（弧度）
+  elevationDelta: number, // 这一次加多少仰角（弧度）
+  zoom: number // 距离乘上几倍；拖动时传 1
+): void {
+  // 目标点：这台相机平移过就用它自己的，否则用挂载时复制的 initialTarget（:66）
+  // 这一行是 10 月 8 日课后加的，配合右键平移（3.6 节）
+  const target = targets.get(camera) ?? initialTarget
+  // ① 读：相机现在在哪（第 3 版的做法）
+  const position = camera.transform.position
+  const x = position[0] - target[0]
+  const y = position[1] - target[1]
+  const z = position[2] - target[2]
+  const horizontal = Math.hypot(x, z)
+  const distance = Math.hypot(horizontal, y)
+  if (!Number.isFinite(distance)) return // 位置里已经有 NaN 或 Infinity：什么都不写
+
+  // ② 算：新的距离、方位角、仰角
+  // 相机正好在目标上时 distance 是 0，0 乘几倍都是 0，所以改用 minDistance
+  const radius = clamp((distance || minDistance) * zoom, minDistance, maxDistance)
+  const azimuth = (Math.atan2(x, z) + azimuthDelta) % TWO_PI // % 只是不让数越转越大
+  const elevation = clamp(
+    Math.atan2(y, horizontal) + elevationDelta,
+    -MAX_ELEVATION, // 新增：仰角有上下限
+    MAX_ELEVATION
+  )
+
+  // ③ 球坐标 → 直角坐标（和前三版同一组公式）
+  const ringRadius = radius * Math.cos(elevation)
+  const next: Vec3Tuple = [
+    target[0] + ringRadius * Math.sin(azimuth),
+    target[1] + radius * Math.sin(elevation),
+    target[2] + ringRadius * Math.cos(azimuth)
+  ]
+  // ④ 写之前再查：Transform 按 Float32 存，3.5e38 存进去就成了 Infinity（第 8 课）
+  if (!next.every((value) =&gt; Number.isFinite(Math.fround(value)))) return
+  camera.transform.setPosition(next)
+  camera.transform.setRotation([-elevation, azimuth, 0]) // 第 25 课 5.2 节：先低头，再转身
+}</code></pre>
+    <div id="lab-final"></div>
+    <p>
+      上下限为什么离 90° 留 0.001 rad，而 three.js 只留 10<sup>−6</sup>（<a data-src="node_modules/three/src/math/Spherical.js:84">Spherical.js:84–88</a>）？上面第二张卡片给出了原因：本项目的 Transform 按 Float32 存位置，three.js 的 Vector3 用的是 JS 的 Float64。离头顶越近，偏移的水平分量越小，小到比目标坐标的 Float32 精度还小时，加到目标坐标上就被舍掉了，下一次就读不出方位角。代码注释只写了「保持确定的水平朝向」，没有点明 Float32，这是我按实测推出来的。
+    </p>
+
+    <h3 id="s2-6">2.6 速度和方向：和 three.js 一模一样</h3>
+    <p>
+      每像素转多少：<code>2π × rotateSpeed ÷ canvas 的 CSS 高度</code>（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:276">mountOrbitCameraInput.ts:276</a>）。three.js 用的是同一个式子，连「用高度、不用宽度」都一样，源码里还特意注了一句「yes, height」（<a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:1018">OrbitControls.js:1018–1020</a>）。用高度，宽屏和竖屏的手感就一样；用 CSS 像素而不用 drawing buffer 的像素，DPR 为 2 的屏幕上也不会转得快一倍。
+    </p>
+    <p>
+      方向也一样：向右拖，方位角变小（three.js 的 <code>_rotateLeft</code> 是 theta 减去角度，<a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:853">:853–863</a>）；向下拖，仰角变大，相机升高。我在 Node 里用同一串事件分别驱动两边（canvas 高 600 px）：
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>依次做</th><th>本项目的 position</th><th>three.js 的 position</th></tr></thead>
+      <tbody>
+        <tr><td>向右拖 150 px</td><td>[−50.0000, 20.0000, 0.0000]</td><td>[−50.0000, 20.0000, 0.0000]</td></tr>
+        <tr><td>再向下拖 100 px</td><td>[−16.3397, 58.3013, 0.0000]</td><td>[−16.3397, 58.3013, 0.0000]</td></tr>
+        <tr><td>再向上拖 600 px（撞到下限）</td><td>[−0.0510, −40.9902, 0.0000]</td><td>[−0.0001, −40.9902, 0.0000]</td></tr>
+      </tbody>
+    </table></div>
+    <p>前两行到小数点后 4 位都一样。第三行的差别只来自两边上下限留的余量不同（0.001 和 10<sup>−6</sup>）。第 5 节有一个自由组合，可以在你的浏览器里重跑。</p>
+
+    <h3 id="s2-7">2.7 滚轮：乘法，不是加法</h3>
+    <pre><code>// mountOrbitCameraInput.ts:296–306（注释是课程加的）
+function onWheel(event: WheelEvent): void {
+  if (closed || !Number.isFinite(event.deltaY) || event.deltaY === 0) return
+  const camera = getCamera()
+  if (camera === null) return // 场景还没装好，或者已经离开 HW2
+  if (drag !== null &amp;&amp; camera !== drag.camera) endDrag() // 拖着拖着换了相机：旧手势作废
+  // deltaY 的单位看 deltaMode：0 是像素；1 是行，按 16 px 算；2 是页，按 canvas 高度算
+  const unit =
+    event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? Math.max(1, canvas.clientHeight) : 1
+  // 指数缩放：deltaY = 100 时 e^0.1 = ×1.105；反方向一格 e^−0.1 = ×0.905，正好抵消
+  const zoom = Math.exp(clamp(event.deltaY * unit * zoomSpeed, -50, 50))
+  applyOrbit(camera, 0, 0, zoom)
+  event.preventDefault() // 不让页面跟着滚。要生效，注册时就得写 passive: false
+}</code></pre>
+    <div id="lab-zoom"></div>
+    <p>
+      three.js 也是乘法，只是底数不同：一格的倍数是 0.95<sup>0.01 × |deltaY| × zoomSpeed</sup>（<a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:846">OrbitControls.js:846–851</a>）。deltaY = 100 时是 ×1.0526，本项目是 ×1.1052，所以 §0 里滚一格两边的距离不一样。按指数换算，three.js 的 zoomSpeed = 1 相当于这里的 zoomSpeed = 0.000513。deltaMode 的处理也有一处不同：一页，three.js 按 100 px 算，这里按 canvas 高度算；另外 three.js 把按着 Ctrl 的滚轮（触控板捏合）放大 10 倍（<a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:1417">:1417–1446</a>），这里没有。
+    </p>
+
+    <h2 id="s3">3. 输入事件</h2>
+
+    <h3 id="s3-1">3.1 pointer 事件速成</h3>
+    <p>鼠标、手指、手写笔都发同一套事件：按下 <code>pointerdown</code> → 移动若干次 <code>pointermove</code> → 松开 <code>pointerup</code>，或者被浏览器收走 <code>pointercancel</code>。代码读了事件上的这几个字段：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>字段</th><th>含义</th><th>这里怎么用</th></tr></thead>
+      <tbody>
+        <tr><td>pointerId</td><td>每个指针一个号码；每根手指各一个</td><td>只认按下的那一个（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:257">:257</a>）</td></tr>
+        <tr><td>isPrimary</td><td>是不是主指针：鼠标、第一根手指</td><td>第二根手指不开始拖动（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:234">:234</a>）</td></tr>
+        <tr><td>button</td><td>这次是哪个键变了：0 左键，2 右键</td><td>左键（单指）开始旋转；鼠标右键开始平移（:235–241，3.6 节）；别的键不管</td></tr>
+        <tr><td>buttons</td><td>此刻按着哪些键，按位记：左键是 1，右键是 2</td><td>移动时，开始这次拖动的那个键已经不在（旋转看左键，平移看右键），说明 pointerup 丢了（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:260">:260–267</a>）</td></tr>
+        <tr><td>clientX / clientY</td><td>指针位置，单位是 CSS 像素</td><td>算 dx、dy（:268–269）</td></tr>
+        <tr><td>pointerType</td><td>'mouse'、'touch'、'pen'</td><td>buttons 的检查只对鼠标做（:263）；平移只认鼠标右键（:238）</td></tr>
+      </tbody>
+    </table></div>
+    <p>另外三个浏览器机制：</p>
+    <ul>
+      <li><strong>pointer capture</strong>：<code>setPointerCapture(id)</code> 以后，这个指针的事件都改送到这个元素，直到 pointerup 或 releasePointerCapture；pointerId 不是一个活着的指针时抛 NotFoundError（MDN）。没有它，拖出 canvas 以后 pointermove 就送到别的元素去了，在外面松手也收不到。</li>
+      <li><strong>touch-action: none</strong>：浏览器不再拿触摸手势去滚动、缩放页面。不设的话，浏览器一接手这个触摸，就给你发 pointercancel（MDN touch-action）。</li>
+      <li><strong>passive: false</strong>：只有非被动的监听里，preventDefault 才有效。wheel 监听挂在 window、document、documentElement、body 上时默认是被动的，挂在 canvas 上默认不是（MDN addEventListener）。这里明写 passive: false，读代码的人一眼就知道这个监听会 preventDefault。</li>
+    </ul>
+
+    <h3 id="s3-2">3.2 一次拖动的记录</h3>
+    <pre><code>// mountOrbitCameraInput.ts:27–34、:233–284、:108–119（注释是课程加的）
+interface DragState {
+  readonly pointerId: number // 哪个指针：鼠标、哪根手指
+  readonly camera: Camera // 按下那一刻的相机
+  readonly mode: 'rotate' | 'pan' // 课后新增：这次是旋转还是平移，中途按别的键也不换
+  x: number // 上一个事件的 clientX（CSS 像素）
+  y: number
+}
+
+function onPointerDown(event: PointerEvent): void {
+  // 已经卸载、已经在拖、不是主指针（第二根手指）：都不管
+  if (closed || drag !== null || !event.isPrimary) return
+  // 左键（或单指）旋转；鼠标右键平移；别的键不管
+  const mode =
+    event.button === 0
+      ? 'rotate'
+      : event.button === 2 &amp;&amp; event.pointerType === &#x27;mouse&#x27;
+        ? 'pan'
+        : null
+  if (mode === null) return
+  const camera = getCamera()
+  if (camera === null) return
+  // 平移只支持透视相机；panSpeed 为 0 表示关掉平移
+  if (mode === 'pan' &amp;&amp; (!(camera instanceof PerspectiveCamera) || panSpeed === 0)) return
+  try {
+    canvas.setPointerCapture(event.pointerId) // 之后这个指针的事件都送到 canvas，拖出画布也一样
+  } catch {
+    return // 指针已失效，或 canvas 已不在文档里：不开始一个结束不了的手势
+  }
+  drag = { pointerId: event.pointerId, camera, mode, x: event.clientX, y: event.clientY }
+  event.preventDefault()
+}
+
+function onPointerMove(event: PointerEvent): void {
+  if (closed || event.pointerId !== drag?.pointerId) return // 不是这次拖动的指针
+  const camera = getCamera()
+  // buttons 按位记：左键 1、右键 2。旋转要左键还按着，平移要右键还按着
+  const requiredButtons = drag.mode === 'pan' ? 2 : 1
+  // 相机已经换了；或者那个键其实早就松开了（pointerup 没送到这里）：结束这次拖动
+  if (
+    camera !== drag.camera ||
+    (event.pointerType === &#x27;mouse&#x27; &amp;&amp; (event.buttons &amp; requiredButtons) === 0)
+  ) {
+    endDrag()
+    return
+  }
+  const dx = event.clientX - drag.x // 和上一个事件比，不是和按下时比
+  const dy = event.clientY - drag.y
+  drag.x = event.clientX
+  drag.y = event.clientY
+  if (!Number.isFinite(dx) || !Number.isFinite(dy) || (dx === 0 &amp;&amp; dy === 0)) return
+  if (drag.mode === 'pan') {
+    applyPan(camera, dx, dy) // 3.6 节
+  } else {
+    // 用 CSS 高度，不用 drawing buffer 的像素：高 DPR 屏幕上手感不变
+    const radiansPerPixel = (TWO_PI * rotateSpeed) / Math.max(1, canvas.clientHeight)
+    applyOrbit(camera, -dx * radiansPerPixel, dy * radiansPerPixel, 1)
+  }
+  event.preventDefault()
+}
+
+function onPointerEnd(event: PointerEvent): void {
+  // pointerup、pointercancel、lostpointercapture 共用这一个函数
+  if (event.pointerId === drag?.pointerId) endDrag()
+}
+
+function endDrag(): void {
+  const previous = drag
+  drag = null // 先清空。即使下面引发 lostpointercapture 又进到这里，也只看到 null
+  if (previous === null) return
+  try {
+    if (canvas.hasPointerCapture(previous.pointerId)) {
+      canvas.releasePointerCapture(previous.pointerId)
+    }
+  } catch {
+    // 指针已经失效：本地手势照样算结束，不再留着旧 Camera 的引用
+  }
+}</code></pre>
+    <p>
+      注意 dx 是和<strong>上一个</strong>事件比，不是和按下时比。每个 pointermove 都在相机现在的位置上再转一小步，配合第 3 版「每次重新读位置」，中途有人改了相机也不会跳。
+    </p>
+
+    <h3 id="s3-3">3.3 「当前相机」：不传相机，传怎样找到它</h3>
+    <pre><code>// setup.ts:124–128、:146–151（注释是课程加的）
+const stopOrbit = mountOrbitCameraInput(
+  ctx.gl.canvas as HTMLCanvasElement,
+  // 不传相机，传「怎样找到现在的相机」：每个事件都问一次 Engine 当前装着哪一台
+  () =&gt; (active &amp;&amp; !closed ? (ctx.engine.currentSceneBinding?.camera ?? null) : null),
+  // target 要和 createHW2Scene 的初始朝向一致；panSpeed 是右键平移的灵敏度（3.6 节）
+  { target: [0, 10, 0], minDistance: 1, maxDistance: 300, panSpeed: 0.8 }
+)
+
+// ……离开 HW2 时切换器调用这个函数：
+return () =&gt; {
+  active = false // 先让 getCamera 交回 null
+  stopOrbit() // 再摘监听：即使下一行清理设备失败，也不会再有人改退出中的相机
+  session.dispose()
+}</code></pre>
+    <p>
+      OrbitControls 在构造时记下相机（<a data-src="node_modules/three/src/extras/Controls.js:26">Controls.js:26</a>，this.object），以后一直控制这一台。旧路径从头到尾只有一台相机，没有问题；HW2 每个预设都是一台新相机，用 three.js 的写法就得每次重建 controls，或者改 controls.object 再 update()。项目的选择是不记相机，每个事件都问一次 Engine。DragState 里记的 camera 只用来认出「拖到一半换了相机」。
+    </p>
+    <div id="lab-events"></div>
+
+    <h3 id="s3-4">3.4 什么时候结束一次拖动</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>发生了什么</th><th>为什么要结束</th></tr></thead>
+      <tbody>
+        <tr><td>pointerup</td><td>正常松手</td></tr>
+        <tr><td>pointercancel</td><td>浏览器收走了这个指针，比如触摸被拿去滚动页面</td></tr>
+        <tr><td>lostpointercapture</td><td>捕获被别的元素拿走，或者被浏览器撤销</td></tr>
+        <tr><td>window 的 blur</td><td>切到别的窗口以后，松手事件可能根本送不到页面</td></tr>
+        <tr><td>webglcontextlost</td><td>画面已经没了，手势不该延续到恢复以后</td></tr>
+        <tr><td>pointermove 时 buttons 里没有开始拖动的那个键（旋转看左键，平移看右键）</td><td>在别处松了手，pointerup 丢了</td></tr>
+        <tr><td>pointermove 时相机换了</td><td>旧相机已经不归这次拖动管</td></tr>
+        <tr><td>卸载</td><td>不再留着任何相机的引用</td></tr>
+      </tbody>
+    </table></div>
+    <p>endDrag 先把 drag 设成 null，再交还捕获。交还时浏览器可能派发 lostpointercapture，又一次调进 onPointerEnd → endDrag；那时 drag 已经是 null，直接返回，不会交还两次。</p>
+
+    <h3 id="s3-5">3.5 挂载和卸载</h3>
+    <pre><code>// 挂载、卸载：mountOrbitCameraInput.ts:308–334（注释是课程加的）
+canvas.style.touchAction = &#x27;none&#x27; // 触屏拖动不再被浏览器拿去滚动、缩放页面
+canvas.addEventListener(&#x27;pointerdown&#x27;, onPointerDown)
+canvas.addEventListener(&#x27;pointermove&#x27;, onPointerMove) // 一直挂着，靠 pointerId 过滤
+canvas.addEventListener(&#x27;pointerup&#x27;, onPointerEnd)
+canvas.addEventListener(&#x27;pointercancel&#x27;, onPointerEnd)
+canvas.addEventListener(&#x27;lostpointercapture&#x27;, onPointerEnd)
+canvas.addEventListener(&#x27;wheel&#x27;, onWheel, { passive: false })
+canvas.addEventListener(&#x27;contextmenu&#x27;, onContextMenu) // 课后新增：右键不弹菜单
+canvas.addEventListener(&#x27;webglcontextlost&#x27;, endDrag) // 只结束手势；context 本身归 Backend 管
+hostWindow?.addEventListener(&#x27;blur&#x27;, endDrag) // 切走窗口时，松手事件可能送不到
+
+return () =&gt; {
+  if (closed) return // 幂等：调两次也只做一次
+  closed = true
+  canvas.removeEventListener(&#x27;pointerdown&#x27;, onPointerDown) // 同一个函数对象才摘得掉（第 23 课）
+  // ……其余 7 个 removeEventListener……
+  hostWindow?.removeEventListener(&#x27;blur&#x27;, endDrag)
+  endDrag()
+  canvas.style.touchAction = previousTouchAction // 还原挂载前的值，不是写死 &#x27;auto&#x27;
+}</code></pre>
+    <p>
+      挂载之前先验证配置（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:66">:66–86</a>）：target 必须是三个 Float32 下有限的数，最小距离大于 0，最大距离不小于最小距离，三个速度（旋转、平移、缩放）都不能是负数。不合格就抛 RangeError，这时还没有改 touchAction、没有挂任何监听，不会留下挂了一半的东西。和 three.js 比有两点不同：OrbitControls 只在按下以后才挂 pointermove 和 pointerup，松手就摘（<a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:1459">OrbitControls.js:1459–1462</a>、:1510–1513），这里一直挂着、靠 pointerId 过滤；OrbitControls 卸载时把 touchAction 写成 'auto'（<a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:497">:497</a>），这里还原成挂载前的值。
+    </p>
+    <div id="lab-mount"></div>
+
+    <h3 id="s3-6">3.6 课后新增：右键平移</h3>
+    <aside class="note"><strong>10 月 12 日补</strong>：这一课写完以后（10 月 8 日下午），你给 mountOrbitCameraInput 加了右键平移。上面各节的节选和行号已经换成现在的代码；第 0 节和各张卡片用的包也重新打过，跑的是带平移的版本。这一节只讲新增的部分。</aside>
+    <p>
+      <strong>需求。</strong>旋转和缩放都绕着同一个目标点 target。想看 Mary 的手、看地板的一角，就得把这个点挪过去。平移要做的事：相机和 target 一起，沿着屏幕的「右」和「上」挪同样的距离。两者之差不变，所以朝向、距离都不变，画面像被手拖着走。
+    </p>
+    <p>
+      <strong>拖 1 像素该挪多远。</strong>目标在相机前方 d 处时，那个距离上能看见的高度是 <code>2 × d × tan(fovY / 2)</code>，它铺满 canvas 的 CSS 高度。用 HW2 的初始值算：相机在 [0, 20, 50]，target 在 [0, 10, 0]，d = √(10² + 50²) = 50.9902；fovY = π/4，可见高度 = 2 × 50.9902 × tan(π/8) = 42.2417。canvas 高 600 px、panSpeed = 0.8 时，每像素挪 42.2417 × 0.8 ÷ 600 = 0.05632。横竖用同一个比例，不再乘 aspect。
+    </p>
+    <pre><code>// mountOrbitCameraInput.ts:184–230（节选；注释是课程加的）
+function applyPan(camera: Camera, dx: number, dy: number): void {
+  // 要用 fovY，所以只支持透视相机
+  if (!(camera instanceof PerspectiveCamera) || panSpeed === 0) return
+  const target = targets.get(camera) ?? initialTarget
+  const position = camera.transform.position
+  const distance = Math.hypot(
+    position[0] - target[0],
+    position[1] - target[1],
+    position[2] - target[2]
+  )
+  // 每像素挪多远：可见高度 × panSpeed ÷ canvas 的 CSS 高度
+  const unitsPerPixel =
+    (2 * distance * Math.tan(camera.fovY / 2) * panSpeed) / Math.max(1, canvas.clientHeight)
+  if (!Number.isFinite(unitsPerPixel) || unitsPerPixel === 0) return
+
+  // 局部矩阵的第 0 列是相机的「右」，第 1 列是相机的「上」（第 25 课）
+  camera.transform.copyLocalMatrixTo(panLocalMatrix)
+  const rightLength = Math.hypot(panLocalMatrix[0]!, panLocalMatrix[1]!, panLocalMatrix[2]!)
+  const upLength = Math.hypot(panLocalMatrix[4]!, panLocalMatrix[5]!, panLocalMatrix[6]!)
+  // …（省略：长度不是有限正数就返回，:200–206）
+
+  // 鼠标向右（dx &gt; 0）→ 相机向左挪，画面里的东西跟着鼠标向右走；向下同理
+  const horizontal = (-dx * unitsPerPixel) / rightLength
+  const vertical = (dy * unitsPerPixel) / upLength
+  // 先算出真正会写进 Transform 的 Float32 位置
+  const nextPosition: Vec3Tuple = [
+    Math.fround(
+      position[0] + horizontal * panLocalMatrix[0]! + vertical * panLocalMatrix[4]!
+    ),
+    Math.fround(
+      position[1] + horizontal * panLocalMatrix[1]! + vertical * panLocalMatrix[5]!
+    ),
+    Math.fround(
+      position[2] + horizontal * panLocalMatrix[2]! + vertical * panLocalMatrix[6]!
+    )
+  ]
+  // target 跟着「实际挪了多少」走：被 Float32 舍掉的微小拖动，target 也不动
+  const nextTarget: Vec3Tuple = [
+    target[0] + (nextPosition[0] - position[0]),
+    target[1] + (nextPosition[1] - position[1]),
+    target[2] + (nextPosition[2] - position[2])
+  ]
+  // …（省略：两者都是有限数才提交，:222–226）
+  camera.transform.setPosition(nextPosition)
+  targets.set(camera, nextTarget)       // 这台相机从此用自己的 target
+}</code></pre>
+    <p>按上面的数跑一遍（Node 里用重建后的包，假 canvas 高 600 px）：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>依次做</th><th>相机 position</th><th>target</th></tr></thead>
+      <tbody>
+        <tr><td>开始</td><td>[0, 20, 50]</td><td>[0, 10, 0]</td></tr>
+        <tr><td>右键向右拖 100 px</td><td>[−5.6322, 20, 50]</td><td>[−5.6322, 10, 0]</td></tr>
+        <tr><td>再左键向右拖 150 px（转 1/4 圈）</td><td>[−55.6322, 20, 0]</td><td>[−5.6322, 10, 0]</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      第二行：相机初始只低头、没有转身，它的「右」就是世界的 +X，所以只有 x 变了，挪了 100 × 0.05632 = 5.632。第三行和 2.6 节表里的第一行比：没平移时转 1/4 圈到 [−50, 20, 0]，现在整个圆挪到了新的 target 周围。这就是 applyOrbit 第一行改成 <code>targets.get(camera) ?? initialTarget</code> 的原因（2.5 节）。
+    </p>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>target 存在哪</th><td>一个 <code>WeakMap&lt;Camera, Vec3Tuple&gt;</code>（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:93">:93–100</a>）。只有平移过的相机才有记录；预设切换造出的新相机查不到，就用挂载时复制的 initialTarget，不会继承旧相机的偏移。WeakMap 不拦着退出的相机被回收。</td></tr>
+      <tr><th>为什么只认鼠标右键</th><td>触屏没有右键，双指手势这一版不做（:10）。按下时就定好这次是旋转还是平移（DragState.mode），中途按别的键也不换（3.2 节）。</td></tr>
+      <tr><th>右键菜单</th><td>挂载期间 canvas 上的 contextmenu 被 preventDefault，卸载后恢复（:286–289、:315）。</td></tr>
+      <tr><th>和 three.js 比</th><td>OrbitControls 的右键平移也按「target 处的可见高度 ÷ canvas 高度」换算，并且也同时挪 position 和 target。它还支持按住 Shift/Ctrl 用左键平移、键盘平移、只在地面上平移（screenSpacePanning = false），这里都没有。</td></tr>
+    </table></div>
+
+    <h2 id="s4">4. 谁来重画：为什么没有 update()</h2>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 200" role="img" aria-label="两帧之间来了三个 pointermove，每个都只改 Transform、让 version 加 2；下一帧 Builder 读相机时 world 矩阵只重算一次">
+          <defs>
+            <marker id="f3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+            <marker id="f3b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <line x1="40" y1="150" x2="730" y2="150" class="line" marker-end="url(#f3a)" />
+          <line x1="40" y1="144" x2="40" y2="156" class="line" />
+          <text x="40" y="172" text-anchor="middle" class="small">上一帧画完</text>
+          <line x1="600" y1="144" x2="600" y2="156" class="line" />
+          <text x="600" y="172" text-anchor="middle" class="small">约 16.7 ms 后，下一帧</text>
+          <g>
+            <line x1="120" y1="40" x2="120" y2="150" class="line dash" />
+            <text x="120" y="32" text-anchor="middle">pointermove</text>
+            <text x="126" y="112" class="small">version 7 → 9</text>
+            <line x1="250" y1="40" x2="250" y2="150" class="line dash" />
+            <text x="250" y="32" text-anchor="middle">pointermove</text>
+            <text x="256" y="112" class="small">9 → 11</text>
+            <line x1="380" y1="40" x2="380" y2="150" class="line dash" />
+            <text x="380" y="32" text-anchor="middle">pointermove</text>
+            <text x="386" y="112" class="small">11 → 13</text>
+          </g>
+          <text x="250" y="192" text-anchor="middle" class="small">每个 pointermove：applyOrbit → setPosition、setRotation，只记 dirty，不算矩阵</text>
+          <rect x="520" y="40" width="190" height="84" rx="4" class="box hl" />
+          <text x="615" y="62" text-anchor="middle">rAF：Engine.loop</text>
+          <text x="615" y="82" text-anchor="middle" class="small">Builder.copyWorldMatrixTo</text>
+          <text x="615" y="100" text-anchor="middle" class="small">看到 version 13，重算 1 次</text>
+          <text x="615" y="116" text-anchor="middle" class="small">求逆 → view → draw</text>
+          <path d="M600 124 L600 142" class="line accent" marker-end="url(#f3b)" />
+        </svg>
+      </div>
+      <figcaption>图 3　一次拖动从事件到画面。setPosition、setRotation 各让 version 加 1；world 矩阵等 Builder 来读时才算，两帧之间来几次事件都只算一次（第 8 课的懒更新）。图里的 version 数字只是示意。</figcaption>
+    </figure>
+    <p>
+      three.js 的 OrbitControls 有一个 update()：拖动的处理函数里会调用它（<a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:1024">OrbitControls.js:1024</a>），由它改位置、lookAt、移动超过阈值时派发 change 事件（:813–818，给「有变化才重画」的页面用）。打开阻尼或自动旋转时，还必须在每帧调用一次（:77）。旧路径的 Engine 就是每帧先 <code>cameraControls.update()</code> 再画（<a data-src="src/engine.ts:533">engine.ts:533</a>）。
+    </p>
+    <p>
+      项目的控制器没有 update()：事件里直接写 Transform，Engine 本来就有一条 rAF 链，下一帧照常画（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:59">mountOrbitCameraInput.ts:59</a>：「不引入第二条 rAF 链」）。HW2 路径的 <code>Engine.update</code> 是空的（<a data-src="src/engine.ts:282">engine.ts:282–289</a>）。代价是没有阻尼：要加的话，需要一个每帧都会被调用的地方，把剩下的角度一点点用掉，而现在 HW2 路径上还没有这样的地方。
+    </p>
+
+    <h2 id="s5">5. 架构视角：对照 three.js</h2>
+    <div class="table-scroll"><table>
+      <thead><tr><th></th><th>three.js r177 OrbitControls</th><th>本项目 mountOrbitCameraInput</th></tr></thead>
+      <tbody>
+        <tr><td>相机</td><td>构造时绑定一台</td><td>每个事件问一次当前相机</td></tr>
+        <tr><td>状态</td><td>target、spherical、sphericalDelta、scale、panOffset 等</td><td>只有 drag（pointerId、相机、上一个坐标）和 closed</td></tr>
+        <tr><td>每次换算的起点</td><td>相机现在的 position</td><td>相机现在的 position</td></tr>
+        <tr><td>转头</td><td>lookAt，存成四元数</td><td>算两个角，存成欧拉角</td></tr>
+        <tr><td>转速</td><td>2π × rotateSpeed ÷ 高度</td><td>同左</td></tr>
+        <tr><td>两极</td><td>留 10<sup>−6</sup>，另可设 min/maxPolarAngle</td><td>留 0.001，不可配置</td></tr>
+        <tr><td>缩放</td><td>0.95 的幂，可缩放到光标处</td><td>e 的幂，绕目标缩放</td></tr>
+        <tr><td>平移</td><td>右键、Shift/Ctrl + 左键、键盘都能平移</td><td>只有鼠标右键（10 月 8 日课后加的，3.6 节）</td></tr>
+        <tr><td>键盘、双指、阻尼、自动旋转</td><td>都有</td><td>都没有（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:10">:10</a> 写了不做双指和惯性）</td></tr>
+        <tr><td>重画</td><td>update() 和 change 事件；阻尼要每帧 update()</td><td>写 Transform，等 Engine 的下一帧</td></tr>
+        <tr><td>配置检查</td><td>不检查</td><td>挂载前检查，不合格什么都不改</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      「效果相似」来自三样相同的东西：每次从相机现在的位置换算球坐标；同样的「像素 → 弧度」式子；移动之后让相机对准目标。其余都是取舍：欧拉角还是四元数，绑定相机还是每次去问，要不要 update 循环。下面的自由组合在你的浏览器里，用假 canvas 把同一串事件分别交给两边：
+    </p>
+    <div id="lab-compare"></div>
+
+    <h2 id="s6">6. 审查视角</h2>
+    <ol>
+      <li>
+        <strong>手感和改造前的 HW2 不一样。</strong>改造前的 HW2 用 three.js 的 OrbitControls，rotateSpeed 是 0.3（HEAD 的 engine.ts 里 setupCamera 那段；现在旧路径还是这个值，<a data-src="src/engine.ts:112">engine.ts:112</a>）。新代码用默认值 1（<a data-src="src/gui/games202/setup.ts:127">setup.ts:127</a> 没传）。canvas 高 600 px 时拖 100 px：以前转 18°，现在转 60°，快了 3.3 倍。滚轮快了约 1.95 倍（2.7 节）。（写这课时右键平移也没了；课后你加回来了，panSpeed 和以前一样是 0.8，见 3.6 节。）在 §0 勾上「旧 HW2 的 rotateSpeed 0.3」，左右各拖一下就能感觉到。<br />
+        <strong>想一想：</strong>如果目标是和以前一样，setup.ts 要传哪两个数？如果新手感是故意的，这个决定该记在哪里，才不会被下一个人当成 bug 改回去？
+      </li>
+      <li>
+        <strong>目标点写在两个地方。</strong>setup.ts 的 target 是 [0, 10, 0]，createHW2Scene 的初始朝向 <code>−atan2(10, 50)</code> 也是按 [0, 10, 0] 算的，可两处之间没有任何联系，只有一句注释「target 与 createHW2Scene 的初始朝向一致」。下面的卡片演示改了其中一处会怎样。
+        <div id="lab-review"></div>
+        <strong>想一想：</strong>你会让哪一边成为唯一的来源？createHW2Scene 交回一个 orbitTarget，还是两边都从 hw2CPUSceneConfig 读同一个常量？
+      </li>
+      <li>
+        <strong>测试抓不住「相机倒过来」。</strong>两极那条测试（<a data-src="tests/unit/rendering/controls/mountOrbitCameraInput.test.ts:137">mountOrbitCameraInput.test.ts:137–152</a>）的注释说「不能翻转相机」，可它的断言只查了三样：位置 y &gt; 9、水平距离 &gt; 0、目标在画面中心（expectLookingAt，:76–84）。我把源码副本里的 MAX_ELEVATION 改成 π/2 + 0.08，打包后按这条测试的步骤跑：三条断言全部通过，而相机的上方 y = −0.080，画面是倒的。第 2.4 节的卡片也说明了：倒过来的相机照样能把目标放在正中。<br />
+        <strong>想一想：</strong>加哪一条断言就能抓住它？（提示：world 矩阵的哪一个分量是相机上方的 y？）
+      </li>
+      <li>
+        <strong>找茬题：</strong><a data-src="src/rendering/controls/mountOrbitCameraInput.ts:37">mountOrbitCameraInput.ts:37</a> 的注释给了限制仰角的两条理由。其中一条在这份实现里不成立。是哪一条？用第 25 课 5.2 节和 2.5 节的内容说明，并说说它在什么样的实现里才成立。
+      </li>
+    </ol>
+
+    <h2 id="s7">7. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0026"></div>
+
+    <h2 id="s8">8. 延伸阅读</h2>
+    <p>
+      <strong>首选（约 10 分钟）：</strong><a href="https://developer.mozilla.org/en-US/docs/Web/API/Pointer_events">MDN · Pointer events</a>（读「Pointer capture」和「touch-action CSS property」两节）；<a href="https://developer.mozilla.org/en-US/docs/Web/API/Element/setPointerCapture">MDN · setPointerCapture</a>。
+    </p>
+    <p>
+      补充：<a href="https://developer.mozilla.org/en-US/docs/Web/API/WheelEvent/deltaMode">MDN · WheelEvent.deltaMode</a>；<a href="https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/addEventListener">MDN · addEventListener</a> 的 passive 一段；three.js 的 <a data-src="node_modules/three/examples/jsm/controls/OrbitControls.js:597">OrbitControls.js 的 update()</a> 整段（:597–822）；项目文档 <a data-src="src/rendering/scene/docs/mesh-and-camera.zh-CN.md:1">mesh-and-camera.zh-CN.md</a> 和 <a data-src="src/rendering/docs/projection-matrix-float32-rationale.zh-CN.md:1">projection-matrix-float32-rationale.zh-CN.md</a>。
+    </p>
+
+    <aside class="ask">
+      做完告诉我：实验卡片和检查题各错了哪几题；审查视角的三个「想一想」和找茬题，直接在对话里回答。§0 里两边拖起来的感觉，以及勾上 rotateSpeed 0.3 以后你更喜欢哪一种，也告诉我。
+    </aside>
+
+    <div class="nav">
+      <a href="0025-camera-math.html">← 第 25 课（插课上篇）：相机的数学</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0016-geometry-and-vertex-input.html">第 16 课：GeometryManager 与顶点输入 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 26 课（插课下篇） · 2026-10-08</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        const R = window.RTeachCamera
+        const L = RTeach.orbitLab
+        const T = [0, 10, 0]
+        const DEG = Math.PI / 180
+
+        // ---------------- 课程版的第 1～3 版：和页面上展示的代码出自同一份 TS（esbuild 去掉类型） ----------------
+        function createOrbitV1(target, firstCamera) {
+          const p = firstCamera.transform.position;
+          const x = p[0] - target[0];
+          const y = p[1] - target[1];
+          const z = p[2] - target[2];
+          const radius = Math.hypot(x, y, z);
+          let azimuth = Math.atan2(x, z);
+          let elevation = Math.atan2(y, Math.hypot(x, z));
+          return {
+            drag(camera, dx, dy, canvasHeight) {
+              const radiansPerPixel = 2 * Math.PI / canvasHeight;
+              azimuth -= dx * radiansPerPixel;
+              elevation += dy * radiansPerPixel;
+              const ring = radius * Math.cos(elevation);
+              camera.transform.setPosition([
+                target[0] + ring * Math.sin(azimuth),
+                target[1] + radius * Math.sin(elevation),
+                target[2] + ring * Math.cos(azimuth)
+              ]);
+            }
+          };
+        }
+        function createOrbitV2(target, firstCamera) {
+          const p = firstCamera.transform.position;
+          const x = p[0] - target[0];
+          const y = p[1] - target[1];
+          const z = p[2] - target[2];
+          const radius = Math.hypot(x, y, z);
+          let azimuth = Math.atan2(x, z);
+          let elevation = Math.atan2(y, Math.hypot(x, z));
+          return {
+            drag(camera, dx, dy, canvasHeight) {
+              const radiansPerPixel = 2 * Math.PI / canvasHeight;
+              azimuth -= dx * radiansPerPixel;
+              elevation += dy * radiansPerPixel;
+              const ring = radius * Math.cos(elevation);
+              camera.transform.setPosition([
+                target[0] + ring * Math.sin(azimuth),
+                target[1] + radius * Math.sin(elevation),
+                target[2] + ring * Math.cos(azimuth)
+              ]);
+              camera.transform.setRotation([-elevation, azimuth, 0]);
+            }
+          };
+        }
+        function createOrbitV3(target) {
+          return {
+            drag(camera, dx, dy, canvasHeight) {
+              const p = camera.transform.position;
+              const x = p[0] - target[0];
+              const y = p[1] - target[1];
+              const z = p[2] - target[2];
+              const horizontal = Math.hypot(x, z);
+              const radius = Math.hypot(horizontal, y);
+              const radiansPerPixel = 2 * Math.PI / canvasHeight;
+              const azimuth = Math.atan2(x, z) - dx * radiansPerPixel;
+              const elevation = Math.atan2(y, horizontal) + dy * radiansPerPixel;
+              const ring = radius * Math.cos(elevation);
+              camera.transform.setPosition([
+                target[0] + ring * Math.sin(azimuth),
+                target[1] + radius * Math.sin(elevation),
+                target[2] + ring * Math.cos(azimuth)
+              ]);
+              camera.transform.setRotation([-elevation, azimuth, 0]);
+            }
+          };
+        }
+
+        // ---------------- 小工具 ----------------
+        const pose = (label, camera) => label + '：position ' + L.vec(camera.transform.position) + '，rotation ' + L.degVec(camera.transform.rotation)
+        const lineOf = (text, kind) => ({ text, kind })
+        const look = (camera) => {
+          const info = L.inspect(camera, T)
+          return '上方 ' + L.vec(info.up, 3) + '；目标在画面上：' + L.where(info)
+        }
+        /** 图 2 的位置：方位角 a、仰角 e、距离 r。 */
+        const orbitPoint = (a, e, r = 50.99, target = T) => {
+          const ring = r * Math.cos(e)
+          return [target[0] + ring * Math.sin(a), target[1] + r * Math.sin(e), target[2] + ring * Math.cos(a)]
+        }
+        const newCamera = (aspect = 1.5) => new R.PerspectiveCamera({ fovY: Math.PI / 4, aspect, near: 0.1, far: 1000 })
+        const distanceOf = (camera) => L.spherical(camera.transform.position, T).distance
+        const mountReal = (camera, canvas, options) =>
+          R.mountOrbitCameraInput(canvas, typeof camera === 'function' ? camera : () => camera, options || { target: T, minDistance: 1, maxDistance: 300 })
+
+        // ---------------- §0 并排画布 ----------------
+        L.viewer(document.getElementById('viewer'))
+
+        // ---------------- §2.2 第 1 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v1'),
+          storageKey: 'lesson-0026-v1',
+          cards: [
+            {
+              title: '§2.2 · 第 1 版：向右拖 150 px',
+              tags: ['第 1 版', '真实 PerspectiveCamera'],
+              question: 'canvas 高 600 px。用第 1 版向右拖 150 px，相机到哪里？目标在画面的哪里？',
+              choices: ['相机到 [−50, 20, 0]，目标跑出画面', '相机到 [−50, 20, 0]，目标仍在正中', '相机不动，只是画面转了 90°'],
+              answer: 0,
+              explain:
+                '位置算对了：方位角从 0 变成 −90°，相机绕到了目标的 −X 一侧。可是 rotation 还是 [−11.31°, 0, 0]，相机仍朝着原来的 −Z 方向，目标在它右手边将近 90° 的地方。只拖 40 px，目标就已经偏到 NDC x = 0.70。绕着转的同时，必须让相机转头。',
+              run: () => {
+                const camera = L.hw2Camera()
+                const orbit = createOrbitV1(T, camera)
+                orbit.drag(camera, 150, 0, 600)
+                const info = L.inspect(camera, T)
+                const other = L.hw2Camera()
+                createOrbitV1(T, other).drag(other, 40, 0, 600)
+                return {
+                  lines: [
+                    lineOf(pose('拖 150 px 之后', camera), 'server'),
+                    lineOf('前方 ' + L.vec(info.forward, 3) + '，和指向目标的方向差 ' + L.num(info.offAxisDeg, 1) + '°', 'result'),
+                    lineOf('目标在画面上：' + L.where(info), 'result'),
+                    lineOf('另一台相机只拖 40 px：目标在画面上 ' + L.where(L.inspect(other, T)), 'muted')
+                  ]
+                }
+              }
+            }
+          ]
+        })
+
+        // ---------------- §2.3 第 2 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v2'),
+          storageKey: 'lesson-0026-v2',
+          cards: [
+            {
+              title: '§2.3 · 第 2 版：拖完一台，换预设，再拖新相机 1 px',
+              tags: ['第 2 版', '真实 PerspectiveCamera'],
+              desc: 'A 是旧预设的相机，已经向右拖了 150 px（方位角 −90°）。切换预设，Engine 装上新相机 B，位置是初始的 [0, 20, 50]。控制器还是同一个。',
+              question: '在 B 上向右拖 1 px，B 会到哪里？',
+              choices: ['跳到 [−50, 20, −0.52] 附近：接着 A 的角度转', '几乎不动：到 [−0.52, 20, 50]', '回到目标点 [0, 10, 0]'],
+              answer: 0,
+              explain:
+                '第 2 版的三个角是挂载时从 A 读的，之后只在自己的变量上加减。换成 B 以后，它仍以为相机在方位角 −90°，于是 1 px 的拖动把 B 从 [0, 20, 50] 一下搬到 [−50, 20, −0.52]：用户只动了 1 px，画面转了 90°。目标倒是在正中，因为这一版会转头。',
+              run: () => {
+                const a = L.hw2Camera()
+                const orbit = createOrbitV2(T, a)
+                orbit.drag(a, 150, 0, 600)
+                const b = L.hw2Camera()
+                const before = pose('B 刚装上', b)
+                orbit.drag(b, 1, 0, 600)
+                return {
+                  lines: [
+                    lineOf(pose('A 拖 150 px 之后', a), 'muted'),
+                    lineOf(before, 'server'),
+                    lineOf(pose('B 拖 1 px 之后', b), 'result'),
+                    lineOf('目标在画面上：' + L.where(L.inspect(b, T)), 'muted')
+                  ]
+                }
+              }
+            }
+          ]
+        })
+
+        // ---------------- §2.4 第 3 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v3'),
+          storageKey: 'lesson-0026-v3',
+          cards: [
+            {
+              title: '§2.4 · 第 3 版：同样换预设，再拖 1 px',
+              tags: ['第 3 版', '真实 PerspectiveCamera'],
+              question: '和上一张卡片一样：A 拖了 150 px，换成新相机 B，在 B 上向右拖 1 px。这次 B 到哪里？',
+              choices: ['几乎不动：到 [−0.52, 20, 50]，只转了 0.6°', '跳到 [−50, 20, −0.52]', '回到目标点 [0, 10, 0]'],
+              answer: 0,
+              explain: '第 3 版不存角度，每次都从 B 自己的位置读出方位角 0，再减去 1 px 对应的 0.6°。换几次相机都不会跳。',
+              run: () => {
+                const orbit = createOrbitV3(T)
+                const a = L.hw2Camera()
+                orbit.drag(a, 150, 0, 600)
+                const b = L.hw2Camera()
+                orbit.drag(b, 1, 0, 600)
+                return { lines: [lineOf(pose('A 拖 150 px 之后', a), 'muted'), lineOf(pose('B 拖 1 px 之后', b), 'result')] }
+              }
+            },
+            {
+              title: '§2.4 · 第 3 版：向下拖 200 px，再向右拖 1 px',
+              tags: ['第 3 版', '真实 PerspectiveCamera'],
+              question: 'canvas 高 600 px，向下拖 200 px 等于仰角加 120°：从 11.31° 到 131.31°，越过了头顶。接着向右拖 1 px，会怎样？',
+              choices: ['拖 200 px 时画面上下颠倒；再拖 1 px，方位角跳 180°，画面翻回来', '仰角被挡在 90°，画面一直是正的', '目标离开画面，相机看向天空'],
+              answer: 0,
+              explain:
+                '越过头顶以后，相机的上方 y = −0.660，地平线倒了，目标却还在正中：第 25 课 5.2 节的写法只保证「对准」。下一次重新读位置时，atan2 算出的仰角只会在 −90°～90° 之间，于是读成 48.69°、方位角加了 180°，rotation 一下从 [−131.31°, 0°, 0°] 变成 [−48.69°, 179.40°, 0°]，画面在一帧之内转了半圈。',
+              run: () => {
+                const camera = L.hw2Camera()
+                const orbit = createOrbitV3(T)
+                orbit.drag(camera, 0, 200, 600)
+                const lines = [lineOf(pose('拖 200 px 之后', camera), 'server'), lineOf(look(camera), 'result')]
+                orbit.drag(camera, 1, 0, 600)
+                lines.push(lineOf(pose('再拖 1 px 之后', camera), 'server'), lineOf(look(camera), 'result'))
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- §2.5 真实代码 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-final'),
+          storageKey: 'lesson-0026-final',
+          cards: [
+            {
+              title: '§2.5 · 真实代码：同样向下拖 200 px，再向右拖 1 px',
+              tags: ['真实代码', 'mountOrbitCameraInput'],
+              desc: '用真实的 mountOrbitCameraInput 挂在假 canvas（高 600 px）上，事件和上一张卡片一样。',
+              question: '这次会怎样？',
+              choices: ['停在 89.94°，画面是正的；再拖 1 px 正常转 0.6°', '和第 3 版一样，先倒过来再翻回去', '停在正好 90°，之后左右拖不动'],
+              answer: 0,
+              explain: '仰角被 MAX_ELEVATION 挡在 90° − 0.001 rad = 89.94°。相机几乎在正上方，上方的 y 只剩 0.001，但仍是正的；再拖 1 px，方位角正常地减 0.6°。',
+              run: () => {
+                const camera = L.hw2Camera()
+                const canvas = L.fakeCanvas({ height: 600 })
+                mountReal(camera, canvas)
+                L.drag(canvas, 0, 200)
+                const lines = [lineOf(pose('拖 200 px 之后', camera), 'server'), lineOf(look(camera), 'result')]
+                L.drag(canvas, 1, 0)
+                lines.push(lineOf(pose('再拖 1 px 之后', camera), 'server'), lineOf(look(camera), 'result'))
+                return { lines }
+              }
+            },
+            {
+              title: '§2.5 · 为什么留 0.001，而不是 three.js 的 10⁻⁶',
+              tags: ['真实 Transform', 'Float32'],
+              desc: '把相机放到「仰角 = 90° − 余量、方位角 1 rad（57.30°）、距离 1」的位置，用项目的 Transform 存进去（按 Float32），再读出来算方位角。目标分别放在三个地方。',
+              question: '余量用 10⁻⁶、目标在 [50, 10, 50] 时，读回来的方位角是多少？',
+              choices: ['0：方位角整个丢了', '1.0000：Float32 足够精确', '大约 1.1：偏了一点'],
+              answer: 0,
+              explain:
+                '离头顶 10⁻⁶ rad 时，水平偏移只有 10⁻⁶ 那么大。Float32 在 50 附近相邻两个数相差 2⁻¹⁸ ≈ 3.8 × 10⁻⁶，50 加上这点偏移存进去还是 50，x、z 的偏移都成了 0，atan2(0, 0) = 0。目标在 [5, 10, 5] 时相邻两个数相差 4.8 × 10⁻⁷，偏移被舍入，读成 1.1071。余量 0.001 时偏移有 10⁻³，三处都读得回来。three.js 的 Vector3 是 Float64（50 附近相差约 7 × 10⁻¹⁵），10⁻⁶ 对它足够。',
+              run: () => {
+                const lines = []
+                for (const margin of [1e-6, 0.001]) {
+                  for (const target of [[0, 10, 0], [5, 10, 5], [50, 10, 50]]) {
+                    const camera = newCamera(1)
+                    camera.transform.setPosition(orbitPoint(1, Math.PI / 2 - margin, 1, target))
+                    const back = L.spherical(camera.transform.position, target).azimuth
+                    lines.push(lineOf('余量 ' + (margin === 0.001 ? '0.001' : '10⁻⁶') + '，目标 ' + L.vec(target, 0) + '：读回的方位角 ' + L.num(back, 4) + '（应为 1.0000）', margin === 1e-6 && target[0] === 50 ? 'result' : 'server'))
+                  }
+                }
+                const v = new R.ThreeVector3(...orbitPoint(1, Math.PI / 2 - 1e-6, 1, [50, 10, 50]))
+                lines.push(lineOf('对照：three.js 的 Vector3（Float64），余量 10⁻⁶，目标 [50, 10, 50]：' + L.num(Math.atan2(v.x - 50, v.z - 50), 4), 'muted'))
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- §2.7 滚轮 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-zoom'),
+          storageKey: 'lesson-0026-zoom',
+          cards: [
+            {
+              title: '§2.7 · 从 50.99 往近处连滚 6 格（deltaY = −100）',
+              tags: ['真实代码', 'mountOrbitCameraInput'],
+              question: '真实代码按指数缩放。如果改成「每格距离减 10」的加法，两种结果分别是多少？',
+              choices: ['指数 27.98；加法 −9.01，已经穿过了目标', '指数 −9.01；加法 27.98', '两种都是 1，被最小距离挡住'],
+              answer: 0,
+              explain:
+                '指数缩放每格乘 e^−0.1 = 0.905，永远不会小于 0；往外滚 10 格再往回滚 10 格，正好回到 50.990。加法每格减 10，第 6 格就成了负数：相机穿过目标，跑到另一边去了，只能再加一道下限去挡。最小、最大距离（1 和 300）是另外的保护。',
+              run: () => {
+                const camera = L.hw2Camera()
+                const canvas = L.fakeCanvas({ height: 600 })
+                mountReal(camera, canvas)
+                const lines = [lineOf('开始：距离 ' + L.num(distanceOf(camera), 2), 'muted')]
+                for (let i = 0; i < 6; i++) L.wheel(canvas, -100)
+                lines.push(lineOf('指数（真实代码）：滚 6 格 −100 → 距离 ' + L.num(distanceOf(camera), 2), 'result'))
+                lines.push(lineOf('加法（假设的写法）：50.99 − 6 × 10 = ' + L.num(50.99 - 60, 2), 'result'))
+                const again = L.hw2Camera()
+                const c2 = L.fakeCanvas({ height: 600 })
+                mountReal(again, c2)
+                for (let i = 0; i < 10; i++) L.wheel(c2, 100)
+                const out = L.num(distanceOf(again), 2)
+                for (let i = 0; i < 10; i++) L.wheel(c2, -100)
+                lines.push(lineOf('往外 10 格 → ' + out + '，再往回 10 格 → ' + L.num(distanceOf(again), 3), 'server'))
+                for (let i = 0; i < 60; i++) L.wheel(c2, -100)
+                const near = L.num(distanceOf(again), 2)
+                for (let i = 0; i < 100; i++) L.wheel(c2, 100)
+                lines.push(lineOf('再往里 60 格 → ' + near + '（最小距离），往外 100 格 → ' + L.num(distanceOf(again), 2) + '（最大距离）', 'server'))
+                const third = L.hw2Camera()
+                const c3 = L.fakeCanvas({ height: 600 })
+                mountReal(third, c3)
+                L.wheel(c3, 3, 1)
+                const lineMode = L.num(distanceOf(third), 3)
+                L.wheel(c3, 1, 2)
+                lines.push(lineOf('deltaMode 1（3 行 = 48 px）→ ' + lineMode + '；再 deltaMode 2（1 页 = canvas 高 600 px）→ ' + L.num(distanceOf(third), 3), 'muted'))
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- §3.3 换相机 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-events'),
+          storageKey: 'lesson-0026-events',
+          cards: [
+            {
+              title: '§3.3 · 拖到一半，换了相机',
+              tags: ['真实代码', '假 canvas'],
+              desc: '在 A 上按下，向右移 75 px；这时预设切换，getCamera() 改为交回 B；再移 75 px、又移 75 px；然后滚一格；最后松手，在 B 上重新拖 75 px。',
+              question: '换相机以后的那两次移动，A 和 B 各怎样？',
+              choices: ['A 停在原处，B 不动；滚轮和新的拖动才作用在 B 上', '改去拖 B：B 从初始位置开始转', 'A 和 B 都跟着转'],
+              answer: 0,
+              explain:
+                '换相机后的第一个 pointermove 发现 getCamera() 不再是 drag.camera，于是 endDrag：清空 drag、交还捕获。后面的移动都不属于任何拖动，被 pointerId 那一行挡掉。滚轮每次都问当前相机，所以作用在 B 上；B 要重新按下才能拖。这样，一次拖动从头到尾只改一台相机。',
+              run: () => {
+                const a = L.hw2Camera()
+                const b = L.hw2Camera()
+                let current = a
+                const canvas = L.fakeCanvas({ height: 600 })
+                mountReal(() => current, canvas)
+                L.pointer(canvas, 'pointerdown', { clientX: 300 })
+                L.pointer(canvas, 'pointermove', { clientX: 375 })
+                const lines = [lineOf(pose('A 移 75 px 之后', a) + '；捕获 ' + canvas.captured, 'server')]
+                current = b
+                L.pointer(canvas, 'pointermove', { clientX: 450 })
+                L.pointer(canvas, 'pointermove', { clientX: 525 })
+                lines.push(lineOf('换成 B，又移两次：A ' + L.vec(a.transform.position) + '，B ' + L.vec(b.transform.position) + '；捕获 ' + canvas.captured, 'result'))
+                lines.push(lineOf('canvas 上的捕获记录：' + canvas.log.join(' → '), 'muted'))
+                L.wheel(canvas, 100)
+                lines.push(lineOf('滚一格：A 距离 ' + L.num(distanceOf(a)) + '，B 距离 ' + L.num(distanceOf(b)), 'server'))
+                L.pointer(canvas, 'pointerup', { clientX: 525 })
+                L.drag(canvas, 75, 0)
+                lines.push(lineOf('松手后在 B 上重新拖 75 px：' + pose('B', b), 'result'))
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- §3.5 挂载与卸载 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-mount'),
+          storageKey: 'lesson-0026-mount',
+          cards: [
+            {
+              title: '§3.5 · 配置不合格：minDistance = 0',
+              tags: ['真实代码', '假 canvas'],
+              question: "canvas 原来的 touchAction 是 'pan-y'。传 minDistance: 0 去挂载，会怎样？",
+              choices: ["抛 RangeError；touchAction 仍是 'pan-y'，一个监听也没挂", '挂上了，只是距离下限改成默认的 0.1', "抛错了，但 touchAction 已经被改成 'none'"],
+              answer: 0,
+              explain: '检查在 :66–86，改 touchAction、挂监听在 :308 以后。先查完再动手，失败时什么都没改，调用者不用收拾半截。target 里有 Float32 存不下的 1e39 也会被拒绝。',
+              run: () => {
+                const camera = L.hw2Camera()
+                const canvas = L.fakeCanvas({ touchAction: 'pan-y' })
+                const lines = []
+                for (const options of [{ target: T, minDistance: 0 }, { target: [0, 1e39, 0] }]) {
+                  try {
+                    R.mountOrbitCameraInput(canvas, () => camera, options)
+                    lines.push(lineOf('挂上了（意外）', 'late'))
+                  } catch (error) {
+                    lines.push(lineOf(JSON.stringify(options).replace('1e+39', '1e39') + ' → ' + error.name + '：' + error.message, 'abort'))
+                  }
+                }
+                lines.push(lineOf("之后：touchAction = '" + canvas.style.touchAction + "'，canvas 上的监听 " + canvas.listeners.size + ' 个', 'result'))
+                return { lines }
+              }
+            },
+            {
+              title: '§3.5 · 卸载两次，然后再拖',
+              tags: ['真实代码', '假 canvas'],
+              question: '挂载 → 按下（拖动开始）→ 调用卸载函数 → 再调用一次 → 拖 100 px、滚一格。结果是？',
+              choices: ["第二次卸载什么也不做；捕获已交还，touchAction 还原成 'pan-y'，相机不动", '第二次卸载抛错：已经卸载过了', '卸载时相机回到挂载前的位置'],
+              answer: 0,
+              explain:
+                '卸载函数先看 closed，第二次直接返回（幂等）。第一次把 8 个 canvas 监听（10 月 8 日课后多了一个 contextmenu）和 window 的 blur 都摘掉，调用 endDrag 交还捕获，再把 touchAction 还原成挂载前的值。卸载不改相机：相机属于 Scene，这里只是借来操纵。',
+              run: () => {
+                const camera = L.hw2Camera()
+                const canvas = L.fakeCanvas({ touchAction: 'pan-y' })
+                const stop = R.mountOrbitCameraInput(canvas, () => camera, { target: T })
+                const lines = [lineOf("挂载后：touchAction = '" + canvas.style.touchAction + "'，监听：" + [...canvas.listeners.keys()].join('、'), 'server')]
+                L.pointer(canvas, 'pointerdown')
+                stop()
+                lines.push(lineOf("第一次卸载：touchAction = '" + canvas.style.touchAction + "'，监听 " + canvas.listeners.size + ' 个，捕获 ' + canvas.captured + '；记录 ' + canvas.log.join(' → '), 'result'))
+                let second = '没有抛错'
+                try {
+                  stop()
+                } catch (error) {
+                  second = '抛了 ' + error.name
+                }
+                lines.push(lineOf('第二次卸载：' + second, 'server'))
+                const before = L.vec(camera.transform.position)
+                L.drag(canvas, 100, 0)
+                L.wheel(canvas, 100)
+                lines.push(lineOf('再拖、再滚：position ' + before + ' → ' + L.vec(camera.transform.position), 'result'))
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- §5 自由组合：同一串事件交给两边 ----------------
+        const scripts = {
+          right150: { label: '向右拖 150 px', run: (c) => L.drag(c, 150, 0) },
+          down100: { label: '向右拖 150 px，再向下拖 100 px', run: (c) => (L.drag(c, 150, 0), L.drag(c, 0, 100)) },
+          up600: { label: '向上拖 600 px（撞到下限）', run: (c) => L.drag(c, 0, -600) },
+          steps: { label: '向左拖 37 px，分 5 次移动', run: (c) => L.drag(c, -37, 0, 5) },
+          wheel: { label: '滚轮 +100 两格，再 −100 两格', run: null },
+          legacy: { label: '向右拖 100 px，three.js 用旧 HW2 的 rotateSpeed 0.3', run: (c) => L.drag(c, 100, 0) }
+        }
+        RTeach.traceLab.playground({
+          mount: document.getElementById('lab-compare'),
+          title: '同一串事件，分别交给项目代码和 three.js（假 canvas，高 600 px）',
+          selects: [{ id: 'script', options: Object.entries(scripts).map(([key, s]) => [key, s.label]) }],
+          describe: () => '两边都从 HW2 的初始位置开始，target [0, 10, 0]，距离 1～300。项目这边是真实的 mountOrbitCameraInput，three.js 这边是 r177 原版的 OrbitControls；事件由同一个函数生成。',
+          run: async (values) => {
+            const key = values.script
+            const ours = L.hw2Camera()
+            const oc = L.fakeCanvas({ height: 600 })
+            const stop = mountReal(ours, oc)
+            const three = L.hw2ThreeCamera()
+            const tc = L.fakeCanvas({ height: 600 })
+            const controls = new R.ThreeOrbitControls(three, tc)
+            controls.target.set(T[0], T[1], T[2])
+            controls.minDistance = 1
+            controls.maxDistance = 300
+            if (key === 'legacy') controls.rotateSpeed = 0.3
+            controls.update()
+            const both = () => [
+              lineOf('项目  ：position ' + L.vec(ours.transform.position, 4) + '，距离 ' + L.num(distanceOf(ours), 4), 'server'),
+              lineOf('three ：position ' + L.vec(three.position.toArray(), 4) + '，距离 ' + L.num(L.spherical(three.position.toArray(), T).distance, 4), 'user')
+            ]
+            const lines = []
+            if (key === 'wheel') {
+              for (const d of [100, 100, -100, -100]) {
+                L.wheel(oc, d)
+                L.wheel(tc, d)
+                lines.push(lineOf('deltaY = ' + d + '：项目距离 ' + L.num(distanceOf(ours), 4) + '，three 距离 ' + L.num(L.spherical(three.position.toArray(), T).distance, 4), 'server'))
+              }
+            } else {
+              scripts[key].run(oc)
+              scripts[key].run(tc)
+              lines.push(...both())
+              lines.push(lineOf('项目的目标：' + L.where(L.inspect(ours, T)) + '；three 的目标：' + L.where(L.inspectThree(three, T)), 'muted'))
+            }
+            stop()
+            controls.dispose()
+            return { lines }
+          }
+        })
+
+        // ---------------- §6 审查 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-review'),
+          storageKey: 'lesson-0026-review',
+          cards: [
+            {
+              title: '§6 · 初始朝向改成看 [0, 15, 0]，target 忘了改',
+              tags: ['真实代码', '假 canvas'],
+              desc: '假设有人把 createHW2Scene 的初始朝向改成 setRotation([−atan2(5, 50), 0, 0])，看向 [0, 15, 0]；setup.ts 的 target 还是 [0, 10, 0]。',
+              question: '用户第一次只向右拖 1 px，画面会怎样？',
+              choices: ['低头的角度从 5.71° 一下变成 11.31°，画面跳了一下', '几乎不动，只转了 0.6°', '相机跑到 [0, 15, 0]'],
+              answer: 0,
+              explain:
+                '控制器每次都按自己的 target 重算朝向，不读相机原来的朝向。原本在正中的 [0, 15, 0] 一下跳到 NDC y = 0.237，用户只动了 1 px。两处数字没有任何检查把它们连在一起，只靠一句注释。',
+              run: () => {
+                const camera = newCamera()
+                camera.transform.setPosition([0, 20, 50])
+                camera.transform.setRotation([-Math.atan2(5, 50), 0, 0])
+                const canvas = L.fakeCanvas({ height: 600 })
+                mountReal(camera, canvas)
+                const lines = [lineOf(pose('改动后的初始相机', camera) + '；[0, 15, 0] 在 ' + L.where(L.inspect(camera, [0, 15, 0])), 'server')]
+                L.drag(canvas, 1, 0)
+                lines.push(lineOf(pose('拖 1 px 之后', camera) + '；[0, 15, 0] 在 ' + L.where(L.inspect(camera, [0, 15, 0])), 'result'))
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0026"]'), [
+          {
+            q: '相机在 [0, 20, 50]，目标在 [0, 10, 0]。它的距离、方位角、仰角是多少？',
+            opts: ['50.99、0°、11.31°', '50、0°、11.31°', '50.99、11.31°、0°'],
+            answer: 0,
+            why: 'offset = (0, 10, 50)：distance = √(10² + 50²) = 50.99，az = atan2(0, 50) = 0，el = atan2(10, 50) = 11.31°（2.1 节）。'
+          },
+          {
+            q: 'canvas 高 600 CSS px，rotateSpeed = 1，向右拖 150 px，方位角变化多少？',
+            opts: ['减小 90°', '增大 90°', '减小 45°'],
+            answer: 0,
+            why: '每像素 2π × 1 ÷ 600 弧度，150 px 是 π/2 = 90°；向右拖方位角变小，和 three.js 的 _rotateLeft 一样（2.6 节）。'
+          },
+          {
+            q: '第 2 版（控制器自己记角度）在切换预设以后出什么问题？',
+            opts: ['第一次拖动，新相机就跳到旧相机的角度', '新相机完全拖不动，要重新挂载', '目标跑出画面，相机朝着原来方向'],
+            answer: 0,
+            why: '记下的角度属于旧相机，新相机在初始位置。拖 1 px 就转了 90°（2.3 节）。'
+          },
+          {
+            q: '第 3 版和 three.js 的 update() 为什么都从相机现在的位置重新算？',
+            opts: ['相机会被别人改，自己记的角度会过时', '这样算更快，可以省掉一次三角函数', 'atan2 只能在挂载以后调用一次'],
+            answer: 0,
+            why: '换预设、工厂设初始取景、外部代码改位置，都会让存下来的角度过时（2.4 节）。'
+          },
+          {
+            q: '仰角的上下限为什么离 90° 留 0.001 rad，而不是 three.js 的 10⁻⁶？',
+            opts: ['位置按 Float32 存，太小的偏移会被舍掉', '只有 0.001 rad 才能让 world 矩阵可逆', 'three.js 的 Vector3 也按 Float32 存'],
+            answer: 0,
+            why: '目标在 [50, 10, 50]、余量 10⁻⁶ 时，读回的方位角是 0（2.5 节第二张卡片）。正好 90° 时 world 矩阵照样可逆。'
+          },
+          {
+            q: '拖到一半，getCamera() 交回了另一台相机，mountOrbitCameraInput 怎么做？',
+            opts: ['结束这次拖动，新相机要重新按下', '改去拖新相机，从它的位置接着转', '两台相机一起转，直到松手为止'],
+            answer: 0,
+            why: '一次拖动只改一台相机；滚轮每次问当前相机（3.3 节）。'
+          },
+          {
+            q: '为什么这个控制器不需要像 OrbitControls 那样每帧调用 update()？',
+            opts: ['事件里直接写 Transform，Engine 下一帧照常画；它也没有阻尼', 'Engine 每一帧都会替它调用一次 applyOrbit', 'Transform 被写入时会立刻触发一次重画'],
+            answer: 0,
+            why: '每帧 update() 是为阻尼、自动旋转准备的。这里没有这两样，下一帧 Builder 读到新的 version 就会重算（第 4 节）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

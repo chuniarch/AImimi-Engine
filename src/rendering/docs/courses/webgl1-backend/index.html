@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebGL1 渲染架构精读课程</title><link rel="stylesheet" href="assets/course.css"><script src="assets/course.js"></script></head>
+<body><h1>WebGL1 渲染架构精读课程</h1>
+<p>从一条 draw 开始，理解资源、场景、状态、各个 Manager 和渲染编排。课程依次包含设计问题、源码解读、交互演示与检查题。</p>
+<p>下面按当前课程文件名顺序排列。编号缺口及兼容入口保留；课文中原有的补课建议也予以保留。</p>
+<p><a href="README.md">阅读说明</a> · <a href="MAINTENANCE.md">维护与更新</a> · <a href="RESOURCES.md">参考资料</a> · <a href="GLOSSARY.md">术语索引</a></p>
+<h2>课程目录</h2><ol><li><a href="lessons/0001-one-draw-four-stages.html">第 1 课 · 一次 draw 的四段调用</a></li>
+<li><a href="lessons/0002-five-failure-channels.html">第 2 课 · GL 怎样告诉你失败了</a></li>
+<li><a href="lessons/0003-architecture-overview.html">第 3 课 · src/rendering 全景</a></li>
+<li><a href="lessons/0004-cpu-resource-gpu-representation.html">第 4 课 · CPU 资源与 GPU 表示</a></li>
+<li><a href="lessons/0005-ownership-and-lifecycle.html">第 5 课 · 所有权与生命周期</a></li>
+<li><a href="lessons/0006-boundaries-and-failure.html">第 6 课 · 边界与失败</a></li>
+<li><a href="lessons/0007-core-resource-errors.html">第 7 课 · core 精读</a></li>
+<li><a href="lessons/0008-transform-and-scenenode.html">第 8 课 · Transform 与 SceneNode</a></li>
+<li><a href="lessons/0009-group-scene-mesh-camera.html">第 9 课 · Group、Scene、Mesh 与 Camera</a></li>
+<li><a href="lessons/0010-vertex-attribute-and-geometry.html">第 10 课 · VertexAttribute 与 Geometry</a></li>
+<li><a href="lessons/0011-shader-module-and-material.html">第 11 课 · ShaderModule 与 Material</a></li>
+<li><a href="lessons/0012-textures-and-render-targets.html">第 12 课 · Texture 家族与 RenderTarget</a></li>
+<li><a href="lessons/0013-capabilities-and-context-lifecycle.html">第 13 课 · Capabilities 与 ContextLifecycle</a></li>
+<li><a href="lessons/0014-webgl1-state.html">第 14 课 · WebGL1State</a></li>
+<li><a href="lessons/0015-program-manager.html">第 15 课 · ProgramManager</a></li>
+<li><a href="lessons/0016-geometry-and-vertex-input.html">第 16 课 · 顶点数据交给 GPU</a></li>
+<li><a href="lessons/0017-cube-texture-manager.html">第 17 课 · 把图片交给 GPU</a></li>
+<li><a href="lessons/0018-resource-manager.html">第 18 课 · 资源协调器</a></li>
+<li><a href="lessons/0019-task15-backend-orchestration.html">第 19 课 · Task 15 编排</a></li>
+<li><a href="lessons/0020-model-files-prt-data-async.html">第 20 课 · 模型文件、PRT 数据与异步加载</a></li>
+<li><a href="lessons/0021-task19-hw2-loaders.html">第 21 课 · HW2 的 OBJ 与 PRT 加载</a></li>
+<li><a href="lessons/0022-code-review-for-simulation.html">第 22 课 · 拿仿真需求审 src/rendering</a></li>
+<li><a href="lessons/0023-designing-fetch-with-timeout.html">第 23 课 · 从零设计 fetchWithTimeout</a></li>
+<li><a href="lessons/0024-http-on-the-wire.html">第 24 课 · 一次请求在网络上怎么走</a></li>
+<li><a href="lessons/0025-camera-and-orbit-controls.html">第 25 课已拆成两课</a></li>
+<li><a href="lessons/0025-camera-math.html">第 25 课 · 相机的数学</a></li>
+<li><a href="lessons/0026-orbit-controls.html">第 26 课 · 轨道控制</a></li>
+<li><a href="lessons/0027-render-target-manager.html">第 27 课 · 离屏画布</a></li>
+<li><a href="lessons/0028-lifecycle-edge-cases.html">第 28 课 · 生命周期的边角</a></li>
+<li><a href="lessons/0029-texture-family-design.html">第 29 课 · 纹理一族的设计思路</a></li>
+<li><a href="lessons/0030-frame-orchestration.html">第 30 课 · 帧编排</a></li>
+<li><a href="lessons/0031-frame-overview.html">第 31 课 · 一帧的全局图</a></li>
+<li><a href="lessons/0032-point-to-pixel.html">第 32 课 · 点落在哪个像素</a></li>
+<li><a href="lessons/0033-pan-from-the-formula.html">第 33 课 · 平移</a></li>
+<li><a href="lessons/0034-zoom-by-multiplying.html">第 34 课 · 滚轮缩放</a></li>
+<li><a href="lessons/0035-roll-orbit-vs-arcball.html">第 35 课 · 歪头</a></li>
+<li><a href="lessons/0036-events-from-zero.html">第 36 课 · 浏览器事件从零开始</a></li>
+<li><a href="lessons/0037-drag-and-capture.html">第 37 课 · 拖动与指针捕获</a></li>
+<li><a href="lessons/0038-buttons-wheel-two-fingers.html">第 38 课 · 右键、滚轮、两根手指</a></li>
+<li><a href="lessons/0039-why-fft-queries-so-often.html">第 39 课 · FFT 为什么频繁查询</a></li>
+<li><a href="lessons/0040-shadow-one-function.html">第 40 课 · 一个函数画完阴影</a></li>
+<li><a href="lessons/0041-build-once-lookup-by-object.html">第 41 课 · 只做一次与每帧做</a></li>
+<li><a href="lessons/0042-what-to-draw-as-data.html">第 42 课 · 画什么写成数据</a></li>
+<li><a href="lessons/0043-snapshot-each-frame.html">第 43 课 · 每帧先抄一份</a></li>
+<li><a href="lessons/0044-passes-and-surface-scope.html">第 44 课 · 两遍变成两个 Pass</a></li>
+<li><a href="lessons/0045-values-into-shader.html">第 45 课 · 阴影值怎样送进 shader</a></li>
+<li><a href="lessons/0046-when-things-go-wrong.html">第 46 课 · 不正常的时候</a></li>
+<li><a href="lessons/0047-how-draw-connects.html">第 47 课 · 一次 draw 怎样接起三样东西</a></li>
+<li><a href="lessons/0048-who-runs-between-passes.html">第 48 课 · 两遍之间谁插得进来</a></li></ol>
+<h2>参考页</h2><ul><li><a href="reference/architecture-map.html">architecture-map</a></li>
+<li><a href="reference/abortable-requests.html">abortable-requests</a></li>
+<li><a href="reference/camera-controls-math.html">camera-controls-math</a></li>
+<li><a href="reference/pointer-events.html">pointer-events</a></li>
+<li><a href="reference/validation-map.html">validation-map</a></li>
+<li><a href="reference/webgl1-api.html">webgl1-api</a></li></ul>
+<p>可以直接双击本页，也可以将整个课程目录放到静态网站。源码链接打开随课程保存的阅读快照，无需安装编辑器。</p>
+<p>课程中既有已实现能力，也有设计提案；请结合各课说明判断。演示包保留发布前原有版本，没有自动重建。</p></body></html>

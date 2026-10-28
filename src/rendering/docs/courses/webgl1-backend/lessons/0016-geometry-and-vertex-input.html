@@ -1,0 +1,2390 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 16 课 · 顶点数据交给 GPU</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/program-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 详细篇 10 · backend ④ · 约 70 分钟</p>
+    <h1>backend ④：把顶点数据交给 GPU——GeometryManager 与顶点输入</h1>
+    <p class="lede">
+      一个 Geometry 在 CPU 上只是几个 TypedArray。要画出来，得做两件事：把数字拷进 GPU 的 buffer（GeometryManager），再告诉 shader 的每个 attribute 从哪个 buffer、按什么格式读（顶点输入）。这一课先用背景盒子的 96 个字节把 GL 调用看明白，再从教程写法出发一版一版补上缺的东西，最后读真实代码：GeometryManager，以及顶点输入的三个文件。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW2 每帧画两样东西：背景盒子和 Mary。Mary 有 4 个属性、30522 个顶点，约 1.40 MiB 的顶点数据；它在哪里上传、上传几次、换预设时怎样删干净，都在这一课。FFT 海面的网格、HW1 的阴影 pass 也走同一条路。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：第 15 课 2.4 节，链接后反射出「属性名 → location」；钩子 (hook) 就是构造 Manager 时从外面递进去的一个函数，Manager 在固定时刻调用它（第 15 课 2.6 节；那一节里 VAO 缓存的那张图，这一课 4.4 节讲完 VAO 以后一步一步重讲）；VAO 里记着 EBO 绑定、ARRAY_BUFFER 是整个 context 共用的（第 14 课 2.4 节，以及上次对话里的五步实测，2.4 节会再给一次）。Geometry 的字段（第 10 课）这一课 1.1 节会连同 HW2 的数再列一遍。如果其中哪一条其实没懂，告诉我，我先补那一块。<br />
+      <strong>这一课从零讲的</strong>：buffer 的三个调用和字节怎样排；vertexAttribPointer 的六个参数；draw 怎样按编号取顶点；上传为什么要先记下、再还回绑定；失败时怎样删干净；Uint32 索引怎样降级；为什么按「Geometry、program」两层缓存 VAO；换 shader 以后缓存里为什么会留下查不到、也没人删的 VAO，beforeDelete 怎样清掉它们；没有 VAO 时怎样每次接线、为什么要关掉用不到的 location；三个文件怎样分工；context 丢失、恢复时它们各做什么。<br />
+      <strong>页面会用到你的显卡</strong>：卡片都在你的浏览器里创建真实的 WebGL context，用完释放。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">原始输入与需求</a></li>
+        <li><a href="#s2">先把 GL 调用看明白</a>：<a href="#s2-1">buffer</a> <a href="#s2-2">pointer</a> <a href="#s2-3">draw</a> <a href="#s2-4">两个绑定点</a></li>
+        <li><a href="#s3">GeometryManager 一版一版写</a>：<a href="#s3-1">第 1 版</a> <a href="#s3-2">第 2 版</a> <a href="#s3-3">真实代码</a> <a href="#s3-4">Uint32 降级</a> <a href="#s3-5">释放</a></li>
+        <li><a href="#s4">顶点输入：把 buffer 接到 location 上</a>：<a href="#s4-1">配对</a> <a href="#s4-2">没有 VAO</a> <a href="#s4-3">有 VAO</a> <a href="#s4-4">换 shader 以后</a> <a href="#s4-5">三个文件</a> <a href="#s4-6">和 Lifecycle 的关系</a></li>
+        <li><a href="#s5">架构视角：对照 three.js</a></li>
+        <li><a href="#s6">审查视角</a></li>
+        <li><a href="#s7">检查题</a></li>
+        <li><a href="#s8">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 原始输入与需求</h2>
+    <h3 id="s1-1">1.1 两份 Geometry</h3>
+    <p>HW2 的背景盒子（<a data-src="src/scenes/games202/hw2/createHW2Scene.ts:187">createHW2Scene.ts:187–215</a>，节选）：</p>
+    <pre><code>new Geometry({
+  attributes: {
+    position: new VertexAttribute({
+      itemSize: 3,                 // 每个顶点 3 个数：x、y、z
+      data: new Float32Array([     // 8 个顶点 × 3 = 24 个 Float32 = 96 字节
+        -1, -1, -1, // 顶点 0
+         1, -1, -1, // 顶点 1
+         1,  1, -1, // 顶点 2
+        -1,  1, -1, // 顶点 3
+        -1, -1,  1, // 顶点 4
+         1, -1,  1, // 顶点 5
+         1,  1,  1, // 顶点 6
+        -1,  1,  1  // 顶点 7
+      ])
+    })
+  },
+  indices: new Uint8Array([        // 12 个三角形 × 3 = 36 个编号，每个 1 字节
+    0, 2, 1, 0, 3, 2, // −Z 面：两个三角形
+    4, 5, 6, 4, 6, 7, // +Z 面
+    // ……另外 4 个面
+  ])
+})</code></pre>
+    <p>Mary（<a data-src="src/scenes/games202/hw2/internal/createHW2PRTGeometry.ts:149">createHW2PRTGeometry.ts:149–161</a>）没有索引：transport 文件按「每个三角形的每个角」写了 30522 行（第 21 课），每一行就是一个顶点。</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Geometry 的字段</th><th>背景盒子</th><th>Mary</th></tr></thead>
+      <tbody>
+        <tr><td>getAttributeNames()</td><td>['position']</td><td>['position', 'aTransportSH0', 'aTransportSH1', 'aTransportSH2']</td></tr>
+        <tr><td>每个属性的 data</td><td>Float32Array，24 个数</td><td>都是 Float32Array，各 91566 个数（30522 × 3）</td></tr>
+        <tr><td>itemSize、normalized</td><td>3、false</td><td>都是 3、false</td></tr>
+        <tr><td>copyIndices()</td><td>Uint8Array，36 个</td><td>null</td></tr>
+        <tr><td>drawCount（要画几个顶点）</td><td>36（有索引时等于索引个数）</td><td>30522（没索引时等于顶点个数）</td></tr>
+        <tr><td>topology</td><td>'triangles'</td><td>'triangles'</td></tr>
+        <tr><td>上传以后占多少字节</td><td>96 + 36 = 132</td><td>4 × 366264 = 1465056（约 1.40 MiB）</td></tr>
+      </tbody>
+    </table></div>
+    <p>两个 shader 要读的属性（<a data-src="src/shaders/environment/cubemapBackground/vertex.vert:12">cubemapBackground/vertex.vert:12</a>、<a data-src="src/shaders/prt/sphericalHarmonics/order2/vertex.vert:12">order2/vertex.vert:12–21</a>）：</p>
+    <pre><code>// 背景：只要一个
+attribute vec3 position;
+
+// PRT（Mary）：要四个。链接后反射出的 location（第 15 课实测）：
+//   position 0、aTransportSH0 1、aTransportSH1 2、aTransportSH2 3
+attribute vec3 position;
+attribute vec3 aTransportSH0;
+attribute vec3 aTransportSH1;
+attribute vec3 aTransportSH2;</code></pre>
+
+    <h3 id="s1-2">1.2 两件事，三个对象</h3>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 220" role="img" aria-label="Geometry 经 GeometryManager 变成 buffer 和读取格式，ShaderModule 经 ProgramManager 变成名字到 location 的表，两者在顶点输入里按名字配对，接好以后才能 draw">
+          <defs>
+            <marker id="h1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+            <marker id="h1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <rect x="10" y="30" width="130" height="50" rx="4" class="box" />
+          <text x="75" y="52" text-anchor="middle">Geometry</text>
+          <text x="75" y="70" text-anchor="middle" class="small">CPU：TypedArray</text>
+          <rect x="10" y="140" width="130" height="50" rx="4" class="box" />
+          <text x="75" y="162" text-anchor="middle">ShaderModule</text>
+          <text x="75" y="180" text-anchor="middle" class="small">CPU：GLSL 文本</text>
+          <rect x="190" y="30" width="170" height="50" rx="4" class="box hl" />
+          <text x="275" y="52" text-anchor="middle">GeometryManager.get</text>
+          <text x="275" y="70" text-anchor="middle" class="small">第 3 节</text>
+          <rect x="190" y="140" width="170" height="50" rx="4" class="box" />
+          <text x="275" y="162" text-anchor="middle">ProgramManager.get</text>
+          <text x="275" y="180" text-anchor="middle" class="small">第 15 课</text>
+          <text x="275" y="104" text-anchor="middle" class="small">名字 → { buffer, FLOAT, 3, false }</text>
+          <text x="275" y="214" text-anchor="middle" class="small">名字 → location</text>
+          <rect x="420" y="80" width="170" height="60" rx="4" class="box hl" />
+          <text x="505" y="104" text-anchor="middle">顶点输入 bind</text>
+          <text x="505" y="124" text-anchor="middle" class="small">按名字配对；第 4 节</text>
+          <rect x="630" y="80" width="120" height="60" rx="4" class="box" />
+          <text x="690" y="104" text-anchor="middle">draw</text>
+          <text x="690" y="124" text-anchor="middle" class="small">Elements / Arrays</text>
+          <line x1="140" y1="55" x2="186" y2="55" class="line" marker-end="url(#h1a)" />
+          <line x1="140" y1="165" x2="186" y2="165" class="line" marker-end="url(#h1a)" />
+          <path d="M360 55 L390 55 L390 100 L416 100" class="line accent" marker-end="url(#h1b)" />
+          <path d="M360 165 L390 165 L390 120 L416 120" class="line" marker-end="url(#h1a)" />
+          <line x1="590" y1="110" x2="626" y2="110" class="line accent" marker-end="url(#h1b)" />
+        </svg>
+      </div>
+      <figcaption>图 1　一次 draw 之前，顶点这一路要经过的对象。Backend.draw 里就是这几行：取 program、取 buffer、然后 vertexInputs.bind，最后 drawElements 或 drawArrays（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:208">WebGL1Backend.ts:208–229</a>）。GeometryManager 不知道 location，ProgramManager 不知道 buffer，两份结果只在顶点输入里相遇。</figcaption>
+    </figure>
+
+    <h3 id="s1-3">1.3 需求：要应付哪些情况</h3>
+    <ol class="steps">
+      <li><strong>同一个 Geometry 只上传一次。</strong>每帧都画 Mary，两个 Mesh 也可能共用一个 Geometry；1.40 MiB 不能每帧拷一遍。</li>
+      <li><strong>上传不能弄乱别人的绑定。</strong>尤其是索引 buffer：它的绑定记在当前 VAO 里，上传时改了它，别的物体就会用错索引。</li>
+      <li><strong>失败不留半成品。</strong>四个属性传到第三个时显存不够，前两个 buffer 要删掉，缓存里也不能出现这个 Geometry。</li>
+      <li><strong>老设备上的大索引。</strong>Uint32 索引要 OES_element_index_uint 扩展；没有时，能无损转成 Uint16 就转，转不了就在建任何 buffer 之前报错。</li>
+      <li><strong>shader 要的属性必须都有。</strong>缺了就报错，而且要在改任何 GL 状态之前报；Geometry 多出来的属性忽略。</li>
+      <li><strong>换 program，location 就可能变。</strong>同一个 Geometry 配不同 shader，接线要按各自的 location 来。</li>
+      <li><strong>没有 VAO 扩展也要能画。</strong>而且上一个物体打开的 location，这次不用就要关掉，否则 draw 可能出错（4.2 节实测）。</li>
+      <li><strong>释放时删干净。</strong>Geometry 释放要删 buffer，但要先让顶点输入放掉借用这些 buffer 的接线；context 丢了不乱发命令。</li>
+    </ol>
+
+    <h2 id="s2">2. 先把 GL 调用看明白</h2>
+    <h3 id="s2-1">2.1 buffer：三步</h3>
+    <pre><code>const buffer = gl.createBuffer()               // ① 在 GPU 上建一个空的 buffer 对象
+gl.bindBuffer(gl.ARRAY_BUFFER, buffer)         // ② 让 ARRAY_BUFFER 这个「绑定点」指向它
+// ③ 把 data 的字节拷进「绑定点指向的那个 buffer」
+gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW)
+// data = 背景盒子的 Float32Array(24)：每个 Float32 占 4 字节，一共 96 字节
+// 第 ③ 步不接收 buffer 参数——它操作的是第 ② 步绑上的那个。GL 的调用大多是这样：先绑，再操作。
+// STATIC_DRAW 是提示：写一次、画很多次。GPU 可以把它放在读得最快的地方。</code></pre>
+    <p>拷进去的 96 个字节是这样排的（每个顶点 12 字节，x、y、z 各 4 字节）：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 214" role="img" aria-label="96 字节的 position buffer 分成 8 段，每段 12 字节是一个顶点；pointer 读第 5 个顶点从第 60 字节开始；索引 buffer 的前三个编号 0、2、1 指向第 0、2、1 段">
+          <defs>
+            <marker id="h2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <text x="20" y="22" class="title">position buffer（96 字节）</text>
+          <rect x="20" y="34" width="88" height="40" class="box" /><text x="64" y="52" text-anchor="middle" class="small">顶点 0</text><text x="64" y="67" text-anchor="middle" class="small">−1,−1,−1</text>
+          <rect x="108" y="34" width="88" height="40" class="box" /><text x="152" y="52" text-anchor="middle" class="small">顶点 1</text><text x="152" y="67" text-anchor="middle" class="small">1,−1,−1</text>
+          <rect x="196" y="34" width="88" height="40" class="box" /><text x="240" y="52" text-anchor="middle" class="small">顶点 2</text><text x="240" y="67" text-anchor="middle" class="small">1,1,−1</text>
+          <rect x="284" y="34" width="88" height="40" class="box" /><text x="328" y="52" text-anchor="middle" class="small">顶点 3</text><text x="328" y="67" text-anchor="middle" class="small">−1,1,−1</text>
+          <rect x="372" y="34" width="88" height="40" class="box" /><text x="416" y="52" text-anchor="middle" class="small">顶点 4</text><text x="416" y="67" text-anchor="middle" class="small">−1,−1,1</text>
+          <rect x="460" y="34" width="88" height="40" class="box hl" /><text x="504" y="52" text-anchor="middle" class="small">顶点 5</text><text x="504" y="67" text-anchor="middle" class="small">1,−1,1</text>
+          <rect x="548" y="34" width="88" height="40" class="box" /><text x="592" y="52" text-anchor="middle" class="small">顶点 6</text><text x="592" y="67" text-anchor="middle" class="small">1,1,1</text>
+          <rect x="636" y="34" width="88" height="40" class="box" /><text x="680" y="52" text-anchor="middle" class="small">顶点 7</text><text x="680" y="67" text-anchor="middle" class="small">−1,1,1</text>
+          <text x="20" y="90" class="small">字节 0</text>
+          <text x="460" y="90" class="small accent">字节 60 = 0 + 5 × 12</text>
+          <text x="724" y="90" text-anchor="end" class="small">字节 96</text>
+          <text x="20" y="204" class="title">↑ index buffer（36 字节，Uint8）</text>
+          <rect x="20" y="142" width="44" height="32" class="box hl" /><text x="42" y="163" text-anchor="middle">0</text>
+          <rect x="64" y="142" width="44" height="32" class="box hl" /><text x="86" y="163" text-anchor="middle">2</text>
+          <rect x="108" y="142" width="44" height="32" class="box hl" /><text x="130" y="163" text-anchor="middle">1</text>
+          <rect x="152" y="142" width="44" height="32" class="box" /><text x="174" y="163" text-anchor="middle">0</text>
+          <rect x="196" y="142" width="44" height="32" class="box" /><text x="218" y="163" text-anchor="middle">3</text>
+          <rect x="240" y="142" width="44" height="32" class="box" /><text x="262" y="163" text-anchor="middle">2</text>
+          <text x="300" y="163" class="small">……共 36 个</text>
+          <text x="420" y="150" class="small accent">第一个三角形：取顶点 0、2、1</text>
+          <text x="420" y="168" class="small accent">→ (−1,−1,−1)、(1,1,−1)、(1,−1,−1)</text>
+          <path d="M42 142 L64 78" class="line accent" marker-end="url(#h2a)" />
+          <path d="M86 142 L232 78" class="line accent" marker-end="url(#h2a)" />
+          <path d="M130 142 L150 78" class="line accent" marker-end="url(#h2a)" />
+        </svg>
+      </div>
+      <figcaption>图 2　背景盒子的两个 buffer。position buffer 里没有「顶点」的概念，只有 96 个字节；是下一节的 pointer 规定了「每 12 字节算一个顶点」。索引 buffer 里存的是顶点编号。</figcaption>
+    </figure>
+
+    <h3 id="s2-2">2.2 vertexAttribPointer：告诉 shader 怎样读</h3>
+    <pre><code>gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer) // 先绑上要读的 buffer
+gl.vertexAttribPointer(
+  0,          // location：shader 的第 0 号输入（PRT 的 position，反射得到）
+  3,          // size：每个顶点读 3 个分量（= itemSize），不足 4 个时 w 补 1
+  gl.FLOAT,   // type：每个分量按 Float32 读（= GeometryManager 记下的 type）
+  false,      // normalized：整数类型时才有意义，true 会把 0..255 映射到 0..1
+  0,          // stride：相邻两个顶点隔多少字节；0 表示「紧挨着」，等于 3 × 4 = 12
+  0           // offset：从第几个字节开始
+)
+gl.enableVertexAttribArray(0) // 打开第 0 号：从数组读。不打开时，它读的是一个固定值
+// 读第 i 个顶点时，从 offset + i × 12 字节开始取 12 字节。i = 5：字节 60～71 → (1, −1, 1)
+// 关键：pointer 把「此刻 ARRAY_BUFFER 绑的是谁」抄下来存好。之后改绑 ARRAY_BUFFER，不影响它。</code></pre>
+    <p>项目里所有属性都是紧挨着排的（stride、offset 固定为 0），所以 GeometryManager 只要交出 buffer、type、itemSize、normalized 四样。</p>
+
+    <h3 id="s2-3">2.3 draw：按编号取顶点</h3>
+    <pre><code>// Mary：没有索引，按 0、1、2……30521 依次取，每 3 个组成一个三角形
+gl.drawArrays(gl.TRIANGLES, 0, 30522)
+
+// 背景盒子：从当前 EBO 里读 36 个 Uint8 编号，按编号取顶点
+gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_BYTE, 0)
+// 第一个三角形读编号 0、2、1 → 每个已打开的 location 都去取第 0、2、1 个顶点
+// drawElements 的参数里没有 buffer：用的是「当前绑在 ELEMENT_ARRAY_BUFFER 上的那个」，
+// 也就是当前 VAO 里记的 EBO</code></pre>
+
+    <h3 id="s2-4">2.4 两个绑定点，和 VAO</h3>
+    <p>上次对话里的实测（无界面 Chrome）再放一次，卡片可以在你的浏览器里重跑：</p>
+    <pre><code>步骤                                      ARRAY_BUFFER  EBO   location 0 读
+1 VAO1 里：绑 B1、pointer、绑 I                B1        I     B1
+2 还在 VAO1：ARRAY_BUFFER 改绑 B2              B2        I     B1    ← pointer 已经抄下了 B1
+3 切到 VAO2（新建，什么都没配）                B2        null  null  ← EBO 跟着 VAO 走
+4 在 VAO2 里 pointer                           B2        null  B2    ← 此刻抄的是 B2
+5 切回 VAO1                                    B2        I     B1    ← I、B1 都回来了</code></pre>
+    <p>
+      反过来，如果第 2 步改绑 B2 以后（还在 VAO1 里）再调用一次 pointer，location 0 就改读 B2：pointer 每调用一次，就把此刻 ARRAY_BUFFER 上的 buffer 重新抄一次。卡片记录的最后一行实测了这一点。
+    </p>
+    <p>
+      记住两句话：<strong>ARRAY_BUFFER 是整个 context 共用的，它只是 pointer 和 bufferData 的「操作对象」</strong>；<strong>每个 location 读哪个 buffer、EBO 是哪个，记在当前 VAO 里</strong>（没有绑任何 VAO 时，记在 context 自带的那个默认 VAO 里）。第 3 节的「上传会弄乱别人的索引」，和第 4 节的「为什么按 program 缓存 VAO」，都从这两句来。
+    </p>
+    <div id="lab-basics"></div>
+
+    <h2 id="s3">3. GeometryManager 一版一版写</h2>
+    <h3 id="s3-1">3.1 第 1 版：照教程写</h3>
+    <pre><code>// 第 1 版：照教程写——每个属性建一个 buffer，有索引再建一个
+function uploadGeometryV1(gl: WebGLRenderingContext, geometry: GeometryLike): GpuGeometryV1 {
+  // 这一次上传的结果：属性名 → 这次新建的 buffer。每次调用都新建一张、交给调用者；
+  // 它不是缓存：下次再传同一个 Geometry，没有人会先查它
+  const attributes = new Map&lt;string, WebGLBuffer&gt;()
+
+  for (const name of geometry.getAttributeNames()) {
+    const data = geometry.getAttribute(name)!.copyData() // 背景盒子的 position：24 个 Float32
+    const buffer = gl.createBuffer()!
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer) // 改了整个 context 共用的 ARRAY_BUFFER
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW) // 96 字节拷进 GPU
+    attributes.set(name, buffer)
+  }
+
+  let indexBuffer: WebGLBuffer | null = null
+  const indices = geometry.copyIndices() // 背景盒子：36 个 Uint8，Mary：null
+
+  if (indices !== null) {
+    indexBuffer = gl.createBuffer()!
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer) // 改的是「当前 VAO」里的 EBO
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW)
+  }
+
+  // 用完不把绑定还回去；也没有缓存，每次调用都重新上传一遍
+  return { attributes, indexBuffer }
+}</code></pre>
+    <p>第 1 版有两个问题。</p>
+    <p>
+      <strong>一是没有缓存。</strong>代码里的 <code>attributes</code> 是一张 Map，但它不是缓存：每次调用都新建一张，装的是「这一次」新建的 buffer，交给调用者就完了，下次调用不会去查它。缓存得是调用结束以后还留着、下次调用先去查的东西，比如 3.2 节第 2 版里作为类字段的 <code>entries</code>。第 1 版没有这样的东西，同一个 Geometry 每要一次，就新建一套 buffer、重拷一遍数据：Mary 每帧 1.40 MiB，而且旧的那套没人记得，删不掉。
+    </p>
+    <p>
+      <strong>二是用完不还绑定，会换掉别人的索引。</strong>上传时绑着哪个 VAO，取决于上传之前最后发生了什么。比如上一次 draw 画的是物体 A，画完 A 的 VAO（VAO_A）还绑着，这时上传背景盒子。第 1 版依次发出这四条命令，注意每一条对 VAO_A 有没有影响：
+    </p>
+    <pre><code>// 上传前：当前 VAO 是 VAO_A，它的 EBO 是 A 自己的索引 I_A
+gl.bindBuffer(gl.ARRAY_BUFFER, B)             // ARRAY_BUFFER 不在 VAO 里：VAO_A 不变
+gl.bufferData(gl.ARRAY_BUFFER, position)      // 数据拷进 B：VAO_A 不变
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, I_盒子) // EBO 绑定点就在当前 VAO 里：
+                                              //   VAO_A 的 EBO 在这一刻变成 I_盒子
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices) // 数据拷进 I_盒子
+// 上传结束不还：下次画 A，bindVertexArrayOES(VAO_A) 带回来的 EBO 是 I_盒子</code></pre>
+    <p>
+      为什么只换掉 EBO，碰不到 location 读的 buffer？回到 2.4 节的表：location 读哪个 buffer，只在调用 vertexAttribPointer 的那一刻从 ARRAY_BUFFER 抄一次。第 1 版只调用 bindBuffer、不调用 pointer（pointer 是第 4 节顶点输入的事），所以 ARRAY_BUFFER 怎么改都碰不到任何 location。EBO 没有「抄」这一步：ELEMENT_ARRAY_BUFFER 这个绑定点本身就存在当前 VAO 里，bindBuffer 一调用就写进去了。下次画 A，按盒子的编号去取 A 的顶点，画错了，也不报错。
+    </p>
+    <p>下面两张卡片只跑第 1 版，把这两个问题跑出来。第 2 版怎样解决，在 3.2 节。</p>
+    <div id="lab-v1"></div>
+
+    <h3 id="s3-2">3.2 第 2 版：缓存，加上「先记下、再还回」</h3>
+    <pre><code>// 第 2 版：按 Geometry 对象缓存；上传前记下两个绑定，上传完绑回去，再告诉 State
+class GeometryCacheV2 {
+  private readonly entries = new Map&lt;GeometryLike, GpuGeometryV1&gt;()
+
+  constructor(
+    private readonly gl: WebGLRenderingContext,
+    private readonly invalidateState: () =&gt; void // 第 14 课：State 记的绑定可能已经过时
+  ) {}
+
+  get(geometry: GeometryLike): GpuGeometryV1 {
+    const cached = this.entries.get(geometry)
+    if (cached !== undefined) return cached // 第二次起：一条 GL 命令也不发
+
+    const gl = this.gl
+    // 上传会改这两个绑定点，先查出现在绑的是谁
+    const previousArray = gl.getParameter(gl.ARRAY_BUFFER_BINDING) as WebGLBuffer | null
+    const previousElements = gl.getParameter(
+      gl.ELEMENT_ARRAY_BUFFER_BINDING
+    ) as WebGLBuffer | null
+
+    try {
+      const result = uploadGeometryV1(gl, geometry)
+      this.entries.set(geometry, result)
+      return result
+    } finally {
+      gl.bindBuffer(gl.ARRAY_BUFFER, previousArray)
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, previousElements) // 把当前 VAO 的 EBO 还回去
+      this.invalidateState()
+    }
+  }
+}</code></pre>
+    <p>
+      缓存的 key 是 Geometry 对象本身（第 4 课：每个 CPU 资源在每个 context 里一份 GPU 表示）。两个 Mesh 共用一个 Geometry 时，第二次 get 直接拿到同一份 buffer。上传前用 getParameter 查出两个绑定点现在是谁，上传完绑回去，当前 VAO 的 EBO 就还原了。最后调用 invalidateState：GeometryManager 绕过 State 直接改过绑定，要告诉 State 它记的可能不对了（第 14 课）。
+    </p>
+    <p>
+      注意第 2 版并没有让 VAO_A「不被碰」：上传过程中，第 3 条命令照样把 VAO_A 的 EBO 换成了 I_盒子。区别在 finally：上传前查出的 previousElements 是 I_A，最后再 bindBuffer(ELEMENT_ARRAY_BUFFER, I_A) 一次，又写回了 VAO_A。也就是「改了，再还原」。用 3.1 节的两个场景，换成第 2 版再跑一次：
+    </p>
+    <div id="lab-v2"></div>
+    <p>
+      第 2 版还缺一样：bufferData 失败时不会抛异常。显存不够时，GL 只是记下一个错误码（OUT_OF_MEMORY，1285），bufferData 照常返回。第 2 版不问 getError，会把一个空的 buffer 当成成功、放进缓存，以后每帧都画不出来，也不报错。下一节的真实代码补上了这一条，以及需求 3、4、8。
+    </p>
+
+    <h3 id="s3-3">3.3 真实代码：get</h3>
+    <pre><code>// WebGL1GeometryManager.ts:104–201（去掉了原注释块；注释是课程加的）
+get(geometry: Geometry): WebGL1GeometryResource {
+  this.assertAvailable(&#x27;get geometry&#x27;) // Manager 还开着、context 没丢
+  if (geometry.disposed) throw new ResourceDisposedError(&#x27;Geometry&#x27;)
+  if (this.releasing.has(geometry)) {
+    throw new WebGLOperationError(&#x27;get geometry&#x27;, &#x27;Geometry&#x27;, &#x27;release is in progress&#x27;)
+  }
+
+  const cached = this.entries.get(geometry)
+  if (cached !== undefined) return cached.resource // 第 2 版的缓存
+
+  // 先在 CPU 上查完能查的：Uint32 索引降不了级，就一个 buffer 都不建（3.4 节）
+  const indices = this.prepareIndices(geometry.copyIndices())
+  const mode = this.primitiveMode(geometry.topology) // &#x27;triangles&#x27; → gl.TRIANGLES
+  const gl = this.gl
+  const owned: WebGLBuffer[] = [] // 这一次新建了哪些 buffer：失败时照单删除
+
+  // 别人留下的 GL 错误，不算到自己头上（第 15 课）
+  this.checkError(&#x27;preflight&#x27;, &#x27;Geometry&#x27;)
+
+  // 第 2 版：先记下两个绑定点现在是谁
+  const previousArray = gl.getParameter(gl.ARRAY_BUFFER_BINDING) as WebGLBuffer | null
+  const previousElements = gl.getParameter(
+    gl.ELEMENT_ARRAY_BUFFER_BINDING
+  ) as WebGLBuffer | null
+  this.checkError(&#x27;capture buffer bindings&#x27;, &#x27;Geometry&#x27;)
+
+  try {
+    const attributes = new Map&lt;string, WebGL1AttributeResource&gt;()
+    let indexBuffer: WebGLBuffer | null = null
+
+    try {
+      for (const name of geometry.getAttributeNames()) {
+        const attribute = geometry.getAttribute(name)!
+        const data = attribute.copyData()
+        const type = this.attributeType(data) // Float32Array → gl.FLOAT
+        const buffer = this.upload(
+          gl.ARRAY_BUFFER,
+          data,
+          `Geometry.attribute:${name}`,
+          owned
+        )
+        // 交给顶点输入的「怎样读」：buffer、分量类型、几个分量、要不要归一化
+        attributes.set(
+          name,
+          Object.freeze({
+            buffer,
+            type,
+            itemSize: attribute.itemSize,
+            normalized: attribute.normalized
+          })
+        )
+      }
+      if (indices !== null) {
+        indexBuffer = this.upload(
+          gl.ELEMENT_ARRAY_BUFFER,
+          indices,
+          &#x27;Geometry.indices&#x27;,
+          owned
+        )
+      }
+    } finally {
+      // 不管成功失败都绑回去；context 丢了就不发命令
+      if (!gl.isContextLost() &amp;&amp; !this.lostValue) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, previousArray)
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, previousElements)
+      }
+      this.hooks.invalidateState()
+    }
+
+    this.checkError(&#x27;restore buffer bindings&#x27;, &#x27;Geometry&#x27;)
+
+    // Uint8Array → UNSIGNED_BYTE
+    const indexType = indices === null ? null : this.indexType(indices)
+    const resource: WebGL1GeometryResource = Object.freeze({
+      attributes,
+      indexBuffer,
+      indexType,
+      drawCount: geometry.drawCount,  // 背景盒子 36，Mary 30522
+      primitiveMode: mode
+    })
+
+    // 全部成功才订阅、才进缓存：缓存里不会出现半成品
+    const unsubscribe = geometry.onDispose(() =&gt; this.release(geometry))
+    this.entries.set(geometry, { resource, unsubscribe })
+    return resource
+  } catch (error) {
+    if (gl.isContextLost() || this.lostValue) {
+      this.invalidateForContextLoss() // 丢了：不发 delete，只丢记录
+      throw new WebGLContextLostError(&#x27;create geometry&#x27;)
+    }
+    for (const buffer of owned) gl.deleteBuffer(buffer) // 照清单删掉这次建的
+    this.hooks.invalidateState()
+    throw error
+  }
+}</code></pre>
+    <p>和第 2 版比，多了四样：上传后用 getError 检查（upload 里）；一张 owned 清单，失败时照单删掉这次建的 buffer；全部成功才进缓存、才订阅 onDispose；context 丢了就只丢记录、不发 delete。upload 和索引预检在下面：</p>
+    <pre><code>// WebGL1GeometryManager.ts:290–305、:314–336（注释是课程加的）
+private prepareIndices(indices: IndexData | null): IndexData | null {
+  // 不是 Uint32，或者设备有 OES_element_index_uint：原样交回
+  if (!(indices instanceof Uint32Array) || this.capabilities.elementIndexUint !== null) {
+    return indices
+  }
+  // 查的是「最大的那个编号」，不是索引个数，也不是顶点个数
+  for (const index of indices) {
+    if (index &gt; 65535) {
+      throw new UnsupportedIndexTypeError(
+        &#x27;Uint32Array&#x27;,
+        &#x27;OES_element_index_uint is unavailable and an index exceeds 65535&#x27;
+      )
+    }
+  }
+  return new Uint16Array(indices) // 每个编号都放得进 16 位：复制一份，CPU 上的原数组不动
+}
+
+private upload(
+  target: number,
+  data: VertexAttributeData | IndexData,
+  label: string,
+  owned: WebGLBuffer[]
+): WebGLBuffer {
+  const gl = this.gl
+  const candidate = gl.createBuffer()
+  this.assertAvailable(&#x27;create buffer&#x27;)
+  const buffer = requireNonNull(
+    candidate,
+    () =&gt; new WebGLResourceCreationError(&#x27;buffer&#x27;, label)
+  )
+  owned.push(buffer) // 一拿到就记进清单：后面 bufferData 失败也找得到它
+  gl.bindBuffer(target, buffer)
+  gl.bufferData(target, data, gl.STATIC_DRAW)
+  // bufferData 失败不会抛异常（比如显存不够），要自己问 getError
+  this.checkError(&#x27;upload buffer&#x27;, label)
+  return buffer
+}</code></pre>
+    <aside class="note"><strong>10 月 12 日更新</strong>：上面几处 <code>checkError</code>（preflight、保存与恢复绑定、每个 buffer 上传后）你在工作区改成了有界循环（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:416">WebGL1GeometryManager.ts:416–444</a>），和第 15 课的 ProgramManager 是同一份写法：一直读到 NO_ERROR，最多 32 次，读到的码一次报出。下面「第 3 个 buffer 上传时显存不够」这张卡片已经换成新代码跑，信息从「GL error 1285」变成了「GL errors: 1285」。第 4 节的顶点输入用的是 VertexInputSupport 自己的 checkError（<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:168">WebGL1VertexInputSupport.ts:168</a>），它还是只读一次：同一次 draw 里，几何体上传和接线这两步遇到同样的错误，报法会不一样。</aside>
+    <div id="lab-real"></div>
+
+    <h3 id="s3-4">3.4 Uint32 索引：能降就降</h3>
+    <p>
+      WebGL1 原生只支持 Uint8、Uint16 两种索引，Uint32 要靠 OES_element_index_uint 扩展（第 13 课探测的能力之一，现在的桌面浏览器基本都有）。没有扩展时，一个 Uint16 最大存 65535。真实代码的做法（上面 prepareIndices）：逐个看编号，全都 ≤ 65535 就复制成 Uint16Array；有一个超过就报 UnsupportedIndexTypeError，而且这时一个 buffer 都还没建。查的是「最大编号」而不是「索引个数」：Mary 如果改成带索引的版本，有 30522 个角、7905 个不同的顶点，最大编号 7904，放得进 Uint16；索引个数再多也没关系。
+    </p>
+    <div id="lab-uint"></div>
+
+    <h3 id="s3-5">3.5 释放：先让顶点输入放手</h3>
+    <pre><code>// WebGL1GeometryManager.ts:212–247（注释是课程加的）
+release(geometry: Geometry): void {
+  const entry = this.entries.get(geometry)
+  if (entry === undefined || this.releasing.has(geometry)) return // 没建过，或者正在删
+
+  if (this.gl.isContextLost() || this.lostValue) {
+    this.invalidateForContextLoss()
+    return
+  }
+
+  this.releasing.add(geometry)
+  try {
+    // ① 先让顶点输入放掉借用这些 buffer 的 VAO、当前接线（和第 15 课 2.6 节同一个套路）
+    this.hooks.beforeDelete?.(geometry)
+    if (this.gl.isContextLost() || this.lostValue) {
+      this.invalidateForContextLoss()
+      return
+    }
+    // ② 退订、移出缓存
+    entry.unsubscribe()
+    this.entries.delete(geometry)
+    // ③ 删除自己拥有的 buffer
+    for (const attribute of entry.resource.attributes.values()) {
+      this.gl.deleteBuffer(attribute.buffer)
+    }
+    if (entry.resource.indexBuffer !== null) {
+      this.gl.deleteBuffer(entry.resource.indexBuffer)
+    }
+    this.hooks.invalidateState()
+  } finally {
+    this.releasing.delete(geometry)
+  }
+}</code></pre>
+    <p>
+      和第 15 课 2.6 节是同一个套路：删除之前先调用 beforeDelete，ResourceManager 往里填的是「请顶点输入放掉这个 Geometry」（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:93">WebGL1ResourceManager.ts:93–98</a>）。这里多一个理由：WebGL 规定，某个 location 打开着、却已经没有 buffer 可读（buffer 被删了，绑定就清空了），draw 会报 INVALID_OPERATION，哪怕 shader 根本不用这个 location（WebGL 1.0 规范「No Client Side Arrays」一节）。4.2 节的卡片实测了这一点。
+    </p>
+
+    <h2 id="s4">4. 顶点输入：把 buffer 接到 location 上</h2>
+    <h3 id="s4-1">4.1 两份结果按名字配对</h3>
+    <pre><code>// ProgramManager 交回（PRT program）：            GeometryManager 交回（Mary）：
+//   position → 0                             position      → { buffer P,  FLOAT, 3, false }
+//   aTransportSH0 → 1                        aTransportSH0 → { buffer T0, FLOAT, 3, false }
+//   aTransportSH1 → 2                        aTransportSH1 → { buffer T1, FLOAT, 3, false }
+//   aTransportSH2 → 3                        aTransportSH2 → { buffer T2, FLOAT, 3, false }
+//
+// resolve 按名字配成：
+//   [{ location 0, buffer P },  { location 1, buffer T0 },
+//    { location 2, buffer T1 }, { location 3, buffer T2 }]
+// apply 对每一条做 2.2 节那三行：bindBuffer、vertexAttribPointer、enableVertexAttribArray，
+// 最后绑 EBO</code></pre>
+    <pre><code>// WebGL1VertexInputSupport.ts:80–103、:112–134（注释是课程加的）
+resolve(
+  geometry: WebGL1GeometryResource,
+  program: WebGL1ProgramResource
+): readonly VertexBinding[] {
+  // program 用到的属性：
+  //   [{ name: &#x27;position&#x27;, location: 0 }, { name: &#x27;aTransportSH0&#x27;, location: 1 }, …]
+  const inputs = this.readInputs(program)
+
+  return inputs.map(({ name, location }) =&gt; {
+    const attribute = geometry.attributes.get(name) // 按名字配对，不猜别名
+    if (attribute === undefined) {
+      // shader 要、Geometry 没有：在改任何 GL 状态之前就报错
+      throw new UnsupportedRenderFeatureError(
+        &#x27;vertex input&#x27;,
+        `missing active attribute ${name}`
+      )
+    }
+    if (
+      !Number.isInteger(attribute.itemSize) ||
+      attribute.itemSize &lt; 1 ||
+      attribute.itemSize &gt; 4
+    ) {
+      throw new UnsupportedRenderFeatureError(
+        &#x27;vertex input&#x27;,
+        `${name}: itemSize must be 1..4`
+      )
+    }
+    return { location, attribute } // Geometry 多出来的属性不会出现在这里
+  })
+}
+
+apply(bindings: readonly VertexBinding[], indexBuffer: WebGLBuffer | null): void {
+  const gl = this.gl
+  for (const { location, attribute } of bindings) {
+    // pointer 记下的是「此刻」的 ARRAY_BUFFER
+    gl.bindBuffer(gl.ARRAY_BUFFER, attribute.buffer)
+    gl.vertexAttribPointer(
+      location,
+      attribute.itemSize,
+      attribute.type,
+      attribute.normalized,
+      0,
+      0
+    )
+    gl.enableVertexAttribArray(location)
+  }
+  // 没有索引也要显式绑 null：不能留着上一个物体的 EBO
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer)
+  this.checkError(&#x27;configure vertex input&#x27;)
+}</code></pre>
+    <p>
+      resolve 只读不写：缺属性、itemSize 不在 1～4、location 不合法，都在这里抛错，这时 GL 状态还没动过（需求 5）。它用到的 readInputs 会对每个 program 再反射一次属性的类型，只收 float、vec2、vec3、vec4：mat4 属性要占 4 个连续 location，现在的接线方式一条 pointer 只接一个 location，所以明确拒绝，而不是悄悄画错（<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:216">WebGL1VertexInputSupport.ts:216–223</a> 的 TODO）。
+    </p>
+    <p>
+      location 由 program 决定，而且和声明顺序有关：同样两个属性，在 SwiftShader 上先声明 position 时它是 0，先声明 aOther 时它是 1。所以同一个 Geometry 配两个 shader，接线可能完全不同（需求 6）。下面的卡片在你的浏览器里查。
+    </p>
+    <div id="lab-resolve"></div>
+
+    <h3 id="s4-2">4.2 没有 VAO：每次 draw 前接一遍线</h3>
+    <p>
+      <strong>先看 GL 里有什么。</strong>没有 VAO 扩展时，顶点输入的状态只有一份，整个 context 共用（就是 2.4 节说的 context 自带的那个默认 VAO）。可以把它想成一张 16 行的表（MAX_VERTEX_ATTRIBS：规范只保证至少 8 行，常见设备和 SwiftShader 上实测是 16，下面按 16 说），每一行对应一个 location，记三样东西：开没开、读哪个 buffer、按什么格式读。表外还有一格：EBO。draw 的时候，GPU 只看这张表取顶点。
+    </p>
+    <pre><code>// 默认的这张表（整个 context 只有一份）。刚建好 context 时：
+// location   开着？   读哪个 buffer
+//    0         关        null
+//    1         关        null
+//    …
+//   15         关        null
+// EBO：null
+
+// 开一行要三条命令（2.2 节）：
+gl.bindBuffer(gl.ARRAY_BUFFER, P)                      // 选中 buffer
+gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0)    // 第 0 行抄下「读 P、每顶点 3 个 float」
+gl.enableVertexAttribArray(0)                          // 第 0 行打开
+// 关一行只要一条：
+gl.disableVertexAttribArray(1)</code></pre>
+    <p>
+      所以没有 VAO 时，顶点输入的工作就是：<strong>每次 draw 之前，把这张表改成这次 draw 要的样子。</strong>HW2 每帧画两样东西，要的样子分别是：
+    </p>
+    <ul>
+      <li>画背景盒子（背景 shader 只要 position，在 location 0）：第 0 行开着、读盒子的 position buffer（下面叫 P盒子）；其余行关；EBO 是盒子的索引 I盒子。</li>
+      <li>画 Mary（PRT shader 要 4 个属性，在 location 0～3）：第 0～3 行开着，分别读 P、T0、T1、T2；其余行关；EBO 是 null（Mary 没有索引）。</li>
+    </ul>
+
+    <p><strong>第 1 版：只管这次要用的行。</strong>按 4.1 节 resolve 配好的结果，一行一行接上，最后绑 EBO：</p>
+    <pre><code>// 没有 VAO 时的第 1 版：每次 draw 前，把这次要用的 location 接好；用不到的不管
+function bindManualV1(
+  gl: WebGLRenderingContext,
+  bindings: readonly BindingLike[],
+  indexBuffer: WebGLBuffer | null
+): void {
+  for (const binding of bindings) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, binding.buffer)
+    gl.vertexAttribPointer(
+      binding.location,
+      binding.itemSize,
+      binding.type,
+      binding.normalized,
+      0,
+      0
+    )
+    gl.enableVertexAttribArray(binding.location) // 打开以后，下一次 draw 不会自动关掉
+  }
+
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer)
+}</code></pre>
+    <p>按 HW2 的顺序走一遍，每一步之后表里第 0～3 行和 EBO 是这样（加粗的是「不该开着」的行）：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>步骤</th><th>0</th><th>1</th><th>2</th><th>3</th><th>EBO</th><th>draw 之后 getError</th></tr></thead>
+      <tbody>
+        <tr><td>① 第 1 帧画背景</td><td>开·P盒子</td><td>关</td><td>关</td><td>关</td><td>I盒子</td><td>0</td></tr>
+        <tr><td>② 画 Mary</td><td>开·P</td><td>开·T0</td><td>开·T1</td><td>开·T2</td><td>null</td><td>0</td></tr>
+        <tr><td>③ 第 2 帧画背景</td><td>开·P盒子</td><td><strong>开·T0</strong></td><td><strong>开·T1</strong></td><td><strong>开·T2</strong></td><td>I盒子</td><td>0</td></tr>
+        <tr><td>④ 换预设：Mary 释放，它的 4 个 buffer 删掉</td><td>开·P盒子</td><td><strong>开·无 buffer</strong></td><td><strong>开·无 buffer</strong></td><td><strong>开·无 buffer</strong></td><td>I盒子</td><td>—</td></tr>
+        <tr><td>⑤ 再画背景</td><td>开·P盒子</td><td><strong>开·无 buffer</strong></td><td><strong>开·无 buffer</strong></td><td><strong>开·无 buffer</strong></td><td>I盒子</td><td>1282</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      第 ③ 步画背景时，第 1～3 行还开着、读着 Mary 的 buffer。背景 shader 不用这三行，所以这一帧还画得对。问题出在第 ④ 步：buffer 删掉时，读它的行被清成「没有 buffer」，可行本身还开着。WebGL 规定，只要有一行开着却没有 buffer 可读，draw 就报 INVALID_OPERATION（1282），不管 shader 用不用这一行（3.5 节）。于是第 ⑤ 步背景画不出来。
+    </p>
+    <p>结论：<strong>这次不用的行，要关掉。</strong>可「哪些行开着」GL 不会主动告诉你，只能自己记。</p>
+    <div id="lab-manual-v1"></div>
+
+    <p><strong>第 2 版：记下上次开了哪些，这次不用的关掉。</strong></p>
+    <pre><code>// 没有 VAO 时的第 2 版：多记一样东西——上一次 bind 打开了哪些 location
+class ManualInputV2 {
+  // 上一次打开的 location，比如画完 Mary 是 {0, 1, 2, 3}
+  private readonly enabled = new Set&lt;number&gt;()
+
+  constructor(private readonly gl: WebGLRenderingContext) {}
+
+  bind(bindings: readonly BindingLike[], indexBuffer: WebGLBuffer | null): void {
+    const gl = this.gl
+    // 这次要开的 location，比如画背景是 {0}
+    const next = new Set(bindings.map((binding) =&gt; binding.location))
+
+    for (const location of this.enabled) {
+      // 上次开、这次不用：关掉。画完 Mary 再画背景，这里关掉 1、2、3
+      if (!next.has(location)) gl.disableVertexAttribArray(location)
+    }
+
+    bindManualV1(gl, bindings, indexBuffer) // 这次要用的，照第 1 版接好
+
+    // 记下这次开了哪些，留给下一次 bind 用
+    this.enabled.clear()
+    for (const location of next) this.enabled.add(location)
+  }
+}</code></pre>
+    <p>同样的顺序，多了一列「这次关掉了哪些」：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>步骤</th><th>enabled（进来时）</th><th>这次要开</th><th>关掉</th><th>1～3 行之后</th><th>draw 之后 getError</th></tr></thead>
+      <tbody>
+        <tr><td>① 第 1 帧画背景</td><td>{}</td><td>{0}</td><td>无</td><td>关</td><td>0</td></tr>
+        <tr><td>② 画 Mary</td><td>{0}</td><td>{0, 1, 2, 3}</td><td>无</td><td>开·T0、T1、T2</td><td>0</td></tr>
+        <tr><td>③ 第 2 帧画背景</td><td>{0, 1, 2, 3}</td><td>{0}</td><td>1、2、3</td><td>关</td><td>0</td></tr>
+        <tr><td>④ Mary 释放</td><td colspan="3">（不经过 bind）</td><td>关</td><td>—</td></tr>
+        <tr><td>⑤ 再画背景</td><td>{0}</td><td>{0}</td><td>无</td><td>关</td><td>0</td></tr>
+      </tbody>
+    </table></div>
+    <div id="lab-manual-v2"></div>
+
+    <p><strong>第 2 版还漏了两种情况。</strong></p>
+    <ol class="steps">
+      <li>
+        <strong>第一次 bind 之前，表里已经有东西。</strong>第 2 版的 enabled 一开始是空集合，等于假设表是全关的。可同一个 canvas 的 context 也许被别的代码用过（比如旧引擎的代码、一个第三方库），留下了开着的行。第 2 版不知道这些行，也就永远不会去关。真实代码的做法：还没接管过（<code>initialized</code> 为 false）时，不知道之前开了什么，就把 0～15 全部当成「可能开着」，这次不用的全关一遍。之后才靠 enabled 记录。
+      </li>
+      <li>
+        <strong>接到一半失败。</strong>比如接到第 3 行时 context 丢了，或者某条命令报了错。这时表里一部分是新的、一部分是旧的，enabled 记录也对不上。真实代码的做法：只要已经开始改 GL（<code>changed</code> 为 true），失败时就把 0～15 全关、两个绑定点清空（resetBindings），记录清空，再把错误抛给调用者；调用者跳过这次 draw，下次 bind 从一张干净的表开始。反过来，如果是 resolve 发现缺属性，这时还没动过 GL，就什么都不用收拾。
+      </li>
+    </ol>
+    <p>真实代码就是第 2 版加上这两条：</p>
+    <pre><code>// WebGL1ManualVertexInputManager.ts:50–104（注释是课程加的）
+bind(
+  geometry: Geometry,
+  gpuGeometry: WebGL1GeometryResource,
+  program: WebGL1ProgramResource
+): void {
+  let changed = false // 只有开始改 GL 以后失败，才需要收拾
+  try {
+    this.support.assertBindable(geometry)
+    this.support.checkError(&#x27;prepare manual vertex input&#x27;)
+
+    const bindings = this.support.resolve(gpuGeometry, program) // 先查完：缺属性就在这里抛
+    const nextEnabled = new Set(bindings.map((binding) =&gt; binding.location)) // 这次要用 {0}
+
+    changed = true
+    // 上次打开了哪些：第一次不知道，就把 0～15 全部当成「可能开着」
+    const previous = this.initialized
+      ? this.enabled
+      : Array.from({ length: this.support.maxAttributes }, (_, index) =&gt; index)
+
+    for (const location of previous) {
+      if (!nextEnabled.has(location)) {
+        this.gl.disableVertexAttribArray(location) // 上次用、这次不用：关掉
+      }
+    }
+
+    this.support.apply(bindings, gpuGeometry.indexBuffer)
+
+    // 全部成功才更新记录
+    this.enabled.clear()
+    for (const location of nextEnabled) {
+      this.enabled.add(location)
+    }
+    this.initialized = true
+    this.currentGeometry = geometry
+    this.currentProgram = program.program
+  } catch (error) {
+    if (!this.support.disposed &amp;&amp; this.support.contextLost) {
+      this.invalidateForContextLoss()
+      throw new WebGLContextLostError(&#x27;bind vertex input&#x27;)
+    }
+    if (changed) {
+      this.resetBindings(true) // 改到一半失败：0～15 全关、两个绑定点清空，调用者跳过这次 draw
+    }
+    throw error
+  } finally {
+    this.hooks.invalidateState()
+  }
+}</code></pre>
+    <div id="lab-manual"></div>
+    <p>
+      最后看一下代价：没有 VAO 时，画一次 Mary，光是接线就要发 4 × 3 + 1 = 13 条 GL 命令（每个属性三条，加上绑 EBO），每帧每次 draw 都重来一遍；另外，真实代码每次还调用两次 getError（进门检查一次、接完检查一次）。下一节的 VAO 把这 13 条变成 1 条。
+    </p>
+
+    <h3 id="s4-3">4.3 有 VAO：接好一次，以后一条命令</h3>
+    <p>
+      <strong>VAO 是什么，再说一次。</strong>一个 VAO 就是一张自己的「16 行表 + EBO」，和 4.2 节那张默认的表结构一样。bindVertexArrayOES(vao) 把「当前的表」换成它；之后的 pointer、enable、绑 EBO，全都写进这张表。所以思路是：<strong>每种要画的组合，录一张表；以后再画这种组合，换上它就行。</strong>换表只要 1 条命令，代替 4.2 节的 13 条。新建的 VAO 是一张全关的表，只开录进去的那几行，所以 4.2 节「关掉不用的行」的问题，在 VAO 这里自然就没有了。
+    </p>
+    <p><strong>第 1 版：每个 Geometry 录一张表。</strong>第一次画某个 Geometry 时，建一个 VAO、换上它、照 4.2 节第 1 版接一遍线，接线就录进去了；以后再画它，直接换上：</p>
+    <pre><code>// 有 VAO 的第 1 版：每个 Geometry 录一张表
+class VaoCacheV1 {
+  private readonly vaos = new Map&lt;object, WebGLVertexArrayObjectOES&gt;() // Geometry → VAO
+
+  constructor(
+    private readonly gl: WebGLRenderingContext,
+    private readonly ext: OES_vertex_array_object
+  ) {}
+
+  bind(
+    geometry: object,
+    bindings: readonly BindingLike[], // 按这次 draw 的 program 算出的接线（4.1 节）
+    indexBuffer: WebGLBuffer | null
+  ): void {
+    const cached = this.vaos.get(geometry)
+    if (cached !== undefined) {
+      // 命中：换上录好的表，一条命令。
+      // 注意 bindings 在这里没用上：表是按「第一次画它时的 program」录的
+      this.ext.bindVertexArrayOES(cached)
+      return
+    }
+
+    const vao = this.ext.createVertexArrayOES()! // 一张新表：16 行全关，EBO 是 null
+    this.ext.bindVertexArrayOES(vao) // 换上它：之后的 pointer、enable、绑 EBO 都写进这张表
+    bindManualV1(this.gl, bindings, indexBuffer) // 录：和 4.2 节第 1 版一样的命令
+    this.vaos.set(geometry, vao)
+  }
+}</code></pre>
+    <p>
+      问题在「录的是哪个 program 的 location」。4.1 节说过：location 由 program 决定，换个 shader 就可能变。设想调试时 Mary 换了一个 shader，它只用 position 和 aTransportSH0，而且链接出来 aTransportSH0 在 0、position 在 1。第 1 版命中了 Mary 的那张表，可那张表是按 PRT program 录的：
+    </p>
+    <pre><code>// Mary 的表（第一次画 Mary 时按 PRT program 录的）：
+//   0 → P（position）  1 → T0  2 → T1  3 → T2
+// 调试 shader 要的：
+//   position 从 1 读    → 表里第 1 行是 T0：position 读到的是传输系数
+//   aTransportSH0 从 0 读 → 表里第 0 行是 P：系数读到的是位置
+// 不报任何错，只是画错</code></pre>
+    <p>所以 key 里必须有 program：同一个 Geometry，配不同的 program，各录各的表。</p>
+    <div id="lab-vao-v1"></div>
+
+    <p><strong>第 2 版：两层 key，先按 Geometry，再按 program。</strong></p>
+    <pre><code>// 有 VAO 的第 2 版：两层 key，先按 Geometry，再按 program
+class VaoCacheV2 {
+  // 外层表：Geometry → 小表；小表：program → VAO
+  private readonly vaos = new Map&lt;object, Map&lt;WebGLProgram, WebGLVertexArrayObjectOES&gt;&gt;()
+
+  constructor(
+    private readonly gl: WebGLRenderingContext,
+    private readonly ext: OES_vertex_array_object
+  ) {}
+
+  bind(
+    geometry: object,
+    program: WebGLProgram, // 多了这个参数：这次 draw 用的 program
+    bindings: readonly BindingLike[],
+    indexBuffer: WebGLBuffer | null
+  ): void {
+    // 查两次：先拿 Geometry 查外层表，得到它的小表；再拿 program 查小表
+    const cached = this.vaos.get(geometry)?.get(program)
+    if (cached !== undefined) {
+      this.ext.bindVertexArrayOES(cached) // 命中：这张表就是按这个 program 录的
+      return
+    }
+
+    const vao = this.ext.createVertexArrayOES()!
+    this.ext.bindVertexArrayOES(vao)
+    bindManualV1(this.gl, bindings, indexBuffer) // 按这个 program 的 location 录
+
+    // 这个 Geometry 第一次出现时，先给它建一张空的小表
+    const programs =
+      this.vaos.get(geometry) ?? new Map&lt;WebGLProgram, WebGLVertexArrayObjectOES&gt;()
+    programs.set(program, vao)
+    this.vaos.set(geometry, programs)
+  }
+}</code></pre>
+    <p>
+      <code>Map&lt;Geometry, Map&lt;program, VAO&gt;&gt;</code> 是 Map 里套 Map，查的时候分两步：先拿 Geometry 查外层表，得到这个 Geometry 自己的小表；再拿 program 查小表，得到 VAO。画完背景、Mary（PRT），再画 Mary（调试 shader）以后，表里是这样：
+    </p>
+    <pre><code>// 外层表（key 是 Geometry）
+//   盒子 → 小表（key 是 program）
+//            program#背景 → VAO#1
+//   Mary → 小表
+//            program#PRT  → VAO#2
+//            program#调试 → VAO#3   ← 换 shader 时新录的一张
+// 下一帧再画 Mary（调试）：get(Mary) 得到 Mary 的小表，.get(program#调试) 得到 VAO#3，命中</code></pre>
+    <div id="lab-vao-v2"></div>
+
+    <p><strong>真实代码在第 2 版上还多做了五件事</strong>（对照下面代码里的注释）：</p>
+    <ol class="steps">
+      <li><strong>先 resolve，再建 VAO。</strong>缺属性时在建 VAO 之前就抛错，不会留下半张表（需求 5）。</li>
+      <li><strong>录完把 ARRAY_BUFFER 还回去，但新 VAO 留着绑定。</strong>录的时候改过 ARRAY_BUFFER，它不在 VAO 里，是整个 context 共用的，要还原；新 VAO 不还原，因为紧接着就要 draw。</li>
+      <li><strong>录到一半失败，就还原进入前的 VAO 和 ARRAY_BUFFER，删掉这张半成品表。</strong>它不进缓存。</li>
+      <li><strong>同一个 Geometry 重新上传过，就重录。</strong>缓存里除了 VAO 还记着录表时的 gpuGeometry。GeometryManager 如果给这个 Geometry 建了新的 buffer，旧表里抄的还是旧 buffer，<code>cached.gpuGeometry === gpuGeometry</code> 不成立，就重录一张、删掉旧的。</li>
+      <li><strong>finally 里通知 State。</strong>换 VAO 等于换了 EBO（第 14 课），录表时还改过 ARRAY_BUFFER，State 记的这两样都可能不对了。</li>
+    </ol>
+    <pre><code>// WebGL1OESVertexInputManager.ts:58–140（注释是课程加的；报错文案用 … 代替）
+bind(
+  geometry: Geometry,
+  gpuGeometry: WebGL1GeometryResource,
+  program: WebGL1ProgramResource
+): void {
+  try {
+    this.support.assertBindable(geometry)
+
+    // 两层 key：先按 Geometry，再按 program（第 15 课 2.6 节）
+    const cached = this.entries.get(geometry)?.get(program.program)
+    if (cached?.gpuGeometry === gpuGeometry) {
+      this.extension.bindVertexArrayOES(cached.vao) // 命中：一条命令就接好了全部输入
+      this.support.assertReady(&#x27;bind cached VAO&#x27;)
+      this.currentVAO = cached.vao
+      return
+    }
+
+    this.support.checkError(&#x27;prepare VAO&#x27;)
+    const bindings = this.support.resolve(gpuGeometry, program) // 先查完再动手
+
+    // 记下现在的 VAO 和 ARRAY_BUFFER，失败时还原
+    const previousVAO = this.gl.getParameter(
+      this.extension.VERTEX_ARRAY_BINDING_OES
+    ) as WebGLVertexArrayObjectOES | null
+    const previousArray = this.gl.getParameter(
+      this.gl.ARRAY_BUFFER_BINDING
+    ) as WebGLBuffer | null
+    this.support.checkError(&#x27;capture vertex input&#x27;)
+
+    const candidate = this.extension.createVertexArrayOES()
+    this.support.assertReady(&#x27;create VAO&#x27;)
+    const vao = requireNonNull(
+      candidate,
+      () =&gt; new WebGLResourceCreationError(&#x27;vertex-array&#x27;, …)
+    )
+
+    try {
+      this.extension.bindVertexArrayOES(vao) // 之后的 pointer、enable、EBO 都录进这个 VAO
+      this.support.apply(bindings, gpuGeometry.indexBuffer)
+      // ARRAY_BUFFER 不属于 VAO：还回去
+      this.gl.bindBuffer(this.gl.ARRAY_BUFFER, previousArray)
+      this.support.checkError(&#x27;finish VAO&#x27;)
+
+      const programs =
+        this.entries.get(geometry) ?? new Map&lt;WebGLProgram, VertexArrayEntry&gt;()
+      programs.set(program.program, { vao, gpuGeometry })
+      this.entries.set(geometry, programs)
+      this.currentVAO = vao // 新 VAO 保持绑定：接下来就要 draw
+
+      // 同一个 Geometry 重新上传过（buffer 换了）：旧 VAO 指着旧 buffer，删掉
+      if (cached !== undefined) {
+        this.extension.deleteVertexArrayOES(cached.vao)
+      }
+    } catch (error) {
+      if (!this.support.contextLost) {
+        this.extension.bindVertexArrayOES(previousVAO)
+        this.gl.bindBuffer(this.gl.ARRAY_BUFFER, previousArray)
+        this.extension.deleteVertexArrayOES(vao) // 半成品不进缓存
+      }
+      throw error
+    }
+  } catch (error) {
+    if (!this.support.disposed &amp;&amp; this.support.contextLost) {
+      this.invalidateForContextLoss()
+      throw new WebGLContextLostError(&#x27;bind vertex input&#x27;)
+    }
+    throw error
+  } finally {
+    this.hooks.invalidateState() // 第 14 课：切 VAO 换掉了 EBO，State 要忘掉
+  }
+}</code></pre>
+    <div id="lab-oes"></div>
+
+    <h3 id="s4-4">4.4 换 shader 以后：缓存里查不到、也没人删的 VAO</h3>
+    <p>
+      第 15 课 2.6 节用一张字符画说「删 program 之前，要先让顶点输入删掉按它建的 VAO」。那时还没讲 VAO，不好懂。现在 4.3 节讲完了，用一个具体的顺序把它重新走一遍。
+    </p>
+    <p>
+      <strong>还是那张两层表。</strong>真实代码里它叫 <code>entries</code>，类型是 <code>Map&lt;Geometry, Map&lt;WebGLProgram, { vao, gpuGeometry }&gt;&gt;</code>（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:30">WebGL1OESVertexInputManager.ts:30</a>），和 4.3 节第 2 版一样查两次，只是小表里除了 VAO 还记着 gpuGeometry。HW2 画完第 1 帧，表里是这样：
+    </p>
+    <pre><code>// 第 1 帧画完：背景用 program#背景，Mary 用 program#1（PRT shader v1 链接出来的）
+// entries（外层表，key 是 Geometry）
+//   盒子 → 小表（key 是 program）
+//            program#背景 → { vao: VAO#1, … }
+//   Mary → 小表
+//            program#1    → { vao: VAO#2, … }
+
+// 第 2 帧画 Mary，调用 bind(Mary, Mary 的 buffers, program#1)：
+//   entries.get(Mary)    → Mary 的小表
+//   小表.get(program#1)   → { vao: VAO#2 }：命中，只发一条 bindVertexArrayOES(VAO#2)
+// 对应 WebGL1OESVertexInputManager.ts:66 这一行：
+const cached = this.entries.get(geometry)?.get(program.program)</code></pre>
+    <p>
+      <strong>bind 收到的 program 从哪来。</strong>只有一个来源：Backend.draw 每次先拿材质的 ShaderModule 向 ProgramManager 要 program，再把它交给顶点输入（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:208">WebGL1Backend.ts:208</a>、<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:217">:217</a>）：
+    </p>
+    <pre><code>const program = generation.resources.programs.get(material.shaderModule) // :208
+// …中间是 useProgram、深度状态、uniform
+generation.resources.vertexInputs.bind(geometry, buffers, program)      // :217</code></pre>
+    <p>所以拿哪个 program 去查小表，完全取决于材质<strong>现在</strong>用的是哪个 ShaderModule。下面整件事的关键就在这里。</p>
+    <p>
+      <strong>换两次 shader，一步一步看。</strong>调试时把 Mary 的材质先换成一个只画 position 的 shader（v2），改完 GLSL 又换成改过的 PRT（v3）。旧的 ShaderModule 没人用了就释放，ProgramManager 收到释放通知，删掉它的 program（第 15 课 2.7 节）。先假设<strong>没有</strong> beforeDelete，没人通知顶点输入：
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>步骤</th><th>发生了什么</th><th>顶点输入做了什么</th><th>Mary 的小表</th><th>活着的 VAO</th></tr></thead>
+      <tbody>
+        <tr><td>①</td><td>第 1 帧：材质用 v1，get(v1) 交出 program#1</td><td>小表里没有 program#1：建 VAO#2，接线</td><td>program#1 → VAO#2</td><td>2 个（VAO#1 是盒子的）</td></tr>
+        <tr><td>②</td><td>第 2 帧：同样</td><td>命中，bindVertexArrayOES(VAO#2)</td><td>不变</td><td>2 个</td></tr>
+        <tr><td>③</td><td>材质换成 v2，get(v2) 交出 program#2</td><td>小表里没有 program#2：建 VAO#3</td><td>program#1 → VAO#2<br />program#2 → VAO#3</td><td>3 个</td></tr>
+        <tr><td>④</td><td>v1 没人用了，释放；ProgramManager 删掉 program#1</td><td>没人通知它，什么也没做</td><td>不变：program#1 那一行还在</td><td>3 个</td></tr>
+        <tr><td>⑤</td><td>材质换成 v3（get 交出 program#3），释放 v2（删掉 program#2）</td><td>建 VAO#4；program#2 的事同样不知道</td><td>program#1 → VAO#2<br />program#2 → VAO#3<br />program#3 → VAO#4</td><td>4 个</td></tr>
+      </tbody>
+    </table></div>
+    <p>第 ⑤ 步以后，program#1、program#2 这两行就是第 15 课那张图里说的情况：</p>
+    <ul>
+      <li><strong>查不到。</strong>要命中 program#1 这一行，得有人拿 program#1 调用 bind。而 bind 的 program 只来自 programs.get(材质的 ShaderModule)：材质现在用 v3；v1 已经释放，再 get(v1) 会直接抛 ResourceDisposedError（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:83">WebGL1ProgramManager.ts:83</a>），ProgramManager 自己的记录也删了。除了小表里的这个 key，再没有代码拿着 program#1。</li>
+      <li><strong>没人删。</strong>没有钩子时，顶点输入只在两种时候删 VAO：Mary 这个 Geometry 释放（releaseGeometry 把 Mary 下面的行全删），或者顶点输入自己 dispose。调 shader 的时候 Mary 一直留着，这两件事都不会发生。</li>
+      <li><strong>一直占着。</strong>VAO 是 GPU 对象。program 删了，GL 不会跟着删 VAO：VAO 里记的是「哪个 location 读哪个 buffer、什么格式」，不记 program（4.3 节）。不调用 deleteVertexArrayOES，它就一直在。</li>
+    </ul>
+    <p>每换一次 shader，就多一行这样的死条目。图 3 上半部分画的是第 ⑤ 步以后的表：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 364" role="img" aria-label="上：没接 beforeDelete 时，Mary 的小表里有 program#1、program#2、program#3 三行，draw 只会拿 program#3 来查，前两行查不到也没人删，GPU 上活着 4 个 VAO。下：接了 beforeDelete，Mary 的小表里只剩 program#3 一行，活着 2 个 VAO。">
+          <defs>
+            <marker id="h3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <text x="20" y="22" class="title">没接 beforeDelete：第 ⑤ 步以后</text>
+          <rect x="20" y="40" width="230" height="74" class="box" />
+          <text x="32" y="60">draw 画 Mary（材质是 v3）</text>
+          <text x="32" y="80" class="accent">① entries.get(Mary)</text>
+          <text x="32" y="100" class="accent">② 小表.get(program#3)</text>
+          <text x="300" y="32" class="small">外层表</text>
+          <text x="410" y="32" class="small">小表</text>
+          <rect x="300" y="40" width="64" height="28" class="box" /><text x="332" y="59" text-anchor="middle">盒子</text>
+          <rect x="410" y="40" width="210" height="28" class="box" /><text x="420" y="59">program#背景 → VAO#1</text>
+          <path d="M364 54 L410 54" class="line" />
+          <rect x="300" y="78" width="64" height="88" class="box hl" /><text x="332" y="126" text-anchor="middle">Mary</text>
+          <rect x="410" y="78" width="210" height="28" class="box bad" /><text x="420" y="97">program#1（已删）→ VAO#2</text>
+          <rect x="410" y="108" width="210" height="28" class="box bad" /><text x="420" y="127">program#2（已删）→ VAO#3</text>
+          <rect x="410" y="138" width="210" height="28" class="box hl" /><text x="420" y="157">program#3 → VAO#4</text>
+          <path d="M364 122 L410 92" class="line dash" />
+          <path d="M364 122 L410 122" class="line dash" />
+          <path d="M364 122 L410 152" class="line accent" marker-end="url(#h3a)" />
+          <path d="M250 80 L300 116" class="line accent" marker-end="url(#h3a)" />
+          <text x="632" y="96" class="small bad">查不到，也没人删：</text>
+          <text x="632" y="112" class="small bad">没有代码还拿着</text>
+          <text x="632" y="128" class="small bad">program#1、#2</text>
+          <text x="632" y="157" class="small accent">命中</text>
+          <text x="20" y="192" class="small">GPU 上活着的 VAO：4 个；会被用到的只有 VAO#1、VAO#4</text>
+          <path d="M20 210 L740 210" class="line dash" />
+          <text x="20" y="236" class="title">接了 beforeDelete：同样的五步以后</text>
+          <rect x="20" y="254" width="230" height="74" class="box" />
+          <text x="32" y="274">draw 画 Mary（材质是 v3）</text>
+          <text x="32" y="294" class="accent">① entries.get(Mary)</text>
+          <text x="32" y="314" class="accent">② 小表.get(program#3)</text>
+          <rect x="300" y="254" width="64" height="28" class="box" /><text x="332" y="273" text-anchor="middle">盒子</text>
+          <rect x="410" y="254" width="210" height="28" class="box" /><text x="420" y="273">program#背景 → VAO#1</text>
+          <path d="M364 268 L410 268" class="line" />
+          <rect x="300" y="292" width="64" height="28" class="box hl" /><text x="332" y="311" text-anchor="middle">Mary</text>
+          <rect x="410" y="292" width="210" height="28" class="box hl" /><text x="420" y="311">program#3 → VAO#4</text>
+          <path d="M364 306 L410 306" class="line accent" marker-end="url(#h3a)" />
+          <path d="M250 294 L300 304" class="line accent" marker-end="url(#h3a)" />
+          <text x="632" y="270" class="small ok">VAO#2、#3 在释放</text>
+          <text x="632" y="286" class="small ok">v1、v2 时已被</text>
+          <text x="632" y="302" class="small ok">releaseProgram 删掉</text>
+          <text x="20" y="352" class="small">GPU 上活着的 VAO：2 个，两个都会被用到</text>
+        </svg>
+      </div>
+      <figcaption>图 3　第 15 课 2.6 节那张字符画，画成表的样子。上：没人通知顶点输入，program#1、#2 删掉以后，以它们为 key 的两行还留在 Mary 的小表里；draw 只会拿 program#3 来查（实线箭头），这两行（虚线）查不到，也没人删。下：接了 beforeDelete，每删一个 program 之前，先删掉以它为 key 的行和 VAO。</figcaption>
+    </figure>
+    <p>
+      <strong>接上 beforeDelete 以后。</strong>ResourceManager 构造 ProgramManager 时递进去的 beforeDelete，内容是「请顶点输入放掉这个 program」（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:100">WebGL1ResourceManager.ts:100–105</a>）。于是第 ④ 步变成：
+    </p>
+    <pre><code>// 释放 v1 时的调用顺序
+v1.dispose()
+  → ProgramManager.release(v1)                  // ProgramManager 在 get 时订阅了 v1 的释放
+      → hooks.beforeDelete(program#1)           // ① 先通知
+          → vertexInputs.releaseProgram(program#1)
+              盒子的小表：没有 program#1，跳过
+              Mary 的小表：有 → deleteVertexArrayOES(VAO#2)，删掉这一行
+      → gl.deleteProgram(program#1)             // ④ 然后才删 program（第 15 课 2.7 节）</code></pre>
+    <pre><code>// WebGL1OESVertexInputManager.ts:183–205（注释是课程加的）
+releaseProgram(program: WebGLProgram): void {
+  if (this.support.disposed) return // 顶点输入自己已经 dispose 了：VAO 早就删光了
+
+  if (this.support.contextLost) {
+    this.invalidateForContextLoss() // context 丢了：不发 delete，只丢记录
+    return
+  }
+
+  // 外层表的每个 Geometry 都翻一遍：一个 program 可能画过好几个 Geometry
+  for (const [geometry, programs] of this.entries) {
+    const entry = programs.get(program) // 这个 Geometry 的小表里有这个 program 吗
+    if (entry === undefined) continue // 没有（比如盒子的小表）：跳过
+
+    this.deleteEntry(entry) // deleteVertexArrayOES；它正绑着的话先 unbind
+    programs.delete(program) // 删掉小表里这一行
+
+    if (programs.size === 0) {
+      // 小表空了，把这个 Geometry 从外层表拿掉，不留空表
+      // （边遍历边删当前这一项，JS 的 Map 允许）
+      this.entries.delete(geometry)
+    }
+  }
+
+  this.support.forgetProgram(program) // 再清掉按 program 缓存的属性类型（4.1 节）
+}</code></pre>
+    <p>
+      它要把外层表的每个 Geometry 都翻一遍，因为一个 program 可以画好几个 Geometry（比如两个 Mesh 共用一个材质），每个 Geometry 下面都可能有一个按它建的 VAO。小表删空了，就把这个 Geometry 从外层表里拿掉，不留空表。
+    </p>
+    <p>
+      为什么一定在 deleteProgram <strong>之前</strong>：releaseProgram 如果抛错，ProgramManager 就停在这里，program 没删，记录还在，以后还能再 release 一次。反过来，先删 program、丢掉记录，再去通知，通知一失败，就再也没人记得还有 VAO 要删（第 15 课 2.6 节的第二张卡片实测过）。下面两张卡片在你的浏览器里跑真实代码，把每一步的表打印出来。
+    </p>
+    <div id="lab-dead"></div>
+
+    <h3 id="s4-5">4.5 三个文件怎样分工</h3>
+    <pre><code>// WebGL1VertexInputManager.ts:61–74（注释是课程加的）
+export function createWebGL1VertexInputManager(
+  gl: WebGLRenderingContext,
+  capabilities: Pick&lt;WebGL1Capabilities, &#x27;vertexArrayObject&#x27; | &#x27;maxVertexAttributes&#x27;&gt;,
+  hooks: WebGL1VertexInputHooks
+): WebGL1VertexInputManager {
+  // 探测时 getExtension(&#x27;OES_vertex_array_object&#x27;) 的结果（第 13 课）；没有就是 null
+  const extension = capabilities.vertexArrayObject
+  if (extension !== null) {
+    return new WebGL1OESVertexInputManager(
+      gl,
+      extension,
+      capabilities.maxVertexAttributes,
+      hooks
+    )
+  }
+  return new WebGL1ManualVertexInputManager(gl, capabilities.maxVertexAttributes, hooks)
+}</code></pre>
+    <div class="table-scroll"><table>
+      <thead><tr><th>文件</th><th>是什么</th><th>拥有什么</th></tr></thead>
+      <tbody>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1VertexInputManager.ts:19">WebGL1VertexInputManager.ts</a></td><td>两种做法共同实现的接口（bind、unbind、releaseGeometry、releaseProgram、invalidateForContextLoss、dispose），外加按能力选哪种的工厂</td><td>什么都不拥有</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:34">WebGL1VertexInputSupport.ts</a></td><td>两种做法共用的零件：resolve（配对和验证）、apply（真正接线）、每个 program 的属性类型缓存</td><td>只有元数据</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:25">WebGL1OESVertexInputManager.ts</a></td><td>有 VAO 的做法：按两层 key 缓存 VAO</td><td>自己建的 VAO</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1ManualVertexInputManager.ts:17">WebGL1ManualVertexInputManager.ts</a></td><td>没有 VAO 的做法：每次接线，记住打开了哪些 location</td><td>只有 enabled 集合等记录</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      两种做法实现同一个接口，Backend 只认接口，不知道用的是哪种（策略模式）。共用的部分放进 Support，两种做法各持有一个 Support 实例，而不是继承同一个父类（组合）。buffer 和 program 都是借来的：两种做法的 release、dispose 只删自己建的 VAO 或清自己的记录，从不删 buffer、program。
+    </p>
+
+    <h3 id="s4-6">4.6 和 Lifecycle 的关系</h3>
+    <p>第 13 课第 2 节说，context 丢了以后，Backend 要把旧的一代作废、再建新的一代。GeometryManager 和顶点输入在这两件事里做的事：</p>
+    <ul>
+      <li>
+        <strong>一代一份。</strong>createGeneration 新建 ResourceManager（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:259">WebGL1Backend.ts:259–267</a>），它再新建顶点输入（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:83">WebGL1ResourceManager.ts:83</a>，工厂按这一代探测到的能力选 OES 或 Manual）和 GeometryManager（:93–98）。buffer 缓存、VAO 缓存、Manual 的 enabled 记录，都跟着各自的 Manager 走，也是一代一份。
+      </li>
+      <li>
+        <strong>lost 事件到达：丢记录、退订，不 delete。</strong>ResourceManager 按「先借用方、后所有者」的顺序逐个通知（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:171">:171–179</a>），顶点输入排在 GeometryManager 前面。GeometryManager（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:250">WebGL1GeometryManager.ts:250</a> 起）记下 lost、退订所有 Geometry、清空缓存，不调用 deleteBuffer。OES 顶点输入（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:208">WebGL1OESVertexInputManager.ts:208–213</a>）清空两层表、忘掉当前 VAO，不调用 deleteVertexArrayOES。Manual（<a data-src="src/rendering/backend/webgl1/WebGL1ManualVertexInputManager.ts:140">WebGL1ManualVertexInputManager.ts:140–147</a>）清空 enabled，并把 initialized 改回 false。buffer 和 VAO 已经随 context 一起失效了，删不删都一样，发命令反而是在对一个死掉的 context 说话。
+      </li>
+      <li>
+        <strong>事件还在排队、context 已经丢了：先发现，不乱删。</strong>GeometryManager.get 开头的 assertAvailable 问 isContextLost（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:447">:447–454</a>）；上传到一半丢了，catch 先判断丢失，作废并抛 WebGLContextLostError，不去删 owned 里已经失效的 buffer（3.3 节）。顶点输入的 bind 一开头就由 Support 检查（assertBindable → assertReady），catch 里同样先判断丢失。
+      </li>
+      <li>
+        <strong>恢复以后：新 Manager，空缓存，从 CPU 数据重建。</strong>第 2 代的 GeometryManager 什么都没有；第一次画 Mary 时 get 重新建 4 个 buffer，数据来自 CPU 的 Geometry：VertexAttribute 一直存着自己的那份数组（第 10 课），所以不用重新下载 OBJ 和 PRT 文件。新的 OES 顶点输入在第一次 bind 时重录 VAO。新的 Manual 因为 initialized 是 false，第一次 bind 会把 0～15 全关一遍：4.2 节「接手之前别人开着的行」那条规则，在恢复以后又用上了一次。
+      </li>
+    </ul>
+    <p>下面的卡片在你的浏览器里真的丢一次 context：</p>
+    <div id="lab-lifecycle"></div>
+
+    <h2 id="s5">5. 架构视角：对照 three.js r177</h2>
+    <ul>
+      <li>
+        <strong>VAO 的 key：三层。</strong>three.js 的 WebGLBindingStates 按 geometry.id → program.id → wireframe 缓存（<a data-src="node_modules/three/src/renderers/webgl/WebGLBindingStates.js:70">WebGLBindingStates.js:70–100</a>）。多出来的 wireframe 一层，是因为线框模式要换一份索引（每条边两个编号）。前两层和本项目相同，理由也相同：location 跟着 program 走。
+      </li>
+      <li>
+        <strong>上传不还绑定，靠的是顺序。</strong>three.js 的 createBuffer 绑上就传，不查也不还（<a data-src="node_modules/three/src/renderers/webgl/WebGLAttributes.js:5">WebGLAttributes.js:5–14</a>）。它不怕弄乱 EBO，是因为 setup 先绑好这个物体自己的 VAO，再上传它的索引（<a data-src="node_modules/three/src/renderers/webgl/WebGLBindingStates.js:13">WebGLBindingStates.js:13–35</a>）：就算改了当前 VAO 的 EBO，改的也正是要用它的那个 VAO。本项目的 GeometryManager 不知道顶点输入的存在，上传时绑着的可能是任何 VAO，所以只能先记下、再还回。这是「谁依赖谁」换来的代价。
+      </li>
+      <li>
+        <strong>什么时候重建。</strong>three.js 每次 setup 都比较「这个 VAO 当初接的属性对象、数据对象、索引」和现在的是否相同（needsUpdate，:137–180），不同就重新接线；本项目只比一个 gpuGeometry 引用，因为 Geometry 是不可变的快照（第 10 课），只有重新上传才会变。three.js 的属性可以改（needsUpdate、version），所以要比得更细。
+      </li>
+      <li>
+        <strong>关掉用不到的 location。</strong>three.js 的 disableUnusedAttributes（:271–287）和 Manual 版的「这次不用就关」是同一件事；r163 起 three.js 不再支持 WebGL1，VAO 总是有；它在一个 VAO 需要重新接线时（比如几何体增删了属性）用这一步关掉不再用的 location。
+      </li>
+    </ul>
+
+    <h2 id="s6">6. 审查视角</h2>
+    <ol>
+      <li>
+        <strong>钩子作废得太多，又不够准。</strong>两种顶点输入在 bind 的 finally 里都调用 invalidateState，Backend 接的是整份 state.invalidate()，把 program、深度、剔除的缓存也清空了，第 14 课实测两帧 HW2 因此多发 6 条命令。可 State 里那个更窄的 invalidateVertexInputState（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:84">WebGL1State.ts:84–86</a>）只清 EBO，也不够：Manual 版接线后 ARRAY_BUFFER 停在最后一个属性的 buffer 上，没有还回去；OES 版倒是还了。<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputManager.ts:44">WebGL1VertexInputManager.ts:44–51</a> 的注释正是因为这一点才要求接整份 invalidate。<br />
+        <strong>想一想：</strong>如果要让 program、深度、剔除的缓存在 draw 之间生效，最小的改法是什么？（提示：一个「只作废两个 buffer 绑定」的方法，钩子的类型要不要跟着变？）
+      </li>
+      <li>
+        <strong>只有静态几何。</strong>GeometryManager 固定用 STATIC_DRAW，没有「改了数据以后更新 buffer」的路径；Geometry 是不可变快照，要变只能建一个新的 Geometry、重新上传。HW2 不需要。FFT 海面的起伏在 shader 里用纹理做，网格本身不变，也不需要。<br />
+        <strong>想一想：</strong>如果以后做粒子，每帧改 1 万个顶点的位置，会在哪几个类上加什么？参考 three.js 的 version 和 updateBuffer（WebGLAttributes.js:76）。
+      </li>
+    </ol>
+
+    <h2 id="s7">7. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0016"></div>
+
+    <h2 id="s8">8. 延伸阅读</h2>
+    <p>
+      <strong>首选（约 10 分钟）：</strong><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/vertexAttribPointer">MDN · vertexAttribPointer</a>（六个参数和字节对齐）；WebGL 1.0 规范的 <a href="https://registry.khronos.org/webgl/specs/latest/1.0/#ATTRIBS_AND_RANGE_CHECKING">Enabled Vertex Attributes and Range Checking</a> 和它前面的 No Client Side Arrays 两小节。
+    </p>
+    <p>
+      补充：<a href="https://registry.khronos.org/webgl/extensions/OES_vertex_array_object/">OES_vertex_array_object 规范</a>（VAO 里记哪些状态）；项目文档 <a data-src="src/rendering/backend/webgl1/docs/vertex-input-strategies.zh-CN.md:1">vertex-input-strategies.zh-CN.md</a>、<a data-src="src/rendering/backend/webgl1/docs/program-and-geometry-managers.zh-CN.md:60">program-and-geometry-managers.zh-CN.md</a> 的 GeometryManager 部分；three.js 的 <a data-src="node_modules/three/src/renderers/webgl/WebGLBindingStates.js:1">WebGLBindingStates.js</a>。
+    </p>
+
+    <aside class="ask">
+      做完告诉我：实验卡片和检查题各错了哪几题；审查视角的两个「想一想」，直接在对话里回答。哪一步还接不上，把那几行贴给我。
+    </aside>
+
+    <div class="nav">
+      <a href="0026-orbit-controls.html">← 第 26 课（插课下篇）：轨道控制</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0017-cube-texture-manager.html">第 17 课：CubeTextureManager 与上传作用域 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 16 课 · 2026-10-08</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        // 只为课程演示：SceneNode/Resource 用 crypto.randomUUID，个别浏览器在 file:// 下没有（第 5 课）
+        if (window.crypto && typeof window.crypto.randomUUID !== 'function') {
+          Object.defineProperty(window.crypto, 'randomUUID', {
+            configurable: true,
+            value: function randomUUID() {
+              const bytes = window.crypto.getRandomValues(new Uint8Array(16))
+              bytes[6] = (bytes[6] & 0x0f) | 0x40
+              bytes[8] = (bytes[8] & 0x3f) | 0x80
+              const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+              return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20)
+            }
+          })
+        }
+
+        const R = window.RTeachProgram
+
+        // 课程版（和页面上展示的代码出自同一份 TS，esbuild 去掉了类型）
+        function uploadGeometryV1(gl, geometry) {
+          const attributes = /* @__PURE__ */ new Map();
+          for (const name of geometry.getAttributeNames()) {
+            const data = geometry.getAttribute(name).copyData();
+            const buffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+            gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+            attributes.set(name, buffer);
+          }
+          let indexBuffer = null;
+          const indices = geometry.copyIndices();
+          if (indices !== null) {
+            indexBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+            gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+          }
+          return { attributes, indexBuffer };
+        }
+        var __defProp = Object.defineProperty;
+        var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+        var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+        class GeometryCacheV2 {
+          constructor(gl, invalidateState) {
+            this.gl = gl;
+            this.invalidateState = invalidateState;
+            __publicField(this, "entries", /* @__PURE__ */ new Map());
+          }
+          get(geometry) {
+            const cached = this.entries.get(geometry);
+            if (cached !== void 0) return cached;
+            const gl = this.gl;
+            const previousArray = gl.getParameter(gl.ARRAY_BUFFER_BINDING);
+            const previousElements = gl.getParameter(
+              gl.ELEMENT_ARRAY_BUFFER_BINDING
+            );
+            try {
+              const result = uploadGeometryV1(gl, geometry);
+              this.entries.set(geometry, result);
+              return result;
+            } finally {
+              gl.bindBuffer(gl.ARRAY_BUFFER, previousArray);
+              gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, previousElements);
+              this.invalidateState();
+            }
+          }
+        }
+        function bindManualV1(gl, bindings, indexBuffer) {
+          for (const binding of bindings) {
+            gl.bindBuffer(gl.ARRAY_BUFFER, binding.buffer);
+            gl.vertexAttribPointer(
+              binding.location,
+              binding.itemSize,
+              binding.type,
+              binding.normalized,
+              0,
+              0
+            );
+            gl.enableVertexAttribArray(binding.location);
+          }
+          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+        }
+        class ManualInputV2 {
+          constructor(gl) {
+            this.gl = gl;
+          }
+          // 上一次打开的 location，比如画完 Mary 是 {0, 1, 2, 3}
+          enabled = /* @__PURE__ */ new Set();
+          bind(bindings, indexBuffer) {
+            const gl = this.gl;
+            const next = new Set(bindings.map((binding) => binding.location));
+            for (const location of this.enabled) {
+              if (!next.has(location)) gl.disableVertexAttribArray(location);
+            }
+            bindManualV1(gl, bindings, indexBuffer);
+            this.enabled.clear();
+            for (const location of next) this.enabled.add(location);
+          }
+        }
+        class VaoCacheV1 {
+          // Geometry → VAO
+          constructor(gl, ext) {
+            this.gl = gl;
+            this.ext = ext;
+          }
+          vaos = /* @__PURE__ */ new Map();
+          bind(geometry, bindings, indexBuffer) {
+            const cached = this.vaos.get(geometry);
+            if (cached !== void 0) {
+              this.ext.bindVertexArrayOES(cached);
+              return;
+            }
+            const vao = this.ext.createVertexArrayOES();
+            this.ext.bindVertexArrayOES(vao);
+            bindManualV1(this.gl, bindings, indexBuffer);
+            this.vaos.set(geometry, vao);
+          }
+        }
+        class VaoCacheV2 {
+          constructor(gl, ext) {
+            this.gl = gl;
+            this.ext = ext;
+          }
+          // 外层表：Geometry → 小表；小表：program → VAO
+          vaos = /* @__PURE__ */ new Map();
+          bind(geometry, program, bindings, indexBuffer) {
+            const cached = this.vaos.get(geometry)?.get(program);
+            if (cached !== void 0) {
+              this.ext.bindVertexArrayOES(cached);
+              return;
+            }
+            const vao = this.ext.createVertexArrayOES();
+            this.ext.bindVertexArrayOES(vao);
+            bindManualV1(this.gl, bindings, indexBuffer);
+            const programs = this.vaos.get(geometry) ?? /* @__PURE__ */ new Map();
+            programs.set(program, vao);
+            this.vaos.set(geometry, programs);
+          }
+        }
+
+        // ---------------- 数据与 shader ----------------
+        // 背景盒子：createHW2Scene.ts:187–215 的同一份数据
+        const CUBE_POSITIONS = [-1, -1, -1, 1, -1, -1, 1, 1, -1, -1, 1, -1, -1, -1, 1, 1, -1, 1, 1, 1, 1, -1, 1, 1]
+        const CUBE_INDICES = [0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 1, 2, 6, 1, 6, 5, 0, 4, 7, 0, 7, 3, 3, 7, 6, 3, 6, 2, 0, 1, 5, 0, 5, 4]
+        const attr = (data, itemSize = 3) => new R.VertexAttribute({ data, itemSize })
+        const cube = () =>
+          new R.Geometry({ attributes: { position: attr(new Float32Array(CUBE_POSITIONS)) }, indices: new Uint8Array(CUBE_INDICES) })
+        /** 一个缩小版的 Mary：3 个顶点，属性名和 HW2 一样，没有索引。 */
+        const miniMary = (names = ['position', 'aTransportSH0', 'aTransportSH1', 'aTransportSH2']) =>
+          new R.Geometry({ attributes: Object.fromEntries(names.map((name, i) => [name, attr(new Float32Array([0, 0, i, 1, 0, i, 0, 1, i]))])) })
+
+        const BG_VS = ['attribute vec3 position;', 'void main() {', '  gl_Position = vec4(position * 0.5, 1.0);', '}'].join('\n')
+        const BG_FS = ['precision mediump float;', 'void main() {', '  gl_FragColor = vec4(1.0);', '}'].join('\n')
+        // 和 PRT 一样的四个属性；三个系数经 varying 交给 fragment，保证它们都是 active
+        const PRT_VS = [
+          'attribute vec3 position;',
+          'attribute vec3 aTransportSH0;',
+          'attribute vec3 aTransportSH1;',
+          'attribute vec3 aTransportSH2;',
+          'varying vec3 vColor;',
+          'void main() {',
+          '  vColor = aTransportSH0 + aTransportSH1 + aTransportSH2;',
+          '  gl_Position = vec4(position, 1.0);',
+          '}'
+        ].join('\n')
+        const PRT_FS = ['precision mediump float;', 'varying vec3 vColor;', 'void main() {', '  gl_FragColor = vec4(vColor, 1.0);', '}'].join('\n')
+        const shader = (name, vertexSource, fragmentSource) => new R.ShaderModule({ name, language: 'glsl-es-100', vertexSource, fragmentSource })
+
+        // ---------------- 真实 WebGL 的小工具 ----------------
+        function freshContext() {
+          const canvas = document.createElement('canvas')
+          canvas.width = 4
+          canvas.height = 4
+          const gl = canvas.getContext('webgl')
+          if (!gl) throw new Error('这个浏览器拿不到 WebGL context')
+          const lose = gl.getExtension('WEBGL_lose_context')
+          return { gl, release: () => { if (lose && !gl.isContextLost()) lose.loseContext() } }
+        }
+        async function withGL(body) {
+          const { gl, release } = freshContext()
+          const lines = []
+          try {
+            await body(gl, lines)
+          } catch (error) {
+            lines.push({ text: '实验里抛出了没有预料到的错误：' + (error && error.name) + '：' + (error && error.message), kind: 'late' })
+          } finally {
+            release()
+          }
+          return { lines }
+        }
+        /**
+         * 给 gl 套一层代理：数 GL 调用，给 buffer 起名字（B1、B2……），也能让某一次 bufferData 假装失败。
+         * failBufferData = n：第 n 次 bufferData 不真的执行，并让下一次 getError 交回 OUT_OF_MEMORY（1285）。
+         */
+        function watch(gl, options = {}) {
+          const buffers = []
+          const names = new Map()
+          const calls = []
+          let bufferDataCount = 0
+          let pendingError = 0
+          const proxy = new Proxy(gl, {
+            get(target, prop) {
+              const value = target[prop]
+              if (typeof value !== 'function') return value
+              return function () {
+                const args = Array.from(arguments)
+                if (prop === 'bufferData') {
+                  bufferDataCount += 1
+                  if (bufferDataCount === options.failBufferData) {
+                    pendingError = target.OUT_OF_MEMORY
+                    calls.push('gl.bufferData(…) → 假装显存不够，什么也没拷')
+                    return undefined
+                  }
+                }
+                if (prop === 'getError' && pendingError !== 0) {
+                  const code = pendingError
+                  pendingError = 0
+                  target.getError()
+                  return code
+                }
+                const result = value.apply(target, args)
+                if (prop === 'createBuffer' && result) {
+                  buffers.push(result)
+                  names.set(result, 'B' + buffers.length)
+                }
+                if (prop !== 'getError' && prop !== 'isContextLost' && prop !== 'getParameter') calls.push('gl.' + String(prop))
+                return result
+              }
+            }
+          })
+          return {
+            gl: proxy,
+            calls,
+            buffers,
+            name: (b) => (b === null ? 'null' : names.get(b) || '别的'),
+            live: () => buffers.filter((b) => gl.isBuffer(b)).length
+          }
+        }
+        const invalidateState = () => undefined
+        const err = (e) => (e && e.name ? e.name : 'Error') + '：' + (e && e.message ? e.message : String(e))
+
+        // ---------------- 2.4 两个绑定点 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-basics'),
+          storageKey: 'lesson-0016-basics',
+          cards: [
+            {
+              title: '五步实测：pointer 抄下的是哪个 buffer',
+              tags: ['真实 WebGL'],
+              desc: '和 2.4 节的表一样的五步：VAO1 里绑 B1、配 pointer、绑索引 I；改绑 B2；切到新的 VAO2；在 VAO2 里配 pointer；切回 VAO1。每一步查三样：ARRAY_BUFFER、EBO、location 0 读的 buffer。',
+              question: '第 5 步切回 VAO1 以后，ARRAY_BUFFER 是谁？',
+              choices: ['B2：它不属于 VAO，切换不影响', 'B1：跟着 VAO1 一起回来了', 'null：切 VAO 会清空它'],
+              answer: 0,
+              explain: 'ARRAY_BUFFER 是整个 context 共用的，切 VAO 不动它；EBO（I）和 location 0 读的 buffer（B1）记在 VAO1 里，切回来就都回来了。GeometryManager 上传时绑索引，改的就是「当前 VAO」的 EBO，所以要还回去（第 3 节）。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const ext = gl.getExtension('OES_vertex_array_object')
+                  if (!ext) return lines.push({ text: '这个浏览器没有 OES_vertex_array_object', kind: 'late' })
+                  const names = new Map()
+                  const name = (o) => (o === null ? 'null' : names.get(o) || '?')
+                  const make = (label) => { const b = gl.createBuffer(); names.set(b, label); return b }
+                  const B1 = make('B1'), B2 = make('B2'), I = make('I')
+                  const show = (step) => lines.push({ text: step + '：ARRAY_BUFFER ' + name(gl.getParameter(gl.ARRAY_BUFFER_BINDING)) + '，EBO ' + name(gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING)) + '，location 0 读 ' + name(gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING)), kind: 'server' })
+                  const VAO1 = ext.createVertexArrayOES(), VAO2 = ext.createVertexArrayOES()
+                  ext.bindVertexArrayOES(VAO1)
+                  gl.bindBuffer(gl.ARRAY_BUFFER, B1)
+                  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(9), gl.STATIC_DRAW)
+                  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0)
+                  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, I)
+                  show('1 VAO1 里：绑 B1、pointer、绑 I')
+                  gl.bindBuffer(gl.ARRAY_BUFFER, B2)
+                  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(9), gl.STATIC_DRAW)
+                  show('2 还在 VAO1：ARRAY_BUFFER 改绑 B2')
+                  ext.bindVertexArrayOES(VAO2)
+                  show('3 切到 VAO2')
+                  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0)
+                  show('4 在 VAO2 里 pointer')
+                  ext.bindVertexArrayOES(VAO1)
+                  show('5 切回 VAO1')
+                  // 补充：ARRAY_BUFFER 现在是 B2，还在 VAO1 里再调用一次 pointer
+                  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0)
+                  show('补充 还在 VAO1，再 pointer 一次')
+                })
+            },
+            {
+              title: '真实 GeometryManager 上传背景盒子',
+              tags: ['真实 WebGL', '项目代码'],
+              question: 'GPU 上两个 buffer 各多大？resource 里记的 type、indexType、drawCount 是什么？',
+              choices: ['96 字节和 36 字节；FLOAT、UNSIGNED_BYTE、36', '96 字节和 144 字节；FLOAT、UNSIGNED_INT、8', '24 字节和 36 字节；FLOAT_VEC3、UNSIGNED_BYTE、12'],
+              answer: 0,
+              explain: '24 个 Float32 是 96 字节，36 个 Uint8 是 36 字节。type 是「每个分量怎样存」，所以是 FLOAT（5126），不是 shader 里的 vec3；索引按 Uint8 上传，drawElements 要用 UNSIGNED_BYTE（5121）；有索引时 drawCount 等于索引个数 36。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const caps = R.detectWebGL1Capabilities(gl)
+                  const geometries = new R.WebGL1GeometryManager(gl, caps, { invalidateState })
+                  const res = geometries.get(cube())
+                  const size = (target, buffer) => { gl.bindBuffer(target, buffer); return gl.getBufferParameter(target, gl.BUFFER_SIZE) }
+                  const position = res.attributes.get('position')
+                  lines.push({ text: 'position buffer：BUFFER_SIZE = ' + size(gl.ARRAY_BUFFER, position.buffer) + '，type = ' + position.type + (position.type === gl.FLOAT ? '（FLOAT）' : '') + '，itemSize = ' + position.itemSize + '，normalized = ' + position.normalized, kind: 'server' })
+                  lines.push({ text: 'index buffer：BUFFER_SIZE = ' + size(gl.ELEMENT_ARRAY_BUFFER, res.indexBuffer) + '，indexType = ' + res.indexType + (res.indexType === gl.UNSIGNED_BYTE ? '（UNSIGNED_BYTE）' : ''), kind: 'server' })
+                  lines.push({ t: '结果', text: 'drawCount = ' + res.drawCount + '，primitiveMode = ' + res.primitiveMode + (res.primitiveMode === gl.TRIANGLES ? '（TRIANGLES）' : ''), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.1 第 1 版 ----------------
+        /** 先给「另一个物体」A 建好 VAO 并留着绑定（像上一次 draw 之后那样），再上传背景盒子。 */
+        function otherObjectVAO(gl, ext) {
+          const vaoA = ext.createVertexArrayOES()
+          ext.bindVertexArrayOES(vaoA)
+          const indexA = gl.createBuffer()
+          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexA)
+          gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint8Array([0, 1, 2]), gl.STATIC_DRAW)
+          return { vaoA, indexA }
+        }
+        /**
+         * 课程写的辅助函数：给 gl 套一层代理，每发一条 bindBuffer / bufferData，
+         * 就记下这条命令，并查一次当前 VAO（这里一直是 VAO_A）的 EBO 是谁。
+         * 第一次绑到 ARRAY_BUFFER 的 buffer 叫 B，第一次绑到 ELEMENT_ARRAY_BUFFER 的叫 I_盒子。
+         */
+        function traceEBO(gl, names, lines) {
+          const label = (b) => (b === null ? 'null' : names.get(b) || '?')
+          const targetName = (t) => (t === gl.ARRAY_BUFFER ? 'ARRAY_BUFFER' : 'ELEMENT_ARRAY_BUFFER')
+          return new Proxy(gl, {
+            get(target, prop) {
+              const value = target[prop]
+              if (typeof value !== 'function') return value
+              return function () {
+                const args = Array.from(arguments)
+                const result = value.apply(target, args)
+                if (prop === 'bindBuffer') {
+                  if (args[1] !== null && !names.has(args[1])) names.set(args[1], args[0] === target.ARRAY_BUFFER ? 'B' : 'I_盒子')
+                  lines.push({ text: 'gl.bindBuffer(' + targetName(args[0]) + ', ' + label(args[1]) + ')　→ VAO_A 的 EBO：' + label(target.getParameter(target.ELEMENT_ARRAY_BUFFER_BINDING)), kind: 'server' })
+                }
+                if (prop === 'bufferData') {
+                  lines.push({ text: 'gl.bufferData(' + targetName(args[0]) + ', ' + args[1].byteLength + ' 字节)　→ VAO_A 的 EBO：' + label(target.getParameter(target.ELEMENT_ARRAY_BUFFER_BINDING)), kind: 'server' })
+                }
+                return result
+              }
+            }
+          })
+        }
+        /** 课程写的辅助函数：A 的 VAO 刚画完、还绑着时，用 upload 上传背景盒子，逐条记录，最后切走再切回 VAO_A。 */
+        function uploadWhileVAOABound(gl, lines, upload) {
+          const ext = gl.getExtension('OES_vertex_array_object')
+          if (!ext) return lines.push({ text: '这个浏览器没有 OES_vertex_array_object', kind: 'late' })
+          const { vaoA, indexA } = otherObjectVAO(gl, ext)
+          const names = new Map([[indexA, 'I_A']])
+          const label = (b) => (b === null ? 'null' : names.get(b) || '?')
+          lines.push({ text: '上传前：当前 VAO 是 VAO_A，它的 EBO：' + label(gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING)), kind: 'user' })
+          upload(traceEBO(gl, names, lines))
+          ext.bindVertexArrayOES(null)
+          ext.bindVertexArrayOES(vaoA)
+          lines.push({ t: '结果', text: '切走再切回 VAO_A，它的 EBO：' + label(gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING)), kind: 'result' })
+          ext.bindVertexArrayOES(null)
+        }
+        const TRACE_NOTE = 'otherObjectVAO、traceEBO、uploadWhileVAOABound 是课程写的辅助函数（项目里没有）：先给物体 A 建一个 VAO 并留着绑定，再给 gl 套一层代理，每条 bindBuffer / bufferData 之后查一次当前 VAO 的 EBO。'
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v1'),
+          storageKey: 'lesson-0016-v1',
+          cards: [
+            {
+              title: '第 1 版：上传时绑着别人的 VAO',
+              tags: ['真实 WebGL', '只跑第 1 版'],
+              desc: '上一次 draw 画的是物体 A：画完，A 的 VAO（VAO_A）还绑着，它的 EBO 是 A 自己的索引 I_A。这时用第 1 版上传背景盒子。每发一条命令，查一次 VAO_A 的 EBO；最后切走再切回 VAO_A，再查一次。',
+              note: TRACE_NOTE,
+              question: '上传结束、切回 VAO_A 以后，它的 EBO 是谁？',
+              choices: ['I_盒子：在第 3 条命令那一刻被换掉了', 'I_A：上传不会碰 A 的 VAO', 'null：上传把它清空了'],
+              answer: 0,
+              explain: '前两条命令只动 ARRAY_BUFFER，它不在 VAO 里，VAO_A 不变。第 3 条 bindBuffer(ELEMENT_ARRAY_BUFFER, I_盒子) 执行时，当前 VAO 还是 VAO_A，而 EBO 绑定点就在当前 VAO 里，所以 VAO_A 的 EBO 当场变成 I_盒子。第 1 版用完不还，切走再切回，VAO_A 带回来的还是 I_盒子。下次画 A 就按盒子的编号取顶点，不报错，只是画错。',
+              run: () => withGL((gl, lines) => uploadWhileVAOABound(gl, lines, (traced) => uploadGeometryV1(traced, cube())))
+            },
+            {
+              title: '第 1 版：同一个 Geometry 要两次（两个 Mesh 共用）',
+              tags: ['真实 WebGL', '只跑第 1 版'],
+              question: '同一个背景盒子用第 1 版上传两次，一共建了几个 buffer？',
+              choices: ['4 个：第二次又建了一套', '2 个：第二次认出是同一个 Geometry', '3 个：索引 buffer 能共用'],
+              answer: 0,
+              explain: '背景盒子一次要 2 个 buffer（position、索引）。第 1 版每次调用都新建一张 attributes 表、一套 buffer，不记得上次传过什么，所以第二次又建了 2 个。两次交回的是两张不同的表，前一套 buffer 没人记着，删不掉。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const w = watch(gl)
+                  const box = cube()
+                  const first = uploadGeometryV1(w.gl, box)
+                  const second = uploadGeometryV1(w.gl, box)
+                  lines.push({ text: '第一次交回 position → ' + w.name(first.attributes.get('position')) + '，第二次 → ' + w.name(second.attributes.get('position')), kind: 'server' })
+                  lines.push({ text: '两次交回的 attributes 是同一张表吗 → ' + (first.attributes === second.attributes), kind: 'server' })
+                  lines.push({ t: '结果', text: 'createBuffer 一共 ' + w.buffers.length + ' 次，GPU 上活着 ' + w.live() + ' 个 buffer', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.2 第 2 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v2'),
+          storageKey: 'lesson-0016-v2',
+          cards: [
+            {
+              title: '第 2 版：同样在绑着 VAO_A 时上传',
+              tags: ['真实 WebGL', '只跑第 2 版'],
+              desc: '和 3.1 节第一张卡片一样的场景，换成第 2 版的 GeometryCacheV2.get。逐条记录里会多出 finally 那两条还原命令。',
+              note: TRACE_NOTE,
+              question: '上传结束、切回 VAO_A 以后，它的 EBO 是谁？',
+              choices: ['I_A：中途被换掉过，finally 又绑了回去', 'I_盒子：和第 1 版一样被换掉', 'null：finally 还回去的是 null'],
+              answer: 0,
+              explain: '记录里第 3 条命令同样把 VAO_A 的 EBO 换成了 I_盒子：第 2 版上传用的就是第 1 版的函数。区别在最后两条：finally 把上传前查到的绑定还回去，ARRAY_BUFFER 还回 null（上传前没绑），ELEMENT_ARRAY_BUFFER 还回 I_A，这一条又写回了 VAO_A。所以第 2 版是「改了，再还原」，不是「没碰」。',
+              run: () => withGL((gl, lines) => uploadWhileVAOABound(gl, lines, (traced) => new GeometryCacheV2(traced, () => undefined).get(cube())))
+            },
+            {
+              title: '第 2 版：同一个 Geometry 要两次',
+              tags: ['真实 WebGL', '只跑第 2 版'],
+              question: '第 2 版一共建了几个 buffer？第二次 get 发了几条 GL 命令？',
+              choices: ['2 个；0 条', '4 个；4 条', '2 个；2 条：要把绑定还原'],
+              answer: 0,
+              explain: '第一次 get 建 2 个 buffer，存进 entries；第二次在第一行就查到了，直接交回同一份，一条 GL 命令都不发（也就没有绑定要还原）。entries 是类的字段，调用结束后还在，这才是缓存。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const w = watch(gl)
+                  const cache = new GeometryCacheV2(w.gl, () => undefined)
+                  const box = cube()
+                  const first = cache.get(box)
+                  const before = w.calls.length
+                  const second = cache.get(box)
+                  lines.push({ text: '第二次 get 发了 ' + (w.calls.length - before) + ' 条 GL 命令；交回的是同一份吗 → ' + (first === second), kind: 'server' })
+                  lines.push({ t: '结果', text: 'createBuffer 一共 ' + w.buffers.length + ' 次，GPU 上活着 ' + w.live() + ' 个 buffer', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.3 真实代码 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-real'),
+          storageKey: 'lesson-0016-real',
+          cards: [
+            {
+              title: '第 3 个 buffer 上传时显存不够',
+              tags: ['真实 WebGL', '代理模拟', '第 2 版 vs 真实代码'],
+              desc: '上传缩小版 Mary（4 个属性）。用代理让第 3 次 bufferData 假装失败：不拷数据，下一次 getError 交回 OUT_OF_MEMORY（1285）。真实浏览器里很难稳定地触发显存不足，所以用代理模拟。',
+              question: '真实代码遇到这种情况会怎样？',
+              choices: ['抛 WebGLOperationError，已建的 3 个 buffer 删掉，不进缓存', '和第 2 版一样正常返回，只是那个 buffer 是空的', '抛错，但已经建的 buffer 留着，下次 get 接着用'],
+              answer: 0,
+              explain: '第 2 版不问 getError，正常返回，缓存里存进一个空的 buffer（BUFFER_SIZE 0），以后每帧都画不出来。真实代码在 upload 里 checkError，抛出 WebGLOperationError；catch 照 owned 清单删掉这次建的 3 个 buffer；缓存里没有它，修好以后再 get 会从头上传。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const w2 = watch(gl, { failBufferData: 3 })
+                  const cache = new GeometryCacheV2(w2.gl, () => undefined)
+                  const res2 = cache.get(miniMary())
+                  const third = [...res2.attributes.values()][2]
+                  gl.bindBuffer(gl.ARRAY_BUFFER, third)
+                  lines.push({ text: '第 2 版：正常返回；第 3 个 buffer 的 BUFFER_SIZE = ' + gl.getBufferParameter(gl.ARRAY_BUFFER, gl.BUFFER_SIZE) + '；活着的 buffer ' + w2.live() + ' 个', kind: 'server' })
+                  const w = watch(gl, { failBufferData: 3 })
+                  const caps = R.detectWebGL1Capabilities(gl)
+                  const geometries = new R.WebGL1GeometryManager(w.gl, caps, { invalidateState })
+                  const mary = miniMary()
+                  try {
+                    geometries.get(mary)
+                    lines.push({ text: '真实代码：没有抛错（意外）', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: '真实代码：抛出 ' + err(error), kind: 'abort' })
+                  }
+                  lines.push({ t: '结果', text: '真实代码建过 ' + w.buffers.length + ' 个 buffer，现在活着 ' + w.live() + ' 个', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.4 Uint32 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-uint'),
+          storageKey: 'lesson-0016-uint',
+          cards: [
+            {
+              title: '没有 OES_element_index_uint 的设备',
+              tags: ['真实 WebGL', '项目代码', '能力换成 null 模拟'],
+              desc: '把能力里的 elementIndexUint 换成 null，假装是老设备。上传两个用 Uint32Array 写索引的 Geometry：一个最大编号 3，一个最大编号 70000（为此给它 70001 个顶点）。',
+              question: '最大编号 70000 的那个会怎样？',
+              choices: ['抛 UnsupportedIndexTypeError，一个 buffer 都没建', '照样上传，编号被截成 70000 − 65536 = 4464', '自动改成按面展开，不用索引'],
+              answer: 0,
+              explain: '最大编号 3 的那个被复制成 Uint16Array 上传，indexType 是 UNSIGNED_SHORT，CPU 上的 Geometry 仍然是 Uint32。最大编号 70000 放不进 16 位；硬转成 Uint16 会变成 4464，画出来的三角形连到错的顶点上。所以 prepareIndices 在建任何 buffer 之前就报错。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const caps = { ...R.detectWebGL1Capabilities(gl), elementIndexUint: null }
+                  const w = watch(gl)
+                  const geometries = new R.WebGL1GeometryManager(w.gl, caps, { invalidateState })
+                  const small = new R.Geometry({ attributes: { position: attr(new Float32Array(CUBE_POSITIONS)) }, indices: new Uint32Array([0, 2, 1, 0, 3, 2]) })
+                  const res = geometries.get(small)
+                  lines.push({ text: '最大编号 3：indexType = ' + res.indexType + (res.indexType === gl.UNSIGNED_SHORT ? '（UNSIGNED_SHORT）' : '') + '；CPU 上 copyIndices() 仍是 ' + small.copyIndices().constructor.name, kind: 'server' })
+                  const big = new R.Geometry({ attributes: { position: attr(new Float32Array(70001 * 3)) }, indices: new Uint32Array([0, 1, 70000]) })
+                  const before = w.buffers.length
+                  try {
+                    geometries.get(big)
+                    lines.push({ text: '最大编号 70000：没有抛错（意外）', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: '最大编号 70000：' + err(error), kind: 'abort' })
+                  }
+                  lines.push({ t: '结果', text: '为最大编号 70000 的 Geometry 建了 ' + (w.buffers.length - before) + ' 个 buffer', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 4.1 配对 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-resolve'),
+          storageKey: 'lesson-0016-resolve',
+          cards: [
+            {
+              title: '同样两个属性，换个声明顺序',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '两个 shader 都用 position 和 aOther，只是声明的先后不同。用真实的 ProgramManager 编译，看反射出的 location。',
+              question: '先声明 aOther 的那个 shader，position 在几号？',
+              choices: ['在你的浏览器里不一定是 0（备课时实测是 1）', '一定是 0：position 总是 0 号', '一定是 −1：position 被优化掉了'],
+              answer: 0,
+              explain: 'location 是链接时由浏览器和驱动分配的，规范只保证每个 active 属性各有一个不重复的编号，不保证顺序。备课时在无界面 Chrome 里，先声明谁谁就是 0。所以同一个 Geometry 配不同 program，接线不能共用（4.3 节的两层缓存）。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const programs = new R.WebGL1ProgramManager(gl, { invalidateState })
+                  const fs = ['precision mediump float;', 'varying vec3 v;', 'void main() {', '  gl_FragColor = vec4(v, 1.0);', '}'].join('\n')
+                  for (const [label, order] of [['先声明 position', ['position', 'aOther']], ['先声明 aOther', ['aOther', 'position']]]) {
+                    const vs = order.map((n) => 'attribute vec3 ' + n + ';').join('\n') + '\nvarying vec3 v;\nvoid main() {\n  v = aOther;\n  gl_Position = vec4(position, 1.0);\n}'
+                    const res = programs.get(shader(label, vs, fs))
+                    lines.push({ text: label + '：position → ' + res.attributes.get('position') + '，aOther → ' + res.attributes.get('aOther'), kind: 'result' })
+                  }
+                })
+            },
+            {
+              title: 'shader 要的属性，Geometry 没有',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '缩小版 Mary 少了 aTransportSH2，配上要四个属性的 PRT shader，用真实的 OES 顶点输入 bind。bind 之前，当前绑着另一个 VAO（背景盒子的）。',
+              question: 'bind 抛错以后，当前绑着的 VAO 是谁？',
+              choices: ['还是背景盒子的 VAO：resolve 在改 GL 之前就抛了', '一个新建的空 VAO', 'null：出错时会解绑'],
+              answer: 0,
+              explain: 'resolve 先按名字配对，aTransportSH2 找不到就抛 UnsupportedRenderFeatureError，这时还没建 VAO、没改任何绑定。调用者（Backend.draw）拿到异常就不会 draw。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const caps = R.detectWebGL1Capabilities(gl)
+                  if (caps.vertexArrayObject === null) return lines.push({ text: '这个浏览器没有 OES_vertex_array_object', kind: 'late' })
+                  const programs = new R.WebGL1ProgramManager(gl, { invalidateState })
+                  const geometries = new R.WebGL1GeometryManager(gl, caps, { invalidateState })
+                  const inputs = R.createWebGL1VertexInputManager(gl, caps, { invalidateState })
+                  const bg = cube()
+                  inputs.bind(bg, geometries.get(bg), programs.get(shader('背景', BG_VS, BG_FS)))
+                  const bgVAO = gl.getParameter(caps.vertexArrayObject.VERTEX_ARRAY_BINDING_OES)
+                  const broken = miniMary(['position', 'aTransportSH0', 'aTransportSH1'])
+                  try {
+                    inputs.bind(broken, geometries.get(broken), programs.get(shader('PRT', PRT_VS, PRT_FS)))
+                    lines.push({ text: 'bind 没有抛错（意外）', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: 'bind 抛出 ' + err(error), kind: 'abort' })
+                  }
+                  const now = gl.getParameter(caps.vertexArrayObject.VERTEX_ARRAY_BINDING_OES)
+                  lines.push({ t: '结果', text: '当前 VAO：' + (now === bgVAO ? '还是背景盒子的' : now === null ? 'null' : '别的 VAO'), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 4.2 没有 VAO ----------------
+        /** 课程写的辅助函数：把 program 的「属性名 → location」和 Geometry 的 buffer 按名字配成接线（课程版的 resolve）。 */
+        const bindingsFor = (res, program) =>
+          [...program.attributes].map(([name, location]) => {
+            const a = res.attributes.get(name)
+            return { location, buffer: a.buffer, itemSize: a.itemSize, type: a.type, normalized: a.normalized }
+          })
+        /** 课程写的辅助函数：给 buffer 起名字，好打印。 */
+        function bufferNames(boxRes, maryRes) {
+          const names = new Map()
+          if (boxRes) {
+            names.set(boxRes.attributes.get('position').buffer, 'P盒子')
+            names.set(boxRes.indexBuffer, 'I盒子')
+          }
+          if (maryRes) {
+            for (const [name, label] of [['position', 'P'], ['aTransportSH0', 'T0'], ['aTransportSH1', 'T1'], ['aTransportSH2', 'T2']]) {
+              names.set(maryRes.attributes.get(name).buffer, label)
+            }
+          }
+          return names
+        }
+        /** 课程写的辅助函数：查当前这张表的几行（开没开、读哪个 buffer）和 EBO。 */
+        function slotLine(gl, names, locations = [0, 1, 2, 3]) {
+          const label = (b) => (b === null ? '无 buffer' : (names.get(b) || '?') + (gl.isBuffer(b) ? '' : '（已删）'))
+          const cells = locations.map(
+            (i) => i + ' ' + (gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_ENABLED) ? '开·' + label(gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING)) : '关')
+          )
+          const ebo = gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING)
+          return cells.join('，') + '，EBO ' + (ebo === null ? 'null' : label(ebo))
+        }
+        /**
+         * 课程写的辅助函数：按 HW2 的顺序画「背景、Mary、背景」，然后 Mary 释放，再画背景。
+         * bindWith(geometry, resource, program) 决定用哪一版接线，可以返回一句备注。
+         */
+        function hw2ManualFrames(gl, lines, bindWith) {
+          const caps = R.detectWebGL1Capabilities(gl)
+          const programs = new R.WebGL1ProgramManager(gl, { invalidateState })
+          const geometries = new R.WebGL1GeometryManager(gl, caps, { invalidateState })
+          const prt = programs.get(shader('PRT', PRT_VS, PRT_FS))
+          const bgProgram = programs.get(shader('背景', BG_VS, BG_FS))
+          const box = cube()
+          const mary = miniMary()
+          const boxRes = geometries.get(box)
+          const maryRes = geometries.get(mary)
+          const names = bufferNames(boxRes, maryRes)
+          const draw = (label, geometry, res, program) => {
+            const note = bindWith(geometry, res, program)
+            gl.useProgram(program.program)
+            gl.getError()
+            if (res.indexBuffer === null) gl.drawArrays(gl.TRIANGLES, 0, 3)
+            else gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_BYTE, 0)
+            const code = gl.getError()
+            lines.push({ text: label + (note ? '（' + note + '）' : '') + '：' + slotLine(gl, names) + '；draw 之后 getError ' + code, kind: code === 0 ? 'server' : 'result' })
+            return code
+          }
+          draw('① 第 1 帧画背景', box, boxRes, bgProgram)
+          draw('② 画 Mary', mary, maryRes, prt)
+          draw('③ 第 2 帧画背景', box, boxRes, bgProgram)
+          mary.dispose() // 换预设：Mary 的 Geometry 释放，GeometryManager 删掉它的 4 个 buffer
+          lines.push({ text: '④ Mary 释放：' + slotLine(gl, names), kind: 'server' })
+          const last = draw('⑤ 再画背景', box, boxRes, bgProgram)
+          lines.push({ t: '结果', text: '第 ⑤ 步 draw 之后 getError → ' + last + (last === gl.INVALID_OPERATION ? '（INVALID_OPERATION）' : ''), kind: 'result' })
+        }
+        /** 课程写的辅助函数：给 gl 套一层代理，记下 disableVertexAttribArray 关掉了哪些行。 */
+        function recordDisables(gl) {
+          const closed = []
+          const proxy = new Proxy(gl, {
+            get(target, prop) {
+              const value = target[prop]
+              if (typeof value !== 'function') return value
+              return function () {
+                if (prop === 'disableVertexAttribArray') closed.push(arguments[0])
+                return value.apply(target, arguments)
+              }
+            }
+          })
+          return { proxy, take: () => (closed.length === 0 ? '没关' : '关掉 ' + closed.splice(0).join('、')) }
+        }
+        const MANUAL_NOTE = 'bindingsFor、bufferNames、slotLine、hw2ManualFrames、recordDisables 是课程写的辅助函数（项目里没有）。ProgramManager、GeometryManager 用的是真实代码；「Mary」是 3 个顶点的缩小版，属性名和 HW2 一样。'
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-manual-v1'),
+          storageKey: 'lesson-0016-manual-v1',
+          cards: [
+            {
+              title: '第 1 版：两帧 HW2，中间换预设',
+              tags: ['真实 WebGL', '只跑第 1 版'],
+              desc: '按上面表格的五步走：画背景、画 Mary、第 2 帧画背景、Mary 释放、再画背景。每一步之后查表的第 0～3 行和 EBO，draw 之后查 getError。',
+              note: MANUAL_NOTE,
+              question: '第 ⑤ 步再画背景，draw 之后 getError 是多少？',
+              choices: ['1282：第 1～3 行还开着，却没有 buffer 可读', '0：背景 shader 不用第 1～3 行', '1281：索引越界'],
+              answer: 0,
+              explain: '第 1 版只接这次要用的行，从来不关。画完 Mary，第 1～3 行一直开着；第 ③ 步它们还读着 Mary 的 buffer，背景 shader 不用，所以没出错。第 ④ 步 Mary 的 buffer 删掉，这三行变成「开着、没有 buffer」，WebGL 规定这样 draw 就报 INVALID_OPERATION，不管 shader 用不用它们。',
+              run: () => withGL((gl, lines) => hw2ManualFrames(gl, lines, (geometry, res, program) => bindManualV1(gl, bindingsFor(res, program), res.indexBuffer)))
+            }
+          ]
+        })
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-manual-v2'),
+          storageKey: 'lesson-0016-manual-v2',
+          cards: [
+            {
+              title: '第 2 版：同样的五步',
+              tags: ['真实 WebGL', '只跑第 2 版'],
+              desc: '同样的顺序，接线换成 ManualInputV2。每一步额外打印这次 bind 关掉了哪些行。',
+              note: MANUAL_NOTE,
+              question: '第 ③ 步画背景时，第 2 版关掉了哪些行？第 ⑤ 步 getError 是多少？',
+              choices: ['关掉 1、2、3；0', '一行都没关；1282', '关掉 0～15；0'],
+              answer: 0,
+              explain: '进入第 ③ 步时 enabled 是 {0, 1, 2, 3}，这次要开的是 {0}，于是关掉 1、2、3。第 ④ 步 Mary 的 buffer 删掉时，这三行已经关了，第 ⑤ 步就没有「开着却没 buffer」的行，getError 是 0。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const recorder = recordDisables(gl)
+                  const input = new ManualInputV2(recorder.proxy)
+                  hw2ManualFrames(gl, lines, (geometry, res, program) => {
+                    input.bind(bindingsFor(res, program), res.indexBuffer)
+                    return recorder.take()
+                  })
+                })
+            }
+          ]
+        })
+        /** 课程写的辅助函数：模拟「接手之前，别的代码在这个 context 上开着第 5 行，而它读的 buffer 已经删了」。 */
+        function leaveStaleLocation5(gl) {
+          const buffer = gl.createBuffer()
+          gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+          gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(9), gl.STATIC_DRAW)
+          gl.vertexAttribPointer(5, 3, gl.FLOAT, false, 0, 0)
+          gl.enableVertexAttribArray(5)
+          gl.deleteBuffer(buffer)
+          gl.bindBuffer(gl.ARRAY_BUFFER, null)
+        }
+        /** 课程写的辅助函数：在一个被别人用过的 context 上，第一次画背景。makeBind 决定用哪一版接线。 */
+        function firstDrawAfterOthers(gl, lines, label, makeBind) {
+          leaveStaleLocation5(gl)
+          const caps = R.detectWebGL1Capabilities(gl)
+          const programs = new R.WebGL1ProgramManager(gl, { invalidateState })
+          const geometries = new R.WebGL1GeometryManager(gl, caps, { invalidateState })
+          const bgProgram = programs.get(shader('背景', BG_VS, BG_FS))
+          const box = cube()
+          const boxRes = geometries.get(box)
+          const names = bufferNames(boxRes, null)
+          lines.push({ text: label + '　接手前：' + slotLine(gl, names, [0, 5]), kind: 'user' })
+          makeBind(gl, caps)(box, boxRes, bgProgram)
+          gl.useProgram(bgProgram.program)
+          gl.getError()
+          gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_BYTE, 0)
+          const code = gl.getError()
+          lines.push({ text: label + '　第一次画背景以后：' + slotLine(gl, names, [0, 5]) + '；draw 之后 getError ' + code, kind: code === 0 ? 'server' : 'result' })
+          return code
+        }
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-manual'),
+          storageKey: 'lesson-0016-manual',
+          cards: [
+            {
+              title: '接手之前，第 5 行已经开着',
+              tags: ['真实 WebGL', '第 2 版 vs 真实代码', '假装没有 VAO 扩展'],
+              desc: '先模拟「别的代码用过这个 context」：它开着第 5 行，读的 buffer 已经删了。然后第一次画背景。第 2 版和真实的 Manual 顶点输入（能力里的 vertexArrayObject 换成 null）各在一个新 context 里跑一次。',
+              note: MANUAL_NOTE + ' leaveStaleLocation5、firstDrawAfterOthers 也是课程写的。',
+              question: '第一次画背景以后，第 2 版和真实代码各得到什么 getError？',
+              choices: ['第 2 版 1282，真实代码 0', '两个都是 0：背景用不到第 5 行', '两个都是 1282'],
+              answer: 0,
+              explain: '第 2 版的 enabled 一开始是空集合，它以为表是全关的，没去关第 5 行，于是 draw 报 1282。真实代码第一次 bind 时 initialized 是 false，把 0～15 全部当成「可能开着」，除了这次要用的第 0 行全关了一遍，第 5 行也关了。',
+              run: () =>
+                withGL((gl, lines) => {
+                  firstDrawAfterOthers(gl, lines, '第 2 版', (g) => {
+                    const input = new ManualInputV2(g)
+                    return (geometry, res, program) => input.bind(bindingsFor(res, program), res.indexBuffer)
+                  })
+                  const second = freshContext()
+                  try {
+                    const code = firstDrawAfterOthers(second.gl, lines, '真实代码', (g, caps) => {
+                      const inputs = R.createWebGL1VertexInputManager(g, { vertexArrayObject: null, maxVertexAttributes: caps.maxVertexAttributes }, { invalidateState })
+                      return (geometry, res, program) => inputs.bind(geometry, res, program)
+                    })
+                    lines.push({ t: '结果', text: '真实代码 draw 之后 getError → ' + code, kind: 'result' })
+                  } finally {
+                    second.release()
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 4.3 有 VAO ----------------
+        // 调试 shader：只用 position 和 aTransportSH0，先声明 aTransportSH0
+        const DEBUG_VS = [
+          'attribute vec3 aTransportSH0;',
+          'attribute vec3 position;',
+          'varying vec3 vColor;',
+          'void main() {',
+          '  vColor = aTransportSH0;',
+          '  gl_Position = vec4(position, 1.0);',
+          '}'
+        ].join('\n')
+        /**
+         * 课程写的辅助函数：直接用 gl 链接一个 program，并用 bindAttribLocation 把 location 定死，
+         * 这样在任何浏览器上 location 都一样（不定死的话由驱动分，4.1 节卡片看过它会随声明顺序变）。
+         */
+        function linkWithLocations(gl, vs, fs, locations) {
+          const program = gl.createProgram()
+          for (const [type, source] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+            const s = gl.createShader(type)
+            gl.shaderSource(s, source)
+            gl.compileShader(s)
+            gl.attachShader(program, s)
+          }
+          for (const [name, location] of Object.entries(locations)) gl.bindAttribLocation(program, location, name)
+          gl.linkProgram(program)
+          return { program, attributes: new Map(Object.entries(locations)) }
+        }
+        /** 课程写的辅助函数：对 program 要的每个属性，查当前表里它那一行读的是哪个 buffer，对不对。 */
+        function checkReads(gl, program, res, names) {
+          return [...program.attributes].map(([name, location]) => {
+            const got = gl.getVertexAttrib(location, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING)
+            const want = res.attributes.get(name).buffer
+            const text = name + ' 从第 ' + location + ' 行读 → ' + (names.get(got) || 'null')
+            return { ok: got === want, text: text + (got === want ? ' ✓' : ' ✗（应该读 ' + names.get(want) + '）') }
+          })
+        }
+        /** 课程写的辅助函数：准备 Mary、两个定死 location 的 program，以及数 createVertexArrayOES 的计数器。 */
+        function maryTwoPrograms(gl) {
+          const ext = gl.getExtension('OES_vertex_array_object')
+          if (!ext) return null
+          const caps = R.detectWebGL1Capabilities(gl)
+          const geometries = new R.WebGL1GeometryManager(gl, caps, { invalidateState })
+          const mary = miniMary()
+          const res = geometries.get(mary)
+          const counter = { created: 0 }
+          const create = ext.createVertexArrayOES.bind(ext)
+          ext.createVertexArrayOES = () => {
+            counter.created += 1
+            return create()
+          }
+          return {
+            ext,
+            mary,
+            res,
+            counter,
+            names: bufferNames(null, res),
+            prt: linkWithLocations(gl, PRT_VS, PRT_FS, { position: 0, aTransportSH0: 1, aTransportSH1: 2, aTransportSH2: 3 }),
+            debug: linkWithLocations(gl, DEBUG_VS, PRT_FS, { aTransportSH0: 0, position: 1 })
+          }
+        }
+        const VAO_NOTE = 'maryTwoPrograms、linkWithLocations、checkReads 是课程写的辅助函数（项目里没有）。两个 program 用 bindAttribLocation 定死了 location：PRT 的 position 在第 0 行，调试 shader 的 aTransportSH0 在第 0 行、position 在第 1 行。'
+        const pushReads = (lines, checks) => checks.forEach((check) => lines.push({ text: '　' + check.text, kind: check.ok ? 'server' : 'result' }))
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-vao-v1'),
+          storageKey: 'lesson-0016-vao-v1',
+          cards: [
+            {
+              title: '第 1 版 VAO：Mary 先配 PRT，再配调试 shader',
+              tags: ['真实 WebGL', '只跑第 1 版'],
+              desc: '用 VaoCacheV1 先画 Mary（PRT），再画 Mary（调试 shader）。每次 bind 之后，对 program 要的每个属性，查当前表里那一行读的是哪个 buffer。',
+              note: VAO_NOTE,
+              question: '第二次（调试 shader），position 读到的是哪个 buffer？',
+              choices: ['T0：命中了按 PRT 录的表，表里第 1 行是 T0', 'P：VAO 会跟着新 program 自动调整', '什么都读不到，bind 报错'],
+              answer: 0,
+              explain: '第二次查缓存只看 Geometry，命中了第一次按 PRT 录的表，传进来的新接线根本没用上。调试 shader 从第 1 行读 position，表里第 1 行是 T0；从第 0 行读 aTransportSH0，表里第 0 行是 P。两个都读错了，而且 GL 不会报任何错。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const m = maryTwoPrograms(gl)
+                  if (m === null) return lines.push({ text: '这个浏览器没有 OES_vertex_array_object', kind: 'late' })
+                  const cache = new VaoCacheV1(gl, m.ext)
+                  cache.bind(m.mary, bindingsFor(m.res, m.prt), m.res.indexBuffer)
+                  lines.push({ text: '画 Mary（PRT）：到目前建过 VAO ' + m.counter.created + ' 个', kind: 'user' })
+                  pushReads(lines, checkReads(gl, m.prt, m.res, m.names))
+                  cache.bind(m.mary, bindingsFor(m.res, m.debug), m.res.indexBuffer)
+                  lines.push({ text: '画 Mary（调试 shader）：到目前建过 VAO ' + m.counter.created + ' 个', kind: 'user' })
+                  const reads = checkReads(gl, m.debug, m.res, m.names)
+                  pushReads(lines, reads)
+                  lines.push({ t: '结果', text: '调试 shader 要的 ' + reads.length + ' 个属性，读错了 ' + reads.filter((r) => !r.ok).length + ' 个', kind: 'result' })
+                })
+            }
+          ]
+        })
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-vao-v2'),
+          storageKey: 'lesson-0016-vao-v2',
+          cards: [
+            {
+              title: '第 2 版 VAO：同样的两次，再来一帧',
+              tags: ['真实 WebGL', '只跑第 2 版'],
+              desc: '用 VaoCacheV2 先画 Mary（PRT），再画 Mary（调试 shader），然后下一帧两种各画一次。看每次建了几个 VAO、读得对不对。',
+              note: VAO_NOTE,
+              question: '换成调试 shader 时，第 2 版建了新 VAO 吗？position 读到谁？',
+              choices: ['建了第 2 个；position 读 P', '没建，命中了 Mary 的表；position 读 T0', '建了第 2 个，同时删掉了第 1 个'],
+              answer: 0,
+              explain: 'Mary 的小表里只有 program#PRT，用 program#调试 去查没命中，于是按调试 shader 的 location 新录一张：第 0 行读 T0，第 1 行读 P。两张表都留在 Mary 的小表里，下一帧画哪个都命中，不再新建。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const m = maryTwoPrograms(gl)
+                  if (m === null) return lines.push({ text: '这个浏览器没有 OES_vertex_array_object', kind: 'late' })
+                  const cache = new VaoCacheV2(gl, m.ext)
+                  const step = (label, program) => {
+                    cache.bind(m.mary, program.program, bindingsFor(m.res, program), m.res.indexBuffer)
+                    lines.push({ text: label + '：到目前建过 VAO ' + m.counter.created + ' 个', kind: 'user' })
+                    pushReads(lines, checkReads(gl, program, m.res, m.names))
+                  }
+                  step('第 1 帧画 Mary（PRT）', m.prt)
+                  step('第 1 帧画 Mary（调试 shader）', m.debug)
+                  const before = m.counter.created
+                  step('第 2 帧画 Mary（PRT）', m.prt)
+                  step('第 2 帧画 Mary（调试 shader）', m.debug)
+                  lines.push({ t: '结果', text: '一共建过 ' + m.counter.created + ' 个 VAO；第 2 帧新建 ' + (m.counter.created - before) + ' 个', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 4.3 有 VAO ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-oes'),
+          storageKey: 'lesson-0016-oes',
+          cards: [
+            {
+              title: '同样画两次 Mary：两种做法各发几条命令',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '真实的 Manual 顶点输入（能力里的 vertexArrayObject 换成 null）和真实的 OES 顶点输入，各给 Mary（PRT program）bind 两次。数第二次 bind 发了几条 GL 命令；getError 单独数。',
+              note: 'counter 是课程写的辅助函数：给 gl 或扩展对象套一层代理，记下每个被调用的方法名。',
+              question: '第二次 bind，Manual 和 OES 各发了几条命令（不算 getError 这类查询）？',
+              choices: ['Manual 13 条，OES 1 条', '两种都是 1 条：第二次都命中了缓存', 'Manual 13 条，OES 0 条：已经绑着就不发'],
+              answer: 0,
+              explain: 'Manual 没有可以换上的表，每次都把 4 行重新接一遍：4 × (bindBuffer + vertexAttribPointer + enableVertexAttribArray) + 绑 EBO = 13 条，外加进门、接完各一次 getError。OES 第二次命中缓存，只发一条 bindVertexArrayOES，也不调用 getError（错误检查只在建 VAO 的那条路上）。真实代码命中时不判断「是不是已经绑着」，所以是 1 条，不是 0 条。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const caps = R.detectWebGL1Capabilities(gl)
+                  if (caps.vertexArrayObject === null) return lines.push({ text: '这个浏览器没有 OES_vertex_array_object', kind: 'late' })
+                  const counter = (target) => {
+                    const calls = []
+                    const proxy = new Proxy(target, {
+                      get(t, p) {
+                        const v = t[p]
+                        if (typeof v !== 'function') return v
+                        return function () {
+                          calls.push(String(p))
+                          return v.apply(t, arguments)
+                        }
+                      }
+                    })
+                    return { proxy, calls }
+                  }
+                  const QUERIES = ['getError', 'getParameter', 'isContextLost', 'getProgramParameter', 'getActiveAttrib']
+                  const summarize = (calls) => {
+                    const commands = calls.filter((c) => !QUERIES.includes(c))
+                    const groups = new Map()
+                    for (const c of commands) groups.set(c, (groups.get(c) || 0) + 1)
+                    const detail = [...groups].map(([c, n]) => c + ' × ' + n).join('，')
+                    return commands.length + ' 条命令（' + (detail || '无') + '），getError ' + calls.filter((c) => c === 'getError').length + ' 次'
+                  }
+                  const programs = new R.WebGL1ProgramManager(gl, { invalidateState })
+                  const geometries = new R.WebGL1GeometryManager(gl, caps, { invalidateState })
+                  const prt = programs.get(shader('PRT', PRT_VS, PRT_FS))
+                  const mary = miniMary()
+                  const res = geometries.get(mary)
+                  const m = counter(gl)
+                  const manual = R.createWebGL1VertexInputManager(m.proxy, { vertexArrayObject: null, maxVertexAttributes: caps.maxVertexAttributes }, { invalidateState })
+                  manual.bind(mary, res, prt)
+                  m.calls.length = 0
+                  manual.bind(mary, res, prt)
+                  lines.push({ text: 'Manual 第二次 bind：' + summarize(m.calls), kind: 'server' })
+                  const g2 = counter(gl)
+                  const e2 = counter(caps.vertexArrayObject)
+                  const oes = R.createWebGL1VertexInputManager(g2.proxy, { ...caps, vertexArrayObject: e2.proxy }, { invalidateState })
+                  oes.bind(mary, res, prt)
+                  g2.calls.length = 0
+                  e2.calls.length = 0
+                  oes.bind(mary, res, prt)
+                  lines.push({ t: '结果', text: 'OES 第二次 bind：' + summarize([...g2.calls, ...e2.calls]), kind: 'result' })
+                })
+            },
+            {
+              title: '同一个 Geometry：同一个 program 画两次，再换一个 program',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '真实的 OES 顶点输入。背景盒子先配背景 shader bind 两次，再配另一个也只用 position 的 shader bind 一次。数 createVertexArrayOES、bindVertexArrayOES 和 vertexAttribPointer 各调用了几次。',
+              question: '第二次 bind（同一对）发了哪些命令？',
+              choices: ['只有 1 条 bindVertexArrayOES', '1 条 bind 加 1 条 pointer：要重新接线', '0 条：已经绑着就什么都不做'],
+              answer: 0,
+              explain: '第一次建 VAO、接线、录好；第二次命中缓存，只绑 VAO。换了 program，即使属性名一样，也建了第二个 VAO：缓存不敢假设两个 program 的 location 相同。真实代码没有「已经绑着就跳过」的判断，所以命中时总会发 1 条 bindVertexArrayOES。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const caps = R.detectWebGL1Capabilities(gl)
+                  const ext = caps.vertexArrayObject
+                  if (ext === null) return lines.push({ text: '这个浏览器没有 OES_vertex_array_object', kind: 'late' })
+                  const counts = { createVertexArrayOES: 0, bindVertexArrayOES: 0, vertexAttribPointer: 0 }
+                  for (const name of ['createVertexArrayOES', 'bindVertexArrayOES']) {
+                    const original = ext[name].bind(ext)
+                    ext[name] = (...args) => { counts[name] += 1; return original(...args) }
+                  }
+                  const w = new Proxy(gl, { get(t, p) { const v = t[p]; if (typeof v !== 'function') return v; return (...args) => { if (p === 'vertexAttribPointer') counts.vertexAttribPointer += 1; return v.apply(t, args) } } })
+                  const programs = new R.WebGL1ProgramManager(gl, { invalidateState })
+                  const geometries = new R.WebGL1GeometryManager(gl, caps, { invalidateState })
+                  const inputs = R.createWebGL1VertexInputManager(w, caps, { invalidateState })
+                  const bg = cube()
+                  const res = geometries.get(bg)
+                  const A = programs.get(shader('背景', BG_VS, BG_FS))
+                  const B = programs.get(shader('背景（另一个）', BG_VS + '\n// 另一个 program', BG_FS))
+                  const step = (label, program) => {
+                    const before = { ...counts }
+                    inputs.bind(bg, res, program)
+                    lines.push({ text: label + '：create ' + (counts.createVertexArrayOES - before.createVertexArrayOES) + '，bindVAO ' + (counts.bindVertexArrayOES - before.bindVertexArrayOES) + '，pointer ' + (counts.vertexAttribPointer - before.vertexAttribPointer), kind: 'server' })
+                  }
+                  step('第一次（背景 shader）', A)
+                  step('第二次（同一对）', A)
+                  step('换成另一个 program', B)
+                  lines.push({ t: '结果', text: '一共建了 ' + counts.createVertexArrayOES + ' 个 VAO', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 4.4 换 shader 以后 ----------------
+        /**
+         * 课程写的辅助函数。按 WebGL1ResourceManager 的接法装好三个真实 Manager，
+         * 照 4.4 节表里的五步让 Mary 的材质换两次 shader，每一步打印顶点输入的缓存表。
+         * withHook 为 false 时，ProgramManager 不接 beforeDelete。
+         */
+        function switchMaryShaders(gl, lines, withHook) {
+          const caps = R.detectWebGL1Capabilities(gl)
+          const ext = caps.vertexArrayObject
+          if (ext === null) {
+            lines.push({ text: '这个浏览器没有 OES_vertex_array_object，顶点输入改走手动接线，没有 VAO 表可看。', kind: 'late' })
+            return
+          }
+          // 给 VAO、program、Geometry 起名字，好打印；顺便数 deleteVertexArrayOES
+          const names = new Map()
+          const vaos = []
+          let deletedVAOs = 0
+          const create = ext.createVertexArrayOES.bind(ext)
+          ext.createVertexArrayOES = () => {
+            const vao = create()
+            vaos.push(vao)
+            names.set(vao, 'VAO#' + vaos.length)
+            return vao
+          }
+          const remove = ext.deleteVertexArrayOES.bind(ext)
+          ext.deleteVertexArrayOES = (vao) => {
+            deletedVAOs += 1
+            return remove(vao)
+          }
+          const inputs = R.createWebGL1VertexInputManager(gl, caps, { invalidateState })
+          const geometries = new R.WebGL1GeometryManager(gl, caps, { invalidateState, beforeDelete: (g) => { inputs.releaseGeometry(g); return undefined } })
+          const programs = new R.WebGL1ProgramManager(
+            gl,
+            withHook
+              ? { invalidateState, beforeDelete: (p) => { inputs.releaseProgram(p); return undefined } } // 和 WebGL1ResourceManager.ts:102–104 一样
+              : { invalidateState }
+          )
+          const box = cube()
+          const mary = miniMary()
+          names.set(box, '盒子')
+          names.set(mary, 'Mary')
+          // 和 Backend.draw 的顺序一样：先 programs.get(材质的 ShaderModule)，再 vertexInputs.bind
+          const draw = (geometry, shaderModule, label) => {
+            const program = programs.get(shaderModule)
+            if (!names.has(program.program)) names.set(program.program, label)
+            inputs.bind(geometry, geometries.get(geometry), program)
+          }
+          // 打印缓存表：直接读 OES 顶点输入的私有字段 entries，只读不改
+          const dump = (title) => {
+            lines.push({ text: title, kind: 'user' })
+            for (const [geometry, table] of inputs.entries) {
+              const rows = [...table].map(([program, entry]) => names.get(program) + (gl.isProgram(program) ? '' : '（已删）') + ' → ' + names.get(entry.vao))
+              lines.push({ text: '　' + names.get(geometry) + ' 的小表：' + rows.join('，'), kind: 'server' })
+            }
+            lines.push({ text: '　GPU 上活着的 VAO：' + vaos.filter((vao) => ext.isVertexArrayOES(vao)).length + ' 个', kind: 'muted' })
+          }
+          const background = shader('背景', BG_VS, BG_FS)
+          const v1 = shader('Mary v1（PRT）', PRT_VS, PRT_FS)
+          const v2 = shader('Mary v2（只画 position）', BG_VS + '\n// 调试用', BG_FS)
+          const v3 = shader('Mary v3（改过的 PRT）', PRT_VS + '\n// 改过', PRT_FS)
+
+          draw(box, background, 'program#背景')
+          draw(mary, v1, 'program#1')
+          dump('① 第 1 帧：背景用 program#背景，Mary 用 v1 → program#1')
+          const createdBefore = vaos.length
+          draw(box, background, 'program#背景')
+          draw(mary, v1, 'program#1')
+          dump('② 第 2 帧：两次都命中，新建 VAO ' + (vaos.length - createdBefore) + ' 个')
+          draw(mary, v2, 'program#2')
+          dump('③ Mary 换成 v2 → program#2')
+          let deletedBefore = deletedVAOs
+          v1.dispose() // 订阅触发 ProgramManager.release(v1)
+          dump('④ 释放 v1：ProgramManager 删掉 program#1；这期间 deleteVertexArrayOES ' + (deletedVAOs - deletedBefore) + ' 次')
+          draw(mary, v3, 'program#3')
+          deletedBefore = deletedVAOs
+          v2.dispose()
+          dump('⑤ Mary 换成 v3 → program#3，释放 v2；这期间 deleteVertexArrayOES ' + (deletedVAOs - deletedBefore) + ' 次')
+          lines.push({
+            t: '结果',
+            text: (withHook ? '接了 beforeDelete：' : '没接 beforeDelete：') + '新建过 ' + vaos.length + ' 个 VAO，还活着 ' + vaos.filter((vao) => ext.isVertexArrayOES(vao)).length + ' 个',
+            kind: 'result'
+          })
+        }
+        const DEAD_NOTE =
+          'switchMaryShaders 和其中的 draw、dump 是课程写的辅助函数（项目里没有）：draw 按 Backend.draw 的顺序调用真实的 programs.get 和 vertexInputs.bind；dump 直接读 OES 顶点输入的私有字段 entries 来打印。TypeScript 的 private 只在编译时检查，运行时照样能读；这里只读不改。Mary 是 3 个顶点的缩小版，属性名和 HW2 一样。'
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-dead'),
+          storageKey: 'lesson-0016-dead',
+          cards: [
+            {
+              title: '真实代码：没接 beforeDelete，Mary 换两次 shader',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '照 4.4 节表里的五步，跑真实的 ProgramManager、GeometryManager 和 OES 顶点输入。ProgramManager 不接 beforeDelete。每一步打印顶点输入的缓存表。',
+              note: DEAD_NOTE,
+              question: '第 ⑤ 步以后，Mary 的小表里有几行？draw 能查到其中几行？',
+              choices: ['3 行，只有 program#3 那行能查到', '1 行：program 删了，以它为 key 的行自动消失', '3 行，3 行都能查到：表里有就能查'],
+              answer: 0,
+              explain:
+                'Map 不知道 GL 那边删了 program：key 还是那个 JS 对象，这一行就一直在。draw 拿来查表的 program 只来自 programs.get(材质的 ShaderModule)，材质现在用 v3，所以只会拿 program#3 来查；v1、v2 已经释放，再 get 它们会抛 ResourceDisposedError。program#1、#2 两行查不到，也没有代码会删它们，VAO#2、#3 一直占着：活着 4 个 VAO，会被用到的只有 VAO#1 和 VAO#4。',
+              run: () => withGL((gl, lines) => switchMaryShaders(gl, lines, false))
+            },
+            {
+              title: '真实代码：接上 beforeDelete，同样五步',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '和上一张一样，只是 ProgramManager 按 WebGL1ResourceManager.ts:100–105 的接法接上 beforeDelete → releaseProgram。每次释放时数一下 deleteVertexArrayOES 调用了几次。',
+              note: DEAD_NOTE,
+              question: '第 ④ 步释放 v1，这期间 deleteVertexArrayOES 调用了几次？',
+              choices: ['1 次：只删 Mary 小表里 program#1 那行的 VAO#2，盒子那行不动', '2 次：盒子和 Mary 的 VAO 都删', '0 次：要等 Mary 释放时才删'],
+              answer: 0,
+              explain:
+                'releaseProgram 把外层表的每个 Geometry 都翻一遍：盒子的小表里没有 program#1，跳过；Mary 的小表里有，删掉 VAO#2 和这一行。第 ⑤ 步同样只删 VAO#3。表里始终只有还可能被查到的行，最后活着 2 个 VAO。顺序是先 releaseProgram，再 deleteProgram（第 15 课 2.7 节的 ① 和 ④）。',
+              run: () => withGL((gl, lines) => switchMaryShaders(gl, lines, true))
+            }
+          ]
+        })
+
+
+        // ---------------- 4.6 和 Lifecycle 的关系 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-lifecycle'),
+          storageKey: 'lesson-0016-lifecycle',
+          cards: [
+            {
+              title: '画 Mary、丢失、恢复、再画',
+              tags: ['真实 WebGL', '项目代码', '真的丢一次 context'],
+              desc: '像 ResourceManager 那样装好第 1 代：ProgramManager、GeometryManager、顶点输入（有 VAO 扩展就是 OES）。上传 Mary 并 bind 一次。然后让 context 丢失，马上再 get；等恢复事件到达后，旧的 GeometryManager 再 get 一次；最后新建第 2 代，get、bind 同一个 Mary。',
+              note: '课程写的部分：装配三个真实 Manager 的 makeGeneration，以及把 canvas 临时挂进页面（不挂的话，有的浏览器不会发出恢复事件），用完移除。',
+              question: '恢复以后，第 2 代的 GeometryManager 交回的 buffer 和第 1 代的是同一个吗？',
+              choices: ['不是：新建了 4 个；旧的 isBuffer 是 false', '是：恢复后旧 buffer 又能用了', '不是，但要重新下载 Mary 的数据才能建'],
+              answer: 0,
+              explain: '丢失后第一次 get，assertAvailable 发现 isContextLost，作废并抛错；从此旧 Manager 记着 lost，恢复以后也拒绝。第 2 代从空缓存开始，用 CPU 的 Geometry 里一直存着的数组重新上传，得到 4 个新 buffer；顶点输入也重录了一个新 VAO。旧的 buffer、VAO 随旧 context 失效，isBuffer、isVertexArrayOES 都是 false。',
+              run: async () => {
+                const canvas = document.createElement('canvas')
+                canvas.width = 4
+                canvas.height = 4
+                canvas.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none'
+                document.body.appendChild(canvas)
+                canvas.addEventListener('webglcontextlost', (event) => event.preventDefault())
+                const gl = canvas.getContext('webgl')
+                const lines = []
+                try {
+                  const lose = gl.getExtension('WEBGL_lose_context')
+                  if (!lose) {
+                    lines.push({ text: '这个浏览器没有 WEBGL_lose_context', kind: 'late' })
+                    return { lines }
+                  }
+                  const prtShader = shader('PRT', PRT_VS, PRT_FS)
+                  const mary = miniMary()
+                  // 像 WebGL1ResourceManager 那样装一代（简化：只有这三个 Manager）
+                  const makeGeneration = () => {
+                    const caps = R.detectWebGL1Capabilities(gl)
+                    const inputs = R.createWebGL1VertexInputManager(gl, caps, { invalidateState })
+                    return {
+                      caps,
+                      inputs,
+                      programs: new R.WebGL1ProgramManager(gl, { invalidateState, beforeDelete: (p) => { inputs.releaseProgram(p); return undefined } }),
+                      geometries: new R.WebGL1GeometryManager(gl, caps, { invalidateState, beforeDelete: (g) => { inputs.releaseGeometry(g); return undefined } })
+                    }
+                  }
+                  const first = makeGeneration()
+                  const firstRes = first.geometries.get(mary)
+                  first.inputs.bind(mary, firstRes, first.programs.get(prtShader))
+                  const oldVAO = first.caps.vertexArrayObject ? gl.getParameter(first.caps.vertexArrayObject.VERTEX_ARRAY_BINDING_OES) : null
+                  lines.push({ text: '第 1 代：上传 Mary（4 个 buffer）并 bind；顶点输入是 ' + (first.caps.vertexArrayObject ? 'OES' : 'Manual'), kind: 'server' })
+                  lose.loseContext()
+                  try {
+                    first.geometries.get(mary)
+                  } catch (error) {
+                    lines.push({ text: '丢失后马上 get → ' + error.name, kind: 'server' })
+                  }
+                  await new Promise((resolve) => setTimeout(resolve, 50))
+                  const restored = new Promise((resolve) => canvas.addEventListener('webglcontextrestored', resolve, { once: true }))
+                  lose.restoreContext()
+                  const outcome = await Promise.race([restored.then(() => 'restored'), new Promise((resolve) => setTimeout(() => resolve('timeout'), 3000))])
+                  if (outcome !== 'restored') {
+                    lines.push({ text: '3 秒内没等到恢复事件，实验停在这里', kind: 'late' })
+                    return { lines }
+                  }
+                  lines.push({ text: '恢复事件到达，isContextLost → ' + gl.isContextLost(), kind: 'user' })
+                  try {
+                    first.geometries.get(mary)
+                  } catch (error) {
+                    lines.push({ text: '旧的 GeometryManager 再 get → ' + error.name, kind: 'server' })
+                  }
+                  const second = makeGeneration()
+                  const secondRes = second.geometries.get(mary)
+                  second.inputs.bind(mary, secondRes, second.programs.get(prtShader))
+                  const newVAO = second.caps.vertexArrayObject ? gl.getParameter(second.caps.vertexArrayObject.VERTEX_ARRAY_BINDING_OES) : null
+                  const buffers = (res) => [...res.attributes.values()].map((a) => a.buffer)
+                  const sameAny = buffers(secondRes).some((b) => buffers(firstRes).includes(b))
+                  lines.push({ text: '第 2 代：get、bind 成功；新 buffer ' + buffers(secondRes).length + ' 个，和旧的有重复吗 → ' + sameAny, kind: 'server' })
+                  const oldAlive = buffers(firstRes).filter((b) => gl.isBuffer(b)).length
+                  const vaoText = oldVAO && second.caps.vertexArrayObject ? '；isVertexArrayOES(旧 VAO) → ' + second.caps.vertexArrayObject.isVertexArrayOES(oldVAO) + '，新 VAO → ' + second.caps.vertexArrayObject.isVertexArrayOES(newVAO) : ''
+                  lines.push({ t: '结果', text: '旧 buffer 还能用的 ' + oldAlive + ' 个' + vaoText, kind: 'result' })
+                } catch (error) {
+                  lines.push({ text: '实验里抛出了没有预料到的错误：' + (error && error.name) + '：' + (error && error.message), kind: 'late' })
+                } finally {
+                  canvas.remove()
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0016"]'), [
+          {
+            q: 'gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW) 把数据拷进了哪个 buffer？',
+            opts: ['当前绑在 ARRAY_BUFFER 上的那个', '最近一次 createBuffer 建的那个', '所有绑过 ARRAY_BUFFER 的 buffer'],
+            answer: 0,
+            why: 'GL 的调用大多是「先绑，再操作」：bufferData 不接收 buffer 参数，操作的是绑定点指向的那个（2.1 节）。'
+          },
+          {
+            q: 'vertexAttribPointer 调用以后，再把 ARRAY_BUFFER 改绑别的 buffer，这个 location 读谁？',
+            opts: ['还是调用那一刻绑着的 buffer', '跟着改成新绑的 buffer', '变成 null，要重新调用 pointer'],
+            answer: 0,
+            why: 'pointer 把「此刻 ARRAY_BUFFER 绑的是谁」抄下来存好（2.2、2.4 节）。'
+          },
+          {
+            q: 'itemSize 3、Float32、stride 0、offset 0，第 5 个顶点从第几个字节开始读？',
+            opts: ['60', '15', '20'],
+            answer: 0,
+            why: 'stride 0 表示紧挨着，每个顶点 3 × 4 = 12 字节，第 5 个从 5 × 12 = 60 开始（2.2 节、图 2）。'
+          },
+          {
+            q: 'GeometryManager 上传完，为什么一定要把 ELEMENT_ARRAY_BUFFER 绑回去？',
+            opts: ['它记在当前 VAO 里，不还会换掉别的物体的索引', '不绑回去，下次 bufferData 会报错', 'WebGL 规定一个 buffer 只能绑一次'],
+            answer: 0,
+            why: 'EBO 绑定是 VAO 的一部分。上传时如果绑着别的物体的 VAO，它的索引就被换掉了（3.1 节卡片）。'
+          },
+          {
+            q: '没有 OES_element_index_uint 时，索引是 Uint32Array([0, 1, 70000])，真实代码怎样？',
+            opts: ['报 UnsupportedIndexTypeError，一个 buffer 都不建', '转成 Uint16 照样上传', '先上传 position，索引留到以后'],
+            answer: 0,
+            why: '70000 放不进 16 位；prepareIndices 在建 buffer 之前检查最大编号（3.4 节）。'
+          },
+          {
+            q: '为什么 VAO 要按「Geometry、program」两层缓存，而不是只按 Geometry？',
+            opts: ['VAO 里录的 location 来自某个 program', 'VAO 里保存了 program 对象', '一个 Geometry 只能配一个 program'],
+            answer: 0,
+            why: '同样的属性，换个 program location 就可能不同（4.1 节卡片），录好的接线不能共用（4.3 节）。'
+          },
+          {
+            q: '没接 beforeDelete 时，program#1 删掉以后，小表里 program#1 → VAO#2 这一行为什么再也查不到？',
+            opts: ['bind 收到的 program 只来自 programs.get(材质的 ShaderModule)，没有代码还拿着 program#1', 'Map 发现 key 指向的 program 被删了，查表时自动跳过', 'GL 删 program 时把 VAO#2 也删了，查到了也没用'],
+            answer: 0,
+            why: 'Map 只按对象身份比较，不知道 GL 那边删没删；查不到是因为再没有人拿 program#1 来查。VAO#2 也没被删，一直占着 GPU（4.4 节）。'
+          },
+          {
+            q: '没有 VAO 时，为什么要关掉这次用不到的 location？',
+            opts: ['它若指向已删的 buffer，draw 会报 INVALID_OPERATION', '打开的 location 越多，draw 越慢', 'shader 会读到它，画面变色'],
+            answer: 0,
+            why: 'WebGL 规定打开着却没有 buffer 可读的 location 会让 draw 失败，不管 shader 用不用它（3.5、4.2 节卡片）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

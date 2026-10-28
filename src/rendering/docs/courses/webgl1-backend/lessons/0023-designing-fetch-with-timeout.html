@@ -1,0 +1,741 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 23 课 · 从零设计 fetchWithTimeout</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/fetch-lab.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 答疑专题 · 约 30 分钟</p>
+    <h1>从零设计一个能取消、会超时的请求函数</h1>
+    <p class="lede">
+      这一课不看现成的答案。我们从「调用者需要什么」出发，一版一版地写。每写完一版，就在实验台上跑几个真实场景：先猜它会怎样，再看它实际做了什么。哪里不够，下一版就改哪里。写到第 6 版，就是你要敲进 <code>src/network/http.ts</code> 的代码。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW2 每次构建场景，createHW2Scene 都要下载 7 个文本文件：OBJ、light、transport 和 4 个 shader。它们全都经过 fetchTextWithTimeout。用户切换场景、服务器卡住、文件丢了，这个函数都要给出正确的结果，上层才知道该安静地丢掉、提示重试，还是报错。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：fetch、Promise、await（第 20 课第 9 节）；try / catch / finally；「先取消、后挂监听，监听永远收不到」（第 20 课第 10 节的实测）。<br />
+      「服务器先回响应头、正文后到」是什么意思，响应在网络上怎么走，见<a href="0024-http-on-the-wire.html">第 24 课</a>。<br />
+      <strong>这一课从零讲的</strong>：AbortController 和 AbortSignal 的分工；<code>{ once: true }</code>；怎样把两个「该停了」的理由合到一起；什么时候收拾。浏览器基线按你定的 2022 年。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol start="0">
+        <li><a href="#s0">先认识两个对象</a></li>
+        <li><a href="#s1">需求：调用者到底要什么</a></li>
+        <li><a href="#s2">第 1 版：能用就行</a></li>
+        <li><a href="#s3">第 2 版：让调用者能取消</a></li>
+        <li><a href="#s4">第 3 版：加上超时</a></li>
+        <li><a href="#s5">第 4 版：两个理由，一个开关</a></li>
+        <li><a href="#s6">第 5 版：进门先看一眼</a></li>
+        <li><a href="#s7">第 6 版：什么时候收拾</a></li>
+        <li><a href="#s8">最终代码：敲进 src</a></li>
+        <li><a href="#s9">这段代码有多通用</a></li>
+        <li><a href="#s10">检查题</a></li>
+        <li><a href="#s11">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s0">0. 先认识两个对象：controller 和 signal</h2>
+    <p>
+      把 AbortController 想成一个<strong>开关</strong>，它出生时自带一盏<strong>灯</strong>，也就是 <code>controller.signal</code>。只有开关能把灯按亮；拿到灯的人只能看它亮没亮，或者登记「灯亮时叫我」。
+    </p>
+    <pre><code>const controller = new AbortController() // 新建一个开关，它自带一盏灯
+const signal = controller.signal         // 拿到这盏灯。取多少次都是同一个对象
+
+signal.aborted   // false：灯还没亮
+signal.reason    // undefined：还没写原因
+
+// 登记：灯亮的那一刻，执行这个函数
+signal.addEventListener('abort', () =&gt; console.log('灯亮了，原因：', signal.reason.message))
+
+controller.abort(new Error('用户切换了场景')) // 按开关：灯亮，原因记成这个 Error 对象，
+                                             // 并且当场执行上面登记的函数，打印「灯亮了，原因：用户切换了场景」
+
+signal.aborted           // true
+signal.throwIfAborted()  // 灯亮着：把原因当作错误抛出；灯没亮：什么也不做
+
+controller.abort(new Error('再按一次')) // 没有任何效果：灯只能亮一次，原因还是「用户切换了场景」
+signal.abort             // undefined：灯上没有开关，拿到灯的人按不了</code></pre>
+    <p>
+      <code>addEventListener</code> 的第三个参数 <code>{ once: true }</code> 表示「这个监听最多执行一次，执行完自动摘掉」。手动摘的时候写 <code>removeEventListener('abort', 同一个函数)</code>：必须传登记时的同一个函数对象，所以要先把函数存进一个常量。
+    </p>
+    <p>
+      下面的实验台用的是模拟服务器：课程页用 file:// 打开，发不了真请求。模拟的 fetch 按 Fetch 规范的取消规则来写，我已经在 Node 里用真实的 fetch 和本地服务器逐个场景对照过，结果一致。每次实验里，<strong>「你的 controller」</strong>代表调用者，比如 HW2SceneController；「你传的原因」就是 <code>new Error('用户切换了场景')</code> 这个对象。为了不让每次实验都等 6 秒，超时缩短成 500 ms。
+    </p>
+
+    <h2 id="s1">1. 需求：调用者到底要什么</h2>
+    <p>先别想代码。站在调用者的位置，把要遇到的情况一条条写下来，每条都写清楚「期望得到什么」：</p>
+    <ol class="steps">
+      <li><strong>正常</strong>：服务器 100 ms 回响应头，正文再传 100 ms。期望：拿到文本。（响应头和正文为什么能分开到，见<a href="0024-http-on-the-wire.html">第 24 课</a>。）</li>
+      <li><strong>等响应头时换场景</strong>：服务器要 300 ms 才回应，你在 100 ms 时点了 CornellBox。期望：立刻停下，而且抛出的就是你写在 <code>abort(原因)</code> 里的那个对象，这样上层能认出「这是我自己取消的」，安静地丢掉，不弹错误。</li>
+      <li><strong>读正文时换场景</strong>：响应头 50 ms 就到了，正文要传 400 ms，你在 200 ms 时取消。期望同上。</li>
+      <li><strong>服务器卡住</strong>：一直不回应。期望：到时间抛出 NetworkTimeoutError，界面可以提示「网络慢，请重试」。</li>
+      <li><strong>调用前就取消了</strong>：你按了取消，之后才轮到这个函数被调用。期望：不发请求，直接抛出你的原因。</li>
+      <li><strong>文件不存在</strong>：服务器回 404。期望：抛出 HttpError，重试也没用。</li>
+      <li><strong>断网</strong>：连不上服务器。期望：抛出 NetworkError，可以重试。</li>
+      <li><strong>大文件下载慢</strong>：响应头 100 ms 就到了，正文要传 900 ms。服务器在正常工作，期望：照常拿到文本，不能被超时误杀。</li>
+    </ol>
+    <p>这张清单就是验收标准。下面每写一版，都拿其中几条来试。</p>
+
+    <h2 id="s2">2. 第 1 版：能用就行</h2>
+    <pre><code>// 第 1 版：能用就行
+async function fetchText(url: string): Promise&lt;string&gt; {
+  const response = await fetch(url) // 发出请求，等服务器回「响应头」（状态码、类型这些）
+  return await response.text() // 再等「正文」全部传完，变成一个字符串
+}</code></pre>
+    <div id="lab-1"></div>
+
+    <h2 id="s3">3. 第 2 版：让调用者能取消</h2>
+    <p>
+      要取消，先得有个入口接收取消。fetch 本来就接受一个 <code>signal</code> 选项，那就让调用者把他的 signal 传进来，原样交给 fetch：
+    </p>
+    <pre><code>// 第 2 版：让调用者能取消
+async function fetchText(url: string, signal?: AbortSignal): Promise&lt;string&gt; {
+  // ← 新增：把调用者的 signal 原样交给 fetch。fetch 自己就会盯着它：
+  //   signal 一亮，fetch 立刻中止网络请求，并让这次 await 失败，
+  //   失败值就是调用者写在 abort(原因) 里的那个「原因」；
+  //   如果调用之前 signal 就已经亮了，fetch 根本不发请求，直接失败。
+  const response = await fetch(url, { signal })
+  // 读正文的时候，fetch 也一直盯着同一个 signal，所以这里同样能被取消
+  return await response.text()
+}</code></pre>
+    <div id="lab-2"></div>
+    <p>
+      <strong>工程上的第一个判断：</strong>如果需求只有「能取消」，写到这里就该停手了。fetch 已经把取消的事全做对了：调用前就亮了不发请求，等响应头时能停，读正文时也能停，抛出的还是调用者自己的原因。平台已经做好的事，不要再写一遍。可是清单里还有「服务器卡住」这一条，fetch 本身没有超时参数。
+    </p>
+
+    <h2 id="s4">4. 第 3 版：加上超时</h2>
+    <p>
+      「到点就停」意味着要有人在到点时按灯。能让 fetch 停下的，只有它盯着的那盏灯；而灯只能由它的开关来按。调用者的开关在调用者手里，函数里拿到的只是那盏灯，按不了。所以函数只能<strong>自己建一个开关</strong>：
+    </p>
+    <pre><code>// 第 3 版：加上超时（先只管超时）
+async function fetchText(
+  url: string,
+  options: { timeout?: number; signal?: AbortSignal } = {}
+): Promise&lt;string&gt; {
+  const { timeout = 6000 } = options
+  // ← 新增：超时要做到「到点就让 fetch 停下」。能让 fetch 停下的只有它盯着的 signal，
+  //   而 signal 只能由创建它的 controller 来按。调用者的 signal 我们按不了
+  //   （signal 上没有 abort 方法），所以自己建一个 controller，自己当那个按开关的人。
+  const controller = new AbortController()
+  // ← 新增：到点就按下自己的开关，并把「为什么按」写成一个超时错误。
+  //   以后 fetch 因此失败，带出来的失败值就是这个超时错误。
+  setTimeout(() =&gt; controller.abort(new NetworkTimeoutError(url, timeout)), timeout)
+  // ← 改动：fetch 只有一个 signal 的位置，现在给了自己的开关。
+  //   调用者传进来的 options.signal 没地方放了：取消功能被弄丢了（下一版解决）。
+  const response = await fetch(url, { signal: controller.signal })
+  return await response.text()
+}</code></pre>
+    <div id="lab-3"></div>
+
+    <h2 id="s5">5. 第 4 版：两个理由，一个开关</h2>
+    <p>
+      现在的处境是：「该停了」有两个理由，调用者取消、超时；可 fetch 只有一个 signal 的位置。解决办法是让两个理由都去按<strong>同一个开关</strong>，fetch 只盯这一个。超时已经在按它了；还差一件事：调用者的灯一亮，我们就替他按一下自己的开关，这叫<strong>转发</strong>。按的时候把调用者写的原因抄过去，开关上写的原因就能说明是哪一种情况。
+    </p>
+    <pre><code>// 第 4 版：两个「该停了」的理由，汇到一个开关上
+async function fetchText(
+  url: string,
+  options: { timeout?: number; signal?: AbortSignal } = {}
+): Promise&lt;string&gt; {
+  // 把调用者的 signal 取出来，改名 callerSignal，免得和自己开关的 signal 混在一起
+  const { timeout = 6000, signal: callerSignal } = options
+  const controller = new AbortController()
+  setTimeout(() =&gt; controller.abort(new NetworkTimeoutError(url, timeout)), timeout)
+  // ← 新增：转发。调用者的 signal 一亮，就按下我们自己的开关，并把调用者写下的原因原样抄过去。
+  //   这样「调用者要停」和「超时要停」都汇到同一个开关上，fetch 只要盯这一个；
+  //   开关上写的原因，说明了到底是哪一种。
+  //   先把函数存进常量：以后要摘掉这个监听，removeEventListener 必须拿到同一个函数对象。
+  const forwardAbort = (): void =&gt; controller.abort(callerSignal?.reason)
+  // { once: true }：这个监听最多执行一次，执行完自动摘掉
+  callerSignal?.addEventListener(&#x27;abort&#x27;, forwardAbort, { once: true })
+  try {
+    const response = await fetch(url, { signal: controller.signal })
+    return await response.text()
+  } catch (error) {
+    // ← 新增：开关被按过，说明是「有人要停」，不是出错。
+    //   这时不管 error 是什么，一律以开关上写的原因为准：
+    //   要么是调用者的原因，要么是超时错误，原样抛给调用者。
+    if (controller.signal.aborted) throw controller.signal.reason
+    // 开关没被按过却失败了：连不上服务器或传输中断，浏览器给的是 TypeError。
+    // 换成项目自己的 NetworkError，调用者用 instanceof NetworkError 就能认出「网络问题」。
+    if (error instanceof TypeError) {
+      throw new NetworkError(url, `Network error: ${error.message}`, { cause: error })
+    }
+    throw error // 其他意料之外的错误：原样往上抛
+  }
+}</code></pre>
+    <p>
+      这一招你已经在项目里见过：<a data-src="src/scenes/games202/hw2/internal/loadHW2CubeImages.ts:122">loadHW2CubeImages.ts:122–124</a> 和 <a data-src="src/scenes/games202/hw2/createHW2Scene.ts:251">createHW2Scene.ts:251–253</a> 都是「自己建开关，再把调用者的取消转发进来」。它们也有自己要停的理由：某一张图失败了，要停掉其余几张。
+    </p>
+    <div id="lab-4"></div>
+
+    <h2 id="s6">6. 第 5 版：进门先看一眼</h2>
+    <p>清单第 5 条还没试过：调用之前就已经取消了。先看第 4 版会怎样：</p>
+    <div id="lab-5a"></div>
+    <pre><code>// 第 5 版：进门先看一眼
+async function fetchText(
+  url: string,
+  options: { timeout?: number; signal?: AbortSignal } = {}
+): Promise&lt;string&gt; {
+  const { timeout = 6000, signal: callerSignal } = options
+  // ← 新增：调用者的 signal 如果在调用之前就亮了，abort 事件已经发生过，
+  //   下面再挂的监听永远等不到它，我们的开关也就永远不会被按——请求会照常发出去。
+  //   所以一进门先查：亮着就把原因当作错误抛出去；没亮就什么也不做。
+  callerSignal?.throwIfAborted()
+  const controller = new AbortController()
+  setTimeout(() =&gt; controller.abort(new NetworkTimeoutError(url, timeout)), timeout)
+  const forwardAbort = (): void =&gt; controller.abort(callerSignal?.reason)
+  callerSignal?.addEventListener(&#x27;abort&#x27;, forwardAbort, { once: true })
+  try {
+    const response = await fetch(url, { signal: controller.signal })
+    return await response.text()
+  } catch (error) {
+    if (controller.signal.aborted) throw controller.signal.reason
+    if (error instanceof TypeError) {
+      throw new NetworkError(url, `Network error: ${error.message}`, { cause: error })
+    }
+    throw error
+  }
+}</code></pre>
+    <div id="lab-5b"></div>
+
+    <h2 id="s7">7. 第 6 版：用完要收拾，难的是什么时候收拾</h2>
+    <p>第 5 版把清单上大部分情况都处理对了，但它从不收拾：挂上去的监听没摘，计时器没停。先看看这会带来什么：</p>
+    <div id="lab-6a"></div>
+    <p>
+      要收拾的东西有两样：挂在调用者 signal 上的转发监听，和计时器。用 <code>finally</code> 收拾最自然，因为成功、失败都会经过它。MDN 讲「怎样实现一个可取消的 API」时，也要求操作正常结束后把 abort 监听摘掉，免得长期存在的 signal 一直抓着它（见第 11 节）。最直接的写法，是把超时和取消放进一个返回 Response 的 fetchWithTimeout，在它的 finally 里收拾：
+    </p>
+    <pre><code>// 第 6 版（错误示范）：知道要收拾，但收拾得太早
+async function fetchWithTimeout(
+  url: string,
+  options: { timeout?: number; signal?: AbortSignal } = {}
+): Promise&lt;Response&gt; {
+  const { timeout = 6000, signal: callerSignal } = options
+  callerSignal?.throwIfAborted()
+  const controller = new AbortController()
+  // ← 改动：记下计时器的编号，收拾时要用它把计时器停掉
+  const timerId = setTimeout(() =&gt; controller.abort(new NetworkTimeoutError(url, timeout)), timeout)
+  const forwardAbort = (): void =&gt; controller.abort(callerSignal?.reason)
+  callerSignal?.addEventListener(&#x27;abort&#x27;, forwardAbort, { once: true })
+  try {
+    return await fetch(url, { signal: controller.signal })
+  } catch (error) {
+    if (controller.signal.aborted) throw controller.signal.reason
+    if (error instanceof TypeError) {
+      throw new NetworkError(url, `Network error: ${error.message}`, { cause: error })
+    }
+    throw error
+  } finally {
+    // ← 新增：不管成功失败，都停掉计时器、摘掉监听。
+    //   问题在于时机：fetch 在「响应头到了」时就返回，finally 也就在这时执行了。
+    clearTimeout(timerId)
+    callerSignal?.removeEventListener(&#x27;abort&#x27;, forwardAbort)
+  }
+}
+
+async function fetchText(
+  url: string,
+  options: { timeout?: number; signal?: AbortSignal } = {}
+): Promise&lt;string&gt; {
+  const response = await fetchWithTimeout(url, options)
+  // 读正文时，上面的 finally 早就执行完了：转发监听已经摘掉，调用者再取消也传不进来
+  return await response.text()
+}</code></pre>
+    <div id="lab-6b"></div>
+    <p>
+      问题在于「整件事」什么时候结束：fetch 在<strong>响应头</strong>到达时就返回了，但正文还没读。收拾必须等到正文读完。办法是把「读正文」也搬进 fetchWithTimeout 里，让调用者用一个 <code>read</code> 函数告诉它怎么读。顺便做一个设计决定：超时只管「服务器多久开始回应」，响应头一到就停掉计时器。
+    </p>
+    <pre><code>// 第 6 版：让「收拾」等到正文读完
+async function fetchWithTimeout&lt;T&gt;(
+  url: string,
+  options: { timeout?: number; signal?: AbortSignal },
+  // ← 新增：调用者告诉我们「拿到响应以后怎么读」（读成文本、二进制……）。
+  //   读正文这件事因此发生在本函数里面，下面的 finally 会等它读完才执行。
+  read: (response: Response) =&gt; Promise&lt;T&gt;
+): Promise&lt;T&gt; {
+  const { timeout = 6000, signal: callerSignal } = options
+  callerSignal?.throwIfAborted()
+  const controller = new AbortController()
+  const timerId = setTimeout(() =&gt; controller.abort(new NetworkTimeoutError(url, timeout)), timeout)
+  const forwardAbort = (): void =&gt; controller.abort(callerSignal?.reason)
+  callerSignal?.addEventListener(&#x27;abort&#x27;, forwardAbort, { once: true })
+  try {
+    const response = await fetch(url, { signal: controller.signal })
+    // ← 新增：响应头到了，就停掉计时器。这是一个设计决定：超时只管「服务器多久开始回应」，
+    //   不管「正文要传多久」，否则一个几十 MB 的文件在慢网络上会被超时误杀。
+    clearTimeout(timerId)
+    // ← 新增：在 try 里面读正文。读的期间转发监听一直挂着，调用者取消照样能传进来。
+    return await read(response)
+  } catch (error) {
+    if (controller.signal.aborted) throw controller.signal.reason
+    if (error instanceof TypeError) {
+      throw new NetworkError(url, `Network error: ${error.message}`, { cause: error })
+    }
+    throw error // read 里自己抛的错误（比如下面的 HttpError）走这里，原样抛出
+  } finally {
+    clearTimeout(timerId) // 没等到响应头就失败时，计时器还在跑，这里停掉
+    callerSignal?.removeEventListener(&#x27;abort&#x27;, forwardAbort) // 整件事结束了，摘掉挂在调用者 signal 上的监听
+  }
+}
+
+function fetchText(
+  url: string,
+  options: { timeout?: number; signal?: AbortSignal } = {}
+): Promise&lt;string&gt; {
+  return fetchWithTimeout(url, options, async (response) =&gt; {
+    // 404 之类：服务器回应了，但给的不是我们要的文件。重试没用，换成 HttpError
+    if (!response.ok) throw new HttpError(url, response.status, response.statusText)
+    return await response.text()
+  })
+}</code></pre>
+    <div id="lab-6c"></div>
+    <p>到这里，清单上的 8 条全部满足。下面这个实验台可以任选一版、任选一个场景运行，自己核对每一格：</p>
+    <div id="lab-play"></div>
+
+    <h2 id="s8">8. 最终代码：敲进 src</h2>
+    <p>
+      和第 6 版相比只多了两处：选项类型换成项目里的 <code>FetchOptions</code>（继承自 fetch 的 RequestInit，多一个 timeout），并且把 method、headers 等其余选项原样交给 fetch。注释写的是每一行存在的理由，可以照抄，也可以精简。
+    </p>
+    <p><strong>src/network/http.ts</strong>（整个文件替换）：</p>
+    <pre><code>import { NetworkError } from &#x27;@/errors/EngineError/NetworkError/BaseError&#x27;
+import { NetworkTimeoutError } from &#x27;@/errors/EngineError/NetworkError/NetworkTimeoutError&#x27;
+import { FetchOptions } from &#x27;./types/fetch-options&#x27;
+
+/**
+ * 发一次请求，并在同一个范围里把响应读完。
+ *
+ * - 调用者取消：抛出调用者写在 abort(原因) 里的那个原因；
+ * - 超时：抛出 NetworkTimeoutError，只计算到响应头到达为止；
+ * - 连不上、传输中断：抛出 NetworkError；
+ * - read 里抛出的错误（比如 HttpError）：原样抛出。
+ *
+ * 浏览器基线 2022：用到 AbortSignal.throwIfAborted 和 abort(reason)，
+ * Chrome 100、Firefox 97、Safari 15.4 起支持。
+ */
+export async function fetchWithTimeout&lt;T&gt;(
+  url: string,
+  options: FetchOptions,
+  read: (response: Response) =&gt; Promise&lt;T&gt;
+): Promise&lt;T&gt; {
+  // 取出超时时间和调用者的 signal；剩下的 method、headers 等原样交给 fetch
+  const { timeout = 6000, signal: callerSignal, ...fetchOptions } = options
+
+  // 调用之前就取消了：abort 事件已经发生过，后面挂的监听等不到它，所以进门先查
+  callerSignal?.throwIfAborted()
+
+  // fetch 只认一个 signal，而「该停了」有两个理由：调用者取消、超时。
+  // 调用者的 signal 我们按不了，所以自己建一个开关，两个理由都来按它，按的时候把原因写在上面
+  const controller = new AbortController()
+
+  // 理由一：超时。到点就按开关，原因写成超时错误
+  const timerId = setTimeout(() =&gt; {
+    controller.abort(new NetworkTimeoutError(url, timeout))
+  }, timeout)
+
+  // 理由二：调用者取消。调用者的 signal 一亮就按开关，原因照抄调用者的。
+  // 存成常量，是为了在 finally 里用同一个函数对象摘掉这个监听
+  const forwardAbort = (): void =&gt; controller.abort(callerSignal?.reason)
+  callerSignal?.addEventListener(&#x27;abort&#x27;, forwardAbort, { once: true })
+
+  try {
+    const response = await fetch(url, { ...fetchOptions, signal: controller.signal })
+    // 响应头到了：超时只管「服务器多久开始回应」，不管正文要传多久
+    clearTimeout(timerId)
+    // 在 try 里面读正文：读的期间转发监听还挂着，调用者取消照样有效
+    return await read(response)
+  } catch (error) {
+    // 开关被按过：是有人要停，不是出错。以开关上写的原因为准
+    if (controller.signal.aborted) throw controller.signal.reason
+    // 连不上或传输中断：浏览器给 TypeError，换成项目的 NetworkError
+    if (error instanceof TypeError) {
+      throw new NetworkError(url, `Network error: ${error.message}`, { cause: error })
+    }
+    // read 里抛出的错误（比如 HttpError）：原样抛出
+    throw error
+  } finally {
+    // 整件事结束了（正文已读完，或已经失败）：停掉计时器，摘掉挂在调用者 signal 上的监听
+    clearTimeout(timerId)
+    callerSignal?.removeEventListener(&#x27;abort&#x27;, forwardAbort)
+  }
+}</code></pre>
+    <p><strong>src/network/fetchText.ts</strong>（整个文件替换；原来的 try/catch 不再需要）：</p>
+    <pre><code>import { HttpError } from &#x27;@/errors/EngineError/NetworkError/HTTPError&#x27;
+import { fetchWithTimeout } from &#x27;./http&#x27;
+import { FetchOptions } from &#x27;./types/fetch-options&#x27;
+
+/**
+ * 获取文本内容：检查 HTTP 状态，再读出全文。
+ * 取消、超时、网络错误都由 fetchWithTimeout 统一处理，这里不需要 try/catch。
+ */
+export function fetchTextWithTimeout(url: string, options: FetchOptions = {}): Promise&lt;string&gt; {
+  return fetchWithTimeout(url, options, async (response) =&gt; {
+    // 服务器回应了，但给的不是我们要的文件（404 等）：重试没用
+    if (!response.ok) {
+      throw new HttpError(url, response.status, response.statusText)
+    }
+
+    // 开发服务器对不存在的路径常常回 index.html（SPA fallback），状态码却是 200
+    const contentType = response.headers.get(&#x27;content-type&#x27;) ?? &#x27;&#x27;
+    if (contentType.includes(&#x27;text/html&#x27;)) {
+      throw new HttpError(
+        url,
+        404,
+        &#x27;Expected text file but got HTML (likely SPA fallback — file does not exist)&#x27;
+      )
+    }
+
+    return await response.text()
+  })
+}</code></pre>
+    <ul>
+      <li>全仓库只有 fetchText.ts 调用 fetchWithTimeout，改签名不影响别处。fetchTextWithTimeout 的签名没变，loadHW2OBJ、loadPRTSHTxt、createHW2Scene、Shader.ts 都不用改。</li>
+      <li>loadHW2OBJ 等处自己写的 <code>signal.throwIfAborted()</code> 保留：入口那几处变成了双保险；await 之后那几处管的是另一件事（响应在取消之前就到了，但还没轮到它们处理），仍然必需。</li>
+      <li>这两份代码我在副本里验证过：tsc 严格模式、生产模式 ESLint、Prettier 都通过；用本地服务器跑了 10 个场景（先取消、等响应头时取消、读正文时取消、超时、404、HTML、不带原因的取消、正常、慢正文、连不上），全部符合清单，结束时调用者 signal 上的监听都是 0。</li>
+    </ul>
+
+    <h2 id="s9">9. 这段代码有多通用</h2>
+    <p><strong>能直接搬到别的项目吗？能</strong>，条件是：</p>
+    <ul>
+      <li>项目用 fetch 发请求；</li>
+      <li>浏览器基线 2022 年起：<code>throwIfAborted</code> 从 Chrome 100、Firefox 97、Safari 15.4 开始支持；<code>abort(原因)</code> 和 <code>signal.reason</code> 是 Chrome 98、Firefox 97、Safari 15.4（MDN 兼容数据）。Node 18 起也都有；</li>
+      <li>换掉三个项目自己的错误类（NetworkError、NetworkTimeoutError、HttpError）和 FetchOptions 类型。fetchText.ts 里「拿到 HTML 就当 404」那条是针对开发服务器的，别的项目按自己的情况决定要不要。</li>
+    </ul>
+    <p><strong>比代码更通用的，是推出它的那几步。</strong>任何一个「可以取消的异步操作」，都可以照这个顺序问自己：</p>
+    <ol class="steps">
+      <li>平台自己认 signal 吗？认的话，直接把调用者的 signal 交给它（第 2 版），到此为止。</li>
+      <li>有没有第二个「该停了」的理由（超时、兄弟任务失败）？有，就自己建一个开关，两个理由都来按它，按的时候写清原因（第 3、4 版）。</li>
+      <li>进门先 <code>throwIfAborted()</code>（第 5 版）。</li>
+      <li>失败时以开关上写的原因为准，不去猜错误的名字（第 4 版的 catch）。</li>
+      <li>等整件事结束了再收拾：摘监听、停计时器（第 6 版）。</li>
+    </ol>
+    <p>
+      图片加载就是一个平台<strong>不</strong>认 signal 的例子：Image 没有 signal 选项，所以 loadFace（<a data-src="src/scenes/games202/hw2/internal/loadHW2CubeImages.ts:19">loadHW2CubeImages.ts:19–79</a>）要在灯亮时自己停下工作（去掉 src），其余几步完全一样。
+    </p>
+    <p>
+      <strong>什么时候不该用它：</strong>只要能取消、不要超时，就用第 2 版那一行。等基线升到 2024 年（<code>AbortSignal.any</code> 从 Chrome 116、Firefox 124、Safari 17.4 开始支持），可以用它把两盏灯合成一盏，省掉转发和摘监听。不过「超时只管响应头」这个决定仍然要自己写，因为 <code>AbortSignal.timeout()</code> 会把读正文的时间也算进去。
+    </p>
+
+    <h2 id="s10">10. 检查题</h2>
+    <p>凭记忆作答，不要翻上面的代码。</p>
+    <div class="quiz" data-quiz="lesson-0023"></div>
+
+    <h2 id="s11">11. 延伸阅读</h2>
+    <p>
+      <strong>首选（约 10 分钟）：</strong><a href="https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal#implementing_an_abortable_api">MDN · AbortSignal 的「Implementing an abortable API」一节</a>。它给出的四条要求是：进门先检查、用 <code>signal.reason</code> 作为失败原因、用 <code>{ once: true }</code> 挂监听、正常结束后把监听摘掉。正好是本课第 3–6 版做的事。
+    </p>
+    <p>
+      补充：<a href="https://developer.chrome.com/blog/abortable-fetch">Jake Archibald · Abortable fetch</a>（2017）讲了 fetch 的取消怎样设计出来。注意它写于 <code>reason</code> 出现之前，所以文中取消时得到的总是名为 AbortError 的错误。
+    </p>
+    <p>速查：<a href="../reference/abortable-requests.html">可取消的请求：速查</a>。</p>
+
+    <aside class="ask">
+      做完告诉我：14 张实验卡片和 6 道检查题各错了哪几题；哪一版、哪一行注释还是看不懂，直接把那几行贴给我。敲完 http.ts 以后，也可以把你的版本贴过来，我帮你对照。
+    </aside>
+
+    <div class="nav">
+      <a href="0021-task19-hw2-loaders.html">← 第 21 课：HW2 的 OBJ 与 PRT 加载</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0024-http-on-the-wire.html">第 24 课：一次请求在网络上怎么走 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 23 课 · 2026-10-06</footer>
+
+    <script>
+      ;(function () {
+        const { NetworkError, NetworkTimeoutError, HttpError } = RTeach.fetchLab.errors
+        const fetch = RTeach.fetchLab.fetch
+
+        // 每一版都是上面代码块去掉类型标注和注释之后的样子（由同一份源文件生成）
+        const versions = {
+    v1: (function () {
+      async function fetchText(url) {
+        const response = await fetch(url);
+        return await response.text();
+      }
+      return { label: "第 1 版", call: (url) => fetchText(url) }
+    })(),
+    v2: (function () {
+      async function fetchText(url, signal) {
+        const response = await fetch(url, { signal });
+        return await response.text();
+      }
+      return { label: "第 2 版", call: (url, signal) => fetchText(url, signal) }
+    })(),
+    v3: (function () {
+      async function fetchText(url, options = {}) {
+        const { timeout = 6e3 } = options;
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new NetworkTimeoutError(url, timeout)), timeout);
+        const response = await fetch(url, { signal: controller.signal });
+        return await response.text();
+      }
+      return { label: "第 3 版", call: (url, signal, timeout) => fetchText(url, { signal, timeout }) }
+    })(),
+    v4: (function () {
+      async function fetchText(url, options = {}) {
+        const { timeout = 6e3, signal: callerSignal } = options;
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new NetworkTimeoutError(url, timeout)), timeout);
+        const forwardAbort = () => controller.abort(callerSignal?.reason);
+        callerSignal?.addEventListener("abort", forwardAbort, { once: true });
+        try {
+          const response = await fetch(url, { signal: controller.signal });
+          return await response.text();
+        } catch (error) {
+          if (controller.signal.aborted) throw controller.signal.reason;
+          if (error instanceof TypeError) {
+            throw new NetworkError(url, `Network error: ${error.message}`, { cause: error });
+          }
+          throw error;
+        }
+      }
+      return { label: "第 4 版", call: (url, signal, timeout) => fetchText(url, { signal, timeout }) }
+    })(),
+    v5: (function () {
+      async function fetchText(url, options = {}) {
+        const { timeout = 6e3, signal: callerSignal } = options;
+        callerSignal?.throwIfAborted();
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new NetworkTimeoutError(url, timeout)), timeout);
+        const forwardAbort = () => controller.abort(callerSignal?.reason);
+        callerSignal?.addEventListener("abort", forwardAbort, { once: true });
+        try {
+          const response = await fetch(url, { signal: controller.signal });
+          return await response.text();
+        } catch (error) {
+          if (controller.signal.aborted) throw controller.signal.reason;
+          if (error instanceof TypeError) {
+            throw new NetworkError(url, `Network error: ${error.message}`, { cause: error });
+          }
+          throw error;
+        }
+      }
+      return { label: "第 5 版", call: (url, signal, timeout) => fetchText(url, { signal, timeout }) }
+    })(),
+    v6wrong: (function () {
+      async function fetchWithTimeout(url, options = {}) {
+        const { timeout = 6e3, signal: callerSignal } = options;
+        callerSignal?.throwIfAborted();
+        const controller = new AbortController();
+        const timerId = setTimeout(() => controller.abort(new NetworkTimeoutError(url, timeout)), timeout);
+        const forwardAbort = () => controller.abort(callerSignal?.reason);
+        callerSignal?.addEventListener("abort", forwardAbort, { once: true });
+        try {
+          return await fetch(url, { signal: controller.signal });
+        } catch (error) {
+          if (controller.signal.aborted) throw controller.signal.reason;
+          if (error instanceof TypeError) {
+            throw new NetworkError(url, `Network error: ${error.message}`, { cause: error });
+          }
+          throw error;
+        } finally {
+          clearTimeout(timerId);
+          callerSignal?.removeEventListener("abort", forwardAbort);
+        }
+      }
+      async function fetchText(url, options = {}) {
+        const response = await fetchWithTimeout(url, options);
+        return await response.text();
+      }
+      return { label: "第 6 版（错误示范）", call: (url, signal, timeout) => fetchText(url, { signal, timeout }) }
+    })(),
+    v6: (function () {
+      async function fetchWithTimeout(url, options, read) {
+        const { timeout = 6e3, signal: callerSignal } = options;
+        callerSignal?.throwIfAborted();
+        const controller = new AbortController();
+        const timerId = setTimeout(() => controller.abort(new NetworkTimeoutError(url, timeout)), timeout);
+        const forwardAbort = () => controller.abort(callerSignal?.reason);
+        callerSignal?.addEventListener("abort", forwardAbort, { once: true });
+        try {
+          const response = await fetch(url, { signal: controller.signal });
+          clearTimeout(timerId);
+          return await read(response);
+        } catch (error) {
+          if (controller.signal.aborted) throw controller.signal.reason;
+          if (error instanceof TypeError) {
+            throw new NetworkError(url, `Network error: ${error.message}`, { cause: error });
+          }
+          throw error;
+        } finally {
+          clearTimeout(timerId);
+          callerSignal?.removeEventListener("abort", forwardAbort);
+        }
+      }
+      function fetchText(url, options = {}) {
+        return fetchWithTimeout(url, options, async (response) => {
+          if (!response.ok) throw new HttpError(url, response.status, response.statusText);
+          return await response.text();
+        });
+      }
+      return { label: "第 6 版", call: (url, signal, timeout) => fetchText(url, { signal, timeout }) }
+    })()
+        }
+
+        const scenarios = {
+          normal: { title: '正常', desc: '服务器 100 ms 回响应头，正文再传 100 ms。', head: 100, body: 100 },
+          waitHead: { title: '等响应头时换场景', desc: '服务器 300 ms 才回响应头；你在 100 ms 时换了场景。', head: 300, body: 50, abortAt: 100 },
+          readBody: { title: '读正文时换场景', desc: '响应头 50 ms 就到了，正文要传 400 ms；你在 200 ms 时换了场景。', head: 50, body: 400, abortAt: 200 },
+          stuck: { title: '服务器卡住', desc: '服务器一直不回应。（实验台的超时是 500 ms）', head: Infinity },
+          preAbort: { title: '调用前就取消了', desc: '你先按了取消，过了一会儿代码才调用这个函数。', head: 100, body: 100, preAbort: true },
+          notFound: { title: '文件不存在', desc: '服务器 50 ms 回了 404。', head: 50, body: 10, status: 404, statusText: 'Not Found', text: 'Not Found' },
+          offline: { title: '断网', desc: '连不上服务器。', fail: 'network' },
+          slowBody: { title: '大文件下载慢', desc: '响应头 100 ms 就到了，正文要传 900 ms。服务器在正常工作。（实验台的超时是 500 ms）', head: 100, body: 900 }
+        }
+
+        const lab = (id, cards) => RTeach.fetchLab.cards({ mount: document.getElementById(id), storageKey: 'lesson-0023-' + id, versions, scenarios, cards })
+
+        lab('lab-1', [
+          {
+            title: '第 1 版遇到换场景', version: 'v1', scenario: 'waitHead',
+            question: '你在 100 ms 时换了场景。第 1 版会怎样？',
+            choices: ['请求照常跑完，交回旧场景文本', '请求立刻停下，抛出你写的原因', '请求立刻停下，交回一个空文本'], answer: 0,
+            explain: '第 1 版根本没有接收取消的入口：你按亮了灯，可没有任何东西在看这盏灯。服务器 300 ms 回应，函数照常交回文本。这是旧场景的数据，不但晚到了，还白白占着网络。'
+          }
+        ])
+        lab('lab-2', [
+          {
+            title: '第 2 版遇到读正文时取消', version: 'v2', scenario: 'readBody',
+            question: '响应头 50 ms 就到了，你在 200 ms 读正文时换场景。第 2 版会怎样？',
+            choices: ['照常读完正文，交回完整的文本', '立刻停下，抛出你写的那个原因', '立刻停下，抛出浏览器造的错误'], answer: 1,
+            explain: 'fetch 从发请求到读完正文，一直盯着你给的灯。看记录：你一按，fetch 立刻中止，失败值就是你写的那个原因对象本身。'
+          },
+          {
+            title: '第 2 版遇到服务器卡住', version: 'v2', scenario: 'stuck',
+            question: '服务器一直不回应。第 2 版会怎样？',
+            choices: ['一直等下去，始终没有任何结果', '等到六秒以后，抛出超时的错误', '立刻就失败，抛出连不上的错误'], answer: 0,
+            explain: '第 2 版里没有任何计时的东西，fetch 本身也没有超时参数：浏览器也许很久以后才放弃，等多久不由你决定。所以需要第 3 版。'
+          }
+        ])
+        lab('lab-3', [
+          {
+            title: '第 3 版遇到服务器卡住', version: 'v3', scenario: 'stuck',
+            question: '服务器一直不回应（实验台的超时是 500 ms）。第 3 版会怎样？',
+            choices: ['五百毫秒以后，抛出超时的错误', '一直等下去，始终没有任何结果', '立刻停下，抛出你写的那个原因'], answer: 0,
+            explain: '计时器到点，按下函数自己的开关，开关上写的原因是 NetworkTimeoutError；fetch 看到灯亮就中止，失败值就是这个超时错误。超时有了。'
+          },
+          {
+            title: '第 3 版遇到换场景', version: 'v3', scenario: 'waitHead',
+            question: '同样是第 3 版，你在 100 ms 时换了场景，会怎样？',
+            choices: ['请求照常跑完，交回旧场景文本', '请求立刻停下，抛出你写的原因', '请求立刻停下，抛出超时的错误'], answer: 0,
+            explain: 'fetch 只有一个 signal 的位置，现在放的是函数自己的开关，你的灯没有任何人在看。超时有了，取消却丢了。两个要停的理由，只有一个位置，这就是第 4 版要解决的问题。'
+          }
+        ])
+        lab('lab-4', [
+          {
+            title: '第 4 版遇到换场景', version: 'v4', scenario: 'waitHead',
+            question: '你在 100 ms 时换了场景。第 4 版抛出的是什么？',
+            choices: ['停下，抛出你写的那个原因对象', '停下，抛出一个浏览器造的错误', '停下，抛出一个超时的错误对象'], answer: 0,
+            explain: '按记录的顺序看：你的 controller 按下，转发监听当场按下函数里的开关并抄过原因；fetch 看到自己盯着的灯亮了，于是中止；catch 发现开关被按过，抛出开关上写的原因。抛出的就是你写的那个对象，不是新造的。记录最后一行先记下：函数结束以后，计时器还是到点按了一次开关，第 7 节专门处理这件事。'
+          },
+          {
+            title: '第 4 版遇到断网', version: 'v4', scenario: 'offline',
+            question: '连不上服务器。第 4 版抛出的是什么？',
+            choices: ['项目的 NetworkError', '浏览器的 TypeError', 'NetworkTimeoutError'], answer: 0,
+            explain: '开关没被按过，所以 catch 不走第一条；浏览器给的是 TypeError，于是换成项目的 NetworkError。上层用 instanceof NetworkError 就能认出「网络问题，可以重试」。'
+          }
+        ])
+        lab('lab-5a', [
+          {
+            title: '第 4 版遇到调用前就取消', version: 'v4', scenario: 'preAbort',
+            question: '你先按了取消，之后才调用第 4 版。会怎样？',
+            choices: ['照常发出请求，交回完整的文本', '不发请求，直接抛出你写的原因', '不发请求，直接抛出超时的错误'], answer: 0,
+            explain: '你的灯在函数被调用之前就亮过了，abort 事件那时已经派发完。函数后来才挂上的转发监听永远等不到它，函数自己的开关也就没人按，而 fetch 盯的正是这个开关。第 2 版没有这个问题：那时 fetch 直接看你的灯，一进门就发现它亮着。'
+          }
+        ])
+        lab('lab-5b', [
+          {
+            title: '第 5 版遇到调用前就取消', version: 'v5', scenario: 'preAbort',
+            question: '同样的场景，第 5 版会怎样？',
+            choices: ['不发请求，直接抛出你写的原因', '照常发出请求，交回完整的文本', '不发请求，直接抛出超时的错误'], answer: 0,
+            explain: 'throwIfAborted() 一进门就看到灯亮着，把原因抛了出去，后面的代码一行都没有执行：没建开关，没挂监听，也没发请求。'
+          }
+        ])
+        lab('lab-6a', [
+          {
+            title: '第 5 版正常结束以后', version: 'v5', scenario: 'normal',
+            question: '一切正常，函数 200 ms 返回。结束以后，你的灯上还挂着几个监听？还会发生什么吗？',
+            choices: ['还挂着一个，计时器之后还会按开关', '一个不剩，之后也不会再发生任何事', '还挂着两个，计时器之后不会再动了'], answer: 0,
+            explain: '函数 200 ms 就返回了，可没人摘监听，也没人停计时器。500 ms 时计时器照样按下开关（记录里标着「函数已结束」），只是请求早就完成，按了也没用。在 HW2 里每次构建都用新的 signal，挂着的监听会跟着旧 signal 一起被回收；可如果有人传进来一个长期存在的 signal，每发一次请求就会多挂一个。'
+          },
+          {
+            title: '第 5 版遇到大文件下载慢', version: 'v5', scenario: 'slowBody',
+            question: '响应头 100 ms 就到了，正文要传 900 ms。第 5 版会怎样？',
+            choices: ['下载到一半，被超时错误打断了', '照常下载完毕，交回完整的文本', '一直等下去，始终没有任何结果'], answer: 0,
+            explain: '计时器从没停过，500 ms 时照样按下开关，把正在传的正文打断了，可服务器明明在正常工作。这说明得先决定「超时到底管什么」。'
+          }
+        ])
+        lab('lab-6b', [
+          {
+            title: '错误示范遇到读正文时取消', version: 'v6wrong', scenario: 'readBody',
+            question: '响应头 50 ms 到，你在 200 ms 读正文时换场景。这一版会怎样？',
+            choices: ['照常读完正文，交回完整的文本', '立刻停下，抛出你写的那个原因', '立刻停下，抛出超时的那个错误'], answer: 0,
+            explain: 'fetch 在响应头到达（50 ms）时就返回了，finally 也在那一刻执行：计时器停了，监听也摘了。200 ms 你再取消时，已经没有任何东西把你的取消传给函数里的开关，正文照常读完。'
+          }
+        ])
+        lab('lab-6c', [
+          {
+            title: '第 6 版遇到读正文时取消', version: 'v6', scenario: 'readBody',
+            question: '同样的场景，第 6 版会怎样？',
+            choices: ['立刻停下，抛出你写的那个原因', '照常读完正文，交回完整的文本', '立刻停下，抛出超时的那个错误'], answer: 0,
+            explain: '读正文发生在 fetchWithTimeout 里面（read），finally 要等它结束才执行，所以 200 ms 时转发监听还挂着，取消照样传得进来。once 让监听执行后自动摘掉；finally 里再摘一次也没有关系。'
+          },
+          {
+            title: '第 6 版遇到大文件下载慢', version: 'v6', scenario: 'slowBody',
+            question: '响应头 100 ms 就到了，正文要传 900 ms。第 6 版会怎样？',
+            choices: ['照常下载完毕，交回完整的文本', '下载到一半，被超时错误打断了', '一直等下去，始终没有任何结果'], answer: 0,
+            explain: '响应头一到，clearTimeout 就停掉了计时器。之后正文传多久都不算超时，而取消仍然有效。'
+          }
+        ])
+
+        RTeach.fetchLab.playground({ mount: document.getElementById('lab-play'), title: '自由组合：任选一版 × 任选一个场景', versions, scenarios })
+
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0023"]'), [
+          {
+            q: '要让 fetch 在超时的时候停下，为什么必须在函数里自己建一个 controller？',
+            opts: ['signal 只能由它的 controller 来按', 'fetch 只接受在函数里新建的 signal', '调用者的 signal 不可以交给 fetch'],
+            answer: 0,
+            why: 'signal 上没有 abort 方法，能按它的只有创建它的那个 controller，而调用者的 controller 在调用者手里（第 0、4 节）。'
+          },
+          {
+            q: '转发监听里为什么写 controller.abort(callerSignal?.reason)，而不是 controller.abort()？',
+            opts: ['让调用者收到的是自己写的原因', '不写原因的话，fetch 停不下来', '不写原因的话，监听就摘不下来'],
+            answer: 0,
+            why: '不带参数也能停下，但浏览器会新造一个 AbortError 当原因，调用者收到的就不是自己写的那个对象了。你原来的 http.ts 就是这样。'
+          },
+          {
+            q: '调用之前 signal 就已经亮了，为什么转发监听帮不上忙？',
+            opts: ['事件已经发生过，后挂的监听等不到', '亮着的 signal 不允许再挂新的监听', '监听会立刻执行，但是原因已经丢了'],
+            answer: 0,
+            why: 'abort 事件只在按下的那一刻派发一次，之后挂上的监听永远不会被调用。所以要进门先 throwIfAborted()（第 6 节）。'
+          },
+          {
+            q: '为什么在拿到响应头之后就调用 clearTimeout？',
+            opts: ['超时只管服务器多久开始回应', '拿到响应头以后取消就不管用', '计时器不停的话，监听摘不掉'],
+            answer: 0,
+            why: '这是一个设计决定：正文传得慢，不等于服务器出了问题。不停掉的话，大文件在慢网络上会被误杀（第 5 版 × 大文件下载慢）。'
+          },
+          {
+            q: '为什么要让调用者传一个 read 进来，而不是直接返回 Response？',
+            opts: ['让收拾等到正文读完以后再做', '让 fetch 少发一次网络请求', '让超时把读正文的时间也算进'],
+            answer: 0,
+            why: '返回 Response 时整件事还没结束，正文还没读。在那时收拾，读正文期间的取消就传不进来了（第 6 版错误示范）。'
+          },
+          {
+            q: '一个新项目只需要「能取消」，不需要超时。最合适的写法是？',
+            opts: ['把 signal 直接交给 fetch 就够了', '照搬本课里写的 fetchWithTimeout', '自己再建一个 controller 来转发'],
+            answer: 0,
+            why: 'fetch 自己已经把取消的事都做对了（第 2 版）。只有出现第二个「该停了」的理由（超时、兄弟任务失败……），才需要自己的开关和转发。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

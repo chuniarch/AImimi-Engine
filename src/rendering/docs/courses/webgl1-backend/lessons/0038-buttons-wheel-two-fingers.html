@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 38 课 · 右键、滚轮、两根手指</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/event-lab.js"></script>
+  </head>
+  <body>
+    <p class="kicker">零基础重写 · 浏览器事件 3/3 · 约 30 分钟</p>
+    <h1>右键、滚轮、两根手指：一个完整的最小例子</h1>
+    <p class="lede">
+      第 37 课的第 3 版能用左键或一根手指拖动。这一课在它上面一次加一样：右键旋转，以及组合键时「键松开了却没有 pointerup」；滚轮缩放；两根手指捏合缩放，以及为什么一定要写 <code>touch-action: none</code>。最后把它们合成一份完整的代码。上一轮我一次贴出这 100 多行，没有逐行解释，所以你看不懂；这一课的每一行都写了注释，而且都是在前两课学过的东西上加出来的。
+    </p>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：第 36 课（事件对象、button 和 buttons、组合键）、第 37 课（状态、增量 dx、指针捕获、统一的结束出口）、第 34 课（滚轮为什么是乘 e 的若干次方）。<br />
+      <strong>这一课讲的</strong>：用 mode 区分手势；用 buttons 检查开始手势的键；wheel 事件的 deltaY、deltaMode、ctrlKey 和 passive；触摸的 pointerType、isPrimary、隐式捕获、touch-action；两指缩放的数学；对照项目代码。<br />
+      <strong>没有触摸屏也能学</strong>：实验台有「合成」按钮，在页面里造出同样字段的事件；还有我在无界面 Chrome 里用真实触摸录下的记录。两样都标明了来源。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">第 1 步：右键旋转，和「键松开了却没有 pointerup」</a></li>
+        <li><a href="#s2">第 2 步：滚轮</a></li>
+        <li><a href="#s3">第 3 步：两根手指</a>：<a href="#s3-1">手指也是指针</a> <a href="#s3-2">touch-action</a> <a href="#s3-3">两指缩放的数学</a></li>
+        <li><a href="#s4">合起来：完整的最小例子</a></li>
+        <li><a href="#s5">对照项目代码</a></li>
+        <li><a href="#s6">检查题</a></li>
+        <li><a href="#s7">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 第 1 步：右键旋转，和「键松开了却没有 pointerup」</h2>
+    <p>左键拖动挪方块，右键拖动转方块。用一个状态变量 <code>mode</code> 记住这次手势是哪一种，pointerdown 时按 button 决定（第 36 课：0 左键，2 右键）。</p>
+    <p>还要处理第 36 课第 6 节的问题：按着左键时再按右键，然后先松开左键，浏览器不发 pointerup，只发一个 buttons 变成 2 的 pointermove。所以 pointermove 里要检查：开始手势的那个键，还在 buttons 里吗？用 <code>bit</code> 记下那个键的位（左键 1，右键 2），检查 <code>(event.buttons &amp; bit) === 0</code>。</p>
+    <div id="lab1"></div>
+    <p>试试：</p>
+    <ul>
+      <li>左键拖、右键拖：一个挪，一个转。</li>
+      <li>按住左键 → 按下右键 → 先松左键。记录里会出现「开始手势的键已经松开」，手势结束了。这时再晃鼠标（右键还按着），方块不动。没有合适的鼠标就点「合成：组合键」，它按同样的顺序造出这几个事件。</li>
+      <li>如果删掉检查那三行：左键松开以后，你按着右键晃鼠标，方块还会被「左键」拖着走。</li>
+    </ul>
+
+    <h2 id="s2">2. 第 2 步：滚轮</h2>
+    <p>滚轮发的是 <strong>wheel</strong> 事件。要用的字段有三个：</p>
+    <ul>
+      <li><strong>deltaY</strong>：这次滚了多少。往下滚是正数，往上滚是负数。「往下滚」指的是页面往下滚、露出下面的内容：规范只按这个方向定义，y 轴朝页面底部为正（<a href="https://w3c.github.io/pointerevents/#interface-wheelevent">W3C Pointer Events 规范</a>）。手指或滚轮往哪边拨才算往下滚，由系统设置决定，例如 macOS 的「自然滚动」开着和关着时方向正好相反；可以在下面的实验台上切换这个设置，比一比同一个手势的 deltaY 正负。鼠标滚一格常见的是 100 左右，但不同系统、不同鼠标不一样（Mac 上还会随滚动速度变化），下面的实验台会显示你的鼠标给多少；触控板一滑，会连续发很多个小的。</li>
+      <li><strong>deltaMode</strong>：deltaY 的单位，0 像素、1 行、2 页（<a href="https://developer.mozilla.org/en-US/docs/Web/API/WheelEvent/deltaMode">MDN</a>）。大多数时候是 0，但读之前要先看它。</li>
+      <li><strong>ctrlKey</strong>：按着 Ctrl 滚，是 true。另外，在触控板上做「双指捏合缩放」时，浏览器也发 wheel 事件，并把 ctrlKey 设成 true（<a href="https://developer.mozilla.org/en-US/docs/Web/API/Element/wheel_event">MDN</a>）。</li>
+    </ul>
+    <p>滚轮在页面上的默认动作是滚动页面。在舞台上滚，我们要缩放方块，不要页面跟着滚，所以调用 preventDefault。这里有一个细节：<code>addEventListener</code> 的第三个参数 <code>{ passive: false }</code>。passive 的意思是「我保证不调用 preventDefault」，浏览器因此不用等函数执行完就能开始滚动。登记在 window、document、html、body 上的 wheel 监听，passive 默认是 true，调用 preventDefault 不起作用；登记在别的元素上默认是 false（<a href="https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/addEventListener">MDN：addEventListener</a>）。舞台不属于前一种，可明确写 false 更清楚：「我一定要能取消」。项目也这样写（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:314">mountOrbitCameraInput.ts:314</a>）。</p>
+    <div id="lab2"></div>
+    <p>试试：鼠标滚一格看 deltaY；用触控板慢慢滑、快快滑，看每个事件的 deltaY；在 Mac 触控板上两指捏合，看 ctrlKey。缩放用的是第 34 课的 e 的若干次方：往上滚一格放大 1.105 倍，往下滚一格缩小同样的比例。</p>
+
+    <h2 id="s3">3. 第 3 步：两根手指</h2>
+    <h3 id="s3-1">3.1 手指也是指针</h3>
+    <p>触摸屏上，每根手指都是一个指针：</p>
+    <ul>
+      <li><strong>pointerType</strong> 是 <code>'touch'</code>；手指按下时 button 是 0，按着时 buttons 是 1。</li>
+      <li>每根手指有自己的 <strong>pointerId</strong>。两根手指，就是两串交错到来的事件：指针 21 的 move、指针 22 的 move、指针 21 的 move……</li>
+      <li>第一根按下的手指，<strong>isPrimary</strong> 是 true，后来的是 false。</li>
+      <li><strong>隐式捕获</strong>：手指按下时，浏览器自动把这个指针捕获到按下的元素上，不用我们调用 setPointerCapture（<a href="https://www.w3.org/TR/pointerevents3/#firing-events-using-the-pointerevent-interface">规范 4.1.3 节</a>）。第 37 课的代码照样调用，不冲突。</li>
+    </ul>
+    <p>同时跟踪好几个指针，第 37 课那一个 <code>dragId</code> 就不够了。改用一张表 <code>pointers</code>：键是指针编号，值是它上一次的位置。JavaScript 的 Map 就是这种「键 → 值」的表：<code>set(键, 值)</code> 存，<code>get(键)</code> 取（没有就是 undefined），<code>delete(键)</code> 删（删到了返回 true），<code>size</code> 是条数。</p>
+
+    <h3 id="s3-2">3.2 touch-action：不让浏览器接手</h3>
+    <p>手指在页面上滑，浏览器的默认动作是滚动页面、双指缩放页面。和滚轮不同，这个默认动作<strong>不能用 preventDefault 取消</strong>：规范规定，页面的平移和缩放只能事先用 CSS 的 <code>touch-action</code> 声明（<a href="https://www.w3.org/TR/pointerevents3/#declaring-direct-manipulation-behavior">规范「Declaring direct manipulation behavior」一节和 pointercancel 一节</a>）。</p>
+    <ul>
+      <li><code>touch-action: auto</code>（默认）：浏览器可以在这块元素上滚动、缩放页面。一旦它决定接手，就给你发一个 <strong>pointercancel</strong>，这个指针之后的事件就不再来了。</li>
+      <li><code>touch-action: none</code>：这块元素上的手指，浏览器一概不接手，事件全部交给你。</li>
+    </ul>
+    <p>实验台的舞台写的是 none。下面是我在无界面 Chrome 里用 DevTools 协议发真实触摸，先把舞台改成 auto，再用一根手指往上滑 120 px，跑的是第 4 节的完整代码：</p>
+    <div id="rec-cancel"></div>
+    <p>只来了一个 pointermove，接着就是 pointercancel：浏览器把这次滑动拿去滚动页面了。项目的轨道控制在挂载时就把 canvas 设成 none（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:308">mountOrbitCameraInput.ts:308</a>），卸载时再还原。</p>
+
+    <h3 id="s3-3">3.3 两指缩放的数学</h3>
+    <p>两根手指张开，方块变大；捏拢，变小。放大多少倍？用两指之间的距离之比：</p>
+    <ul>
+      <li>一次 pointermove 只报告一根手指的新位置，另一根不动。设动的这根从 A 移到 A'，另一根在 B。</li>
+      <li>移动前两指距离 <code>before = |A − B|</code>，移动后 <code>after = |A' − B|</code>（|…| 是长度，用 Math.hypot 算）。</li>
+      <li>缩放乘上 <code>after ÷ before</code>。比如两指从相距 100 px 张开到 140 px，就乘 1.4。</li>
+      <li>两指的中点 (A + B) ÷ 2 变成 (A' + B) ÷ 2，挪了 (A' − A) ÷ 2，也就是这根手指位移的一半。方块跟着中点挪 dx/2、dy/2。</li>
+    </ul>
+    <p>为什么用比值而不用差值？和第 34 课一样：比值每一步相乘，张开再捏回原来的距离，缩放正好回到原来的大小。</p>
+
+    <h2 id="s4">4. 合起来：完整的最小例子</h2>
+    <p>把第 37 课第 3 版和本课三步合在一起，就是上一轮那份「完整的最小实例」，这次每一行都有注释。舞台上：左键或一根手指拖动，右键旋转，滚轮或两根手指缩放。</p>
+    <div id="lab4"></div>
+    <p>合成按钮造出来的手指事件，和真手指的字段一样（pointerType 是 'touch'，各有 pointerId），只是浏览器不会为它们发 lostpointercapture。真实触摸是什么样，看我在无界面 Chrome 里用 DevTools 协议录下的两指捏合：</p>
+    <div id="rec-pinch"></div>
+    <p>对照第 3.3 节：第二根手指（指针 3）从相距 100 px 张开 40 px，缩放乘 140 ÷ 100 = 1.4；第一根手指（指针 2）再往外 20 px，距离 160，再乘 160 ÷ 140，累计 1.6。松开一根以后，状态回到 move，剩下那根手指继续拖动方块。每个 pointerup 后面都跟着一个 lostpointercapture，那是隐式捕获被解除；end 发现编号已经不在表里，什么也不做。</p>
+
+    <h2 id="s5">5. 对照项目代码</h2>
+    <p>项目的 mountOrbitCameraInput 比这个最小例子少了两样，多了三样：</p>
+    <ul>
+      <li><strong>没有双指缩放。</strong>pointerdown 第一行就是 <code>if (closed || drag !== null || !event.isPrimary) return</code>（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:234">:234</a>）：第二根手指 isPrimary 是 false，直接忽略。所以在触摸屏上，HW2 只能一根手指转动，不能捏合缩放。HW2 主要在电脑上用，这是一个取舍。</li>
+      <li><strong>没有转方块，而是转相机。</strong>左键是 rotate（第 35 课的两个角），右键是 pan（第 33 课），滚轮是第 34 课的缩放。</li>
+      <li><strong>右键只认鼠标</strong>：<code>event.button === 2 &amp;&amp; event.pointerType === 'mouse'</code>（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:238">:238</a>）。触控笔的侧键 button 也是 2，项目不让它平移。</li>
+      <li><strong>拖动途中换了相机就结束手势</strong>（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:262">:262</a>）：HW2 切换预设相机时，不能把旧相机的拖动接到新相机上。</li>
+      <li><strong>context 丢失也结束手势</strong>（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:317">:317</a>）。</li>
+    </ul>
+
+    <h2 id="s6">6. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0038"></div>
+
+    <h2 id="s7">7. 延伸阅读</h2>
+    <ul>
+      <li>速查：<a href="../reference/pointer-events.html">指针事件</a>（第 36–38 课的字段、骨架和实测现象）。</li>
+      <li>首选：<a href="https://developer.mozilla.org/en-US/docs/Web/API/Pointer_events/Pinch_zoom_gestures">MDN：Pinch zoom gestures</a>。用 pointer 事件做双指缩放的官方示例：一张表存所有按下的指针，pointermove 时比较两指距离，结构和第 4 节一样。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/CSS/touch-action">MDN：touch-action</a>：none、pan-x、pan-y 等取值。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Element/wheel_event">MDN：wheel event</a>：滚轮缩放的例子、ctrlKey 与触控板缩放。</li>
+    </ul>
+
+    <aside class="note">
+      哪一行代码看不懂，直接在对话里问我，把那一行贴过来。做完告诉我检查题错了哪几题。
+    </aside>
+
+    <div class="nav">
+      <a href="0037-drag-and-capture.html">← 第 37 课：拖动与指针捕获</a>
+      <a href="../index.html">课程首页</a>
+      <span style="color: var(--muted)">下一课待定 →</span>
+    </div>
+    <footer>src/rendering 精读课 · 第 38 课 · 2026-10-15</footer>
+
+    <script>
+      // 2026-10-15 在无界面 Chrome 155 里用 DevTools 协议（Input.dispatchMouseEvent / dispatchTouchEvent）发真实输入、从实验台读回的记录
+      window.RECORDED_CANCEL = "   0 ms  pointerdown 指针 4 touch isPrimary = true button = 0\n   0 ms      状态 idle → move（第一根手指）\n  18 ms  pointermove 指针 4 (0, -20) → 角度 0.0°，缩放 1.000\n  19 ms  pointercancel 指针 4\n  19 ms      状态 move → idle（pointercancel）\n  19 ms  lostpointercapture 指针 4"
+      window.RECORDED_PINCH = "   0 ms  pointerdown 指针 2 touch isPrimary = true button = 0\n   1 ms      状态 idle → move（第一根手指）\n  18 ms  pointerdown 指针 3 touch isPrimary = false button = 0\n  19 ms      状态 move → pinch（第二根手指）\n  52 ms  pointermove 指针 3 (40, 0) → 角度 0.0°，缩放 1.400\n  84 ms  pointermove 指针 2 (-20, 0) → 角度 0.0°，缩放 1.600\n  87 ms  pointerup 指针 2\n  88 ms      状态 pinch → move（pointerup）\n  88 ms  lostpointercapture 指针 2\n 117 ms  pointermove 指针 3 (10, 10) → 角度 0.0°，缩放 1.600\n 134 ms  pointermove 指针 3 (10, 10) → 角度 0.0°，缩放 1.600\n 139 ms  pointerup 指针 3\n 139 ms      状态 move → idle（pointerup）\n 139 ms  lostpointercapture 指针 3"
+    </script>
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        // ================= 第 1 步 =================
+        function step1(stage, box, print) {
+          let boxX = 150
+          let boxY = 100
+          let angle = 0 // 方块转了多少度
+          let dragId = null
+          let mode = null // 'move' 左键挪动，'rotate' 右键旋转
+          let bit = 0 // 开始手势的键在 buttons 里的位：左键 1，右键 2
+          let lastX = 0
+          let lastY = 0
+          function draw() {
+            box.style.left = boxX + 'px'
+            box.style.top = boxY + 'px'
+            box.style.transform = 'rotate(' + angle + 'deg)'
+          }
+          draw()
+
+          stage.addEventListener('pointerdown', (event) => {
+            if (dragId !== null) return
+            if (event.button === 0) {
+              mode = 'move'
+              bit = 1
+            } else if (event.button === 2) {
+              mode = 'rotate'
+              bit = 2
+            } else {
+              return // 中键：不开始任何手势
+            }
+            dragId = event.pointerId
+            lastX = event.clientX
+            lastY = event.clientY
+            stage.setPointerCapture(event.pointerId)
+            print('down：button = ' + event.button + '，开始 ' + mode)
+          })
+          stage.addEventListener('pointermove', (event) => {
+            if (event.pointerId !== dragId) return
+            // 新增：开始手势的那个键已经不按着了，却没收到 pointerup
+            if ((event.buttons & bit) === 0) {
+              end('开始手势的键已经松开（buttons = ' + event.buttons + '）')
+              return
+            }
+            const dx = event.clientX - lastX
+            const dy = event.clientY - lastY
+            lastX = event.clientX
+            lastY = event.clientY
+            if (mode === 'move') {
+              boxX += dx
+              boxY += dy
+            } else {
+              angle += dx * 0.5 // 右键：每横拖 1 像素转 0.5°
+            }
+            draw()
+            print('move：buttons = ' + event.buttons + '，dx = ' + dx +
+              '，角度 ' + angle.toFixed(1) + '°')
+          })
+
+          function end(reason) {
+            if (dragId === null) return
+            dragId = null
+            print('结束：' + reason)
+          }
+          for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+            stage.addEventListener(type, (event) => {
+              if (event.pointerId === dragId) end(type)
+            })
+          }
+          stage.addEventListener('contextmenu', (event) => event.preventDefault())
+        }
+
+        // ================= 第 2 步 =================
+        function step2(stage, box, print) {
+          let scale = 1 // 方块放大了多少倍
+          box.style.left = '150px'
+          box.style.top = '100px'
+
+          stage.addEventListener(
+            'wheel',
+            (event) => {
+              event.preventDefault() // 不让页面跟着滚
+              // 统一换成像素：1 行按 16 像素，1 页按舞台高度
+              let pixels = event.deltaY
+              if (event.deltaMode === 1) pixels = event.deltaY * 16
+              if (event.deltaMode === 2) pixels = event.deltaY * stage.clientHeight
+              // 第 34 课：乘 e 的若干次方。往下滚（deltaY > 0）缩小
+              scale *= Math.exp(-pixels * 0.001)
+              box.style.transform = 'scale(' + scale + ')'
+              print('wheel：deltaY = ' + event.deltaY.toFixed(1) +
+                '，deltaMode = ' + event.deltaMode +
+                '，ctrlKey = ' + event.ctrlKey + ' → 缩放 ' + scale.toFixed(4))
+            },
+            // passive: false：明确声明「我要调用 preventDefault」
+            { passive: false }
+          )
+        }
+
+        // ================= 合起来 =================
+        function full(stage, box, print) {
+          // ---- 被控制的方块 ----
+          let boxX = 150
+          let boxY = 100
+          let angle = 0
+          let scale = 1
+          function draw() {
+            box.style.left = boxX + 'px'
+            box.style.top = boxY + 'px'
+            box.style.transform = 'rotate(' + angle + 'deg) scale(' + scale + ')'
+          }
+          draw()
+
+          // ---- 手势状态 ----
+          // 'idle' 没有手势；'move' 左键或一根手指；'rotate' 右键；'pinch' 两根手指
+          let mode = 'idle'
+          // 参与手势的指针：编号 → 上一次的位置 { x, y }
+          const pointers = new Map()
+          // 鼠标开始手势的键在 buttons 里的位；手指是 0（手指不检查 buttons）
+          let bit = 0
+          function setMode(next, reason) {
+            print('    状态 ' + mode + ' → ' + next + '（' + reason + '）')
+            mode = next
+          }
+
+          // ---- 按下：决定开始哪种手势 ----
+          stage.addEventListener('pointerdown', (event) => {
+            const mouse = event.pointerType === 'mouse'
+            print('pointerdown 指针 ' + event.pointerId + ' ' + event.pointerType +
+              ' isPrimary = ' + event.isPrimary + ' button = ' + event.button)
+            if (mode === 'idle' && event.button === 0) {
+              setMode('move', mouse ? '鼠标左键' : '第一根手指')
+              bit = mouse ? 1 : 0
+            } else if (mode === 'idle' && event.button === 2 && mouse) {
+              setMode('rotate', '鼠标右键')
+              bit = 2
+            } else if (mode === 'move' && !mouse && pointers.size === 1) {
+              setMode('pinch', '第二根手指')
+            } else {
+              print('    忽略：这个键或这根手指不开始任何手势')
+              return
+            }
+            pointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
+            stage.setPointerCapture(event.pointerId)
+          })
+
+          // ---- 移动：按状态把位移换成变化量 ----
+          stage.addEventListener('pointermove', (event) => {
+            const last = pointers.get(event.pointerId)
+            if (last === undefined) return // 不参与手势的指针（含划过的鼠标）
+            if (bit !== 0 && (event.buttons & bit) === 0) {
+              end(event.pointerId, '开始手势的键已经松开')
+              return
+            }
+            const dx = event.clientX - last.x
+            const dy = event.clientY - last.y
+            if (mode === 'move') {
+              boxX += dx
+              boxY += dy
+            } else if (mode === 'rotate') {
+              angle += dx * 0.5
+            } else if (mode === 'pinch') {
+              // 另一根手指的位置（这一次它没有动）
+              let other = null
+              for (const [id, p] of pointers) if (id !== event.pointerId) other = p
+              const before = Math.hypot(last.x - other.x, last.y - other.y)
+              const after = Math.hypot(event.clientX - other.x, event.clientY - other.y)
+              scale *= after / before // 第 3.3 节：距离之比
+              boxX += dx / 2 // 中点只挪了这根手指位移的一半
+              boxY += dy / 2
+            }
+            last.x = event.clientX
+            last.y = event.clientY
+            draw()
+            print('pointermove 指针 ' + event.pointerId + ' (' + dx + ', ' + dy +
+              ') → 角度 ' + angle.toFixed(1) + '°，缩放 ' + scale.toFixed(3))
+          })
+
+          // ---- 结束：所有结束方式都走这里 ----
+          function end(pointerId, reason) {
+            // 不在表里：已经结束过，或者从来没参与手势
+            if (!pointers.delete(pointerId)) return
+            if (stage.hasPointerCapture(pointerId)) stage.releasePointerCapture(pointerId)
+            // 两根手指松开一根：剩下那根继续拖动
+            setMode(pointers.size === 0 ? 'idle' : 'move', reason)
+          }
+          for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+            stage.addEventListener(type, (event) => {
+              print(type + ' 指针 ' + event.pointerId)
+              end(event.pointerId, type)
+            })
+          }
+          window.addEventListener('blur', () => {
+            // [...pointers.keys()]：先抄一份编号，因为 end 会从表里删
+            for (const id of [...pointers.keys()]) end(id, '窗口失去焦点')
+          })
+
+          // ---- 滚轮：不需要状态，每个事件自己算 ----
+          stage.addEventListener(
+            'wheel',
+            (event) => {
+              event.preventDefault()
+              let pixels = event.deltaY
+              if (event.deltaMode === 1) pixels = event.deltaY * 16
+              if (event.deltaMode === 2) pixels = event.deltaY * stage.clientHeight
+              scale *= Math.exp(-pixels * 0.001)
+              draw()
+              print('wheel deltaY = ' + event.deltaY.toFixed(1) +
+                ' ctrlKey = ' + event.ctrlKey + ' → 缩放 ' + scale.toFixed(3))
+            },
+            { passive: false }
+          )
+          stage.addEventListener('contextmenu', (event) => event.preventDefault())
+        }
+
+        const E = RTeach.eventLab
+        const chord = [
+          { type: 'pointerdown', x: 150, y: 100, button: 0, buttons: 1 },
+          { type: 'pointermove', x: 160, y: 100, button: -1, buttons: 1 },
+          { type: 'pointermove', x: 160, y: 100, button: 2, buttons: 3 },
+          { type: 'pointermove', x: 160, y: 100, button: 0, buttons: 2 },
+          { type: 'pointermove', x: 190, y: 100, button: -1, buttons: 2 },
+          { type: 'pointerup', x: 190, y: 100, button: 2, buttons: 0 }
+        ]
+        E.run({
+          mount: document.getElementById('lab1'),
+          fn: step1,
+          box: true,
+          height: 220,
+          hint: '左键拖动、右键旋转；试试组合键',
+          sims: [{ label: '合成：组合键（按左 → 按右 → 松左 → 晃 → 松右）', steps: chord }]
+        })
+        E.run({
+          mount: document.getElementById('lab2'),
+          fn: step2,
+          box: true,
+          height: 220,
+          hint: '在这里滚轮，或在触控板上捏合',
+          sims: [
+            { label: '合成：往上滚一格（deltaY = −100）', steps: [{ type: 'wheel', deltaY: -100 }] },
+            { label: '合成：触控板捏合（ctrlKey，deltaY = −8）', steps: [{ type: 'wheel', deltaY: -8, ctrlKey: true }] }
+          ]
+        })
+        const touch = (type, id, x, y, primary) => ({
+          type,
+          pointerId: id,
+          pointerType: 'touch',
+          isPrimary: primary,
+          x,
+          y,
+          button: type === 'pointermove' ? -1 : 0,
+          buttons: type === 'pointerup' ? 0 : 1
+        })
+        E.run({
+          mount: document.getElementById('lab4'),
+          fn: full,
+          box: true,
+          height: 240,
+          hint: '左键/一指拖动，右键旋转，滚轮/两指缩放',
+          sims: [
+            {
+              label: '合成：一根手指拖动',
+              steps: [touch('pointerdown', 21, 150, 100, true), touch('pointermove', 21, 180, 110, true), touch('pointermove', 21, 210, 120, true), touch('pointerup', 21, 210, 120, true)]
+            },
+            {
+              label: '合成：两根手指张开',
+              steps: [
+                touch('pointerdown', 21, 100, 110, true),
+                touch('pointerdown', 22, 200, 110, false),
+                touch('pointermove', 22, 240, 110, false),
+                touch('pointermove', 21, 80, 110, true),
+                touch('pointerup', 21, 80, 110, true),
+                touch('pointermove', 22, 250, 120, false),
+                touch('pointerup', 22, 250, 120, false)
+              ]
+            },
+            { label: '合成：组合键', steps: chord }
+          ]
+        })
+        E.recorded(
+          document.getElementById('rec-cancel'),
+          '无界面 Chrome 155，DevTools 协议发真实触摸；舞台改成 touch-action: auto，一根手指从 (300, 150) 往上滑，每步 20 px',
+          window.RECORDED_CANCEL || '（记录还没生成）'
+        )
+        E.recorded(
+          document.getElementById('rec-pinch'),
+          '无界面 Chrome 155，DevTools 协议发真实触摸（舞台 touch-action: none）：两指相距 100 px 按下 → 第二指外移 40 → 第一指外移 20 → 松开第一指 → 第二指再挪两次 → 松开',
+          window.RECORDED_PINCH || '（记录还没生成）'
+        )
+
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0038"]'), [
+          {
+            q: '右键拖动开始后（bit = 2），什么样的 pointermove 会让手势结束？',
+            opts: ['buttons & 2 等于 0 的', 'button 等于 −1 的', 'buttons 等于 3 的'],
+            answer: 0,
+            why: '第 1 节：右键不在 buttons 里了，说明它已经松开，即使没收到 pointerup。button −1 只是「这次没有键变化」，buttons 3 表示左右都按着。'
+          },
+          {
+            q: 'wheel 监听为什么要写 { passive: false }？',
+            opts: ['声明要调用 preventDefault', '让 deltaY 变成以像素为单位', '让滚轮事件来得更频繁一些'],
+            answer: 0,
+            why: '第 2 节：passive 为 true 的监听调用 preventDefault 不起作用；window、document、body 上的 wheel 默认就是 passive。'
+          },
+          {
+            q: '舞台的 touch-action 是 auto，手指往上滑。会发生什么？',
+            opts: ['浏览器滚动页面并发 pointercancel', '浏览器照常发 pointermove 直到松开', '调用 preventDefault 就能阻止滚动'],
+            answer: 0,
+            why: '第 3.2 节：页面平移只能用 touch-action 事先声明，不能用 preventDefault 取消。浏览器接手时发 pointercancel。'
+          },
+          {
+            q: '两指相距 80 px，一根手指移动后相距 100 px。缩放乘以多少？',
+            opts: ['100 ÷ 80 = 1.25', '100 − 80 = 20', '80 ÷ 100 = 0.8'],
+            answer: 0,
+            why: '第 3.3 节：缩放乘移动后距离 ÷ 移动前距离。'
+          },
+          {
+            q: '两指缩放时，一根手指挪了 (20, 0)，方块挪多少？',
+            opts: ['(10, 0)：中点挪了一半', '(20, 0)：跟着手指挪', '(0, 0)：缩放时不挪'],
+            answer: 0,
+            why: '第 3.3 节：中点 (A + B)/2 里只有 A 变了，变化量是 (A′ − A)/2。'
+          },
+          {
+            q: '项目的轨道控制在触摸屏上，第二根手指按下时会怎样？',
+            opts: ['被忽略：isPrimary 是 false', '开始双指缩放相机', '结束第一根手指的手势'],
+            answer: 0,
+            why: '第 5 节：onPointerDown 第一行要求 event.isPrimary，第二根手指直接返回。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

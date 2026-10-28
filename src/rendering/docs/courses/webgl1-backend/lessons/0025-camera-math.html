@@ -1,0 +1,1127 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 25 课 · 相机的数学</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/camera-bundle.js"></script>
+    <script src="../assets/orbit-lab.js"></script>
+  </head>
+  <body>
+    <p class="kicker">插课上篇 · 接在第 15 课之后 · 约 40 分钟</p>
+    <h1>相机的数学：从公式到代码</h1>
+    <p class="lede">
+      一台相机交给渲染器的，只有两个矩阵：view 矩阵 V 和投影矩阵 P。这一课先用数学把它们推出来：每个矩阵的每一项表示什么，公式从哪来。然后再看 three.js 和本项目怎样把同一组公式写成代码：16 个数按什么顺序存，在哪一行、什么时候算。全课跟着 HW2 里的一个点走，最后算出它落在 900 × 600 画布的哪个像素上。下篇（第 26 课）再讲轨道控制：拖动怎样改变这台相机。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— FFT 海面要绕着看，HW1 的阴影要从光源那里再放一台相机、算一套 V 和 P。弄清相机矩阵每一项的来历，才能自己加光源相机、检查阴影贴图对不对，看到 Float32Array 里的 16 个数也知道哪个是哪个。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：向量的加减、点乘、叉乘，矩阵乘列向量；sin、cos、tan；第 8 课的 Transform（position、rotation、scale 三组数，rotation 用弧度）；第 9 课 PerspectiveCamera 的四个参数。<br />
+      <strong>这一课从零讲的</strong>：一个点经过的五个坐标系；齐次坐标与 4 × 4 矩阵每一列的含义；相机 world 矩阵 C；view 矩阵为什么等于 C 的逆（两种推导），什么时候不止是逆；lookAt 怎样造出三根轴，欧拉角怎样记下同一个朝向；透视投影矩阵的推导；16 个数的存法（列主序）；three.js 和本项目分别在哪里、什么时候算这些矩阵。<br />
+      <strong>页面不用显卡</strong>：卡片和第 9 节的实验台调用打包进来的项目真实代码（Transform、PerspectiveCamera、gl-matrix）和 three.js r177 原版。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">原始输入，和要回答的问题</a></li>
+        <li><a href="#s2">齐次坐标与 4 × 4 矩阵</a></li>
+        <li><a href="#s3">相机的 world 矩阵 C</a></li>
+        <li><a href="#s4">view 矩阵 V：两种推导</a></li>
+        <li><a href="#s5">三根轴从哪来：lookAt 与欧拉角</a></li>
+        <li><a href="#s6">投影矩阵 P：从视锥推出来</a></li>
+        <li><a href="#s7">16 个数怎么存：列主序</a></li>
+        <li><a href="#s8">一帧里谁在什么时候算</a></li>
+        <li><a href="#s9">实验台：自己改数</a></li>
+        <li><a href="#s10">检查题</a></li>
+        <li><a href="#s11">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 原始输入，和要回答的问题</h2>
+    <p>HW2 的相机就是这 10 行（<a data-src="src/scenes/games202/hw2/createHW2Scene.ts:373">createHW2Scene.ts:373–382</a>）：</p>
+    <pre><code>// createHW2Scene.ts:373–382（原样，只把原注释换成了课程的注释）
+const camera = new PerspectiveCamera({
+  fovY: Math.PI / 4, // 竖直方向的视角：π/4 弧度 = 45°
+  aspect: 1,         // 画面宽 ÷ 高；Engine 装场景时按真实画布改掉（engine.ts:431–438）
+  near: 0.1,         // 近平面离相机 0.1
+  far: 1000          // 远平面离相机 1000
+})
+camera.name = &#x27;HW2 camera&#x27;
+camera.transform.setPosition([0, 20, 50]) // 相机放在哪
+// 相机朝哪：一个绕 X 轴的角，−0.1974 弧度 = −11.31°。第 5 节讲这个数怎么来
+camera.transform.setRotation([-Math.atan2(10, 50), 0, 0])</code></pre>
+    <p>
+      Mary 的 Transform 是放大 10 倍（<a data-src="src/scenes/games202/hw2/_config/hw2CPUSceneConfig.ts:24">hw2CPUSceneConfig.ts:24–28</a>），所以模型文件里坐标为 (0, 2, 0) 的点，在世界里是 (0, 20, 0)。画布按 900 × 600 算（aspect = 1.5；工厂写的 1 会被 Engine 换成真实宽高比）。<strong>要回答的问题：这个点画在画布的哪个像素上？</strong>
+    </p>
+    <p>shader 里只有一行（<a data-src="src/shaders/prt/sphericalHarmonics/order2/vertex.vert:44">order2/vertex.vert:44</a>）：</p>
+    <pre><code>gl_Position = uProjectionMatrix * uViewMatrix * uModelMatrix * vec4(position, 1.0);
+//            P                   V             M              模型坐标的点</code></pre>
+    <p>从右往左读：点先乘 M 进世界，再乘 V 进相机坐标，再乘 P 进裁剪坐标。之后 GPU 自己除以 w、按 viewport 换成像素。一共经过五个坐标系：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 170" role="img" aria-label="点从模型坐标经过 M、V、P、除以 w、viewport 依次变成世界、相机、裁剪、NDC、像素坐标，下面写着 HW2 那个点在每一步的数值">
+          <defs>
+            <marker id="g1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+          </defs>
+          <rect x="10" y="30" width="104" height="44" rx="4" class="box" />
+          <text x="62" y="57" text-anchor="middle">模型</text>
+          <rect x="136" y="30" width="104" height="44" rx="4" class="box" />
+          <text x="188" y="57" text-anchor="middle">世界</text>
+          <rect x="262" y="30" width="104" height="44" rx="4" class="box hl" />
+          <text x="314" y="57" text-anchor="middle">相机（view）</text>
+          <rect x="388" y="30" width="104" height="44" rx="4" class="box hl" />
+          <text x="440" y="57" text-anchor="middle">裁剪（clip）</text>
+          <rect x="514" y="30" width="104" height="44" rx="4" class="box" />
+          <text x="566" y="57" text-anchor="middle">NDC</text>
+          <rect x="640" y="30" width="104" height="44" rx="4" class="box" />
+          <text x="692" y="57" text-anchor="middle">像素</text>
+          <line x1="114" y1="52" x2="134" y2="52" class="line" marker-end="url(#g1a)" />
+          <text x="125" y="22" text-anchor="middle" class="small">×M</text>
+          <line x1="240" y1="52" x2="260" y2="52" class="line accent" marker-end="url(#g1a)" />
+          <text x="251" y="22" text-anchor="middle" class="small accent">×V</text>
+          <line x1="366" y1="52" x2="386" y2="52" class="line accent" marker-end="url(#g1a)" />
+          <text x="377" y="22" text-anchor="middle" class="small accent">×P</text>
+          <line x1="492" y1="52" x2="512" y2="52" class="line" marker-end="url(#g1a)" />
+          <text x="503" y="22" text-anchor="middle" class="small">÷w</text>
+          <line x1="618" y1="52" x2="638" y2="52" class="line" marker-end="url(#g1a)" />
+          <text x="629" y="22" text-anchor="middle" class="small">viewport</text>
+          <text x="62" y="98" text-anchor="middle" class="small">(0, 2, 0)</text>
+          <text x="188" y="98" text-anchor="middle" class="small">(0, 20, 0)</text>
+          <text x="314" y="98" text-anchor="middle" class="small">(0, 9.806,</text>
+          <text x="314" y="114" text-anchor="middle" class="small">−49.029)</text>
+          <text x="440" y="98" text-anchor="middle" class="small">(0, 23.673,</text>
+          <text x="440" y="114" text-anchor="middle" class="small">48.839, 49.029)</text>
+          <text x="566" y="98" text-anchor="middle" class="small">(0, 0.4828,</text>
+          <text x="566" y="114" text-anchor="middle" class="small">0.9961)</text>
+          <text x="692" y="98" text-anchor="middle" class="small">(450, 155.1)</text>
+          <text x="62" y="150" text-anchor="middle" class="small">Mesh 的 Transform</text>
+          <text x="377" y="150" text-anchor="middle" class="small accent">这两个矩阵来自相机：本课的主题</text>
+          <text x="629" y="150" text-anchor="middle" class="small">GPU 自己做</text>
+        </svg>
+      </div>
+      <figcaption>图 1　同一个点在五个坐标系里的坐标（用项目代码算出，第 9 节可以自己改数重算）。第 2～6 节依次推出每一步，最后一节用实验台把整条链再走一遍。</figcaption>
+    </figure>
+    <p>后面要用的符号，先在这里定好。每个符号只表示一样东西：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>符号</th><th>含义</th><th>单位</th><th>HW2 的值</th></tr></thead>
+      <tbody>
+        <tr><td>eye</td><td>相机在世界里的位置</td><td>世界单位</td><td>(0, 20, 50)</td></tr>
+        <tr><td>target</td><td>相机对准的点</td><td>世界单位</td><td>(0, 10, 0)</td></tr>
+        <tr><td>p</td><td>我们跟踪的那个点</td><td>世界单位</td><td>(0, 20, 0)</td></tr>
+        <tr><td>r、u、b</td><td>相机的右方、上方、后方，都是长度为 1 的向量</td><td>无</td><td>第 3 节算出</td></tr>
+        <tr><td>f</td><td>相机的前方，f = −b</td><td>无</td><td>第 3 节算出</td></tr>
+        <tr><td>M、C、V、P</td><td>Mesh 的 world 矩阵、相机的 world 矩阵、view 矩阵、投影矩阵</td><td>—</td><td>第 3、4、6 节</td></tr>
+        <tr><td>fovY</td><td>竖直方向的视角</td><td>弧度</td><td>π/4（45°）</td></tr>
+        <tr><td>aspect</td><td>画布宽 ÷ 高</td><td>无</td><td>900 ÷ 600 = 1.5</td></tr>
+        <tr><td>near、far</td><td>近平面、远平面到相机的距离（都是正数）</td><td>世界单位</td><td>0.1、1000</td></tr>
+        <tr><td>az、el</td><td>方位角（azimuth）、仰角（elevation）</td><td>弧度</td><td>第 5 节算出</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="s2">2. 齐次坐标与 4 × 4 矩阵</h2>
+    <h3 id="s2-1">2.1 先约定写法</h3>
+    <p>
+      本课和 GLSL、gl-matrix、three.js 用的是同一种写法：<strong>向量写成一列，矩阵写在左边</strong>，p′ = A · p。三维的点补成四个数 (x, y, z, 1)，方向补成 (x, y, z, 0)，最后这个数叫 w。为什么要补一个数：平移不是 3 × 3 矩阵能做的乘法，补上 w 以后，平移也能写成矩阵乘法。用 HW2 的相机位置做例子：
+    </p>
+    <pre><code>// 平移矩阵 Tr(0, 20, 50)：把东西挪到 (0, 20, 50)
+// ┌ 1  0  0   0 ┐   ┌ 0 ┐   ┌  0 ┐
+// │ 0  1  0  20 │ · │ 0 │ = │ 20 │   点 (0, 0, 0)，w = 1：被挪到 (0, 20, 50)
+// │ 0  0  1  50 │   │ 0 │   │ 50 │
+// └ 0  0  0   1 ┘   └ 1 ┘   └  1 ┘
+//
+// 同一个矩阵乘方向 (1, 0, 0)，w = 0：最后一列乘的是 0，结果还是 (1, 0, 0, 0)。
+// 方向只有朝向、没有位置，所以平移不影响它。这正是想要的。</code></pre>
+
+    <h3 id="s2-2">2.2 矩阵的每一列是什么</h3>
+    <p>
+      记矩阵 A 第 r 行、第 c 列的数为 a<sub>rc</sub>（行号、列号都从 0 数）。拿 A 去乘四个最简单的列向量，看结果是什么：
+    </p>
+    <pre><code>// A · (1, 0, 0, 0) = (a00, a10, a20, a30)   = 第 0 列：原来的 X 轴方向，变换后指向哪
+// A · (0, 1, 0, 0) = (a01, a11, a21, a31)   = 第 1 列：原来的 Y 轴方向，变换后指向哪
+// A · (0, 0, 1, 0) = (a02, a12, a22, a32)   = 第 2 列：原来的 Z 轴方向，变换后指向哪
+// A · (0, 0, 0, 1) = (a03, a13, a23, a33)   = 第 3 列：原来的原点，变换后在哪
+//
+// 任何一个点 (x, y, z, 1) = x·(1,0,0,0) + y·(0,1,0,0) + z·(0,0,1,0) + (0,0,0,1)，所以
+// A · (x, y, z, 1) = x·第 0 列 + y·第 1 列 + z·第 2 列 + 第 3 列</code></pre>
+    <p>最后一行就是理解相机矩阵的钥匙：<strong>一个变换矩阵的四列，就是「新坐标系的三根轴」和「新坐标系的原点」</strong>。</p>
+
+    <h2 id="s3">3. 相机的 world 矩阵 C</h2>
+    <p>
+      相机也是场景里的一个节点，它有自己的坐标系：原点在镜头上，三根轴是右方 r（相机自己的 +X）、上方 u（+Y）、后方 b（+Z）。OpenGL、three.js、gl-matrix 都约定<strong>相机朝自己的 −Z 看</strong>（<a data-src="src/rendering/scene/cameras/PerspectiveCamera.ts:104">PerspectiveCamera.ts:104</a>），所以前方 f = −b。
+    </p>
+    <p>
+      一个点在相机坐标系里的坐标是 (x, y, z)，意思是：从镜头出发，往右走 x、往上走 y、往后走 z。它在世界里的位置因此是 eye + x·r + y·u + z·b。对照 2.2 节最后一行，这正是一个矩阵乘法，而这个矩阵的四列就是 r、u、b、eye：
+    </p>
+    <pre><code>//     ┌ r.x  u.x  b.x  eye.x ┐
+// C = │ r.y  u.y  b.y  eye.y │      C · (x, y, z, 1) = x·r + y·u + z·b + eye
+//     │ r.z  u.z  b.z  eye.z │
+//     └  0    0    0     1   ┘
+//
+// HW2（第 5 节推出三根轴；这里先用结果）：
+//     ┌ 1   0         0        0 ┐   第 0 列 r   = (1, 0, 0)               右方：世界的 +X
+// C = │ 0   0.98058   0.19612  20 │   第 1 列 u   = (0, 0.98058, −0.19612)  上方：跟着低头往前倾
+//     │ 0  −0.19612   0.98058  50 │   第 2 列 b   = (0, 0.19612, 0.98058)   后方；前方 f = −b
+//     └ 0   0         0         1 ┘   第 3 列 eye = (0, 20, 50)
+//
+// 验算：相机正前方 50.99 远的点，相机坐标是 (0, 0, −50.99)
+// C · (0, 0, −50.99, 1) = −50.99·b + eye
+//                       = (0, −10.000, −50.000) + (0, 20, 50) = (0, 10, 0) = target</code></pre>
+    <p>
+      这就是第 25 课旧版里那句「world 矩阵的四列依次是相机的右方、上方、后方和位置」的来历：不是约定俗成，而是 2.2 节「列 = 新坐标系的轴和原点」直接推出来的。下面的图把这几根轴画在 HW2 的场景里。
+    </p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 260" role="img" aria-label="从 −X 往 +X 看 HW2 场景的 y-z 平面：相机在 z 等于 50、y 等于 20，前方 f 指向目标 (0, 10, 0)，后方 b 朝后略朝上，上方 u 朝上略朝前">
+          <defs>
+            <marker id="g2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+            <marker id="g2b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+          </defs>
+          <text x="20" y="22" class="title">从 −X 往 +X 看：y 朝上，z 朝右</text>
+          <line x1="60" y1="230" x2="720" y2="230" class="line" marker-end="url(#g2b)" />
+          <text x="726" y="234">+z</text>
+          <line x1="100" y1="250" x2="100" y2="40" class="line" marker-end="url(#g2b)" />
+          <text x="94" y="44" text-anchor="end">+y</text>
+          <text x="100" y="248" text-anchor="start" class="small">　z = 0</text>
+          <text x="500" y="248" text-anchor="middle" class="small">z = 50</text>
+          <line x1="500" y1="226" x2="500" y2="234" class="line" />
+          <circle cx="100" cy="150" r="4" class="tip" />
+          <text x="110" y="170" class="small">target (0, 10, 0)</text>
+          <line x1="500" y1="70" x2="100" y2="150" class="line dash" />
+          <circle cx="500" cy="70" r="5" class="tip accent" />
+          <text x="512" y="96" class="accent">eye (0, 20, 50)</text>
+          <path d="M500 70 L441 82" class="line accent" marker-end="url(#g2a)" />
+          <text x="372" y="112" class="small accent">f = −b（朝目标）</text>
+          <path d="M500 70 L559 58" class="line accent" marker-end="url(#g2a)" />
+          <text x="566" y="58" class="small accent">b（后方）</text>
+          <path d="M500 70 L488 12" class="line accent" marker-end="url(#g2a)" />
+          <text x="480" y="20" text-anchor="end" class="small accent">u（上方）</text>
+          <text x="520" y="196" class="small">r = (1, 0, 0)：垂直于纸面，指向纸里</text>
+        </svg>
+      </div>
+      <figcaption>图 2　HW2 相机的三根轴（箭头长度只是示意）。相机在目标的后上方，低头 11.31° 看向目标；上方 u 跟着往前倾 11.31°，所以是 (0, cos 11.31°, −sin 11.31°) = (0, 0.98058, −0.19612)。图里 y、z 用同一个比例（1 单位 = 8 像素），所以箭头的角度是真实的。</figcaption>
+    </figure>
+
+    <h2 id="s4">4. view 矩阵 V：两种推导，结果一样</h2>
+    <h3 id="s4-1">4.1 view space 是什么</h3>
+    <p>
+      投影要求点先换到这样一个坐标系里：<strong>相机在原点，x 朝右，y 朝上，朝 −z 看</strong>。这叫 view space（相机空间、眼空间）。拿它和第 3 节比一比：这个定义和相机自己的局部坐标系完全一样。所以 V 要做的事就是：已知一个点的世界坐标，求它的相机局部坐标。这正好是 C 的反方向。
+    </p>
+    <h3 id="s4-2">4.2 推导一：反过来解</h3>
+    <pre><code>// C 把相机坐标变成世界坐标：  p_world = C · p_view
+// 两边左乘 C 的逆：            C⁻¹ · p_world = p_view
+// 所以                         V = C⁻¹</code></pre>
+    <h3 id="s4-3">4.3 推导二：先平移，再旋转（GAMES101 的做法）</h3>
+    <p>
+      不求逆也能写出来。第一步，把相机挪回原点：所有点减去 eye。第二步，问「这个点在 r、u、b 三个方向上各走了多远」。因为 r、u、b 两两垂直、长度都是 1，在某个方向上走了多远，就是和这个方向的点乘：
+    </p>
+    <pre><code>// p_view = ( r·(p − eye),  u·(p − eye),  b·(p − eye) )
+//
+// 写成矩阵：前三行就是 r、u、b 横着放，第 3 列是 −r·eye、−u·eye、−b·eye
+//     ┌ r.x  r.y  r.z  −r·eye ┐
+// V = │ u.x  u.y  u.z  −u·eye │
+//     │ b.x  b.y  b.z  −b·eye │
+//     └  0    0    0     1    ┘
+//
+// HW2：
+//   −u·eye = −(0.98058·20 + (−0.19612)·50) = −(19.6116 − 9.8058) = −9.8058
+//   −b·eye = −(0.19612·20 + 0.98058·50)    = −(3.9224 + 49.0290) = −52.9514
+//     ┌ 1   0         0          0       ┐
+// V = │ 0   0.98058  −0.19612   −9.8058  │
+//     │ 0   0.19612   0.98058  −52.9514  │
+//     └ 0   0         0          1       ┘
+//
+// 跟踪的点 p = (0, 20, 0)，p − eye = (0, 0, −50)：
+//   x = r·(0, 0, −50) = 0
+//   y = u·(0, 0, −50) = (−0.19612)·(−50) =   9.806    在镜头上方 9.806
+//   z = b·(0, 0, −50) =   0.98058·(−50) = −49.029    在镜头前方 49.029（−z 是前方）</code></pre>
+    <p>
+      两种推导为什么相等：C 可以拆成「先旋转、再平移」，C = Tr(eye) · Rot，其中 Rot 的三列是 r、u、b。三列两两垂直、长度为 1 的矩阵，逆等于转置（行列互换），所以 C⁻¹ = Rot<sup>T</sup> · Tr(−eye)。Rot<sup>T</sup> 的三行就是 r、u、b，正是推导二的矩阵。
+    </p>
+
+    <h3 id="s4-4">4.4 什么时候不只是一个逆</h3>
+    <p>V = C⁻¹ 成立，靠的是「相机局部坐标系的约定」和「view space 的约定」一致。不一致时，要在中间再乘一个固定的矩阵：</p>
+    <ul>
+      <li>
+        <strong>局部坐标系朝向不同。</strong>如果某套约定让相机朝自己的 +Z 看，就得先把它的局部坐标转成「朝 −Z 看」，比如绕 Y 轴转 180°：V = K · C⁻¹，K = Ry(180°)。three.js 的做法是让相机和其他物体朝向不同：lookAt 对相机和灯光让 −Z 对准目标，对其他物体让 +Z 对准目标（<a data-src="node_modules/three/src/core/Object3D.js:688">Object3D.js:688–694</a>）。这样相机的局部坐标系就是 view space，matrixWorldInverse 一个逆就够了（<a data-src="node_modules/three/src/cameras/Camera.js:92">Camera.js:92–97</a>）。
+      </li>
+      <li>
+        <strong>C 里带缩放。</strong>相机或它的父节点放大了 2 倍，C 的三列就不再是长度 1，C⁻¹ 也就不等于转置。用通用的求逆仍然得到「世界 → 相机局部」，只是看到的世界会缩小一半。项目和 three.js 都用通用求逆（<a data-src="src/rendering/frame/RenderListBuilder.ts:84">RenderListBuilder.ts:84</a> 的 mat4.invert），没有利用「转置更便宜」；HW2 的相机缩放是 1，父节点 Scene 是单位矩阵。
+      </li>
+    </ul>
+    <p>本项目里 V 是这样来的：</p>
+    <pre><code>// RenderListBuilder.ts:54–95（节选，注释是课程加的）
+const cameraWorld = new Float32Array(16)
+const viewMatrix = new Float32Array(16)
+const projection = new Float32Array(16)
+
+// ① 相机的 world matrix：先按需更新相机和祖先（第 8 课），再复制出来
+camera.copyWorldMatrixTo(cameraWorld)
+const world = copyMat4Snapshot(cameraWorld, &#x27;camera.worldMatrix&#x27;) // 检查 16 个数都有限
+
+// ② view = world 的逆。world 把「相机自己的坐标」搬到世界里；
+//    反过来，view 把世界里的点搬到「以相机为原点、朝 −Z 看」的坐标里
+if (mat4.invert(viewMatrix, world) === null)
+  throw new InvalidRenderViewError(&#x27;camera.worldMatrix&#x27;, &#x27;must be invertible&#x27;)
+
+// ③ projection：PerspectiveCamera 已经算好，复制一份（第 9 课）
+camera.copyProjectionMatrixTo(projection)
+
+// ④ 相机在世界里的位置：world 第 3 列的前三个数
+const position: Vec3Tuple = Object.freeze([world[12], world[13], world[14]])
+
+const viewState: ViewState = Object.freeze({
+  viewMatrix: copyMat4Snapshot(viewMatrix, &#x27;camera.viewMatrix&#x27;),
+  projectionMatrix: copyMat4Snapshot(projection, &#x27;camera.projectionMatrix&#x27;),
+  cameraWorldPosition: position
+})</code></pre>
+    <div id="lab-view"></div>
+
+    <h2 id="s5">5. 三根轴从哪来：lookAt 与欧拉角</h2>
+    <p>第 3 节先用了 r、u、b 的值。它们从哪来？最常见的给法是「相机在 eye，看向 target」。</p>
+    <h3 id="s5-1">5.1 lookAt：两次叉积</h3>
+    <pre><code>// 输入：eye = (0, 20, 50)，target = (0, 10, 0)，世界的上方 up = (0, 1, 0)
+// ① 前方 f = normalize(target − eye) = normalize(0, −10, −50)
+//          = (0, −10, −50) / 50.990 = (0, −0.19612, −0.98058)
+// ② 右方 r = normalize(f × up)
+//          f × up = (f.y·0 − f.z·1,  f.z·0 − f.x·0,  f.x·1 − f.y·0) = (0.98058, 0, 0)
+//          归一化 → (1, 0, 0)
+// ③ 上方 u = r × f
+//          = (0·(−0.98058) − 0·(−0.19612),  0·0 − 1·(−0.98058),  1·(−0.19612) − 0·0)
+//          = (0, 0.98058, −0.19612)
+// ④ 后方 b = −f = (0, 0.19612, 0.98058)
+//
+// 为什么用 f × up 求右方：叉积垂直于两个输入，所以 r 一定和 up 垂直，
+// 也就是水平的——相机不会歪头。
+// 为什么 u 不直接用 up：up 和 f 不垂直（相机低着头），r × f 才是和两者都垂直的那个「上」。</code></pre>
+    <p>three.js 的 Matrix4.lookAt 就是这几步，只是变量名不同（_z 是 b，_x 是 r，_y 是 u），算完直接写进矩阵的前三列：</p>
+    <pre><code>// three.js r177 Matrix4.js:463–508（节选；注释是课程加的）
+lookAt( eye, target, up ) {
+  const te = this.elements;
+  _z.subVectors( eye, target );   // 从目标指回相机：这就是后方 b（还没归一化）
+  if ( _z.lengthSq() === 0 ) {
+    _z.z = 1;                     // 相机和目标重合：随便给一个方向
+  }
+  _z.normalize();
+  _x.crossVectors( up, _z );      // up × b = 右方 r
+  if ( _x.lengthSq() === 0 ) {
+    // 正对头顶或脚底：up 和 b 平行，叉积是 0。把 b 挪一点再算
+    if ( Math.abs( up.z ) === 1 ) { _z.x += 0.0001; } else { _z.z += 0.0001; }
+    _z.normalize();
+    _x.crossVectors( up, _z );
+  }
+  _x.normalize();
+  _y.crossVectors( _z, _x );      // b × r = 上方 u
+  te[ 0 ] = _x.x; te[ 4 ] = _y.x; te[ 8 ] = _z.x;   // 写进第 0、1、2 列（列主序，第 7 节）
+  te[ 1 ] = _x.y; te[ 5 ] = _y.y; te[ 9 ] = _z.y;
+  te[ 2 ] = _x.z; te[ 6 ] = _y.z; te[ 10 ] = _z.z;
+  return this;
+}
+
+// 谁调用它：Object3D.js:686–698（节选）
+_position.setFromMatrixPosition( this.matrixWorld );   // eye = 自己现在的位置
+if ( this.isCamera || this.isLight ) {
+  _m1.lookAt( _position, _target, this.up );          // 相机和灯：−Z 朝目标
+} else {
+  _m1.lookAt( _target, _position, this.up );          // 其他物体：+Z 朝目标
+}
+this.quaternion.setFromRotationMatrix( _m1 );          // 只留下旋转，存成四元数</code></pre>
+
+    <h3 id="s5-2">5.2 本项目：Transform 不存三根轴，存三个角</h3>
+    <p>
+      你问的「up 不是由 front 和 right 叉出来的吗」——是的，5.1 节就是这么算的。可本项目的 Transform 没有 lookAt，它只存三个欧拉角，用的时候由角度算出旋转矩阵（第 8 课）：
+    </p>
+    <pre><code>// Transform 的 rotation = [α, β, γ]（弧度），旋转矩阵 Rot = Rz(γ) · Ry(β) · Rx(α)
+//   Rx(α)：绕 X 轴转 α         Ry(β)：绕 Y 轴转 β
+//   ┌ 1   0      0    ┐       ┌  cos β  0  sin β ┐
+//   │ 0  cos α −sin α │       │   0     1   0    │
+//   └ 0  sin α  cos α ┘       └ −sin β  0  cos β ┘
+//
+// 三根轴就是 Rot 的三列（2.2 节）。不歪头意味着 γ = 0，Rot = Ry(β) · Rx(α)。
+// 后方 b = Rot 的第 2 列 = Ry(β) · Rx(α) · (0, 0, 1)
+//        = Ry(β) · (0, −sin α, cos α)
+//        = (cos α · sin β,  −sin α,  cos α · cos β)
+//
+// 要求 b 等于「从目标指向相机」的方向。设 offset = eye − target = (dx, dy, dz)，
+// horizontal = √(dx² + dz²) 是水平距离，distance = √(horizontal² + dy²)：
+//   −sin α = dy / distance          → α = −atan2(dy, horizontal) = −el   （el 叫仰角）
+//   sin β : cos β = dx : dz         → β = atan2(dx, dz)          =  az   （az 叫方位角）
+//
+// 所以 rotation = [−el, az, 0]。HW2：offset = (0, 10, 50)，horizontal = 50
+//   el = atan2(10, 50) = 0.19740 rad = 11.31°，az = atan2(0, 50) = 0
+//   rotation = [−0.19740, 0, 0]              ← 就是 createHW2Scene.ts:382 写的 −atan2(10, 50)
+//
+// 验算：Rx(−11.31°) 的三列
+//   第 0 列 (1, 0, 0)                     = r
+//   第 1 列 (0, cos 11.31°, −sin 11.31°)  = (0, 0.98058, −0.19612) = u
+//   第 2 列 (0, sin 11.31°,  cos 11.31°)  = (0, 0.19612,  0.98058) = b
+// 和 5.1 节两次叉积的结果一模一样。</code></pre>
+    <p>
+      所以 [−11.31°, 0, 0] 不是另一个朝向，而是<strong>同一组三根轴的另一种记法</strong>：three.js 记的是四元数（由三根轴换算），本项目记的是三个角（由方向用 atan2 换算）。atan2(对边, 邻边) 交回一个角，它的正切等于「对边 ÷ 邻边」，而且看两个数的正负分象限：atan2(10, 50) = 11.31°，atan2(10, −50) = 168.69°。
+    </p>
+    <p>角度怎样变回 16 个数，在 Transform 的这个函数里：</p>
+    <pre><code>// Transform.ts:253–274（注释是课程加的）
+private updateLocalMatrixIfNeeded(): void {
+  if (!this.localMatrixDirty) return // TRS 没改过：直接用上次算好的 16 个数
+
+  const rotationQuaternion = quat.create()
+
+  // ① 三个欧拉角 → 四元数。gl-matrix 要「度」，所以乘 180/π。
+  //    组合顺序是 Rot = Rz · Ry · Rx（第 8 课 2.4 节）
+  quat.fromEuler(
+    rotationQuaternion,
+    this.rotationValue[0] * RADIANS_TO_DEGREES,
+    this.rotationValue[1] * RADIANS_TO_DEGREES,
+    this.rotationValue[2] * RADIANS_TO_DEGREES
+  )
+
+  // ② 四元数 + 位置 + 缩放 → C_local = Tr(position) · Rot · Scale，
+  //    按列主序写进 localMatrixValue 的 16 个数（第 7 节）
+  mat4.fromRotationTranslationScale(
+    this.localMatrixValue,
+    rotationQuaternion,
+    this.positionValue,
+    this.scaleValue
+  )
+
+  this.localMatrixDirty = false
+}</code></pre>
+    <p>最后一步 fromRotationTranslationScale 写进的，正是第 3 节 C 的四列：</p>
+    <pre><code>// gl-matrix 3.4.3 mat4.js:1170–1208 的写入部分（节选；注释是课程加的）
+// 前面几行由四元数 (x, y, z, w) 算出 xx、xy、wz 等中间量
+out[0] = (1 - (yy + zz)) * sx;  // ┐
+out[1] = (xy + wz) * sx;        // │ 第 0 列：旋转后的 X 轴 × 缩放 sx = 相机的右方 r
+out[2] = (xz - wy) * sx;        // ┘
+out[3] = 0;
+out[4] = (xy - wz) * sy;        // ┐
+out[5] = (1 - (xx + zz)) * sy;  // │ 第 1 列：旋转后的 Y 轴 × sy = 上方 u
+out[6] = (yz + wx) * sy;        // ┘
+out[7] = 0;
+out[8] = (xz + wy) * sz;        // ┐
+out[9] = (yz - wx) * sz;        // │ 第 2 列：旋转后的 Z 轴 × sz = 后方 b
+out[10] = (1 - (xx + yy)) * sz; // ┘
+out[11] = 0;
+out[12] = v[0];                 // ┐
+out[13] = v[1];                 // │ 第 3 列：位置
+out[14] = v[2];                 // ┘
+out[15] = 1;</code></pre>
+    <p>
+      顺序不能换。同样三个数 [−30°, 60°, 0]，按 Rz·Ry·Rx 是「先低头、再绕世界竖直轴转身」；按 three.js 欧拉角默认的 'XYZ'（Rot = Rx·Ry·Rz）就成了「先转身、再绕世界 X 轴低头」，转身以后世界 X 轴已经不是相机的右方，结果歪了头。下面三张卡片把同一个朝向交给两边去算。
+    </p>
+    <div id="lab-aim"></div>
+
+    <h2 id="s6">6. 投影矩阵 P：从视锥推出来</h2>
+    <h3 id="s6-1">6.1 要达到什么</h3>
+    <p>
+      相机能看到的范围是一个截掉尖的金字塔，叫视锥 (frustum)：在 view space 里，它夹在 z = −near 和 z = −far 之间，上下张角是 fovY，左右张角由 aspect 决定。投影要把视锥里的点压进一个立方体，叫 NDC（标准化设备坐标）：x、y、z 都在 [−1, 1] 之间。约定是 x = −1 在画面左边、+1 在右边，y = −1 在下边、+1 在上边；近平面上的点 z = −1，远平面上的点 z = +1（OpenGL 的约定，gl-matrix 的函数名 perspectiveNO 里的 NO 就是「负一到一」）。
+    </p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 250" role="img" aria-label="侧面看视锥：相机在原点朝右看，深度为 d 处的可见半高是 d 乘 tan(fovY/2)，点 y 除以这个半高就是 NDC 的 y">
+          <defs>
+            <marker id="g3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+          </defs>
+          <text x="20" y="22" class="title">侧面看视锥（相机朝 −z 看，这里画成朝右）</text>
+          <circle cx="70" cy="140" r="5" class="tip" />
+          <text x="62" y="160" text-anchor="end" class="small">相机</text>
+          <line x1="70" y1="140" x2="730" y2="140" class="line dash" />
+          <text x="736" y="144" class="small">−z</text>
+          <line x1="70" y1="140" x2="700" y2="40" class="line" />
+          <line x1="70" y1="140" x2="700" y2="240" class="line" />
+          <path d="M150 140 A80 80 0 0 0 149 127.3" class="line" />
+          <text x="205" y="136" class="small">fovY / 2</text>
+          <line x1="130" y1="130.5" x2="130" y2="149.5" class="line accent" />
+          <text x="130" y="176" text-anchor="middle" class="small accent">near</text>
+          <line x1="520" y1="140" x2="520" y2="68.6" class="line" />
+          <text x="526" y="96" class="small">半高 = d · tan(fovY / 2)</text>
+          <circle cx="520" cy="110" r="5" class="tip accent" />
+          <text x="512" y="106" text-anchor="end" class="small accent">点 (y, z)</text>
+          <line x1="520" y1="134" x2="520" y2="146" class="line" />
+          <text x="360" y="158" text-anchor="middle" class="small">深度 d = −z（点到相机的前后距离）</text>
+          <text x="20" y="236" class="small">y_ndc = y ÷ 半高 = y ÷ (d · tan(fovY / 2))</text>
+        </svg>
+      </div>
+      <figcaption>图 3　同一个深度 d 处，画面上下边缘之间的半高是 d · tan(fovY / 2)。点的 y 除以这个半高，就是它在画面上的相对高度：0 在中间，±1 在上下边缘。</figcaption>
+    </figure>
+    <h3 id="s6-2">6.2 一步一步推</h3>
+    <pre><code>// 第 1 步：x、y（相似三角形，图 3）
+//   深度 d = −z，那里的半高 = d · tan(fovY / 2)，半宽 = aspect · 半高
+//   y_ndc = y / (d · tan(fovY/2)) = F · y / (−z)             F = 1 / tan(fovY / 2)
+//   x_ndc = x / (aspect · d · tan(fovY/2)) = (F / aspect) · x / (−z)
+//   HW2：F = 1 / tan(22.5°) = 2.41421，F / aspect = 1.60948
+//   跟踪的点：y = 9.806，−z = 49.029 → y_ndc = 2.41421 · 9.806 / 49.029 = 0.4828
+//
+// 第 2 步：「除以 −z」不是矩阵乘法能做的，交给 GPU
+//   让矩阵算出 w_clip = −z（第 3 行写成 0, 0, −1, 0），x_clip = (F/aspect)·x，y_clip = F·y。
+//   GPU 拿到 (x_clip, y_clip, z_clip, w_clip) 以后，自己把前三个数除以 w_clip。这叫透视除法。
+//
+// 第 3 步：z。也要除以 w，所以设 z_clip = A·z + B，z_ndc = (A·z + B) / (−z)，要求
+//   z = −near 时 z_ndc = −1：  (−A·near + B) / near = −1  →  −A·near + B = −near
+//   z = −far  时 z_ndc = +1：  (−A·far  + B) / far  =  1  →  −A·far  + B =  far
+//   两式相减：−A·(far − near) = far + near   →  A = (far + near) / (near − far)
+//   代回第一式：B = A·near − near            →  B = 2·far·near / (near − far)
+//   HW2：A = 1000.1 / (−999.9) = −1.00020，B = 200 / (−999.9) = −0.20002
+//
+// 合起来：
+//     ┌ F/aspect   0    0    0 ┐     HW2：┌ 1.60948  0        0         0       ┐
+// P = │   0        F    0    0 │          │ 0        2.41421  0         0       │
+//     │   0        0    A    B │          │ 0        0       −1.00020  −0.20002 │
+//     └   0        0   −1    0 ┘          └ 0        0       −1         0       ┘
+//
+// 跟踪的点 p_view = (0, 9.806, −49.029, 1)：
+//   p_clip = (0,  2.41421·9.806,  −1.00020·(−49.029) − 0.20002,  49.029)
+//          = (0,  23.673,  48.839,  49.029)
+//   p_ndc  = (0,  23.673 / 49.029,  48.839 / 49.029) = (0, 0.4828, 0.9961)</code></pre>
+    <p>
+      z_ndc = 0.9961：离相机 49 个单位，在 [−1, 1] 里已经很靠近远端 1 了。z 除以的是 −z，所以 NDC 的深度不是均匀的：大部分精度留给离 near 很近的地方。near 设得越小，远处越不准，这是 near 不该随手设成 0.0001 的原因。
+    </p>
+    <h3 id="s6-3">6.3 最后一步：NDC → 像素</h3>
+    <pre><code>// gl.viewport(0, 0, 900, 600) 定下换算（State.bindSurface 发出，第 14 课）：
+//   x_px = (x_ndc + 1) / 2 · 900 = (0 + 1) / 2 · 900       = 450
+//   y_px = (y_ndc + 1) / 2 · 600 = (0.4828 + 1) / 2 · 600  = 444.9
+//          WebGL 的窗口坐标，y 从画布底边往上数
+//   换成从顶边往下数（CSS、截图的习惯）：600 − 444.9 = 155.1
+// 答案：这个点画在 (450, 155.1)。</code></pre>
+    <p>代码里，P 由 gl-matrix 的 perspective 算出（PerspectiveCamera.ts:113 调用），一项一项正好是上面的式子：</p>
+    <pre><code>// gl-matrix 3.4.3 mat4.js:1374–1403（注释是课程加的；下标 i = 4·列 + 行，见第 7 节）
+export function perspectiveNO(out, fovy, aspect, near, far) {
+  var f = 1.0 / Math.tan(fovy / 2), // F = 1 / tan(fovY / 2)；HW2：2.41421
+      nf;
+  out[0] = f / aspect;              // 第 0 行第 0 列：F / aspect；aspect 1.5 时 1.60948
+  out[1] = 0;
+  out[2] = 0;
+  out[3] = 0;
+  out[4] = 0;
+  out[5] = f;                       // 第 1 行第 1 列：F
+  out[6] = 0;
+  out[7] = 0;
+  out[8] = 0;
+  out[9] = 0;
+  out[11] = -1;                     // 第 3 行第 2 列：−1，于是 w_clip = −z_view
+  out[12] = 0;
+  out[13] = 0;
+  out[15] = 0;
+
+  if (far != null &amp;&amp; far !== Infinity) {
+    nf = 1 / (near - far);
+    // 第 2 行第 2 列：A = (far + near) / (near − far)；HW2：−1.00020
+    out[10] = (far + near) * nf;
+    // 第 2 行第 3 列：B = 2·far·near / (near − far)；HW2：−0.20002
+    out[14] = 2 * far * near * nf;
+  } else {
+    out[10] = -1;                   // far 取无穷大时的极限；PerspectiveCamera 不接受 Infinity
+    out[14] = -2 * near;
+  }
+
+  return out;
+}</code></pre>
+    <p>three.js 走的是一条更一般的路：先算出近平面上的上下左右边界，再按「任意视锥」的公式填矩阵。视锥左右、上下对称时，结果和上面一模一样：</p>
+    <pre><code>// three.js r177 PerspectiveCamera.js:353–381（节选；注释是课程加的）
+updateProjectionMatrix() {
+  const near = this.near;
+  // fov 用「度」；top 是近平面上的半高
+  let top = near * Math.tan( DEG2RAD * 0.5 * this.fov ) / this.zoom;
+  let height = 2 * top;
+  let width = this.aspect * height;
+  let left = - 0.5 * width;
+  // ……setViewOffset、filmOffset 会再挪 left、top；默认不挪……
+  this.projectionMatrix.makePerspective(
+    left, left + width, top, top - height, near, this.far, this.coordinateSystem );
+}
+
+// Matrix4.js:1108–1146（节选）
+makePerspective( left, right, top, bottom, near, far ) {
+  const x = 2 * near / ( right - left );   // = 2·near / (aspect·2·top) = F / aspect
+  const y = 2 * near / ( top - bottom );   // = 2·near / (2·top) = F
+  const a = ( right + left ) / ( right - left ); // 视锥左右对称时是 0
+  const b = ( top + bottom ) / ( top - bottom ); // 上下对称时是 0
+  const c = - ( far + near ) / ( far - near );   // = A
+  const d = ( - 2 * far * near ) / ( far - near ); // = B
+  te[ 0 ] = x; te[ 4 ] = 0; te[ 8 ] = a;  te[ 12 ] = 0;
+  te[ 1 ] = 0; te[ 5 ] = y; te[ 9 ] = b;  te[ 13 ] = 0;
+  te[ 2 ] = 0; te[ 6 ] = 0; te[ 10 ] = c; te[ 14 ] = d;
+  te[ 3 ] = 0; te[ 7 ] = 0; te[ 11 ] = -1; te[ 15 ] = 0;
+}</code></pre>
+    <div id="lab-proj"></div>
+
+    <h2 id="s7">7. 16 个数怎么存：列主序</h2>
+    <p>
+      数学上的矩阵是 4 行 4 列。内存里只有一排 16 个数（Float32Array）。gl-matrix、three.js 的 elements、WebGL 的 uniformMatrix4fv、GLSL 的 mat4，用的都是<strong>列主序 (column-major)</strong>：先放第 0 列的 4 个数，再放第 1 列，依此类推。第 r 行第 c 列的数，放在下标 <code>4·c + r</code>：
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th></th><th>第 0 列</th><th>第 1 列</th><th>第 2 列</th><th>第 3 列</th></tr></thead>
+      <tbody>
+        <tr><th>第 0 行</th><td>[0]　1</td><td>[4]　0</td><td>[8]　0</td><td>[12]　0</td></tr>
+        <tr><th>第 1 行</th><td>[1]　0</td><td>[5]　0.98058</td><td>[9]　0.19612</td><td>[13]　20</td></tr>
+        <tr><th>第 2 行</th><td>[2]　0</td><td>[6]　−0.19612</td><td>[10]　0.98058</td><td>[14]　50</td></tr>
+        <tr><th>第 3 行</th><td>[3]　0</td><td>[7]　0</td><td>[11]　0</td><td>[15]　1</td></tr>
+      </tbody>
+    </table></div>
+    <p>表里方括号是下标，后面是 HW2 的 C。所以内存里的 16 个数是：</p>
+    <pre><code>// camera.copyWorldMatrixTo(world) 之后，world 里依次是：
+//   [0..3]   1, 0, 0, 0                 ← 第 0 列：r
+//   [4..7]   0, 0.98058, −0.19612, 0    ← 第 1 列：u
+//   [8..11]  0, 0.19612, 0.98058, 0     ← 第 2 列：b
+//   [12..15] 0, 20, 50, 1               ← 第 3 列：eye
+// 所以 RenderListBuilder 取相机位置写的是 [world[12], world[13], world[14]]
+// （RenderListBuilder.ts:89）</code></pre>
+    <p>
+      你问「world 是不是数学矩阵的转置」：<strong>不是，它就是那个矩阵，只是一列一列地存</strong>。容易误会的原因是：把这 16 个数每 4 个一行打印出来，屏幕上的每一行其实是数学上的一列，看上去像转置。真正会出现「转置」的地方，是两个库给矩阵赋值的函数参数顺序不同：
+    </p>
+    <pre><code>// three.js r177 Matrix4.js:121–128（注释是课程加的）
+// 参数按「数学上一行一行读」的顺序给：n12 是第 1 行第 2 个
+set( n11, n12, n13, n14, n21, n22, n23, n24, n31, n32, n33, n34, n41, n42, n43, n44 ) {
+  const te = this.elements;
+  // 存的时候按列放：数学上的第 1 行分散到下标 0、4、8、12
+  te[ 0 ] = n11; te[ 4 ] = n12; te[ 8 ] = n13; te[ 12 ] = n14;
+  te[ 1 ] = n21; te[ 5 ] = n22; te[ 9 ] = n23; te[ 13 ] = n24;
+  te[ 2 ] = n31; te[ 6 ] = n32; te[ 10 ] = n33; te[ 14 ] = n34;
+  te[ 3 ] = n41; te[ 7 ] = n42; te[ 11 ] = n43; te[ 15 ] = n44;
+  return this;
+}
+
+// gl-matrix 正好相反：mat4.fromValues(m00, m01, m02, m03, …) 的参数就按存储顺序给，
+// m01 的意思是「第 0 列第 1 行」。同样传 1～16，两边存出来的数组互为转置。</code></pre>
+    <p>
+      数交给 GPU 时也按列主序：<code>gl.uniformMatrix4fv(location, false, value)</code>，第二个参数 transpose 在 WebGL 1 里必须是 false，value 按列主序（MDN）；项目就是这样传的（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:391">WebGL1Uniforms.ts:391</a>）。GLSL 里 <code>m[2]</code> 取的是第 2 列。所以 shader 里写 <code>uViewMatrix * vec4(position, 1.0)</code>，算的就是数学上的 V · p，不用再转置。
+    </p>
+    <div id="lab-store"></div>
+
+    <h2 id="s8">8. 一帧里谁在什么时候算</h2>
+    <p>公式一样，两边算的时机不同：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>数学量</th><th>本项目</th><th>three.js r177</th></tr></thead>
+      <tbody>
+        <tr><td>相机的局部矩阵 Tr · Rot · Scale</td><td>Transform 改过才重算：欧拉角 → 四元数 → 16 个数（<a data-src="src/rendering/scene/Transform.ts:253">Transform.ts:253–274</a>）</td><td>每帧 compose(position, quaternion, scale)（<a data-src="node_modules/three/src/core/Object3D.js:1107">Object3D.js:1107–1109</a>），旋转本来就存成四元数</td></tr>
+        <tr><td>世界矩阵 C = 父 · 局部</td><td>被读时才算，看版本号（<a data-src="src/rendering/scene/SceneNode.ts:353">SceneNode.ts:353–380</a>，第 8 课）</td><td>每帧递归 updateMatrixWorld（<a data-src="node_modules/three/src/core/Object3D.js:1126">Object3D.js:1126–1140</a>）</td></tr>
+        <tr><td>V = C⁻¹</td><td>Builder 每帧求一次逆，结果放进 ViewState，不存在相机上（RenderListBuilder.ts:84）</td><td>updateMatrixWorld 时顺手求逆，存在 camera.matrixWorldInverse（Camera.js:92–97）</td></tr>
+        <tr><td>P</td><td>只在构造和 setPerspective 时算（<a data-src="src/rendering/scene/cameras/PerspectiveCamera.ts:110">PerspectiveCamera.ts:110–133</a>，第 9 课）</td><td>改了 fov、aspect 等字段后要手动 updateProjectionMatrix()（<a data-src="node_modules/three/src/cameras/PerspectiveCamera.js:353">PerspectiveCamera.js:353–381</a>）</td></tr>
+        <tr><td>P · V · M · p</td><td>三个矩阵分别上传，每个顶点在 shader 里连乘（vertex.vert:44）</td><td>CPU 先算 modelView = V · M（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:2005">WebGLRenderer.js:2005</a>），shader 里 projectionMatrix * modelViewMatrix * p</td></tr>
+        <tr><td>NDC → 像素</td><td colspan="2">GPU 按 gl.viewport 做（6.3 节）</td></tr>
+      </tbody>
+    </table></div>
+    <div id="lab-time"></div>
+
+    <h2 id="s9">9. 实验台：自己改数</h2>
+    <p>
+      改 eye、target、视角、画布尺寸和点的坐标，下面按第 3～7 节的顺序，把每一步的数都列出来。三根轴和角度按本课的公式算；C、V、P 来自项目真实代码（Transform、mat4.invert、PerspectiveCamera），并和 three.js 的 lookAt、updateProjectionMatrix 比对。默认值就是本课的 HW2 例子。
+    </p>
+    <div id="math-lab"></div>
+
+    <h2 id="s10">10. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0025"></div>
+
+    <h2 id="s11">11. 延伸阅读</h2>
+    <p>
+      <strong>首选（约 15 分钟）：</strong>GAMES101 第 4 讲「Transformation Cont.」的视图变换和透视投影部分（<a href="https://sites.cs.ucsb.edu/~lingqi/teaching/games101.html">课程主页</a>）。它的推导和本课 4.3、6.2 节一致，区别是它先把视锥压成长方体、再做正交投影，最后得到同一个矩阵。
+    </p>
+    <p>
+      补充：<a href="https://learnopengl.com/Getting-started/Coordinate-Systems">LearnOpenGL · Coordinate Systems</a>（五个坐标系）；<a href="https://www.songho.ca/opengl/gl_projectionmatrix.html">songho · OpenGL Projection Matrix</a>（把 6.2 节的 z 那一步推得更细，也有非对称视锥）；<a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/uniformMatrix">MDN · uniformMatrix</a>（transpose 必须为 false、列主序）。项目文档 <a data-src="src/rendering/docs/projection-matrix-float32-rationale.zh-CN.md:1">projection-matrix-float32-rationale.zh-CN.md</a> 讲为什么投影矩阵存成 Float32。
+    </p>
+
+    <aside class="ask">
+      做完告诉我：卡片和检查题各错了哪几题；第 3、4、5、7 节是不是回答了你问的四个问题，哪一步还接不上，直接把那几行贴给我。下篇第 26 课讲轨道控制，会用到这里的 az、el 和 C。
+    </aside>
+
+    <div class="nav">
+      <a href="0015-program-manager.html">← 第 15 课：ProgramManager</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0026-orbit-controls.html">第 26 课（插课下篇）：轨道控制 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 25 课（插课上篇） · 2026-10-08</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        const R = window.RTeachCamera
+        const L = RTeach.orbitLab
+        const { mat4, vec4 } = R
+        const DEG = Math.PI / 180
+        const EYE = [0, 20, 50]
+        const TARGET = [0, 10, 0]
+        const POINT = [0, 20, 0]
+
+        // ---------------- 小工具 ----------------
+        const fx = (x, n = 5) => L.num(x, n)
+        const vec = (v, n = 5) => '(' + Array.from(v, (x) => fx(x, n)).join(', ') + ')'
+        const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+        const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+        const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+        const len = (a) => Math.hypot(a[0], a[1], a[2])
+        const norm = (a) => a.map((x) => x / len(a))
+        /** 按数学排法打印：第 r 行第 c 列取下标 4c + r。 */
+        const grid = (m, n = 5) => [0, 1, 2, 3].map((r) => '┃ ' + [0, 1, 2, 3].map((c) => fx(m[c * 4 + r], n).padStart(n + 5)).join(' ') + ' ┃')
+        const maxDiff = (a, b) => {
+          let d = 0
+          for (let i = 0; i < 16; i++) d = Math.max(d, Math.abs(a[i] - b[i]))
+          return d
+        }
+        const line = (text, kind) => ({ text, kind })
+        const gridLines = (title, m, kind = 'server') => [line(title, 'muted'), ...grid(m).map((g) => line(g, kind))]
+        const cameraAt = (eye, rotation, aspect = 1.5, scale) => {
+          const camera = new R.PerspectiveCamera({ fovY: Math.PI / 4, aspect, near: 0.1, far: 1000 })
+          camera.transform.setPosition(eye)
+          camera.transform.setRotation(rotation)
+          if (scale) camera.transform.setScale(scale)
+          return camera
+        }
+        const worldOf = (camera) => {
+          const m = new Float32Array(16)
+          camera.copyWorldMatrixTo(m)
+          return m
+        }
+        const hw2 = () => cameraAt(EYE, [-Math.atan2(10, 50), 0, 0])
+        /** 按 4.3 节手写 V：前三行是 r、u、b（由 C 的三列取出），第 3 列是 −r·eye 等。 */
+        const handView = (C) => {
+          const r = [C[0], C[1], C[2]], u = [C[4], C[5], C[6]], b = [C[8], C[9], C[10]], eye = [C[12], C[13], C[14]]
+          const m = new Float32Array(16)
+          for (const [row, axis] of [[0, r], [1, u], [2, b]]) {
+            m[row] = axis[0]
+            m[4 + row] = axis[1]
+            m[8 + row] = axis[2]
+            m[12 + row] = -dot(axis, eye)
+          }
+          m[15] = 1
+          return m
+        }
+        const apply = (m, p) => Array.from(vec4.transformMat4(vec4.create(), [p[0], p[1], p[2], p.length > 3 ? p[3] : 1], m))
+
+        // ---------------- §4 V ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-view'),
+          storageKey: 'lesson-0025b-view',
+          cards: [
+            {
+              title: '§4 · 两种推导算出的 V，一样吗',
+              tags: ['真实代码', 'mat4.invert'],
+              desc: '用项目的 PerspectiveCamera 摆出 HW2 的相机，copyWorldMatrixTo 取出 C。一份 V 用 mat4.invert(C) 求（Builder 的做法），另一份按 4.3 节手写：r、u、b 横着放，第 3 列是 −r·eye、−u·eye、−b·eye。',
+              question: '两份 V 的 16 个数，最大相差多少？',
+              choices: ['只差 Float32 的最后一位：是同一个矩阵', '相差很大：求逆和「横着放」是两回事', '只有第 3 列不一样'],
+              answer: 0,
+              explain:
+                '最大差约 4 × 10⁻⁶，出在 −52.95135 和 −52.95136：Float32 在 50 附近只能分辨到约 4 × 10⁻⁶。C 的三列两两垂直、长度为 1，这样的旋转矩阵的逆就是它的转置，所以「横着放」再配上 −r·eye 那一列，正是 C⁻¹。拿 V 乘跟踪的点，得到 (0, 9.806, −49.029)：在镜头上方 9.806、前方 49.029。',
+              run: () => {
+                const C = worldOf(hw2())
+                const V1 = mat4.invert(mat4.create(), C)
+                const V2 = handView(C)
+                return {
+                  lines: [
+                    ...gridLines('mat4.invert(C)：', V1),
+                    ...gridLines('手写 Rotᵀ · Tr(−eye)：', V2),
+                    line('16 个数最大差：' + maxDiff(V1, V2).toExponential(2), 'result'),
+                    line('V · (0, 20, 0, 1) = ' + vec(apply(V1, POINT), 3), 'result')
+                  ]
+                }
+              }
+            },
+            {
+              title: '§4.4 · 相机放大 2 倍以后',
+              tags: ['真实代码', '缩放'],
+              desc: '同一台 HW2 相机，再 setScale([2, 2, 2])。V 仍用 mat4.invert(C) 求；同时也用「横着放」的手写公式算一份，只是这回 C 的三列长度是 2。',
+              question: '用 mat4.invert 求出的 V，把点 (0, 20, 0) 变成什么？',
+              choices: ['(0, 4.903, −24.515)：整个世界缩小一半', '(0, 9.806, −49.029)：缩放不影响 view', '(0, 19.612, −98.058)：整个世界放大一倍'],
+              answer: 0,
+              explain:
+                '相机的单位长度变成了世界里的 2，所以世界在相机坐标里缩小一半。手写的「横着放」公式这时不再是逆：三根轴长度是 2，点乘出来的坐标反而放大一倍，得到 (0, 19.612, −98.058)，错成了反方向。所以通用代码要用真正的求逆；只有确定没有缩放时，才能用转置省计算。',
+              run: () => {
+                const C = worldOf(cameraAt(EYE, [-Math.atan2(10, 50), 0, 0], 1.5, [2, 2, 2]))
+                const V = mat4.invert(mat4.create(), C)
+                return {
+                  lines: [
+                    line('C 的第 0 列长度：' + fx(len([C[0], C[1], C[2]]), 3), 'muted'),
+                    line('mat4.invert(C) · (0, 20, 0, 1) = ' + vec(apply(V, POINT), 3), 'result'),
+                    line('手写「横着放」· (0, 20, 0, 1) = ' + vec(apply(handView(C), POINT), 3) + '（这时已经不是逆）', 'late')
+                  ]
+                }
+              }
+            }
+          ]
+        })
+
+        // ---------------- §5 三根轴 ----------------
+        const A60 = 60 * DEG
+        const E30 = 30 * DEG
+        const orbitPoint = (az, el, r = 50.99) => {
+          const ring = r * Math.cos(el)
+          return [TARGET[0] + ring * Math.sin(az), TARGET[1] + r * Math.sin(el), TARGET[2] + ring * Math.cos(az)]
+        }
+        const EYE60 = orbitPoint(A60, E30)
+        const threeAt = (eye, order) => {
+          const camera = new R.ThreePerspectiveCamera(45, 1.5, 0.1, 1000)
+          camera.position.set(eye[0], eye[1], eye[2])
+          if (order) {
+            camera.rotation.order = order
+            camera.rotation.set(-E30, A60, 0)
+          }
+          return camera
+        }
+
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-aim'),
+          storageKey: 'lesson-0025b-aim',
+          cards: [
+            {
+              title: '§5 · lookAt 的三根轴，和 Transform 的 [−11.31°, 0, 0]',
+              tags: ['真实代码', 'Transform'],
+              desc: '一边按 5.1 节的两次叉积算 r、u、b；一边用项目的 Transform 写 rotation = [−atan2(10, 50), 0, 0]，再从 world 矩阵取出前三列。',
+              question: '两边的三根轴一样吗？',
+              choices: ['一样，只差在 Float32 的最后一位', 'u 不一样：Transform 没做叉积', '只有 r 一样，u 和 b 都偏了'],
+              answer: 0,
+              explain: '欧拉角只是同一组三根轴的另一种记法：三个角在 Transform 里先换成四元数，再写成矩阵的三列（5.2 节）。up 照样等于 r × f，只是这个关系藏在了角度里。',
+              run: () => {
+                const f = norm(sub(TARGET, EYE))
+                const r = norm(cross(f, [0, 1, 0]))
+                const u = cross(r, f)
+                const b = f.map((x) => -x)
+                const C = worldOf(hw2())
+                return {
+                  lines: [
+                    line('两次叉积：r = ' + vec(r) + '，u = ' + vec(u) + '，b = ' + vec(b), 'server'),
+                    line('Transform：第 0 列 ' + vec([C[0], C[1], C[2]]) + '，第 1 列 ' + vec([C[4], C[5], C[6]]) + '，第 2 列 ' + vec([C[8], C[9], C[10]]), 'server'),
+                    line('最大差：' + Math.max(...[0, 1, 2].map((i) => Math.abs(r[i] - C[i])), ...[0, 1, 2].map((i) => Math.abs(u[i] - C[4 + i])), ...[0, 1, 2].map((i) => Math.abs(b[i] - C[8 + i]))).toExponential(2), 'result')
+                  ]
+                }
+              }
+            },
+            {
+              title: '§5 · 同样三个数，交给 three.js 的欧拉角',
+              tags: ['three.js r177', '真实代码'],
+              desc: "换一个更一般的朝向：方位角 60°、仰角 30°，相机在 (38.24, 35.49, 22.08)，rotation = [−30°, 60°, 0]。three.js 相机放在同一位置，camera.rotation.set(−30°, 60°, 0)，order 依次试 'XYZ'（默认）、'YXZ'、'ZYX'。",
+              question: "order 是默认的 'XYZ' 时，结果怎样？",
+              choices: ['偏离目标约 16°，右方 y = −0.433，歪了头', '和项目一样：对准目标，不歪头', '偏离目标，但右方仍然水平'],
+              answer: 0,
+              explain:
+                "'XYZ' 是 Rot = Rx · Ry · Rz：先转身，再绕世界的 X 轴低头。转过身以后，世界的 X 轴已经不是相机的右方，所以低头低歪了。'ZYX' 就是项目的顺序；z 角为 0 时 'YXZ'（Ry · Rx）也一样。three.js 的文档也建议第一人称相机用 'YXZ'。",
+              run: () => {
+                const lines = []
+                for (const order of ['XYZ', 'YXZ', 'ZYX']) {
+                  const info = L.inspectThree(threeAt(EYE60, order), TARGET)
+                  lines.push(line("'" + order + "'：前方 " + vec(info.forward, 3) + '，偏离目标 ' + fx(info.offAxisDeg, 2) + '°；右方 ' + vec(info.right, 3), order === 'XYZ' ? 'result' : 'server'))
+                }
+                return { lines }
+              }
+            },
+            {
+              title: '§5 · three.js 的 lookAt，和项目的两个角',
+              tags: ['three.js r177', '真实代码'],
+              desc: 'three.js 相机放在 (38.24, 35.49, 22.08)，调用 lookAt(0, 10, 0)。项目相机放在同一处，rotation = [−30°, 60°, 0]。比较两边 world 矩阵的 16 个数，再看 three.js 的 camera.rotation 读数。',
+              question: '16 个数最大相差多少？camera.rotation 读出来是多少？',
+              choices: ['不到 10⁻⁷；rotation 却是 [−49.11°, 48.59°, 40.89°]', '完全相同，rotation 也是 [−30°, 60°, 0]', '差 0.5 左右：lookAt 不保证右方水平'],
+              answer: 0,
+              explain:
+                "同一个朝向，矩阵相同。three.js 存的是四元数，rotation 按它默认的 'XYZ' 顺序换算出来，所以是另一组数；按 'YXZ' 或 'ZYX' 去读，才是 [−30°, 60°, 0]。欧拉角的三个数，只有和顺序一起说才有意义。",
+              run: () => {
+                const three = threeAt(EYE60, null)
+                three.lookAt(TARGET[0], TARGET[1], TARGET[2])
+                const ours = cameraAt(EYE60, [-E30, A60, 0])
+                const a = L.inspectThree(three, TARGET)
+                const lines = [line('world 矩阵 16 个数的最大差：' + maxDiff(a.world, worldOf(ours)).toExponential(2), 'result')]
+                const r = three.rotation
+                lines.push(line("three 的 camera.rotation（'XYZ' 读法）：" + L.degVec([r.x, r.y, r.z]), 'result'))
+                for (const order of ['YXZ', 'ZYX']) {
+                  const e = new R.ThreeEuler().setFromQuaternion(three.quaternion, order)
+                  lines.push(line("同一个四元数按 '" + order + "' 读：" + L.degVec([e.x, e.y, e.z]), 'server'))
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- §6 P ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-proj'),
+          storageKey: 'lesson-0025b-proj',
+          cards: [
+            {
+              title: '§6 · 三种算法算出的 P',
+              tags: ['真实代码', 'three.js r177'],
+              desc: 'fovY = 45°、aspect = 1.5、near = 0.1、far = 1000。第一份按 6.2 节的公式手写；第二份是项目 PerspectiveCamera 里 gl-matrix 算的；第三份是 three.js 的 updateProjectionMatrix（它走「任意视锥」的 makePerspective）。',
+              question: '三份矩阵一样吗？',
+              choices: ['一样：视锥对称时，makePerspective 就是同一个公式', 'three.js 的不一样：它用的是上下左右边界', 'gl-matrix 把第 2 行第 3 列和第 3 行第 2 列放反了'],
+              answer: 0,
+              explain: 'makePerspective 的 x = 2·near / (right − left)，right − left = aspect · 2 · near · tan(fovY/2)，约掉以后就是 F / aspect；a、b 在对称视锥里是 0；c、d 就是 A、B。差别只来自 Float32 和 Float64 的舍入。',
+              run: () => {
+                const F = 1 / Math.tan(Math.PI / 8)
+                const n = 0.1, f = 1000, aspect = 1.5
+                const hand = new Float32Array(16)
+                hand[0] = F / aspect
+                hand[5] = F
+                hand[10] = (f + n) / (n - f)
+                hand[11] = -1
+                hand[14] = (2 * f * n) / (n - f)
+                const ours = new Float32Array(16)
+                hw2().copyProjectionMatrixTo(ours)
+                const three = new R.ThreePerspectiveCamera(45, 1.5, 0.1, 1000)
+                return {
+                  lines: [
+                    ...gridLines('按 6.2 节手写（F = ' + fx(F) + '，A = ' + fx(hand[10]) + '，B = ' + fx(hand[14]) + '）：', hand),
+                    line('项目（gl-matrix）与手写的最大差：' + maxDiff(hand, ours).toExponential(2), 'result'),
+                    line('three.js 与手写的最大差：' + maxDiff(hand, three.projectionMatrix.elements).toExponential(2), 'result')
+                  ]
+                }
+              }
+            },
+            {
+              title: '§6 · 跟踪的点画在哪个像素',
+              tags: ['真实代码'],
+              desc: '把世界里的 (0, 20, 0) 依次乘 V、乘 P、除以 w，再按 900 × 600 的 viewport 换成像素。V、P 都取自项目代码。',
+              question: '按「从画布顶边往下数」的习惯，这个点在哪个像素？',
+              choices: ['(450, 155.1)', '(450, 444.9)', '(450, 300)'],
+              answer: 0,
+              explain: 'NDC 的 y = 0.4828，在中线以上。WebGL 的窗口坐标从底边往上数：(0.4828 + 1) / 2 × 600 = 444.9；换成从顶边往下数是 600 − 444.9 = 155.1。所以选 444.9 的话，是把「从下往上」当成了「从上往下」。',
+              run: () => {
+                const camera = hw2()
+                const V = mat4.invert(mat4.create(), worldOf(camera))
+                const P = new Float32Array(16)
+                camera.copyProjectionMatrixTo(P)
+                const view = apply(V, POINT)
+                const clip = apply(P, view)
+                const ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]]
+                const fromBottom = ((ndc[1] + 1) / 2) * 600
+                return {
+                  lines: [
+                    line('世界 ' + vec(POINT, 0), 'muted'),
+                    line('× V → 相机 ' + vec(view.slice(0, 3), 3), 'server'),
+                    line('× P → 裁剪 ' + vec(clip, 3), 'server'),
+                    line('÷ w → NDC ' + vec(ndc, 4), 'server'),
+                    line('viewport：x = (' + fx(ndc[0], 4) + ' + 1) / 2 × 900 = ' + fx(((ndc[0] + 1) / 2) * 900, 1) + '；y 从底边数 = ' + fx(fromBottom, 1) + '，从顶边数 = ' + fx(600 - fromBottom, 1), 'result')
+                  ]
+                }
+              }
+            }
+          ]
+        })
+
+        // ---------------- §7 存储 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-store'),
+          storageKey: 'lesson-0025b-store',
+          cards: [
+            {
+              title: '§7 · 内存里第 12、13、14 个数是什么',
+              tags: ['真实代码'],
+              question: 'HW2 相机 copyWorldMatrixTo 以后，world[12]、world[13]、world[14] 是什么？',
+              choices: ['相机位置 (0, 20, 50)', '后方 b (0, 0.196, 0.981)', '第 3 行的 0, 0, 0'],
+              answer: 0,
+              explain: '下标 12、13、14 = 4 × 3 + 0、1、2，是第 3 列的前三个数，也就是 eye。按行去理解的话会以为是第 3 行，那一行在下标 3、7、11、15，全是 0、0、0、1。',
+              run: () => {
+                const C = worldOf(hw2())
+                return {
+                  lines: [
+                    line('16 个数：' + Array.from(C, (x) => fx(x, 3)).join(', '), 'server'),
+                    line('[12..14] = ' + vec([C[12], C[13], C[14]], 3), 'result'),
+                    line('[3], [7], [11], [15] = ' + [C[3], C[7], C[11], C[15]].join(', ') + '（数学上的第 3 行）', 'muted')
+                  ]
+                }
+              }
+            },
+            {
+              title: '§7 · 同样传 1～16，three.js 与 gl-matrix',
+              tags: ['three.js r177', 'gl-matrix'],
+              question: 'new Matrix4().set(1, 2, …, 16) 和 mat4.fromValues(1, 2, …, 16)，内存里各是什么顺序？',
+              choices: ['three：1, 5, 9, 13, …；gl-matrix：1, 2, 3, 4, …', '两边都是 1, 2, 3, 4, …', '两边都是 1, 5, 9, 13, …'],
+              answer: 0,
+              explain: 'three.js 的 set 让你按「一行一行读」的顺序写，所以第 1 行的四个数分到下标 0、4、8、12。gl-matrix 的 fromValues 让你直接按存储顺序写。两边存法都是列主序，只是参数的约定不同。',
+              run: () => {
+                const args = Array.from({ length: 16 }, (_, i) => i + 1)
+                return {
+                  lines: [
+                    line('three.js Matrix4.set(1..16).elements：' + new R.ThreeMatrix4().set(...args).elements.join(', '), 'result'),
+                    line('gl-matrix mat4.fromValues(1..16)：' + Array.from(mat4.fromValues(...args)).join(', '), 'result')
+                  ]
+                }
+              }
+            }
+          ]
+        })
+
+        // ---------------- §8 时机 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-time'),
+          storageKey: 'lesson-0025b-time',
+          cards: [
+            {
+              title: '§8 · three.js：改了 aspect，忘了 updateProjectionMatrix',
+              tags: ['three.js r177', '真实代码'],
+              question: 'three.js 相机的 aspect 从 1.5 改成 2，但没有调用 updateProjectionMatrix()。projectionMatrix 的 [0]（F / aspect）变不变？',
+              choices: ['不变，还是按 1.5 算的 1.60948', '自动变成按 2 算的 1.20711', '变成 NaN，要等下次渲染才恢复'],
+              answer: 0,
+              explain:
+                'three.js 的 fov、aspect、near、far 都是普通字段，P 要等 updateProjectionMatrix() 才重算，所以旧路径 resize 时要写两行（engine.ts:494–495）。项目把四个参数放在只读的 getter 后面：直接赋值，严格模式下抛 TypeError；只能用 setPerspective 一次改完，改参数和重算 P 分不开（第 9 课）。',
+              run: () => {
+                const three = new R.ThreePerspectiveCamera(45, 1.5, 0.1, 1000)
+                const lines = [line('three.js：m[0] = ' + fx(three.projectionMatrix.elements[0]), 'muted')]
+                three.aspect = 2
+                lines.push(line('camera.aspect = 2 之后：m[0] = ' + fx(three.projectionMatrix.elements[0]) + '（没变）', 'result'))
+                three.updateProjectionMatrix()
+                lines.push(line('updateProjectionMatrix() 之后：m[0] = ' + fx(three.projectionMatrix.elements[0]), 'server'))
+                const ours = hw2()
+                try {
+                  ours.aspect = 2
+                  lines.push(line('ours.aspect = 2 没有报错（意外）', 'late'))
+                } catch (error) {
+                  lines.push(line('项目：ours.aspect = 2 → ' + error.name + '（aspect 只有 getter）', 'abort'))
+                }
+                ours.setPerspective({ fovY: ours.fovY, aspect: 2, near: ours.near, far: ours.far })
+                const m = new Float32Array(16)
+                ours.copyProjectionMatrixTo(m)
+                lines.push(line('项目：setPerspective({ …, aspect: 2 }) → m[0] = ' + fx(m[0]) + '，projectionVersion = ' + ours.projectionVersion, 'result'))
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- §9 实验台 ----------------
+        ;(function mathLab(mount) {
+          const fields = [
+            ['eye', '相机 eye', EYE],
+            ['target', '目标 target', TARGET],
+            ['point', '跟踪的点 p（世界）', POINT]
+          ]
+          const scalars = [
+            ['fov', 'fovY（度）', 45],
+            ['w', '画布宽（px）', 900],
+            ['h', '画布高（px）', 600],
+            ['near', 'near', 0.1],
+            ['far', 'far', 1000]
+          ]
+          const html = ['<div class="mlab-grid">']
+          for (const [id, label, v] of fields) {
+            html.push('<label>' + label + '</label><span>' + v.map((x, i) => '<input type="number" step="any" data-id="' + id + i + '" value="' + x + '">').join('') + '</span>')
+          }
+          for (const [id, label, v] of scalars) html.push('<label>' + label + '</label><span><input type="number" step="any" data-id="' + id + '" value="' + v + '"></span>')
+          html.push('</div><pre class="mlab-out"></pre>')
+          mount.innerHTML = html.join('')
+          const out = mount.querySelector('.mlab-out')
+          const read = (id) => Number(mount.querySelector('[data-id="' + id + '"]').value)
+          const tri = (id) => [read(id + '0'), read(id + '1'), read(id + '2')]
+
+          function run() {
+            const eye = tri('eye'), target = tri('target'), p = tri('point')
+            const fovDeg = read('fov'), w = read('w'), h = read('h'), near = read('near'), far = read('far')
+            const o = []
+            const offset = sub(eye, target)
+            if (len(offset) === 0) return (out.textContent = 'eye 和 target 重合：没有方向，三根轴算不出来。')
+            const f = norm(sub(target, eye))
+            const rRaw = cross(f, [0, 1, 0])
+            o.push('① 三根轴（5.1 节，两次叉积）')
+            o.push('   f = normalize(target − eye) = ' + vec(f))
+            if (len(rRaw) < 1e-9) {
+              o.push('   f × up = 0：正对头顶或脚底，lookAt 算不出右方（three.js 会把 b 挪 0.0001）')
+            } else {
+              const r = norm(rRaw), u = cross(r, f)
+              o.push('   r = normalize(f × up) = ' + vec(r))
+              o.push('   u = r × f = ' + vec(u))
+              o.push('   b = −f = ' + vec(f.map((x) => -x)))
+            }
+            const horizontal = Math.hypot(offset[0], offset[2])
+            const az = Math.atan2(offset[0], offset[2])
+            const el = Math.atan2(offset[1], horizontal)
+            o.push('② 角度（5.2 节）：offset = eye − target = ' + vec(offset, 3) + '，horizontal = ' + fx(horizontal, 3))
+            o.push('   az = atan2(' + fx(offset[0], 3) + ', ' + fx(offset[2], 3) + ') = ' + fx(az) + ' rad = ' + fx(az / DEG, 2) + '°')
+            o.push('   el = atan2(' + fx(offset[1], 3) + ', ' + fx(horizontal, 3) + ') = ' + fx(el) + ' rad = ' + fx(el / DEG, 2) + '°')
+            o.push('   rotation = [−el, az, 0] = [' + fx(-el) + ', ' + fx(az) + ', 0]')
+            let camera
+            try {
+              camera = new R.PerspectiveCamera({ fovY: fovDeg * DEG, aspect: w / h, near, far })
+            } catch (error) {
+              o.push('', 'PerspectiveCamera 拒绝了这组参数：' + error.name + '：' + error.message)
+              return (out.textContent = o.join('\n'))
+            }
+            camera.transform.setPosition(eye)
+            camera.transform.setRotation([-el, az, 0])
+            const C = worldOf(camera)
+            const V = mat4.invert(mat4.create(), C)
+            const P = new Float32Array(16)
+            camera.copyProjectionMatrixTo(P)
+            const three = new R.ThreePerspectiveCamera(fovDeg, w / h, near, far)
+            three.position.set(eye[0], eye[1], eye[2])
+            three.lookAt(target[0], target[1], target[2])
+            three.updateMatrixWorld()
+            o.push('', '③ C（第 3 节；项目 Transform 算出，按数学排法）', ...grid(C))
+            o.push('   内存里的 16 个数（每行一列）：')
+            for (let c = 0; c < 4; c++) o.push('     [' + (4 * c) + '..' + (4 * c + 3) + '] ' + Array.from(C.slice(4 * c, 4 * c + 4), (x) => fx(x, 4)).join(', '))
+            o.push('   和 three.js lookAt 的 matrixWorld 最大差：' + maxDiff(C, three.matrixWorld.elements).toExponential(2))
+            o.push('', '④ V = C⁻¹（第 4 节）', ...grid(V))
+            const F = 1 / Math.tan((fovDeg * DEG) / 2)
+            o.push('', '⑤ P（第 6 节）：F = ' + fx(F) + '，F/aspect = ' + fx(F / (w / h)) + '，A = ' + fx((far + near) / (near - far)) + '，B = ' + fx((2 * far * near) / (near - far)), ...grid(P))
+            o.push('   和 three.js updateProjectionMatrix 的最大差：' + maxDiff(P, three.projectionMatrix.elements).toExponential(2))
+            const view = apply(V, p)
+            const clip = apply(P, view)
+            o.push('', '⑥ 跟踪的点：世界 ' + vec(p, 3))
+            o.push('   × V → 相机 ' + vec(view.slice(0, 3), 3))
+            o.push('   × P → 裁剪 ' + vec(clip, 3))
+            if (clip[3] <= 0) {
+              o.push('   w = ' + fx(clip[3], 3) + ' ≤ 0：点在相机背后或正侧面，画不出来')
+            } else {
+              const ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]]
+              const inside = ndc.every((x) => Math.abs(x) <= 1)
+              o.push('   ÷ w → NDC ' + vec(ndc, 4) + (inside ? '' : '（有一项超出 [−1, 1]：在视锥外，会被裁掉）'))
+              o.push('   像素：x = ' + fx(((ndc[0] + 1) / 2) * w, 1) + '，y（从顶边往下数）= ' + fx(((1 - ndc[1]) / 2) * h, 1))
+            }
+            out.textContent = o.join('\n')
+          }
+          mount.addEventListener('input', run)
+          run()
+        })(document.getElementById('math-lab'))
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0025"]'), [
+          {
+            q: '相机 world 矩阵 C 的第 3 列（最后一列）是什么？',
+            opts: ['相机在世界里的位置 eye', '相机的后方 b', '全是 0，最后一个是 1'],
+            answer: 0,
+            why: 'C 乘 (0, 0, 0, 1) 得到第 3 列：相机坐标系的原点在世界里的位置（2.2 节、第 3 节）。'
+          },
+          {
+            q: 'view 矩阵为什么可以直接写成 C 的逆？',
+            opts: ['view space 定义成相机自己的局部坐标系', 'C 的逆总是等于 C 的转置', 'WebGL 规定 view 矩阵必须是一个逆'],
+            answer: 0,
+            why: '「相机在原点、朝 −z 看」正是相机局部坐标系的约定，所以 V 就是「世界 → 相机局部」= C⁻¹。约定不一致时还要乘一个固定矩阵（4.4 节）。'
+          },
+          {
+            q: 'HW2 相机的 rotation 为什么是 [−11.31°, 0, 0]？',
+            opts: ['目标在正前下方，只需绕 X 轴低头 atan2(10, 50)', 'three.js 的 lookAt 先算出了这三个角', '−11.31° 是 fovY 的一半，让画面居中'],
+            answer: 0,
+            why: 'offset = eye − target = (0, 10, 50)，方位角 atan2(0, 50) = 0，仰角 atan2(10, 50) = 11.31°，rotation = [−el, az, 0]（5.2 节）。'
+          },
+          {
+            q: 'Float32Array 存的相机矩阵里，下标 12、13、14 是什么？',
+            opts: ['相机的位置（第 3 列）', '数学上第 3 行的三个数', '相机的后方 b'],
+            answer: 0,
+            why: '列主序：第 r 行第 c 列放在 4c + r。12、13、14 是第 3 列的前三个数（第 7 节）。'
+          },
+          {
+            q: 'three.js 的 new Matrix4().set(1, 2, …, 16) 以后，elements[1] 是几？',
+            opts: ['5', '2', '4'],
+            answer: 0,
+            why: 'set 的参数按行读：第 1 行是 1、2、3、4，第 2 行第 1 个数是 5。存储按列，elements[1] 是第 1 行第 0 列，也就是 5（第 7 节）。'
+          },
+          {
+            q: '透视矩阵的最后一行为什么是 (0, 0, −1, 0)？',
+            opts: ['让 w_clip = −z，GPU 除以 w 完成透视除法', '让远处的点 z 变成 −1', '让矩阵可以求逆'],
+            answer: 0,
+            why: '「除以深度」不是矩阵乘法能做的，所以让矩阵把 −z 放进 w，交给 GPU 去除（6.2 节第 2 步）。'
+          },
+          {
+            q: 'F = 1 / tan(fovY / 2) 在投影里管什么？',
+            opts: ['视角越小 F 越大，画面放得越大', '决定近平面离相机多远', '决定 NDC 深度的范围'],
+            answer: 0,
+            why: 'y_ndc = F · y / (−z)：F 越大，同样的 y 在画面上越高，相当于放大。fovY 从 45° 减到 30°，F 从 2.414 变成 3.732（6.2 节）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

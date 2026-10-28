@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>架构地图 · WebGL1 后端</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+  </head>
+  <body class="wide">
+    <p class="kicker">参考 · 随课程更新 · 源码快照 2026-09-23（dev-dual-webgl-backend-refactor）</p>
+    <h1>架构地图：src/rendering 与 WebGL1 后端</h1>
+    <p class="lede">
+      供反复查阅的一页纸：分几层、一次 draw 经过谁、每个文件拥有和借用什么、GPU 对象归谁删、校验放在哪里、和 three.js 怎么对应。所有 <code>文件:行号</code> 都能点击，会在 VS Code 里打开 worktree 中的源码。
+    </p>
+
+    <nav class="toc">
+      <ol>
+        <li><a href="#layers">四层与依赖方向</a></li>
+        <li><a href="#draw">一次 draw 的目标顺序（Task 15）</a></li>
+        <li><a href="#files">webgl1/ 文件地图</a></li>
+        <li><a href="#ownership">GPU 对象所有权</a></li>
+        <li><a href="#wiring">接线：ResourceManager 怎样组装</a></li>
+        <li><a href="#lifecycles">三种容易混淆的生命周期</a></li>
+        <li><a href="#validation">校验的四个维度</a></li>
+        <li><a href="#threejs">与 three.js r177 的对应</a></li>
+        <li><a href="#todo">尚未实现与刻意延后的部分</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="layers">1. 四层与依赖方向</h2>
+    <p>来源：HW2 架构设计 §4（<code>codex-workspace/…/2026-08-26-hw2-complete-webgl1-architecture-design.md</code>）。高层描述「画什么」，Backend 决定「在当前这个 WebGL1 context 上怎么画」。</p>
+    <div class="layers">
+      <div class="layer">
+        <div class="name">第一层 · 场景与逻辑资源（CPU，没有任何 GL handle）· 已实现</div>
+        <code>scene/</code> SceneNode、Group、Scene、Mesh、Transform、cameras/ · <code>resources/</code> Geometry、VertexAttribute、ShaderModule、Material、Texture2D、CubeTexture、RenderTarget · <code>core/</code> Resource、errors、requireNonNull
+      </div>
+      <div class="arrow-down">↓ 数据：第二层读取第一层（只借用，不持有设备）</div>
+      <div class="layer">
+        <div class="name">第二层 · 帧提取与编排 · 只有类型</div>
+        已有：<a data-src="src/rendering/frame/RenderItem.ts:15">RenderItem</a>、<a data-src="src/rendering/frame/ViewState.ts:13">ViewState</a>（一帧的值快照）。未实现：RenderList、RenderListBuilder、RenderPass、ForwardPass、RenderPipeline、Renderer（Task 16–18）
+      </div>
+      <div class="arrow-down">↓ 调用：只通过 RenderBackend 接口</div>
+      <div class="layer here">
+        <div class="name">第三层 · 设备后端 · 基础设施已实现，编排类 2026-09-26 有了初版</div>
+        <a data-src="src/rendering/backend/RenderBackend.ts:18">RenderBackend</a>（接口：ready、resizeDrawingBuffer、withRenderSurface、draw、dispose；清除改成进入 withRenderSurface 时的一项描述）、<a data-src="src/rendering/backend/RenderSurface.ts:10">RenderSurface</a> · <code>webgl1/</code> 下 13 个文件（第 3 节；Task 15 又加了 WebGL1SurfaceScope、WebGL1Uniforms）· <code>WebGL1Backend</code> <span class="tag t15">Task 15</span>
+      </div>
+      <div class="arrow-down">↓ 调用：唯一持有 gl 的一层</div>
+      <div class="layer">
+        <div class="name">第四层 · 平台与设备</div>
+        HTMLCanvasElement · WebGLRenderingContext · 浏览器（ANGLE）· 驱动 · GPU
+      </div>
+    </div>
+    <p><strong>两种方向。</strong>调用（谁调用谁、谁持有谁）只沿 Engine → Renderer → Pipeline → Pass → Backend → GL 往下走；类型的 import 则指向数据：处理数据的机器都可以读第一层的资源和第二层的值类型，这些数据不知道任何读它的机器。原则是被依赖的一方更稳定、更通用。禁止的反向依赖包括：Backend 知道 Pass、Scene 或 HW2；Mesh 知道 framebuffer 或 GL；Resource 知道具体 Manager（Resource 只提供 <code>onDispose</code> 通知，不知道谁在听）；Pass 自己调用 <code>gl.clear</code>、<code>gl.useProgram</code> 或 <code>gl.draw*</code>。</p>
+    <p><strong>Backend 独占它的 context。</strong>后端之外的任何代码都不能直接改同一个 context 的 program、VAO、buffer、framebuffer、viewport 或渲染状态；否则 <code>WebGL1State</code> 的缓存就不可信了（HW2 设计 §18）。</p>
+
+    <h2 id="draw">2. 一次 draw 的目标顺序 <span class="tag t15">Task 15</span></h2>
+    <p>来源：HW2 设计 §23 和 <a data-src="src/rendering/backend/RenderBackend.ts:37">RenderBackend.withRenderSurface</a> 的契约。下面是<strong>目标</strong>编排；左边列出的零件已经存在；把它们串起来的 <code>WebGL1Backend</code> 在 2026-09-26 有了初版（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:192">WebGL1Backend.draw</a>），实际顺序见表下的说明。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>#</th><th>步骤</th><th>由谁完成</th><th>状态</th></tr>
+        <tr><td>0</td><td>进入输出作用域：捕获真实 FRAMEBUFFER_BINDING 与 VIEWPORT → try { 解析目标 → 绑定 → 执行回调 } finally { 恢复 }</td><td><a data-src="src/rendering/backend/webgl1/WebGL1State.ts:180">State.captureSurfaceState</a> / <a data-src="src/rendering/backend/webgl1/WebGL1State.ts:207">bindSurface</a> / <a data-src="src/rendering/backend/webgl1/WebGL1State.ts:255">restoreSurfaceState</a>、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:73">renderTargets.get</a></td><td>初版：WebGL1SurfaceScope</td></tr>
+        <tr><td>1</td><td>检查生命周期：Backend ready，Geometry、Material 没有 disposed</td><td>Backend（依靠 <a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:110">lifecycle.isReady</a>）</td><td>初版</td></tr>
+        <tr><td>2</td><td>取得 program（首次会编译、链接、反射）</td><td><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:80">programs.get(material.shaderModule)</a></td><td>已有</td></tr>
+        <tr><td>3</td><td>取得 GPU geometry（首次会上传）</td><td><a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:104">geometries.get(geometry)</a></td><td>已有</td></tr>
+        <tr><td>4</td><td>选用 program</td><td><a data-src="src/rendering/backend/webgl1/WebGL1State.ts:47">state.useProgram</a></td><td>已有</td></tr>
+        <tr><td>5</td><td>应用渲染状态：深度测试、深度写入、深度函数、剔除</td><td><a data-src="src/rendering/backend/webgl1/WebGL1State.ts:121">state.setDepthState</a>、<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:144">setCullMode</a></td><td>已有</td></tr>
+        <tr><td>6</td><td>上传内建 uniform：model、view、projection、normal 矩阵和 cameraPosition，名字来自 <a data-src="src/rendering/resources/ShaderModule.ts:91">builtInUniforms</a></td><td>Backend：<code>uniformMatrix4fv</code>、<code>uniform3fv</code></td><td>初版</td></tr>
+        <tr><td>7</td><td>上传 Material 参数；纹理参数要选纹理单元（<code>activeTexture</code> → <code>bindTexture</code> → <code>uniform1i</code>），cubemap 先经 <a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:80">cubeTextures.get</a></td><td>Backend</td><td>初版</td></tr>
+        <tr><td>8</td><td>接线</td><td><a data-src="src/rendering/backend/webgl1/WebGL1VertexInputManager.ts:21">vertexInputs.bind(geometry, gpuGeometry, program)</a></td><td>已有</td></tr>
+        <tr><td>9</td><td>发出 draw：有索引就 <code>drawElements(primitiveMode, drawCount, indexType, 0)</code>，否则 <code>drawArrays(primitiveMode, 0, drawCount)</code>——这些参数 <a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:36">WebGL1GeometryResource</a> 都已经算好</td><td>Backend</td><td>初版</td></tr>
+      </table>
+    </div>
+    <aside class="note"><strong>2026-09-26 初版的实际顺序：</strong>先解析资源（programs.get、geometries.get），再做 uniform 预检（<code>uniforms.prepare</code>：验证所有 active uniform，cubemap 第一次用到时会在这里上传）；然后才 useProgram、应用渲染状态、上传 uniform，最后绑定顶点输入并发出 draw（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:183">WebGL1Backend.ts:183–231</a>）。和上表的差别在于「预检提前」：资源的冷路径可能让 State 缓存失效，所以要先把资源都解析完，再应用这一次 draw 的状态。</aside>
+
+    <h2 id="files">3. webgl1/ 文件地图</h2>
+    <p>一共约 3170 行（2026-09-23）。按职责分成五组。「拥有」表示负责创建和删除；「借用」表示只使用、不负责删除。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>文件</th><th>行</th><th>一句话职责</th><th>拥有</th><th>借用</th><th>谁调用它</th></tr>
+        <tr><td colspan="6"><strong>设备与状态</strong></td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1Capabilities.ts:40">WebGL1Capabilities</a></td><td>65</td><td>一次性探测扩展和上限，生成冻结快照</td><td>快照对象</td><td>gl</td><td>Backend 组装时；context 恢复后重新探测</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:72">WebGLContextLifecycle</a></td><td>300</td><td>监听 lost/restored 事件，驱动状态机和回调顺序</td><td>两个事件监听</td><td>canvas（只当 EventTarget 用）</td><td>浏览器事件；Backend 注入回调</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1State.ts:30">WebGL1State</a></td><td>307</td><td>缓存「上次设成了什么」，值相同就省略 GL 命令；捕获和恢复输出目标</td><td>没有 GPU 对象</td><td>gl、各 Manager 创建的 handle</td><td>Backend；Manager 通过 invalidateState 回调让它失效</td></tr>
+        <tr><td colspan="6"><strong>资源 Manager（每个 context 一代）</strong></td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:55">WebGL1ProgramManager</a></td><td>345</td><td>ShaderModule → 编译、链接、反射 → program，并缓存</td><td>WebGLProgram（WebGLShader 只在构建期间临时存在）</td><td>ShaderModule（CPU）</td><td>Backend；ShaderModule 的 dispose 通知</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:68">WebGL1GeometryManager</a></td><td>407</td><td>Geometry → 属性 buffer 和索引 buffer，并缓存</td><td>WebGLBuffer</td><td>Geometry（CPU）、capabilities.elementIndexUint</td><td>Backend；Geometry 的 dispose 通知</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:65">WebGL1CubeTextureManager</a></td><td>313</td><td>CubeTexture → 上传六个面、设置 sampler 参数</td><td>WebGLTexture（cube）</td><td>CubeTexture 及其借来的图片</td><td>Backend（draw 时解析纹理参数）</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:53">WebGL1RenderTargetManager</a></td><td>367</td><td>RenderTarget → FBO、颜色纹理、深度 renderbuffer；revision 变了就整体替换</td><td>WebGLFramebuffer、WebGLTexture、WebGLRenderbuffer</td><td>RenderTarget（CPU）</td><td>Backend（withRenderSurface、解析附件引用）</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:62">WebGL1TextureUploadSupport</a></td><td>94</td><td>工具函数：上传作用域（保存并恢复像素存储状态和纹理绑定）、错误检查、上限查询</td><td>—</td><td>gl</td><td>两个纹理类 Manager</td></tr>
+        <tr><td colspan="6"><strong>顶点输入（策略模式）</strong></td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1VertexInputManager.ts:19">WebGL1VertexInputManager</a></td><td>74</td><td>两种策略共同实现的接口，外加按能力选择策略的工厂函数</td><td>—</td><td>—</td><td>ResourceManager（组装时调用一次工厂）</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:34">WebGL1VertexInputSupport</a></td><td>253</td><td>共享工具：program × geometry 的兼容性检查（resolve）、pointer 配置（apply）、每个 program 的反射缓存</td><td>反射缓存（纯 CPU）</td><td>buffer、program</td><td>两种策略（组合，不是继承）</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:25">WebGL1OESVertexInputManager</a></td><td>245</td><td>有 VAO 扩展：把接线「录」进 VAO，按 Geometry × WebGLProgram 缓存</td><td>WebGLVertexArrayObjectOES</td><td>buffer、program</td><td>Backend.draw；releaseGeometry、releaseProgram 由 beforeDelete 触发</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1ManualVertexInputManager.ts:17">WebGL1ManualVertexInputManager</a></td><td>185</td><td>没有 VAO 扩展：每次 draw 重新接线，关掉遗留的 location</td><td>「哪些 location 开着」的记录</td><td>buffer、program</td><td>同上</td></tr>
+        <tr><td colspan="6"><strong>组合根 (composition root)</strong></td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:43">WebGL1ResourceManager</a></td><td>215</td><td>组装当前这一代的全部 Manager，连接 beforeDelete，规定整体的失效与释放顺序</td><td>5 个 Manager 实例</td><td>gl、capabilities、hooks</td><td>Backend</td></tr>
+        <tr><td colspan="6"><strong>编排（未实现）</strong></td></tr>
+        <tr><td><code>WebGL1Backend</code> <span class="tag t15">Task 15</span></td><td>—</td><td>实现 RenderBackend：创建 context、组装以上一切、执行 draw、处理 lost/restored</td><td>State、ResourceManager、Lifecycle</td><td>canvas</td><td>Renderer / Pass（经 RenderBackend 接口）</td></tr>
+      </table>
+    </div>
+
+    <h2 id="ownership">4. GPU 对象所有权</h2>
+    <p>核心规则：<strong>CPU Resource 决定逻辑生命周期；Manager 只管理「这个 context」里的 GPU 表示。</strong>Manager 从不调用 CPU 资源的 <code>dispose()</code>，只订阅它的 <code>onDispose</code> 通知。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>GPU 对象</th><th>谁创建</th><th>谁删除、何时删除</th><th>缓存 key</th></tr>
+        <tr><td>WebGLShader</td><td>ProgramManager.compile</td><td>同一次 get 的 finally 里就删（链接成功后先 detach）</td><td>不缓存</td></tr>
+        <tr><td>WebGLProgram</td><td>ProgramManager.get</td><td>ProgramManager.release：ShaderModule dispose 或 Manager dispose 时；如果正在使用，先 <code>useProgram(null)</code></td><td>ShaderModule 对象身份</td></tr>
+        <tr><td>WebGLBuffer（属性、索引）</td><td>GeometryManager.upload</td><td>GeometryManager.release：Geometry dispose 时；<strong>删之前</strong>先释放依赖它的 VAO</td><td>Geometry 对象身份</td></tr>
+        <tr><td>WebGLVertexArrayObjectOES</td><td>OESVertexInputManager.bind（首次组合时）</td><td>releaseGeometry、releaseProgram（经 beforeDelete，<strong>先于</strong> buffer 和 program）或 dispose</td><td>Geometry → WebGLProgram 两层 Map</td></tr>
+        <tr><td>WebGLTexture（cube）</td><td>CubeTextureManager.get</td><td>CubeTextureManager.release：CubeTexture dispose 时</td><td>CubeTexture 对象身份</td></tr>
+        <tr><td>FBO、颜色纹理、深度 renderbuffer</td><td>RenderTargetManager.create</td><td>release（RenderTarget dispose 时），或者 revision 变化时：新的一套建完整后，再删旧的</td><td>RenderTarget 对象身份 + revision</td></tr>
+        <tr><td>（无）</td><td>WebGL1State</td><td>—</td><td>只记「上次设成了什么」；<code>undefined</code> = 不知道，<code>null</code> = 明确没有绑定</td></tr>
+      </table>
+    </div>
+    <p>context 丢失时，所有 Manager 走 <code>invalidateForContextLoss()</code>：只丢记录、取消订阅，<strong>不</strong>对已经失效的 context 调用任何 delete，而且这一代 Manager 永远不再复用。恢复后由 Backend 重新探测能力、创建新的一代。</p>
+
+    <h2 id="wiring">5. 接线：ResourceManager 怎样组装</h2>
+    <p>来源：<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:72">WebGL1ResourceManager 构造函数</a>。</p>
+<pre><code>WebGL1Backend（Task 15）
+ ├─ WebGL1State ◀──────────── hooks.invalidateState（凡是 Manager 直接改过 GL 状态，都会调用它）
+ ├─ WebGLContextLifecycle     onLost → 整批失效；restore → 新 capabilities + 新 State + 新 ResourceManager
+ └─ WebGL1ResourceManager
+     ├─ vertexInputs  = createWebGL1VertexInputManager(gl, caps, hooks)   → 有 VAO 扩展选 OES，否则选 Manual
+     ├─ geometries    beforeDelete: geometry =&gt; vertexInputs.releaseGeometry(geometry)
+     ├─ programs      beforeDelete: program  =&gt; vertexInputs.releaseProgram(program)
+     ├─ cubeTextures
+     └─ renderTargets
+
+ dispose 顺序：vertexInputs → renderTargets → cubeTextures → geometries → programs
+            （先结束借用方，再结束被借用的资源的所有者；某一步失败就停在那一步，下次 dispose 从那里重试）</code></pre>
+    <p>为什么用显式的 <code>beforeDelete</code> 回调，而不是让 VertexInputManager 也去订阅 Geometry 的 <code>onDispose</code>？因为几个 listener 的执行先后取决于注册顺序，而「先删 VAO、再删 buffer」这个顺序必须由代码结构来保证，不能靠运气（HW2 设计 §22.1）。</p>
+    <p>为什么只传 <code>invalidateState</code> 回调，而不把整个 State 传进去？Manager 只需要「让缓存失效」这一项能力，不应该顺带获得改 viewport、剔除方式的能力。这就是窄接口 (narrow interface) 和依赖注入。</p>
+
+    <h2 id="lifecycles">6. 三种容易混淆的生命周期</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th>谁的</th><th>状态</th><th>转换由什么触发</th><th>源码</th></tr>
+        <tr><td>CPU Resource</td><td>可用 → disposed（单向）</td><td><code>dispose()</code>/<code>tryDispose()</code>，或者最后一个 Scene 引用释放；先通知 listener，再清 CPU 数据</td><td><a data-src="src/rendering/core/Resource.ts:197">Resource.finalizeDisposal</a></td></tr>
+        <tr><td>一代 Manager</td><td>可用 → lost（只丢记录）/ disposed（按顺序删 GPU 对象）</td><td>context 丢失通知，或者入口处发现 <code>isContextLost()</code>；Backend dispose</td><td><a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:158">invalidateForContextLoss</a>、<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:184">dispose</a></td></tr>
+        <tr><td>context 状态机</td><td>ready → lost → restoring → ready 或 restore-failed；任何状态 → disposed</td><td>浏览器事件；<code>transitionVersion</code> 防止旧调用栈覆盖新状态</td><td><a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:169">handleLost</a>、<a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:227">handleRestored</a></td></tr>
+      </table>
+    </div>
+    <p>另外还有两个名字里带 restore、但与 context 恢复无关的东西：<code>State.restoreSurfaceState()</code> 恢复的是临时切换过的 framebuffer 和 viewport；GeometryManager、RenderTargetManager、TextureUploadSupport 在 finally 里恢复的是它们临时改动过的<strong>绑定</strong>。</p>
+
+    <h2 id="validation">7. 校验的四个维度</h2>
+    <p>来源：<code>src/rendering/docs/design-reading-guide.zh-CN.md</code>，讲解顺序第 4 条。遇到任何一处校验，先问它属于哪一类，再问它挡住了哪个反例。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>维度</th><th>什么时候知道</th><th>项目里的例子</th></tr>
+        <tr><td><strong>输入</strong>（类型、范围、形状）</td><td>CPU 构造时就能判断，只判一次</td><td>VertexAttribute 的 itemSize 必须能整除数据长度（<a data-src="src/rendering/resources/VertexAttribute.ts:86">VertexAttribute.ts:86</a>）；索引不能超出 vertexCount，drawCount 要和拓扑匹配（<a data-src="src/rendering/resources/Geometry.ts:212">Geometry.ts:212</a>）；Material 参数要是有限数、int32 范围内（<a data-src="src/rendering/resources/materialParameters.ts:156">materialParameters.ts:156–174</a>）；RenderTarget 尺寸是正的安全整数；fovY ∈ (0, π)</td></tr>
+        <tr><td><strong>设备能力</strong>（扩展、上限）</td><td>只有拿到具体 context 才知道；每个 context 的每一代都要重新判断</td><td>MAX_VERTEX_ATTRIBS；Uint32 索引需要扩展，或者最大值 ≤ 65535（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:290">GeometryManager.prepareIndices</a>）；cube 尺寸上限、NPOT 规则、浮点纹理扩展（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:203">validateStorage</a>）；MRT 扩展和附件数量上限（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:156">RenderTargetManager.validate</a>）</td></tr>
+        <tr><td><strong>组合兼容</strong>（两份各自合法的资源相遇）</td><td>program 与 geometry 第一次组合时</td><td>shader 用到的每个 active attribute，Geometry 里都要有同名数据；itemSize 在 1..4；location 唯一且小于上限；拒绝矩阵 attribute（<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:80">VertexInputSupport.resolve</a>、<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:184">readInputs</a>）</td></tr>
+        <tr><td><strong>生命周期</strong>（会变的状态）</td><td>每个入口都要查；跨过一次 GL 查询或外部回调之后还要再查一次</td><td>Resource.disposed；Manager 是否已 disposed；<code>isContextLost()</code>（后端里共 34 处）；<code>releasing</code> 集合防止重入；<code>transitionVersion</code></td></tr>
+      </table>
+    </div>
+    <p>把校验放在哪一层，取决于<strong>最早能在哪里知道答案</strong>：不可变的输入在构造时判一次就够；设备能力要等拿到 context；会变的生命周期每次都得重新确认。每个 GL 调用失败时各自通过哪条通道报告，见 <a href="webgl1-api.html#channels">API 速查 · 五种失败通道</a>。</p>
+
+    <h2 id="threejs">8. 与 three.js r177 的对应</h2>
+    <p>three.js 自 r163 起不再支持 WebGL1（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:101">WebGLRenderer.js:101</a>），所以对照看的是它的 <strong>WebGL2</strong> 内部实现。模块的切分几乎一一对应，差别在于具体取舍。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>本项目</th><th>three.js r177</th><th>相同</th><th>不同</th></tr>
+        <tr>
+          <td>WebGL1State</td>
+          <td><a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:575">WebGLState.useProgram</a>、<a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:470">enable</a></td>
+          <td>用 JS 缓存省略重复的 GL 调用</td>
+          <td>three.js 的 <a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:1185">reset()</a> 会真的把 GL 重置成默认值，再把缓存同步成这些默认值；本项目的 <code>invalidate()</code> 只遗忘缓存（全部置为 undefined），不发任何 GL 命令</td>
+        </tr>
+        <tr>
+          <td>VertexInputManager（OES / Manual）</td>
+          <td><a data-src="node_modules/three/src/renderers/webgl/WebGLBindingStates.js:70">WebGLBindingStates.getBindingState</a></td>
+          <td>VAO 按 geometry × program 缓存</td>
+          <td>three.js 只用 WebGL2 原生 VAO，key 里还多一层 wireframe；本项目多了一条「没有扩展时手动接线」的策略</td>
+        </tr>
+        <tr>
+          <td>ProgramManager</td>
+          <td><a data-src="node_modules/three/src/renderers/webgl/WebGLPrograms.js:377">getProgramCacheKey</a>、<a data-src="node_modules/three/src/renderers/webgl/WebGLPrograms.js:591">acquireProgram</a>、<a data-src="node_modules/three/src/renderers/webgl/WebGLPrograms.js:622">releaseProgram</a></td>
+          <td>懒编译并缓存</td>
+          <td>three.js 用「材质参数拼出的字符串」作 key，用 <code>usedTimes</code> 引用计数；本项目用 ShaderModule 对象身份，释放跟随 Resource 的生命周期</td>
+        </tr>
+        <tr>
+          <td>GeometryManager</td>
+          <td><a data-src="node_modules/three/src/renderers/webgl/WebGLGeometries.js:9">WebGLGeometries.onGeometryDispose</a>、<a data-src="node_modules/three/src/renderers/webgl/WebGLAttributes.js:76">WebGLAttributes.updateBuffer</a></td>
+          <td>监听 dispose：删除 buffer，并清理这个 geometry 相关的 VAO 状态</td>
+          <td><strong>顺序正好相反</strong>：three.js 先删 buffer、后调用 <code>releaseStatesOfGeometry</code>（第 13–38 行）；本项目用 beforeDelete 保证先删 VAO、再删 buffer。另外，three.js 按单个 BufferAttribute 管 buffer，支持用 <code>bufferSubData</code> 局部更新；本项目整份 Geometry 静态上传（STATIC_DRAW），没有更新接口</td>
+        </tr>
+        <tr>
+          <td>CubeTextureManager、RenderTargetManager</td>
+          <td><a data-src="node_modules/three/src/renderers/webgl/WebGLTextures.js:1285">uploadCubeTexture</a>、<a data-src="node_modules/three/src/renderers/webgl/WebGLTextures.js:1837">setupRenderTarget</a></td>
+          <td>上传、设置 sampler 参数、建 FBO</td>
+          <td>three.js 用一个 WebGLTextures 包办 2D、cube、3D 纹理和 FBO；本项目按资源类型拆成几个 Manager；pixelStorei 的处理，three.js 是每次按纹理属性直接设置，本项目是「保存 → 设成确定值 → 恢复」</td>
+        </tr>
+        <tr>
+          <td>Capabilities</td>
+          <td><a data-src="node_modules/three/src/renderers/webgl/WebGLCapabilities.js:3">WebGLCapabilities</a>、WebGLExtensions</td>
+          <td>探测上限和扩展</td>
+          <td>本项目返回冻结的快照，每一代 context 重新探测一次</td>
+        </tr>
+        <tr>
+          <td>ContextLifecycle</td>
+          <td><a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1013">onContextLost</a>、<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1023">onContextRestore</a></td>
+          <td>都调用 <code>preventDefault()</code>；恢复时重建全部内部模块（three.js 是重跑 <code>initGLContext</code>）</td>
+          <td>本项目有显式的状态机、用 transitionVersion 防重入、保留失败诊断；three.js 只有一个 <code>_isContextLost</code> 标志</td>
+        </tr>
+        <tr>
+          <td>Resource.onDispose、Manager 里的 <code>Map&lt;CPU 对象, …&gt;</code></td>
+          <td>EventDispatcher 的 <code>'dispose'</code> 事件、<a data-src="node_modules/three/src/renderers/webgl/WebGLProperties.js:3">WebGLProperties 的 WeakMap</a></td>
+          <td>都用「CPU 对象 → GPU 记录」的映射，CPU 对象里不存 handle</td>
+          <td>本项目用 Map，配合显式的 unsubscribe 和 Scene 引用计数；three.js 用 WeakMap，释放完全靠用户手动调用 <code>dispose()</code></td>
+        </tr>
+      </table>
+    </div>
+
+    <h2 id="todo">9. 尚未实现与刻意延后的部分</h2>
+    <ul>
+      <li><strong>WebGL1Backend</strong>（Task 15）：2026-09-26 有了初版（创建 context、withRenderSurface 与入口清除、draw、lost 和 restored 之后换一代），真实浏览器测试还没跑过。<span class="tag t15">Task 15</span></li>
+      <li><strong>Texture2D 的 Manager</strong>：ResourceManager 里目前只有 cube 纹理的 Manager（见 <a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:130">ResourceManager.ts:130</a> 的注释）。</li>
+      <li><strong>uniform 反射与完整性检查</strong>：<code>TODO(material-uniform-reflection)</code>，见 <a data-src="src/rendering/resources/Material.ts:178">Material.ts:178</a>。WebGL1 后端已经做到了：缺值、类型不符都拒绝这次 draw（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:156">WebGL1Uniforms.ts:156–162</a>）；这个 TODO 留给将来不靠 GL 反射的后端（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:67">WebGL1Uniforms.ts:67–68</a>）。</li>
+      <li><strong>矩阵 attribute</strong>：<code>TODO(vertex-input-matrix-layout)</code>，见 <a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:216">VertexInputSupport.ts:216</a>。</li>
+      <li><strong>更多拓扑</strong>（points、line-loop、triangle-fan）：<code>TODO(geometry-topology-expansion)</code>，见 <code>src/rendering/TODOList.md</code>。</li>
+      <li><strong>context 恢复失败后的重试策略</strong>：<code>TODO(webgl-context-restore-retry-policy)</code>。</li>
+      <li><strong>dispose listener 抛错时的语义</strong>：<code>src/rendering/TODOList.md</code> 第一条。</li>
+    </ul>
+
+    <div class="nav">
+      <a href="../index.html">← 课程首页</a>
+      <a href="webgl1-api.html">WebGL1 API 速查 →</a>
+    </div>
+    <footer>架构地图 · 2026-09-23 · 行号对应 dev-dual-webgl-backend-refactor 当时的 working tree，源码改动后需要同步更新</footer>
+  </body>
+</html>

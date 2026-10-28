@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 32 课 · 点落在哪个像素</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/camera-bundle.js"></script>
+    <script src="../assets/orbit-lab.js"></script>
+    <script src="../assets/view-lab.js"></script>
+  </head>
+  <body>
+    <p class="kicker">零基础重写 · 相机数学 1/4 · 约 25 分钟</p>
+    <h1>一个 3D 点，会画到屏幕的第几个像素</h1>
+    <p class="lede">
+      轨道控制的平移、滚轮缩放，背后都是同一条公式：给一个 3D 点，算出它画在画布的第几行、第几列。这一课从零推出这条公式。用到的数学只有直角三角形和 tan。每推一步，你都可以拖滑块验证，旁边同时显示「公式算出来的」和「项目的相机矩阵算出来的」两个数。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 你问过：「横着移动为什么用高度 h，不用宽度 w」「近点、远点是在哪个空间里近、怎么才算近」「目标点 z = 0，哪来的深度」。这三个问题的答案都在这一课的公式里。后面三课（平移、滚轮、歪头）全部从这条公式推出来。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：直角三角形；知道 3D 点可以写成 (x, y, z) 三个数。别的都从头讲，不要求记得第 25、26 课。<br />
+      <strong>这一课讲的</strong>：世界坐标和相机坐标；深度；视场角和 tan；可见高度；1 个像素等于多少世界长度；点落在哪个像素的公式；横向为什么也用 h ÷ H；HW2 的相机低着头时，深度怎样算。<br />
+      <strong>页面会用到</strong>：项目的 PerspectiveCamera（10 月 13 日打包的工作区版本），只做 CPU 计算，不用显卡。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">要回答的问题</a></li>
+        <li><a href="#s2">两套坐标：世界坐标和相机坐标</a></li>
+        <li><a href="#s3">深度 D</a></li>
+        <li><a href="#s4">视场角和 tan：深度 D 处能看到多高</a></li>
+        <li><a href="#s5">换成像素</a></li>
+        <li><a href="#s6">横向为什么也用 h ÷ H</a></li>
+        <li><a href="#s7">回到 HW2：相机低着头时，深度怎样算</a></li>
+        <li><a href="#s8">近大远小</a></li>
+        <li><a href="#s9">检查题</a></li>
+        <li><a href="#s10">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 要回答的问题</h2>
+    <p>HW2 的相机放在 (0, 20, 50)，看着 Mary 胸口的 (0, 10, 0)。画布宽 900 像素、高 600 像素，垂直视场角 45°。</p>
+    <ul>
+      <li>速查：<a href="../reference/camera-controls-math.html">相机控制的数学</a>（第 32–35 课的公式和数字都在这一页）。</li>
+      <li>(0, 10, 0) 画在画布正中，第 450 列、第 300 行。这是相机「看着它」的意思。</li>
+      <li>问题：它右边 5 个单位的点 (5, 10, 0)，画在第几列？</li>
+    </ul>
+    <p>答案是第 521.02 列。这一课结束时，你能用笔算出这个数，并知道每一步为什么这样算。</p>
+
+    <h2 id="s2">2. 两套坐标：世界坐标和相机坐标</h2>
+    <p>同一个点，可以用两套不同的坐标来描述。</p>
+    <ul>
+      <li><strong>世界坐标 (world space)</strong>：整个场景共用的一套坐标。地面是 y = 0，Mary 站在原点附近。「相机在 (0, 20, 50)」「目标在 (0, 10, 0)」，说的都是世界坐标。它不随相机移动。</li>
+      <li><strong>相机坐标 (camera space，也叫 view space)</strong>：以相机自己为原点的坐标。规定：
+        <ul>
+          <li>x 轴指向画面的<strong>右边</strong>；</li>
+          <li>y 轴指向画面的<strong>上边</strong>；</li>
+          <li>相机看向 <strong>−z</strong> 方向，也就是说，相机正前方的点，z 是负数。</li>
+        </ul>
+        一个点的相机坐标 (x, y, z) 回答的是：从相机看过去，这个点在右边多少、上边多少、前面多远。相机一动，所有点的相机坐标都跟着变。
+      </li>
+    </ul>
+    <p>画面上的位置只取决于<strong>相机坐标</strong>：一个点在相机看来偏右多少、偏上多少，画面上就偏右多少、偏上多少。所以第一步，总是先把世界坐标换成相机坐标。</p>
+    <p>为了先把公式推出来，第 3–6 节用最简单的相机：<strong>放在世界原点、不旋转</strong>。这时两套坐标完全一样，世界坐标拿来就能用。第 7 节再回到 HW2 那台不在原点、还低着头的相机。</p>
+
+    <h2 id="s3">3. 深度 D</h2>
+    <p><strong>深度 (depth)</strong> 是一个点在相机<strong>正前方</strong>多远，记作 D。相机看向 −z，所以 D = −z（相机坐标里的 z）。</p>
+    <ul>
+      <li>点 (0, 0, −50)：在相机正前方 50 个单位，D = 50。</li>
+      <li>点 (5, 3, −50)：偏右 5、偏上 3，可正前方的距离还是 50，D = 50。</li>
+      <li>点 (0, 0, 10)：在相机背后，D = −10，画不出来。</li>
+    </ul>
+    <p>要注意，深度不是「点到相机的直线距离」。点 (5, 3, −50) 到相机的直线距离是 √(5² + 3² + 50²) = 50.34，深度是 50。只有在视线正中间的点，两者才相等。下面所有公式用的都是深度。</p>
+
+    <h2 id="s4">4. 视场角和 tan：深度 D 处能看到多高</h2>
+    <p>相机能看到的范围是一个向前张开的「锥」。从侧面看（下面的图），它是两条从相机出发的斜线，上下各张开一半的角度。上下两条线的夹角就是<strong>垂直视场角 fovY (field of view)</strong>。HW2 用 45°，所以视线上下各张开 22.5°。</p>
+    <p>在深度 D 处竖一块垂直于视线的板：板上能被看到的部分，就是这一深度处画面能装下的全部高度。它有多高？看视线以上那一半，是一个直角三角形：</p>
+    <ul>
+      <li>直角在视线和板的交点；</li>
+      <li>沿着视线那条边（邻边）长 D；</li>
+      <li>板上那条边（对边）就是要求的「半高」；</li>
+      <li>相机那个角是 fovY / 2。</li>
+    </ul>
+    <p>tan 的定义就是「对边 ÷ 邻边」：tan(fovY/2) = 半高 ÷ D。所以：</p>
+<pre>半高 = D × tan(fovY/2)
+可见高度 h(D) = 2 × D × tan(fovY/2)</pre>
+    <p>代入 HW2 的数：tan(22.5°) = 0.41421，意思是沿视线每往前走 1 个单位，上边界就升高 0.41421 个单位。D = 50.99 时，半高 = 50.99 × 0.41421 = 21.12，可见高度 h = 42.24。也就是说，在目标那么远的地方，画面从上到下能装下 42.24 个世界单位。</p>
+
+    <h2 id="s5">5. 换成像素</h2>
+    <p>画布有 H = 600 行像素。在深度 D 处，这 600 行正好铺满可见高度 h(D)，所以：</p>
+<pre>深度 D 处：1 个像素 = h(D) ÷ H 个世界单位</pre>
+    <p>D = 50.99 时，1 个像素 = 42.24 ÷ 600 = 0.0704 个世界单位。反过来说，1 个世界单位 = 600 ÷ 42.24 = 14.20 个像素。</p>
+    <p>现在算点画在哪一行。点在视线上方 y 个单位，换成像素就是 y ÷ (h/H) 个像素。画面中心是第 300 行；屏幕的行号<strong>向下</strong>增大，所以向上 y 要用减号。列也一样，中心是第 450 列，列号向右增大，用加号：</p>
+<pre>px = W/2 + x × H / h(D)        （第几列）
+py = H/2 − y × H / h(D)        （第几行）
+其中 h(D) = 2 × D × tan(fovY/2)          ★</pre>
+    <p>第 1 节的问题：x = 5，D = 50.99，px = 450 + 5 × 600 ÷ 42.24 = 450 + 71.02 = 521.02。</p>
+    <p>下面拖三个滑块验证：读数先一步一步代入公式，最后一行用项目的 PerspectiveCamera 投影矩阵再算一遍（相机放在原点、不旋转，正是这一节假设的相机）。两个 py 应该一样。可以试试：</p>
+    <ul>
+      <li>把 y 拖到 21.12 附近，P 正好在上边界，py 接近 0。</li>
+      <li>把 D 拖小，P 不动，py 往上跑；拖大，py 往中心靠。</li>
+      <li>把 fovY 拖大，同一个 P 离中心更近：视场角大，同一个高度占的像素少。</li>
+    </ul>
+    <div id="side"></div>
+
+    <h2 id="s6">6. 横向为什么也用 h ÷ H</h2>
+    <p>★ 的第一行，横向的 px 也是 x × H / h(D)，分母里是高度 h、画布高 H，没有宽度 W。这是你问过的问题。原因是：横纵两个方向「1 个像素等于多少世界单位」，算出来完全相等。</p>
+    <ol>
+      <li>项目把相机的宽高比 aspect 设成画布的宽高比：aspect = W ÷ H = 900 ÷ 600 = 1.5（<a data-src="src/rendering/scene/cameras/PerspectiveCamera.ts:11">PerspectiveCamera 的 aspect 参数</a>；画布大小一变，Engine 就用 drawing buffer 的宽 ÷ 高重设它，<a data-src="src/engine.ts:431">engine.ts:431–435</a>）。</li>
+      <li>投影矩阵规定：可见宽度 w = aspect × 可见高度 h。D = 50.99 时，w = 1.5 × 42.24 = 63.36。</li>
+      <li>这 63.36 个单位铺满 W = 900 列：横向 1 个像素 = 63.36 ÷ 900 = 0.0704 个单位。</li>
+      <li>纵向 1 个像素 = 42.24 ÷ 600 = 0.0704 个单位。两个数相同。</li>
+    </ol>
+    <p>用字母写：w ÷ W = (W/H × h) ÷ W = h ÷ H，W 被约掉了。在几何上，这就是「像素是正方形的」：一个像素横着、竖着代表同样长的世界距离。所以横向用 h/H 不是写错，它和 w/W 本来就是同一个数。三维软件通常只用高度来换算，three.js 的 OrbitControls 也写了注释：只用 clientHeight，宽高比就不会让速度变形（本地文件 OrbitControls.js:908）。</p>
+    <p>只有一种情况两者不同：相机的 aspect 和画布的 W/H 不一样，画面被横向拉伸或压扁了（比如画布变宽了，却忘了更新相机）。这时像素不再是正方形，横向就要改用 w/W。</p>
+
+    <h2 id="s7">7. 回到 HW2：相机低着头时，深度怎样算</h2>
+    <p>HW2 的相机不在原点，还低着头（从 (0, 20, 50) 看向 (0, 10, 0)，向下 11.3°）。这时世界坐标不能直接代进 ★，要先换成相机坐标。下面这张侧视图，从世界的 +x 方向看过去：横轴是世界 z，竖轴是世界 y。</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 640 290" role="img" aria-label="侧视图。相机在世界 (0,20,50)，视线斜向下穿过目标 (0,10,0)，继续延伸到远点 (0,0,-50)。近点 (0,20,30) 在视线上方，从它向视线作垂线，垂足离相机 19.61。目标的世界 z 是 0，可它沿视线离相机 50.99。">
+          <defs>
+            <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+          </defs>
+          <line x1="610" y1="230" x2="34" y2="230" class="line" marker-end="url(#f1a)" />
+          <text x="40" y="220" class="small">世界 +z</text>
+          <line x1="330" y1="262" x2="330" y2="40" class="line" marker-end="url(#f1a)" />
+          <text x="338" y="48" class="small">世界 +y</text>
+          <text x="300" y="250" class="small">z = 0</text>
+          <text x="84" y="250" class="small">z = 50</text>
+          <text x="530" y="250" class="small">z = −50</text>
+          <line x1="105" y1="140" x2="600" y2="239" class="line accent" />
+          <text x="120" y="206" class="small accent">视线 = 相机的 −z 方向</text>
+          <circle cx="105" cy="140" r="6" fill="currentColor" />
+          <text x="40" y="122" class="title">相机 (0, 20, 50)</text>
+          <circle cx="330" cy="185" r="5" fill="#b23a2f" />
+          <text x="342" y="172" class="small">目标 (0, 10, 0)：D = 50.99</text>
+          <circle cx="195" cy="140" r="5" fill="#b23a2f" />
+          <text x="200" y="122" class="small">近点 (0, 20, 30)</text>
+          <line x1="195" y1="140" x2="191.5" y2="157.3" class="line dash" />
+          <text x="150" y="180" class="small">垂足：D = 19.61</text>
+          <circle cx="555" cy="230" r="5" fill="#b23a2f" />
+          <text x="420" y="274" class="small">远点 (0, 0, −50)：D = 101.98</text>
+        </svg>
+      </div>
+      <figcaption>图 1　深度是沿着视线量的。目标的世界 z 是 0，可它沿视线离相机 50.99；近点不在视线上，从它向视线作垂线，垂足离相机 19.61，这就是它的深度。</figcaption>
+    </figure>
+    <p>这张图回答了「目标点 z = 0，哪来的深度」：z = 0 是<strong>世界坐标</strong>，说的是它在世界的哪里；深度是<strong>相机坐标</strong>里的量，说的是它在相机正前方多远。两者是不同坐标系里的数，没有理由相等。</p>
+    <p>深度怎样算？先求视线方向的<strong>单位向量</strong>（长度为 1 的方向）f：</p>
+<pre>目标 − 相机 = (0, 10, 0) − (0, 20, 50) = (0, −10, −50)
+长度 = √(0² + 10² + 50²) = √2600 = 50.99
+f = (0, −10, −50) ÷ 50.99 = (0, −0.1961, −0.9806)</pre>
+    <p>一个点 P 的深度，就是从相机到 P 的向量在 f 方向上「走了多远」，用点积 (dot product) 算：两个向量对应分量相乘再相加。</p>
+<pre>D = (P − 相机) · f
+
+近点 (0, 20, 30)：P − 相机 = (0, 0, −20)
+D = 0 × 0 + 0 × (−0.1961) + (−20) × (−0.9806) = 19.61
+
+远点 (0, 0, −50)：P − 相机 = (0, −20, −100)
+D = 0 + (−20) × (−0.1961) + (−100) × (−0.9806) = 3.92 + 98.06 = 101.98</pre>
+    <p>这就是我上一轮说的「近点」「远点」：<strong>近</strong>指深度小（在相机和目标之间），<strong>远</strong>指深度大（在目标后面）。近点到相机的直线距离是 20，深度是 19.61，又一次说明这两者不是一回事。</p>
+    <p>同样的道理，x、y 也要沿着相机自己的右方向、上方向量（同样是点积）。项目里不用一个个点积去算：相机的 world 矩阵求逆就是 view 矩阵（第 25 课），乘一次就把世界坐标换成了相机坐标。下面的卡片用项目的相机矩阵算四个点，再拿相机坐标代进 ★：</p>
+    <div id="lab-depth"></div>
+
+    <h2 id="s8">8. 近大远小</h2>
+    <p>把 ★ 换个角度读：同样 5 个世界单位长的东西，在屏幕上占 5 × H / h(D) 个像素。h(D) 和 D 成正比，所以<strong>占的像素和 D 成反比</strong>：</p>
+<pre>D = 19.61（近点那么远）：5 × 600 ÷ 16.25 = 184.65 px
+D = 50.99（目标那么远）：5 × 600 ÷ 42.24 =  71.02 px
+D = 101.98（远点那么远）：5 × 600 ÷ 84.48 =  35.51 px</pre>
+    <p>深度翻倍（50.99 → 101.98），像素减半（71.02 → 35.51）。这就是透视的「近大远小」。下一课的平移，就是这个「反比」造成的：同样挪动相机，近处的东西在屏幕上挪得多，远处的挪得少。</p>
+
+    <h2 id="s9">9. 检查题</h2>
+    <p>先别往回翻，凭记忆做。答错了，回到对应那一节，拖一下滑块再想。</p>
+    <div class="quiz" data-quiz="lesson-0032"></div>
+
+    <h2 id="s10">10. 延伸阅读</h2>
+    <ul>
+      <li>首选：<a href="https://www.scratchapixel.com/lessons/3d-basic-rendering/computing-pixel-coordinates-of-3d-point/mathematics-computing-2d-coordinates-of-3d-points.html">Scratchapixel：Mathematics of Computing the 2D Coordinates of a 3D Point</a>。用相似三角形讲「为什么要除以深度」，图很多。它把画面放在离相机 1 个单位的地方，没有讲视场角，正好和这一课的第 4 节互补。</li>
+      <li><a href="https://learnopengl.com/Getting-started/Coordinate-Systems">LearnOpenGL：Coordinate Systems</a>：世界坐标、相机坐标（view space）、投影这几步的全貌。</li>
+      <li>本课程第 25 课（相机的数学）：view 矩阵和投影矩阵每一项的来历。这一课只用到它们的结果。</li>
+    </ul>
+
+    <aside class="note">
+      哪一步推不下去，直接在对话里问我，说清楚是第几节的哪一句。做完告诉我检查题错了哪几题，然后进下一课。
+    </aside>
+
+    <div class="nav">
+      <a href="0028-lifecycle-edge-cases.html">← 第 28 课：生命周期的边角情况</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0033-pan-from-the-formula.html">第 33 课：平移 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 32 课 · 2026-10-15</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+        const R = window.RTeachCamera
+        const num = RTeach.viewLab.num
+
+        RTeach.viewLab.sideView(document.getElementById('side'))
+
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-depth'),
+          storageKey: 'lesson-0032-depth',
+          cards: [
+            {
+              title: 'HW2 的相机：四个点的相机坐标和像素',
+              tags: ['项目代码（PerspectiveCamera）', '只用 CPU'],
+              desc: '相机在 (0, 20, 50)、低头看 (0, 10, 0)，画布 900 × 600。用相机的 world 矩阵求逆得到 view 矩阵，把四个世界点换成相机坐标；深度 D = −z。再把相机坐标的 x、y、D 代进 ★，和投影矩阵直接算出的像素比较。',
+              note: '课程写的部分：调用顺序和输出格式。相机（PerspectiveCamera、Transform）和矩阵运算（gl-matrix）都是项目里用的那一份。',
+              question: '目标点 (0, 10, 0) 的世界 z 是 0。它的深度 D 是多少？',
+              choices: ['50.99：沿视线离相机这么远', '0：深度就是世界坐标的 z', '10：深度就是世界坐标的 y'],
+              answer: 0,
+              explain:
+                '深度是相机坐标里的量（相机正前方多远），世界 z 是世界坐标里的量，两者没有理由相等。目标在视线正中，相机坐标是 (0, 0, −50.99)，深度 50.99；近点的相机坐标是 (0, 3.92, −19.61)，所以它在画面中心上方（第 155 行），深度 19.61；远点也在视线上，深度 101.98。四个点代进 ★ 的结果和投影矩阵算出的完全一样。',
+              run: () => {
+                const camera = RTeach.orbitLab.hw2Camera(1.5)
+                const world = R.mat4.create()
+                camera.copyWorldMatrixTo(world)
+                const view = R.mat4.invert(R.mat4.create(), world)
+                const projection = R.mat4.create()
+                camera.copyProjectionMatrixTo(projection)
+                const t = Math.tan(camera.fovY / 2)
+                const lines = []
+                for (const [name, p] of [['目标点', [0, 10, 0]], ['近点', [0, 20, 30]], ['远点', [0, 0, -50]], ['目标右边 5', [5, 10, 0]]]) {
+                  const v = R.vec4.transformMat4(R.vec4.create(), R.vec4.fromValues(p[0], p[1], p[2], 1), view)
+                  const D = -v[2]
+                  const h = 2 * D * t
+                  const px = 450 + (v[0] * 600) / h
+                  const py = 300 - (v[1] * 600) / h
+                  const clip = R.vec4.transformMat4(R.vec4.create(), v, projection)
+                  const mx = ((clip[0] / clip[3] + 1) / 2) * 900
+                  const my = ((1 - clip[1] / clip[3]) / 2) * 600
+                  lines.push({ t: name, text: '世界 (' + p.join(', ') + ') → 相机坐标 (' + [v[0], v[1], v[2]].map((x) => num(x, 4)).join(', ') + ')，深度 D = ' + num(D, 4), kind: 'server' })
+                  lines.push({ t: '', text: '★：px = 450 + ' + num(v[0], 4) + ' × 600 ÷ ' + num(h, 4) + ' = ' + num(px, 2) + '，py = 300 − ' + num(v[1], 4) + ' × 600 ÷ ' + num(h, 4) + ' = ' + num(py, 2) })
+                  lines.push({ t: '', text: '投影矩阵：(' + num(mx, 2) + ', ' + num(my, 2) + ')', kind: 'result' })
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0032"]'), [
+          {
+            q: '「深度 D」指的是什么？',
+            opts: ['点在相机正前方的距离', '点在世界坐标里的 z 值', '点到相机的直线距离'],
+            answer: 0,
+            why: '第 3 节：D 是相机坐标里的 −z。它不等于世界 z（第 7 节：目标世界 z = 0，深度 50.99），也不等于直线距离（近点直线距离 20，深度 19.61）。'
+          },
+          {
+            q: '垂直视场角 45°，深度 D = 10。这一深度处的可见高度是多少？',
+            opts: ['约 8.28 个世界单位', '约 4.14 个世界单位', '约 45.0 个世界单位'],
+            answer: 0,
+            why: 'h = 2 × D × tan(22.5°) = 2 × 10 × 0.41421 = 8.28。4.14 是半高，忘了乘 2。'
+          },
+          {
+            q: '画布高 600 像素，某深度处可见高度是 60。1 个像素等于多少世界单位？',
+            opts: ['0.1 个世界单位', '10 个世界单位', '0.6 个世界单位'],
+            answer: 0,
+            why: '600 个像素铺满 60 个单位：60 ÷ 600 = 0.1。反过来，1 个单位 = 10 个像素。'
+          },
+          {
+            q: '横向换算为什么也可以用 h ÷ H，而不用 w ÷ W？',
+            opts: ['aspect 等于 W÷H，两者相等', '横向移动本来就比较慢', 'W 比 H 大，算出来更稳'],
+            answer: 0,
+            why: '第 6 节：w = (W/H) × h，所以 w ÷ W = h ÷ H，像素是正方形的。只有 aspect 和画布宽高比不一致、画面被拉伸时，两者才不同。'
+          },
+          {
+            q: '一根 2 个单位长、垂直于视线的棒，深度从 20 变成 40。它在屏幕上占的像素会怎样？',
+            opts: ['变成原来的一半', '变成原来的两倍', '保持不变'],
+            answer: 0,
+            why: '第 8 节：占的像素 = 长度 × H ÷ h(D)，h(D) 和 D 成正比，所以像素和 D 成反比。深度翻倍，像素减半。'
+          },
+          {
+            q: '算一个点画在哪个像素，第一步要做什么？',
+            opts: ['把世界坐标换成相机坐标', '把世界坐标直接除以深度', '先算点到原点的直线距离'],
+            answer: 0,
+            why: '第 2、7 节：画面位置只取决于相机看到的偏右、偏上、前方多远。相机不在原点或者转过时，要先用 view 矩阵（或者对三根轴做点积）换成相机坐标，才能代进 ★。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

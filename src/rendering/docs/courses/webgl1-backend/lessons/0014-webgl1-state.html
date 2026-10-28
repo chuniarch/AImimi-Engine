@@ -1,0 +1,1402 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 14 课 · WebGL1State</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/state-lab.js"></script>
+    <script src="../assets/state-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 详细篇 8 · backend ② · 约 40 分钟</p>
+    <h1>backend ②：什么时候可以不发 GL 命令</h1>
+    <p class="lede">
+      GL 是状态机：useProgram、bindBuffer、enable 设下去的值会一直留着，直到下一次改它。连着画几个用同一个材质的物体，同样的命令就会一遍遍重发。WebGL1State 记住上一次设的值，相同就不发。这一课从「画三次同一个模型」出发，一版一版写出这个缓存，看清它在什么时候会骗人；再看同一个类里为什么偏偏不缓存输出目标，每次都去问 GL，以及这样做每帧要问多少次。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 每次 draw，Backend 都经过 State 设 program、深度和剔除（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:214">WebGL1Backend.ts:214</a>、<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:308">:308–329</a>）；每进入一次 surface scope，都经过 State 记下、切换、恢复输出目标（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:208">WebGL1SurfaceScope.ts:208、218、306</a>）；每个 Manager 绕过 State 改了 GL 以后，都通过钩子让 State 作废（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:264">WebGL1Backend.ts:264–266</a>）。FFT 迁移计划的「决定 4」问的就是这一课第 3 节的事。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：GL 是状态机，useProgram、bindBuffer、enable 的作用（第 1 课）；「缓存什么时候过期」（第 4 课第 5 节）；surface scope 的骨架：先记下、再切换、finally 里恢复（第 6 课卡片 D）；Backend.draw 的顺序和卡片 H（第 19 课）；context 丢失（第 13 课）。VAO 在第 1 课出现过，这一课只用到一条事实：每个 VAO 各自记着一份索引 buffer（EBO）绑定，卡片会在你的浏览器里验证。<br />
+      <strong>这一课从零讲的</strong>：缓存里 undefined 和 null 为什么不能混用；invalidate 为什么只「忘记」、不「重置」；切换 VAO 以后为什么只作废 EBO；深度状态为什么信缓存、输出目标为什么每次查询，以及每帧要查多少次。<br />
+      <strong>页面会用到你的显卡</strong>：标着「真实 WebGL」的三张卡片和第 3.4 节的计时实验，会在你的浏览器里创建 WebGL context，用完释放。其余卡片用一个会记账的假 GL：它不画像素，只记下每一条命令、每一次查询，并跟踪 GL 里真实的绑定。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">需求</a>：<a href="#s1-1">一次 draw 发哪些命令</a> <a href="#s1-2">要应付的情况</a></li>
+        <li><a href="#s2">一版一版写</a>：<a href="#s2-1">第 0 版</a> <a href="#s2-2">第 1 版</a> <a href="#s2-3">第 2 版</a> <a href="#s2-4">第 3 版</a> <a href="#s2-5">真实代码</a> <a href="#s2-6">和 Lifecycle 的关系</a></li>
+        <li><a href="#s3">信缓存，还是每次问 GL</a>：<a href="#s3-1">深度</a> <a href="#s3-2">输出目标</a> <a href="#s3-3">每帧问几次</a> <a href="#s3-4">一次要多久</a> <a href="#s3-5">两种改法</a></li>
+        <li><a href="#s4">架构视角：对照 three.js</a></li>
+        <li><a href="#s5">审查视角</a></li>
+        <li><a href="#s6">检查题</a></li>
+        <li><a href="#s7">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 需求</h2>
+
+    <h3 id="s1-1">1.1 先看原始输入：一次 draw 之前发哪些状态命令</h3>
+    <p>这是 Backend.draw 里设状态的几行，和它调用的 applyDrawState：</p>
+    <pre><code>// WebGL1Backend.ts:214–217、:308–329（节选，注释是课程加的）
+generation.state.useProgram(program.program)      // 经过 State：可以去重
+this.applyDrawState(material, generation.state)   // 见下面
+generation.uniforms.upload(commands)
+// 顶点输入：自己绑 VAO 和 buffer，不经过 State
+generation.resources.vertexInputs.bind(geometry, buffers, program)
+
+private applyDrawState(material: Material, state: WebGL1State): void {
+  const gl = this.gl
+  // 还不支持的功能：每次 draw 都无条件关掉，不经过 State（6 条命令）
+  for (const capability of [gl.BLEND, gl.STENCIL_TEST, gl.SCISSOR_TEST,
+    gl.POLYGON_OFFSET_FILL, gl.SAMPLE_ALPHA_TO_COVERAGE, gl.SAMPLE_COVERAGE]) {
+    gl.disable(capability)
+  }
+  gl.colorMask(true, true, true, true) // 这 4 条也是每次都发
+  gl.depthRange(0, 1)
+  gl.frontFace(gl.CCW)
+  gl.lineWidth(1)
+
+  // 经过 State：深度测试、深度写入、深度比较，最多 3 条；剔除，最多 2 条
+  state.setDepthState(material.state)
+  state.setCullMode(material.state.cullMode)
+}</code></pre>
+    <p>
+      HW2 每帧画两样东西。先画背景立方体：深度测试开、深度写入关、比较函数 less-equal、剔除正面（<a data-src="src/scenes/games202/hw2/createHW2Scene.ts:357">createHW2Scene.ts:357–362</a>）。再画 Mary：用 Material 的默认值，深度测试开、深度写入开、less-equal、剔除背面（<a data-src="src/rendering/resources/Material.ts:116">Material.ts:116–139</a>）。经过 State 的那部分，每次 draw 最多 1 + 3 + 2 = 6 条命令。State 要做的，就是把其中和上一次相同的省掉。
+    </p>
+    <p>为了先看清楚缓存本身，第 2 节的前几版只管四样东西：program、顶点 buffer、索引 buffer、深度测试开关。深度的另外两项和剔除，到 2.5 节的真实代码里再补全，做法完全一样。</p>
+
+    <h3 id="s1-2">1.2 需求：要应付哪些情况</h3>
+    <ol class="steps">
+      <li><strong>重复的值不发。</strong>同一个模型画三次（比如场景里三棵一样的树），每次 draw 前都要设 program P、顶点 buffer B、索引 buffer I、打开深度测试。第二、三次和第一次完全一样，不该再发。</li>
+      <li><strong>一开始什么都不知道。</strong>State 刚建好时，GL 里绑着什么，它并不知道。同一个 canvas 上的旧渲染器可能刚画完，留下了它的 program：对同一个 canvas 再调一次 getContext，拿到的就是同一个 context（第 19 课卡片 E）。所以每样东西第一次都必须发。</li>
+      <li><strong>null 也是要发的值。</strong><code>useProgram(null)</code> 是「解绑」，删除 program 之前常常要先这样做。它不能被当成「已经是这样了」跳过。</li>
+      <li><strong>有人绕过 State 改了 GL，要能作废。</strong>上传模型、创建离屏目标的代码会直接调用 bindBuffer、bindFramebuffer。改完以后，State 记的就不对了。</li>
+      <li><strong>切换 VAO 会顺带换掉索引绑定。</strong>只作废受影响的那一项，program 和深度照常去重。</li>
+      <li><strong>context 丢了，就不再发命令。</strong>丢失期间发的命令，浏览器会默默丢掉。</li>
+      <li><strong>临时换输出目标，结束后换回来。</strong>进入一段离屏绘制前记下当前的 framebuffer 和 viewport，结束时（正常结束或抛错）恢复；嵌套时，每一层恢复到自己的入口（第 6 课卡片 D）。</li>
+    </ol>
+
+    <h2 id="s2">2. 一版一版写</h2>
+
+    <h3 id="s2-1">2.1 第 0 版：不缓存</h3>
+    <pre><code>// 第 0 版：不缓存。每次调用都原样发给 GL
+class StateV0 {
+  constructor(private readonly gl: WebGLRenderingContext) {}
+
+  useProgram(program: WebGLProgram | null): void {
+    this.gl.useProgram(program) // 不管 GL 里是不是已经是它，照发
+  }
+
+  bindArrayBuffer(buffer: WebGLBuffer | null): void {
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, buffer) // 顶点数据从哪个 buffer 读
+  }
+
+  bindElementArrayBuffer(buffer: WebGLBuffer | null): void {
+    this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER, buffer) // 索引从哪个 buffer 读
+  }
+
+  setDepthTest(enabled: boolean): void {
+    if (enabled) this.gl.enable(this.gl.DEPTH_TEST)
+    else this.gl.disable(this.gl.DEPTH_TEST)
+  }
+}</code></pre>
+    <div id="lab-v0"></div>
+
+    <h3 id="s2-2">2.2 第 1 版：记住上一次的值，初值用 null</h3>
+    <p>最直接的想法：每样东西记一个字段，设之前先比较，相同就 return。字段总得有个初值，最顺手的是 null，意思是「什么也没绑」。three.js 就是这样写的（第 4 节）。</p>
+    <pre><code>// 第 1 版：记住上一次设的值，相同就不发。初值用 null
+class StateV1 {
+  private programValue: WebGLProgram | null = null // 初值 null：当作「现在什么也没绑」
+  private arrayBufferValue: WebGLBuffer | null = null
+  private elementArrayBufferValue: WebGLBuffer | null = null
+  // 深度测试只会是 true / false，null 表示还没设过
+  private depthTestValue: boolean | null = null
+
+  constructor(private readonly gl: WebGLRenderingContext) {}
+
+  useProgram(program: WebGLProgram | null): void {
+    if (this.programValue === program) return // 和记住的一样：认为 GL 里已经是它，不发
+    this.gl.useProgram(program)
+    this.programValue = program // 发完再记，记的就是 GL 里现在的值
+  }
+
+  bindArrayBuffer(buffer: WebGLBuffer | null): void {
+    if (this.arrayBufferValue === buffer) return
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, buffer)
+    this.arrayBufferValue = buffer
+  }
+
+  bindElementArrayBuffer(buffer: WebGLBuffer | null): void {
+    if (this.elementArrayBufferValue === buffer) return
+    this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER, buffer)
+    this.elementArrayBufferValue = buffer
+  }
+
+  setDepthTest(enabled: boolean): void {
+    if (this.depthTestValue === enabled) return
+    if (enabled) this.gl.enable(this.gl.DEPTH_TEST)
+    else this.gl.disable(this.gl.DEPTH_TEST)
+    this.depthTestValue = enabled
+  }
+}</code></pre>
+    <div id="lab-v1"></div>
+    <p>
+      问题出在初值。null 在这里身兼两职：既表示「我还不知道」，又是 useProgram 的一个合法参数「解绑」。两件事撞在一起，第一次 <code>useProgram(null)</code> 就被跳过了。下面这张卡片在你的浏览器里看看跳过的后果。
+    </p>
+    <div id="lab-v1-real"></div>
+
+    <h3 id="s2-3">2.3 第 2 版：初值改成 undefined，并加上 invalidate</h3>
+    <p>
+      第一处改动：「不知道」换一个 null 以外的值来表示。字段不写初值就是 undefined，它不等于任何 program，也不等于 null，所以每样东西第一次一定会发。这就是真实代码类注释里那句「undefined 表示缓存未知，null 表示已知没有绑定对象」（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:24">WebGL1State.ts:24–25</a>），测试的第一条守的就是它（<a data-src="tests/unit/rendering/backend/webgl1/WebGL1State.test.ts:25">WebGL1State.test.ts:25–41</a>）。
+    </p>
+    <p>第二处改动是为了第 4 条需求。先看没有它会怎样，再看加上以后：</p>
+    <pre><code>// 第 2 版：初值改成 undefined（「不知道」），并加上 invalidate
+class StateV2 {
+  // 不写初值，就是 undefined：「不知道 GL 里现在是什么」
+  // null 留给「确实没绑」：useProgram(null) 是一条真实的解绑命令，不能和「不知道」混用
+  private programValue: WebGLProgram | null | undefined
+  private arrayBufferValue: WebGLBuffer | null | undefined
+  private elementArrayBufferValue: WebGLBuffer | null | undefined
+  private depthTestValue: boolean | undefined
+
+  constructor(private readonly gl: WebGLRenderingContext) {}
+
+  useProgram(program: WebGLProgram | null): void {
+    // undefined 不等于任何 program，也不等于 null：第一次一定发
+    if (this.programValue === program) return
+    this.gl.useProgram(program)
+    this.programValue = program
+  }
+
+  bindArrayBuffer(buffer: WebGLBuffer | null): void {
+    if (this.arrayBufferValue === buffer) return
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, buffer)
+    this.arrayBufferValue = buffer
+  }
+
+  bindElementArrayBuffer(buffer: WebGLBuffer | null): void {
+    if (this.elementArrayBufferValue === buffer) return
+    this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER, buffer)
+    this.elementArrayBufferValue = buffer
+  }
+
+  setDepthTest(enabled: boolean): void {
+    if (this.depthTestValue === enabled) return
+    if (enabled) this.gl.enable(this.gl.DEPTH_TEST)
+    else this.gl.disable(this.gl.DEPTH_TEST)
+    this.depthTestValue = enabled
+  }
+
+  /**
+   * 有人绕过我直接改了 GL（比如上传新 buffer 时直接 bindBuffer）：把记住的全部忘掉。
+   * 只改 JS 里的记录，不发任何 GL 命令；下次设置时，不管值是什么都重新发。
+   */
+  invalidate(): void {
+    this.programValue = undefined
+    this.arrayBufferValue = undefined
+    this.elementArrayBufferValue = undefined
+    this.depthTestValue = undefined
+  }
+}</code></pre>
+    <div id="lab-v2"></div>
+    <p>
+      invalidate 只做一件事：把记住的值全部改回「不知道」。它<strong>不发任何 GL 命令</strong>，也不把 GL 改回什么默认值；GL 里现在是什么，就还是什么。下一次设置时，因为「不知道」不等于任何值，命令照常发出，缓存和 GL 重新对上。真实代码的注释管这叫「遗忘全部已缓存状态，但不把 GPU 重置成任何默认值」（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:265">WebGL1State.ts:265–280</a>）。第 4 节会和 three.js 的 reset 对比：那边是发 31 条命令，把 GL 改成一组已知的默认值。
+    </p>
+
+    <h3 id="s2-4">2.4 第 3 版：切换 VAO 以后，只作废 EBO</h3>
+    <p>先在你的浏览器里确认一条事实：哪些绑定跟着 VAO 走，哪些不跟。</p>
+    <div id="lab-vao-real"></div>
+    <p>
+      <a href="https://registry.khronos.org/OpenGL/extensions/OES/OES_vertex_array_object.txt">OES_vertex_array_object 规范</a>把 ELEMENT_ARRAY_BUFFER_BINDING 列为 VAO 状态的一部分，并特意写明 ARRAY_BUFFER_BINDING 除外（顶点数据来自哪个 buffer，是在 vertexAttribPointer 那一刻记进 VAO 的）。所以切换 VAO 以后，State 记的 EBO 就不可信了，其余几项照样可信。第 2 版只有「全部忘掉」一种失效，用在这里太粗了：program 和深度也会跟着重发。第 3 版加一个只管 EBO 的失效：
+    </p>
+    <pre><code>// 第 3 版：第 2 版的类原样保留，只多一个方法
+class StateV3 {
+  // ……第 2 版的四个字段、四个设置方法、invalidate，一行不改……
+
+  /**
+   * EBO（ELEMENT_ARRAY_BUFFER）的绑定存在 VAO 里，每个 VAO 各有一份。
+   * 切到另一个 VAO，GL 里的 EBO 就变成那个 VAO 自己的，我记住的那个已经不对了。
+   * program、ARRAY_BUFFER、深度测试都不属于 VAO，切换 VAO 不影响它们，用不着全部忘掉。
+   */
+  invalidateVertexInputState(): void {
+    this.elementArrayBufferValue = undefined
+  }
+}</code></pre>
+    <div id="lab-v3"></div>
+
+    <h3 id="s2-5">2.5 真实代码：比第 3 版多了什么</h3>
+    <p>
+      第 3 版已经满足了前五条需求。真实代码再做三件事：每个设置方法先检查 context 有没有丢（第 6 条）；深度拆成测试、写入、比较三项分别缓存，再加上剔除；另外三个方法管输出目标（第 7 条，放到第 3 节）。每一代 Manager 配一个新的 State（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:259">WebGL1Backend.ts:259–267</a>），所以恢复以后，旧缓存不会混进新的一代。
+    </p>
+    <pre><code>// 项目里的真实代码（WebGL1State.ts:30–169、:265–306，节选，注释是课程加的）
+export class WebGL1State {
+  private readonly gl: WebGLRenderingContext
+
+  // 和第 3 版一样：不写初值 = undefined = 不知道；null = 确实没绑
+  private programValue: WebGLProgram | null | undefined
+  private arrayBufferValue: WebGLBuffer | null | undefined
+  private elementArrayBufferValue: WebGLBuffer | null | undefined
+  // 第 3 版只有一个深度开关；真实代码把 Material 的 RenderState 拆成四个字段，各记各的
+  private depthTestValue: boolean | undefined
+  private depthWriteValue: boolean | undefined
+  private depthFunctionValue: DepthFunction | undefined
+  private cullModeValue: CullMode | undefined
+
+  // 构造时不去问 GL，也不发命令：一律从「不知道」开始
+  constructor(gl: WebGLRenderingContext) {
+    this.gl = gl
+  }
+
+  useProgram(program: WebGLProgram | null): void {
+    this.assertContextAvailable(&#x27;use program&#x27;) // 新增：丢了就别发（见下面）
+    if (this.programValue === program) return
+    this.gl.useProgram(program)
+    this.programValue = program
+  }
+
+  // bindArrayBuffer、bindElementArrayBuffer、invalidateVertexInputState 和第 3 版相同，略
+
+  setDepthState(state: RenderState): void {
+    this.assertContextAvailable(&#x27;set depth state&#x27;)
+    // &#x27;less-equal&#x27; → gl.LEQUAL
+    const depthFunction = this.toDepthFunction(state.depthFunction)
+
+    // 三个字段分开比较：只有变了的那一项才发命令
+    if (this.depthTestValue !== state.depthTest) {
+      if (state.depthTest) this.gl.enable(this.gl.DEPTH_TEST)
+      else this.gl.disable(this.gl.DEPTH_TEST)
+      this.depthTestValue = state.depthTest
+    }
+    if (this.depthWriteValue !== state.depthWrite) {
+      this.gl.depthMask(state.depthWrite)
+      this.depthWriteValue = state.depthWrite
+    }
+    // 缓存里存的是 &#x27;less-equal&#x27; 这样的字符串，比较的也是字符串；
+    // 只有发命令时才换成 GL 的数字
+    if (this.depthFunctionValue !== state.depthFunction) {
+      this.gl.depthFunc(depthFunction)
+      this.depthFunctionValue = state.depthFunction
+    }
+  }
+
+  setCullMode(mode: CullMode): void {
+    this.assertContextAvailable(&#x27;set cull mode&#x27;)
+    if (this.cullModeValue === mode) return
+    switch (mode) {
+      case &#x27;none&#x27;: // 不剔除：关掉 CULL_FACE 就够了
+        this.gl.disable(this.gl.CULL_FACE)
+        break
+      case &#x27;front&#x27;: // 剔除正面：打开 CULL_FACE，再指定剔除哪一面
+        this.gl.enable(this.gl.CULL_FACE)
+        this.gl.cullFace(this.gl.FRONT)
+        break
+      case &#x27;back&#x27;:
+        this.gl.enable(this.gl.CULL_FACE)
+        this.gl.cullFace(this.gl.BACK)
+        break
+      default:
+        // 以后加了新的剔除模式，这里会编译不过
+        assertNever(mode, &#x27;Unsupported WebGL1 cull mode&#x27;)
+    }
+    this.cullModeValue = mode
+  }
+
+  // 和第 2 版一样：只忘，不发命令，也不把 GL 改回任何默认值
+  invalidate(): void {
+    this.programValue = undefined
+    this.arrayBufferValue = undefined
+    this.elementArrayBufferValue = undefined
+    this.depthTestValue = undefined
+    this.depthWriteValue = undefined
+    this.depthFunctionValue = undefined
+    this.cullModeValue = undefined
+  }
+
+  // 每个设置方法第一行都调用它
+  private assertContextAvailable(operation: string): void {
+    if (this.gl.isContextLost()) {
+      this.invalidate() // GL 里的东西已经全没了，记住的值都作废
+      // 丢失期间的命令浏览器会默默丢掉，不如直接告诉调用者
+      throw new WebGLContextLostError(operation)
+    }
+  }
+}</code></pre>
+    <div id="lab-final"></div>
+    <p>
+      第二张卡片的结果和第 19 课卡片 H 是同一件事，这里换成数命令：顶点输入的 bind 每次都在 finally 里调用钩子（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:136">WebGL1OESVertexInputManager.ts:136–138</a>），而钩子接的是整份 <code>state.invalidate()</code>（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:264">WebGL1Backend.ts:264–266</a>）。2.4 节专门为切换 VAO 写的 invalidateVertexInputState，在正式代码里没有人调用（第 5 节）。
+    </p>
+
+    <h3 id="s2-6">2.6 和 Lifecycle 的关系</h3>
+    <p>
+      第 13 课第 2 节说过，context 丢了以后 Backend 要做两件事：把旧的一代作废，再建新的一代。State 在这两件事里的位置，可以归成四点：
+    </p>
+    <ol>
+      <li><strong>一代一个 State。</strong>createGeneration 每次都 <code>new WebGL1State(this.gl)</code>（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:261">WebGL1Backend.ts:261</a>）。恢复时整个换成新的，旧的不再被引用，所以 State 不需要「重置」方法。</li>
+      <li><strong>lost 事件到达：只忘，不发命令。</strong>onLost → invalidateGeneration → <code>state.invalidate()</code>（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:331">:331–336</a>）。context 已经丢了，命令发出去也会被浏览器丢掉，所以这里和 2.3 节的 invalidate 一样，只把缓存改回「不知道」。</li>
+      <li><strong>事件还在排队、context 已经丢了：先发现，再抛错。</strong>第 13 课的卡片测到，<code>loseContext()</code> 返回时 isContextLost 已经是 true，lost 事件却还没派发。这段空隙里有人调用 State，每个方法第一行的 assertContextAvailable 会先发现：作废缓存，抛出 WebGLContextLostError（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:283">WebGL1State.ts:283–288</a>）；2.5 节最后一张卡片演示过。出门恢复输出目标时也一样，只作废、不发命令（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:255">:255–259</a>）。</li>
+      <li><strong>新的一代从「全都不知道」开始。</strong>新 context 里的状态是 GL 的默认值，和旧缓存毫无关系。新 State 的七个字段全是 undefined，所以恢复后的第一次 draw，program、深度、剔除都会发一遍。这是 2.3 节选 undefined 而不选 null 的又一个好处：不用为恢复写特殊代码。</li>
+    </ol>
+    <p>下面用假 GL 和项目真实的 State 走一遍：画一次 Mary，然后浏览器收走 GPU、事件还在排队，接着 lost 事件到达，最后恢复、建第 2 代。</p>
+    <div id="lab-lifecycle"></div>
+
+    <h2 id="s3">3. 信缓存，还是每次问 GL</h2>
+
+    <h3 id="s3-1">3.1 深度：信缓存</h3>
+    <p>上面几版有一个共同前提：缓存记的值就是 GL 里的值。还有一种做法不需要这个前提：每次设置之前，先问 GL 现在是什么。</p>
+    <pre><code>// 另一种做法（课程自写，用来对比）：不信缓存，每次先问 GL 现在是什么
+class QueriedDepthState {
+  constructor(private readonly gl: WebGLRenderingContext) {}
+
+  setDepthState(state: RenderState): void {
+    const gl = this.gl
+    // 三次查询：不管值有没有变，每次调用都要问
+    const testNow = gl.isEnabled(gl.DEPTH_TEST)
+    const writeNow = gl.getParameter(gl.DEPTH_WRITEMASK) as boolean
+    const funcNow = gl.getParameter(gl.DEPTH_FUNC) as number
+
+    if (testNow !== state.depthTest) {
+      if (state.depthTest) gl.enable(gl.DEPTH_TEST)
+      else gl.disable(gl.DEPTH_TEST)
+    }
+    if (writeNow !== state.depthWrite) gl.depthMask(state.depthWrite)
+    // DEPTH_FUNC 查回来是 GL 的数字（比如 515），要先把 &#x27;less-equal&#x27; 换成数字再比
+    const wanted = toGLDepthFunction(gl, state.depthFunction)
+    if (funcNow !== wanted) gl.depthFunc(wanted)
+  }
+}</code></pre>
+    <div id="lab-depth"></div>
+    <p>
+      真实代码选了信缓存，并在 setDepthState 的注释里把账算清楚了（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:88">WebGL1State.ts:88–117</a>）：每次查询，一帧调用 1000 次就多出 3000 次查询；查询有调用成本，还可能要等 GPU 进程回话。省掉查询的代价是一条规矩：受管理的状态必须经过 State 修改；谁绕过它，谁就得调用 invalidate。所以 invalidate 不是可有可无的补丁，而是「信缓存」这个选择的另一半。
+    </p>
+
+    <h3 id="s3-2">3.2 输出目标：每次都问</h3>
+    <p>同一个类里，管输出目标的三个方法却反过来：一律不缓存，进入时问 GL，切换时照发，退出时按问到的值恢复。</p>
+    <pre><code>// 项目里的真实代码（WebGL1State.ts:180–263，注释是课程加的）
+
+// 进入一段临时绘制之前调用：把 GL 里现在的输出目标问出来，记下来
+captureSurfaceState(): SurfaceStateSnapshot {
+  this.assertContextAvailable(&#x27;capture surface&#x27;)
+  // 两次查询。这里不用缓存，每次都问 GL 真实的值
+  const framebuffer = this.gl.getParameter(this.gl.FRAMEBUFFER_BINDING) as
+    WebGLFramebuffer | null
+  const viewport = this.gl.getParameter(this.gl.VIEWPORT) as Int32Array
+  this.assertContextAvailable(&#x27;capture surface&#x27;) // 查询途中丢了：查到的是 null，不能用
+  // viewport 复制成冻结的四个数：GL 交回的 Int32Array 不能被别人改掉
+  const copiedViewport: readonly [number, number, number, number] = Object.freeze([
+    viewport[0]!, viewport[1]!, viewport[2]!, viewport[3]!
+  ])
+  return Object.freeze({ framebuffer, viewport: copiedViewport })
+}
+
+// 切到这次要画的目标。null 表示画到屏幕（默认 framebuffer）
+bindSurface(resource: WebGL1SurfaceResource | null): void {
+  this.assertContextAvailable(&#x27;bind surface&#x27;)
+  // 不比较、不跳过：创建 RenderTarget 时 Manager 会直接绑定新的 FBO，GL 里现在是什么说不准
+  this.gl.bindFramebuffer(
+    this.gl.FRAMEBUFFER,
+    resource === null ? null : resource.framebuffer
+  )
+  // 屏幕用 drawing buffer 的像素尺寸，离屏目标用它自己的尺寸
+  this.gl.viewport(
+    0,
+    0,
+    resource === null ? this.gl.drawingBufferWidth : resource.width,
+    resource === null ? this.gl.drawingBufferHeight : resource.height
+  )
+}
+
+// 临时绘制结束（正常或抛错，都在 finally 里调用）：回到进入之前记下的目标
+restoreSurfaceState(snapshot: SurfaceStateSnapshot): void {
+  if (this.gl.isContextLost()) {
+    this.invalidate() // 丢了：旧 framebuffer 已经失效，绑回去也没用。只忘记缓存
+    return // 不抛错：外层可能正在抛 draw 的原始错误，这里再抛会把它盖住
+  }
+  this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, snapshot.framebuffer)
+  this.gl.viewport(...snapshot.viewport)
+}</code></pre>
+    <p>为什么这里不信缓存？</p>
+    <ul>
+      <li><strong>迁移期，同一个 context 上还有旧代码。</strong>旧引擎的渲染路径不经过 State，它绑过什么 framebuffer、设过什么 viewport，State 不可能知道。State 的注释写明，查询真实 framebuffer 和 viewport 是「记录作用域入口」，和逐 draw 设深度「不是同一种使用频率和职责」（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:112">WebGL1State.ts:112–114</a>）。</li>
+      <li><strong>创建离屏目标时，Manager 会直接绑定新的 FBO。</strong>RenderTargetManager 先查出原来的 framebuffer，绑定新的 FBO 配置附件，最后再绑回原来那个（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:246">WebGL1RenderTargetManager.ts:246</a>、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:262">:262</a>、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:350">:350</a>）。它用的也是查询到的真实值。所以 scope 必须在解析目标之前先记下入口（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:184">WebGL1SurfaceScope.ts:184</a>）。</li>
+      <li><strong>恢复错了，后面的绘制就画到别处。</strong>入口可能是屏幕，也可能是外层 scope 的离屏目标。记错一次，外层剩下的 draw 就全画错了地方（第 6 课卡片 D）。</li>
+    </ul>
+
+    <h3 id="s3-3">3.3 每帧要问几次</h3>
+    <p>
+      代价是：每进入一次 scope，至少查询 2 次。scope 带清屏时，清屏代码还要再查几项，因为 WebGL 的 clear 受写掩码和 scissor 影响，要先查出来、临时改掉、清完再改回去（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:359">WebGL1SurfaceScope.ts:359–382</a>）。下面两张卡片用项目的真实 WebGL1SurfaceScope 和 WebGL1State，在假 GL 上数查询次数。
+    </p>
+    <div id="lab-scope"></div>
+    <p>
+      FFT 的数字来自迁移计划的默认配置：4 层海浪，每层 N = 512，log₂N = 9；每层每帧 74 次 draw（频谱 1 次、IFFT 4 × 2 × 9 = 72 次、组装 1 次），每次 draw 换一个目标，所以每次 draw 一个 scope，4 层共 296 个。旧的 FFT 代码（v3）是一整块，自己知道绘制顺序，只在 pass 入口查询一次，共 7 次。新代码由通用的积木拼成，每块积木不知道外面是什么，只好每次进门都问一遍。下面可以自己组合：
+    </p>
+    <div id="lab-scope-play"></div>
+
+    <h3 id="s3-4">3.4 次数不等于耗时</h3>
+    <p>
+      592 次查询要多久，取决于浏览器怎样回答它。MDN 的 WebGL 最佳实践说，<code>get*Parameter()</code> 一般来说「可能要 flush 再往返一次」，有些情况浏览器会缓存答案，免去往返，但不要依赖这一点（<a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices#avoid_blocking_api_calls_in_production">MDN · Avoid blocking API calls in production</a>）。Chrome 的 WebGL 跑在独立的 GPU 进程里，需要往返的查询要同步等对方回答；具体哪些查询需要往返，我没有查证 Chrome 的源码。所以用你的浏览器量一量：
+    </p>
+    <div id="lab-timing"></div>
+    <p>我备课时用无界面 Chrome（Chrome 的软件渲染 SwiftShader）量到的数：</p>
+    <pre><code>                         每次      每帧 592 次（FFT）
+getParameter 这两项      0.2–0.6 μs   约 0.14 ms   ← 不到一帧预算 16.7 ms 的 1%
+读 JS 缓存               几乎为 0     约 0.003 ms
+getError（对照）          37–62 μs     约 23 ms     ← 超过一整帧</code></pre>
+    <p>（两次运行，每种组合各跑 60 帧取平均；表里是两次运行的范围。）</p>
+    <p>
+      同样是「问 GL」，getError 每次要等 GPU 进程回话，比这两项 getParameter 慢一百倍以上。这两项这么快，看起来 Chrome 没有为它们跨进程，在本进程就答了。至少在这台机器的 Chrome 上，FFT 每帧 592 次这两项查询不是瓶颈；查询前先排 300 次 draw，结果也差不多。这只是一种浏览器的结果：Firefox、Safari 怎样回答这两项查询，我没有测；MDN 也提醒不要依赖浏览器的这种缓存。所以请在你的浏览器里跑一遍，把数字告诉我。迁移计划定的原则是「先测量再优化」，这组数字就是测量的第一步。
+    </p>
+
+    <h3 id="s3-5">3.5 如果要省，有两种改法</h3>
+    <ul>
+      <li>
+        <strong>嵌套的 scope 从外层推导入口。</strong>内层 scope 的入口，就是外层 scope 刚刚绑定的那个目标和 viewport。scope 自己有一个栈（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:212">WebGL1SurfaceScope.ts:212</a>），只要在栈里多记一项「这一层绑定了什么」，内层就不用问 GL，只有最外层查询。FFT 每层套一个外层 scope，每帧大约 8 次查询。改动只在 WebGL1SurfaceScope 内部，需要信任的范围也最小：只信「scope 嵌套期间没有别人改输出目标」。上面的自由组合里，「每层套一个外层 scope」那一项按现在的代码是 896 次，反而更多：外层自己查 2 次，内层每个照样查 2 次，退出时还要用 isFramebuffer 确认外层的 FBO 还活着（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:302">:302</a>）。
+      </li>
+      <li>
+        <strong>State 记住 framebuffer 和 viewport。</strong>和 three.js 一样，平时一次都不查。前提有两个：一是 Backend 独占 context，旧代码不再碰它；二是失效要先拆细，否则就会像 2.5 节第二张卡片那样，每次 draw 都被清空。
+      </li>
+    </ul>
+    <p>迁移计划写于测量之前，建议是 FFT 接入时做第一种，第二种等实测确认是瓶颈再做。有了 3.4 节的数字，这条建议可以重新掂量：如果你常用的浏览器也这样快，保持现状、不改也说得过去。计划文件在工作区 <code>claude-workspace/fft-ocean-migration/2026-10-02-fft-ocean-migration-plan.zh-CN.md</code> 的决定 4 和风险 6.2。</p>
+
+    <h2 id="s4">4. 架构视角：对照 three.js r177</h2>
+    <ul>
+      <li>
+        <strong>缓存的范围：three.js 几乎什么都缓存，包括输出目标。</strong>bindFramebuffer 和 viewport 都先比较缓存，相同就不发（<a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:492">WebGLState.js:492–520</a>、<a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:1132">:1132–1141</a>）。它只在构造时问一次 VIEWPORT 和 SCISSOR_BOX（<a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:414">:414–418</a>），之后每帧一次都不查。前提是 three.js 独占这个 context。
+      </li>
+      <li>
+        <strong>「不知道」怎么表示：两种写法都有。</strong>开关用一个空对象记录，没设过的开关读出来是 undefined，第一次 enable 一定会发（<a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:365">:365</a>、<a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:470">:470–490</a>），和本项目一样。program 的初值却是 null（<a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:371">:371</a>），也就是第 1 版的写法。它不出问题，是因为 three.js 平时的流程从不调用 <code>useProgram(null)</code>。本项目真正需要解绑的地方在 ProgramManager：它直接问 GL 当前的 program，是要删的那个才调用 <code>gl.useProgram(null)</code>，然后调用钩子让 State 作废（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:232">WebGL1ProgramManager.ts:232–237</a>）。
+      </li>
+      <li>
+        <strong>和别人共用 context：reset 对 invalidate。</strong>three.js 给混用多个库的应用准备了 <code>renderer.resetState()</code>（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:3355">WebGLRenderer.js:3355–3366</a>），它调用的 state.reset 发出 31 条 GL 命令，把混合、剔除、深度、模板、framebuffer、program、viewport 等等全部设成已知的默认值，再把缓存也设成这些值（<a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:1185">WebGLState.js:1185–1273</a>）。本项目的 invalidate 一条命令也不发，只把缓存改成「不知道」，下次用到哪项再发哪项。代价是 GL 里可能还留着别人开的混合或 scissor，所以 Backend 每次 draw 都把还不支持的功能无条件关掉（1.1 节 applyDrawState 的前 10 条命令）。
+      </li>
+      <li>
+        <strong>取舍：</strong>three.js 是一个独占 context 的完整引擎，缓存一切、出事时整体 reset，简单而且快。本项目正处在新旧两条渲染路径共用一个 context 的迁移期：program、深度、剔除这些只有新路径会碰的状态信缓存；输出目标这种旧代码和资源创建都会碰的状态，每次问 GL。等旧路径退出，这一侧也可以向 three.js 靠拢（3.5 节的第二种改法）。
+      </li>
+    </ul>
+
+    <h2 id="s5">5. 审查视角</h2>
+    <ol>
+      <li>
+        <strong>三个方法只有测试在调用。</strong>全仓库搜 bindArrayBuffer、bindElementArrayBuffer、invalidateVertexInputState，除了定义，只出现在 <a data-src="tests/unit/rendering/backend/webgl1/WebGL1State.test.ts:32">WebGL1State.test.ts</a> 里。两种顶点输入策略都自己直接绑定 VAO 和 buffer，然后调用整份 invalidate（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:136">OES :136–138</a>、<a data-src="src/rendering/backend/webgl1/WebGL1ManualVertexInputManager.ts:101">Manual :101–103</a>），它们的接口注释也要求接完整的 invalidate（<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputManager.ts:43">WebGL1VertexInputManager.ts:43–53</a>）。第 19 课 10.2 节问过「失效拆细，还是删掉缓存」；这里补上一个事实：拆细所需的那个方法其实已经写好了，只是没有接上。<strong>想一想：</strong>是删掉这三个方法，还是让顶点输入改走 State 的 bindArrayBuffer、bindElementArrayBuffer？各要改哪几处？
+      </li>
+      <li>
+        <strong>State 的前提，现在由 Engine 来保证。</strong>「信缓存」要求受管理的状态都经过 State（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:102">WebGL1State.ts:102–106</a>）。新的 Engine 让新旧两条路径互斥：HW2 期间旧路径不画（<a data-src="src/engine.ts:55">engine.ts:55–58</a>）；离开 HW2 时先释放整个 Backend，再动 GL（<a data-src="src/engine.ts:241">engine.ts:241–251</a>）；下次进入 HW2 又是一个新的 State。<strong>想一想：</strong>有了这个保证，输出目标还需要每次查询吗？如果改成 State 记住 framebuffer 和 viewport，哪些地方必须调用 invalidate？（提示：RenderTargetManager 创建 FBO 的那条路径。）
+      </li>
+      <li>
+        <strong>找茬题：</strong>WebGL1State.ts 第 230–240 行的注释里，有一句话已经不符合现在的代码了。找出来，并说出是哪一处代码让它过时的。
+      </li>
+    </ol>
+
+    <h2 id="s6">6. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0014"></div>
+
+    <h2 id="s7">7. 延伸阅读</h2>
+    <p>
+      <strong>首选（约 5 分钟）：</strong><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices#avoid_blocking_api_calls_in_production">MDN · WebGL best practices 的「Avoid blocking API calls in production」一节</a>。它列出了哪些调用会让 JS 线程停下来等 GPU 进程，正好对应第 3 节「信缓存还是每次问」的代价。
+    </p>
+    <p>
+      补充：three.js 的 <a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:1185">WebGLState.js 的 reset</a>，对照本项目的 invalidate 读；项目文档 <a data-src="src/rendering/backend/webgl1/docs/device-and-state.zh-CN.md:1">device-and-state.zh-CN.md</a> 的「先区分三个状态」和「为什么缓存会出错」两节。
+    </p>
+
+    <aside class="ask">
+      做完告诉我：实验卡片和检查题各错了哪几题；审查视角的两个「想一想」和找茬题，直接在对话里回答。3.4 节的计时实验，把你的浏览器跑出的数字贴给我，我们一起看值不值得改。
+    </aside>
+
+    <div class="nav">
+      <a href="0013-capabilities-and-context-lifecycle.html">← 第 13 课：Capabilities 与 ContextLifecycle</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0015-program-manager.html">第 15 课：ProgramManager →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 14 课 · 2026-10-07</footer>
+
+    <script>
+      ;(function () {
+        const R = window.RTeachState
+        const L = RTeach.stateLab
+
+        // 四个版本（和上面代码块是同一份源文件，去掉了类型标注）
+        const StateV0 = (function () {
+class StateV0 {
+  constructor(gl) {
+    this.gl = gl;
+  }
+  useProgram(program) {
+    this.gl.useProgram(program);
+  }
+  bindArrayBuffer(buffer) {
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, buffer);
+  }
+  bindElementArrayBuffer(buffer) {
+    this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER, buffer);
+  }
+  setDepthTest(enabled) {
+    if (enabled) this.gl.enable(this.gl.DEPTH_TEST);
+    else this.gl.disable(this.gl.DEPTH_TEST);
+  }
+}
+          return StateV0
+        })()
+        const StateV1 = (function () {
+var __defProp = Object.defineProperty;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+class StateV1 {
+  constructor(gl) {
+    this.gl = gl;
+    __publicField(this, "programValue", null);
+    // 初值 null：当作「现在什么也没绑」
+    __publicField(this, "arrayBufferValue", null);
+    __publicField(this, "elementArrayBufferValue", null);
+    // 深度测试只会是 true / false，null 表示还没设过
+    __publicField(this, "depthTestValue", null);
+  }
+  useProgram(program) {
+    if (this.programValue === program) return;
+    this.gl.useProgram(program);
+    this.programValue = program;
+  }
+  bindArrayBuffer(buffer) {
+    if (this.arrayBufferValue === buffer) return;
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, buffer);
+    this.arrayBufferValue = buffer;
+  }
+  bindElementArrayBuffer(buffer) {
+    if (this.elementArrayBufferValue === buffer) return;
+    this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER, buffer);
+    this.elementArrayBufferValue = buffer;
+  }
+  setDepthTest(enabled) {
+    if (this.depthTestValue === enabled) return;
+    if (enabled) this.gl.enable(this.gl.DEPTH_TEST);
+    else this.gl.disable(this.gl.DEPTH_TEST);
+    this.depthTestValue = enabled;
+  }
+}
+          return StateV1
+        })()
+        const StateV2 = (function () {
+var __defProp = Object.defineProperty;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+class StateV2 {
+  constructor(gl) {
+    this.gl = gl;
+    // 不写初值，就是 undefined：「不知道 GL 里现在是什么」
+    // null 留给「确实没绑」：useProgram(null) 是一条真实的解绑命令，不能和「不知道」混用
+    __publicField(this, "programValue");
+    __publicField(this, "arrayBufferValue");
+    __publicField(this, "elementArrayBufferValue");
+    __publicField(this, "depthTestValue");
+  }
+  useProgram(program) {
+    if (this.programValue === program) return;
+    this.gl.useProgram(program);
+    this.programValue = program;
+  }
+  bindArrayBuffer(buffer) {
+    if (this.arrayBufferValue === buffer) return;
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, buffer);
+    this.arrayBufferValue = buffer;
+  }
+  bindElementArrayBuffer(buffer) {
+    if (this.elementArrayBufferValue === buffer) return;
+    this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER, buffer);
+    this.elementArrayBufferValue = buffer;
+  }
+  setDepthTest(enabled) {
+    if (this.depthTestValue === enabled) return;
+    if (enabled) this.gl.enable(this.gl.DEPTH_TEST);
+    else this.gl.disable(this.gl.DEPTH_TEST);
+    this.depthTestValue = enabled;
+  }
+  /**
+   * 有人绕过我直接改了 GL（比如上传新 buffer 时直接 bindBuffer）：把记住的全部忘掉。
+   * 只改 JS 里的记录，不发任何 GL 命令；下次设置时，不管值是什么都重新发。
+   */
+  invalidate() {
+    this.programValue = void 0;
+    this.arrayBufferValue = void 0;
+    this.elementArrayBufferValue = void 0;
+    this.depthTestValue = void 0;
+  }
+}
+          return StateV2
+        })()
+        const StateV3 = (function () {
+var __defProp = Object.defineProperty;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+class StateV3 {
+  constructor(gl) {
+    this.gl = gl;
+    // 不写初值，就是 undefined：「不知道 GL 里现在是什么」
+    // null 留给「确实没绑」：useProgram(null) 是一条真实的解绑命令，不能和「不知道」混用
+    __publicField(this, "programValue");
+    __publicField(this, "arrayBufferValue");
+    __publicField(this, "elementArrayBufferValue");
+    __publicField(this, "depthTestValue");
+  }
+  useProgram(program) {
+    if (this.programValue === program) return;
+    this.gl.useProgram(program);
+    this.programValue = program;
+  }
+  bindArrayBuffer(buffer) {
+    if (this.arrayBufferValue === buffer) return;
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, buffer);
+    this.arrayBufferValue = buffer;
+  }
+  bindElementArrayBuffer(buffer) {
+    if (this.elementArrayBufferValue === buffer) return;
+    this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER, buffer);
+    this.elementArrayBufferValue = buffer;
+  }
+  setDepthTest(enabled) {
+    if (this.depthTestValue === enabled) return;
+    if (enabled) this.gl.enable(this.gl.DEPTH_TEST);
+    else this.gl.disable(this.gl.DEPTH_TEST);
+    this.depthTestValue = enabled;
+  }
+  /**
+   * 有人绕过我直接改了 GL（比如上传新 buffer 时直接 bindBuffer）：把记住的全部忘掉。
+   * 只改 JS 里的记录，不发任何 GL 命令；下次设置时，不管值是什么都重新发。
+   */
+  invalidate() {
+    this.programValue = void 0;
+    this.arrayBufferValue = void 0;
+    this.elementArrayBufferValue = void 0;
+    this.depthTestValue = void 0;
+  }
+  /**
+   * EBO（ELEMENT_ARRAY_BUFFER）的绑定存在 VAO 里，每个 VAO 各有一份。
+   * 切到另一个 VAO，GL 里的 EBO 就变成那个 VAO 自己的，我记住的那个已经不对了。
+   * program、ARRAY_BUFFER、深度测试都不属于 VAO，切换 VAO 不影响它们，用不着全部忘掉。
+   */
+  invalidateVertexInputState() {
+    this.elementArrayBufferValue = void 0;
+  }
+}
+          return StateV3
+        })()
+        function toGLDepthFunction(gl, value) {
+          return value === 'less' ? gl.LESS : value === 'less-equal' ? gl.LEQUAL : gl.ALWAYS
+        }
+        const QueriedDepthState = (function () {
+class QueriedDepthState {
+  constructor(gl) {
+    this.gl = gl;
+  }
+  setDepthState(state) {
+    const gl = this.gl;
+    const testNow = gl.isEnabled(gl.DEPTH_TEST);
+    const writeNow = gl.getParameter(gl.DEPTH_WRITEMASK);
+    const funcNow = gl.getParameter(gl.DEPTH_FUNC);
+    if (testNow !== state.depthTest) {
+      if (state.depthTest) gl.enable(gl.DEPTH_TEST);
+      else gl.disable(gl.DEPTH_TEST);
+    }
+    if (writeNow !== state.depthWrite) gl.depthMask(state.depthWrite);
+    const wanted = toGLDepthFunction(gl, state.depthFunction);
+    if (funcNow !== wanted) gl.depthFunc(wanted);
+  }
+}
+          return QueriedDepthState
+        })()
+
+        // ---------------- 公用剧本 ----------------
+
+        /** 同一个模型画三次：每次 draw 前设 program P、顶点 buffer B、索引 buffer I、打开深度测试。 */
+        function threeDraws(Version) {
+          const fake = L.createGL()
+          const t = L.trace(fake)
+          const state = new Version(fake.gl)
+          const P = fake.handle('P'), B = fake.handle('B'), I = fake.handle('I')
+          for (let i = 1; i <= 3; i++) {
+            t.step('第 ' + i + ' 次 draw 之前：useProgram(P)、bindArrayBuffer(B)、bindElementArrayBuffer(I)、setDepthTest(true)', () => {
+              state.useProgram(P)
+              state.bindArrayBuffer(B)
+              state.bindElementArrayBuffer(I)
+              state.setDepthTest(true)
+            })
+          }
+          t.result('三次 draw 一共发出 ' + fake.count('cmd') + ' 条命令')
+          return t.report()
+        }
+
+        /** 旧渲染器留下 program L；新 State 想先解绑。 */
+        function unbindLeftover(Version) {
+          const fake = L.createGL()
+          const t = L.trace(fake)
+          const old = fake.handle('L')
+          t.step('旧渲染器画完最后一帧，GL 里留着它的 program L', () => fake.gl.useProgram(old))
+          let state
+          t.step('新建 State', () => { state = new Version(fake.gl) })
+          t.cache(state)
+          t.step('state.useProgram(null)：先解绑，准备删除 L', () => state.useProgram(null))
+          t.actual(['program'])
+          const kept = fake.actual().program === old
+          t.result(kept ? 'GL 里仍然是 L：解绑被跳过了' : 'GL 里已经是 null：解绑生效了')
+          return t.report()
+        }
+
+        /** 上传另一个模型的代码直接 bindBuffer(B2)，用完没有绑回去。 */
+        function bypassUpload(withInvalidate) {
+          const fake = L.createGL()
+          const t = L.trace(fake)
+          const state = new StateV2(fake.gl)
+          const B1 = fake.handle('B1'), B2 = fake.handle('B2')
+          t.step('draw 1：state.bindArrayBuffer(B1)', () => state.bindArrayBuffer(B1))
+          t.step('上传另一个模型：直接 gl.bindBuffer(ARRAY_BUFFER, B2) 写入数据（bufferData 略），用完没有绑回去' + (withInvalidate ? '；最后调用 state.invalidate()' : ''), () => {
+            fake.gl.bindBuffer(fake.gl.ARRAY_BUFFER, B2)
+            if (withInvalidate) state.invalidate()
+          })
+          t.cache(state)
+          t.actual(['arrayBuffer'])
+          t.step('draw 2：state.bindArrayBuffer(B1)，接着 vertexAttribPointer 从当前的 ARRAY_BUFFER 读顶点', () => state.bindArrayBuffer(B1))
+          t.actual(['arrayBuffer'])
+          t.result('vertexAttribPointer 读的是 ' + fake.name(fake.actual().arrayBuffer) + (fake.actual().arrayBuffer === B1 ? '：对的' : '：另一个模型的顶点'))
+          return t.report()
+        }
+
+        /** 同一个模型换一个 program 画：为新 program 新建 VAO2。新建的 VAO 里什么也没绑。 */
+        function newVao(Version, callFineInvalidate) {
+          const fake = L.createGL()
+          const t = L.trace(fake)
+          const state = new Version(fake.gl)
+          const P = fake.handle('P'), Q = fake.handle('Q'), I = fake.handle('I')
+          let vao1, vao2
+          t.step('draw 1（program P）：创建并绑定 VAO1，state.bindElementArrayBuffer(I) 把索引记进 VAO1', () => {
+            state.useProgram(P)
+            vao1 = fake.ext.createVertexArrayOES()
+            fake.ext.bindVertexArrayOES(vao1)
+            state.bindElementArrayBuffer(I)
+          })
+          t.step('draw 2（同一个模型换成 program Q）：新建 VAO2 并绑定' + (callFineInvalidate ? '，然后调用 state.invalidateVertexInputState()' : ''), () => {
+            state.useProgram(Q)
+            vao2 = fake.ext.createVertexArrayOES()
+            fake.ext.bindVertexArrayOES(vao2)
+            if (callFineInvalidate) state.invalidateVertexInputState()
+          })
+          t.cache(state)
+          t.actual(['vao', 'elementArrayBuffer'])
+          t.step('配置 VAO2：state.bindElementArrayBuffer(I)', () => state.bindElementArrayBuffer(I))
+          t.actual(['vao', 'elementArrayBuffer'])
+          let error = 0
+          t.step('gl.drawElements(TRIANGLES, 6, UNSIGNED_SHORT, 0)，再 gl.getError()', () => {
+            fake.gl.drawElements(fake.gl.TRIANGLES, 6, fake.gl.UNSIGNED_SHORT, 0)
+            error = fake.gl.getError()
+          })
+          t.step('draw 3（这个模型用 program Q 再画一次，还是 VAO2）：绑定 VAO2' + (callFineInvalidate ? '，invalidateVertexInputState()' : '') + '，state.useProgram(Q)', () => {
+            fake.ext.bindVertexArrayOES(vao2)
+            if (callFineInvalidate) state.invalidateVertexInputState()
+            state.useProgram(Q)
+          })
+          t.result(error === 0 ? 'drawElements 正常（getError = 0）' : 'drawElements 失败：getError = ' + error + '（INVALID_OPERATION，VAO2 里没有索引 buffer）')
+          return t.report()
+        }
+
+        const RENDER_STATES = {
+          background: Object.freeze({ depthTest: true, depthWrite: false, depthFunction: 'less-equal', cullMode: 'front' }),
+          mary: Object.freeze({ depthTest: true, depthWrite: true, depthFunction: 'less-equal', cullMode: 'back' })
+        }
+
+        /** 按 Backend.draw 的顺序画两帧 HW2：背景，然后 Mary。fine=true 时只让 EBO 失效。 */
+        function hw2Frames(fine) {
+          const fake = L.createGL()
+          const t = L.trace(fake)
+          const state = new R.WebGL1State(fake.gl)
+          const programs = { background: fake.handle('P背景'), mary: fake.handle('PMary') }
+          for (let frame = 1; frame <= 2; frame++) {
+            for (const item of ['background', 'mary']) {
+              t.step('第 ' + frame + ' 帧画' + (item === 'background' ? '背景' : ' Mary') + '：useProgram、setDepthState、setCullMode；之后顶点输入 bind，finally 里调用' + (fine ? ' invalidateVertexInputState()' : '钩子 → state.invalidate()'), () => {
+                state.useProgram(programs[item])
+                state.setDepthState(RENDER_STATES[item])
+                state.setCullMode(RENDER_STATES[item].cullMode)
+                if (fine) state.invalidateVertexInputState()
+                else state.invalidate()
+              })
+            }
+          }
+          return { report: t, commands: fake.count('cmd') }
+        }
+
+        // ---------------- 真实 WebGL 用的小工具 ----------------
+
+        function freshContext() {
+          const canvas = document.createElement('canvas')
+          canvas.width = 4
+          canvas.height = 4
+          const gl = canvas.getContext('webgl')
+          if (!gl) throw new Error('这个浏览器拿不到 WebGL context')
+          const lose = gl.getExtension('WEBGL_lose_context')
+          return { gl, release: () => { if (lose && !gl.isContextLost()) lose.loseContext() } }
+        }
+
+        function makeProgram(gl) {
+          const vs = gl.createShader(gl.VERTEX_SHADER)
+          gl.shaderSource(vs, 'void main() { gl_Position = vec4(0.0, 0.0, 0.0, 1.0); gl_PointSize = 1.0; }')
+          gl.compileShader(vs)
+          const fs = gl.createShader(gl.FRAGMENT_SHADER)
+          gl.shaderSource(fs, 'precision mediump float; void main() { gl_FragColor = vec4(1.0); }')
+          gl.compileShader(fs)
+          const program = gl.createProgram()
+          gl.attachShader(program, vs)
+          gl.attachShader(program, fs)
+          gl.linkProgram(program)
+          gl.deleteShader(vs)
+          gl.deleteShader(fs)
+          return program
+        }
+
+        // ---------------- 2.1 第 0 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v0'),
+          storageKey: 'lesson-0014-v0',
+          cards: [
+            {
+              title: '第 0 版：同一个模型画三次',
+              tags: ['假 GL', '第 0 版'],
+              question: '画三次，第 0 版一共发出几条状态命令？',
+              choices: ['12 条：每次 draw 4 条', '4 条：后两次一条也不发', '3 条：每次 draw 发 1 条'],
+              answer: 0,
+              explain: '第 0 版不记任何东西，每次调用都照发。第二、三次 draw 的 8 条命令，设的值和 GL 里已有的完全一样，是白发的。HW2 每帧只有两次 draw，白发几条无所谓；FFT 每帧近 300 次 draw 时，这类重复就值得省了。',
+              run: () => threeDraws(StateV0)
+            }
+          ]
+        })
+
+        // ---------------- 2.2 第 1 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v1'),
+          storageKey: 'lesson-0014-v1',
+          cards: [
+            {
+              title: '第 1 版：同一个模型画三次',
+              tags: ['假 GL', '第 1 版'],
+              question: '同样画三次，第 1 版一共发出几条状态命令？',
+              choices: ['4 条：后两次一条也不发', '12 条：每次 draw 4 条', '8 条：第三次才开始省'],
+              answer: 0,
+              explain: '第一次 draw，四个字段都是初值 null（深度是 null，不等于 true），所以四条都发，发完记下。第二、三次每一项都和记住的相同，全部跳过。第 1 条需求满足了。',
+              run: () => threeDraws(StateV1)
+            },
+            {
+              title: '第 1 版：旧渲染器留下了 program',
+              tags: ['假 GL', '第 1 版'],
+              desc: 'GL 里留着旧渲染器的 program L。新建一个第 1 版的 State，第一件事是 useProgram(null) 解绑，准备删除 L。',
+              question: '第 1 版会发出 gl.useProgram(null) 吗？',
+              choices: ['不会：它以为现在已经是 null', '会：null 是一条真实的解绑命令', '会抛错：useProgram 不收 null'],
+              answer: 0,
+              explain: '初值 null 本来的意思是「还不知道」，可它和参数 null（解绑）相等，于是这次解绑被跳过了。GL 里仍然是 L。这违反了第 2、3 条需求：State 并不知道 GL 里是什么，却当成知道了。',
+              run: () => unbindLeftover(StateV1)
+            }
+          ]
+        })
+
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v1-real'),
+          storageKey: 'lesson-0014-v1-real',
+          cards: [
+            {
+              title: '跳过解绑以后，删掉 L 会怎样',
+              tags: ['真实 WebGL', '你的浏览器'],
+              desc: '在你的浏览器里：先 gl.useProgram(L)，模拟旧渲染器留下的 program；再用第 1 版和第 2 版的 State 分别 useProgram(null)，然后 gl.deleteProgram(L)。',
+              question: '第 1 版那一轮，deleteProgram(L) 以后 gl.isProgram(L) 是什么？',
+              choices: ['true：L 还在用，删除被推迟', 'false：L 已经被浏览器删掉了', '抛错：不能删正在用的 program'],
+              answer: 0,
+              explain: 'GL 的规则是：正在使用的 program 只会被标记为「待删除」，等它不再是当前 program 时才真正删掉。第 1 版跳过了解绑，所以 L 仍是当前 program，isProgram 仍是 true，它占的资源也没有释放。第 2 版发出了 useProgram(null)，删除立刻生效。本项目真正删 program 的地方在 ProgramManager：它直接问 GL 当前的 program，是要删的那个才调用 gl.useProgram(null)（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:232">WebGL1ProgramManager.ts:232–237</a>），不依赖 State 的缓存。',
+              run: async () => {
+                const { gl, release } = freshContext()
+                const lines = []
+                try {
+                  for (const [label, Version] of [['第 1 版', StateV1], ['第 2 版', StateV2]]) {
+                    const program = makeProgram(gl)
+                    gl.useProgram(program)
+                    lines.push({ text: label + '：gl.useProgram(L) 之后，CURRENT_PROGRAM 是 L 吗 → ' + (gl.getParameter(gl.CURRENT_PROGRAM) === program), kind: 'user' })
+                    const state = new Version(gl)
+                    state.useProgram(null)
+                    lines.push({ text: '　state.useProgram(null) 之后，CURRENT_PROGRAM 是 L 吗 → ' + (gl.getParameter(gl.CURRENT_PROGRAM) === program), kind: 'server' })
+                    gl.deleteProgram(program)
+                    lines.push({ text: '　gl.deleteProgram(L) 之后，gl.isProgram(L) → ' + gl.isProgram(program) + '；getError → ' + gl.getError(), kind: gl.isProgram(program) ? 'late' : 'result' })
+                    gl.useProgram(null)
+                  }
+                } finally {
+                  release()
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 2.3 第 2 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v2'),
+          storageKey: 'lesson-0014-v2',
+          cards: [
+            {
+              title: '第 2 版：旧渲染器留下了 program',
+              tags: ['假 GL', '第 2 版'],
+              desc: '和第 1 版的第二张卡片同一个剧本。',
+              question: '这一次，第 2 版会发出 gl.useProgram(null) 吗？',
+              choices: ['会：undefined 不等于 null', '不会：它以为现在已经是 null', '会抛错：useProgram 不收 null'],
+              answer: 0,
+              explain: '新建时 programValue 是 undefined，记录里写成「不知道」。undefined !== null，所以解绑照发。之后记下 null，再调用 useProgram(null) 才会跳过，那时它确实知道 GL 里没绑东西。',
+              run: () => unbindLeftover(StateV2)
+            },
+            {
+              title: '有人绕过 State 绑了另一个 buffer',
+              tags: ['假 GL', '第 2 版', '没有调用 invalidate'],
+              desc: 'draw 1 经过 State 绑了 B1。上传另一个模型的代码直接调用 gl.bindBuffer(ARRAY_BUFFER, B2)，用完没有绑回去，也没有告诉 State。',
+              question: 'draw 2 的 vertexAttribPointer 会从哪个 buffer 读顶点？',
+              choices: ['B2：另一个模型的顶点', 'B1：State 刚刚绑的那个', '哪个都不读，GL 会报错'],
+              answer: 0,
+              explain: 'State 记的是 B1，GL 里实际是 B2。draw 2 调用 bindArrayBuffer(B1) 时，State 以为「已经是 B1」，跳过了。vertexAttribPointer 读的是当前绑定的 B2，画出来的是另一个模型的顶点，而且不报任何错。',
+              run: () => bypassUpload(false)
+            },
+            {
+              title: '同样绕过，但改完调用了 invalidate',
+              tags: ['假 GL', '第 2 版', '调用了 invalidate'],
+              desc: '同一个剧本，只多了一步：上传代码改完 GL 以后调用 state.invalidate()。',
+              question: 'draw 2 的 bindArrayBuffer(B1) 会发出命令吗？',
+              choices: ['会：invalidate 让缓存变成不知道', '不会：缓存里记的仍然是 B1', '不会：invalidate 已经绑回了 B1'],
+              answer: 0,
+              explain: 'invalidate 本身一条命令也没发（记录里那一步只有上传代码自己的 bindBuffer），只是把四个字段改回「不知道」。draw 2 时 undefined !== B1，于是重新发出 bindBuffer(B1)，缓存和 GL 又对上了。项目的 GeometryManager 做得更多：上传前先查出原来的绑定（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:133">WebGL1GeometryManager.ts:133–134</a>），上传完绑回去，最后还是调用钩子让 State 作废（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:164">:164–170</a>）。正常情况下绑回去就够了；作废是给异常路径兜底：比如上传途中 context 丢了，绑回去那一步被跳过。',
+              run: () => bypassUpload(true)
+            }
+          ]
+        })
+
+        // ---------------- 2.4 VAO ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-vao-real'),
+          storageKey: 'lesson-0014-vao-real',
+          cards: [
+            {
+              title: '切换 VAO，哪些绑定跟着变',
+              tags: ['真实 WebGL', '你的浏览器'],
+              desc: 'VAO1 里绑了索引 buffer I；ARRAY_BUFFER 绑的是 B。然后新建 VAO2 并绑定它。',
+              question: '绑定 VAO2 以后，GL 里的 EBO 和 ARRAY_BUFFER 分别是什么？',
+              choices: ['EBO 变成 null，ARRAY_BUFFER 还是 B', '两个都还是原来的 I 和 B', '两个都变成了 null'],
+              answer: 0,
+              explain: 'EBO 绑定存在 VAO 里：VAO2 是新建的，里面没有绑索引，所以是 null；切回 VAO1，I 又回来了。ARRAY_BUFFER 是整个 context 的状态，切换 VAO 不影响它。没有 EBO 时 drawElements 报 INVALID_OPERATION（1282），绑上以后是 0。',
+              run: async () => {
+                const { gl, release } = freshContext()
+                const lines = []
+                try {
+                  const ext = gl.getExtension('OES_vertex_array_object')
+                  if (!ext) return { lines: [{ text: '这台设备没有 OES_vertex_array_object，做不了这个实验', kind: 'late' }] }
+                  const program = makeProgram(gl)
+                  gl.useProgram(program)
+                  const I = gl.createBuffer()
+                  const B = gl.createBuffer()
+                  const name = (value) => (value === null ? 'null' : value === I ? 'I' : value === B ? 'B' : '另一个对象')
+                  const show = (label, kind) => lines.push({ text: label + '：EBO = ' + name(gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING)) + '，ARRAY_BUFFER = ' + name(gl.getParameter(gl.ARRAY_BUFFER_BINDING)), kind: kind || '' })
+                  const vao1 = ext.createVertexArrayOES()
+                  ext.bindVertexArrayOES(vao1)
+                  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, I)
+                  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 0, 0]), gl.STATIC_DRAW)
+                  gl.bindBuffer(gl.ARRAY_BUFFER, B)
+                  show('绑定 VAO1，绑 I 和 B 之后', 'user')
+                  const vao2 = ext.createVertexArrayOES()
+                  ext.bindVertexArrayOES(vao2)
+                  show('新建并绑定 VAO2 之后', 'late')
+                  gl.drawElements(gl.POINTS, 3, gl.UNSIGNED_SHORT, 0)
+                  lines.push({ text: '　在 VAO2 上 drawElements → getError = ' + gl.getError(), kind: 'late' })
+                  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, I)
+                  gl.drawElements(gl.POINTS, 3, gl.UNSIGNED_SHORT, 0)
+                  lines.push({ text: '　给 VAO2 绑上 I 再 drawElements → getError = ' + gl.getError(), kind: 'result' })
+                  ext.bindVertexArrayOES(vao1)
+                  show('切回 VAO1 之后', 'server')
+                  ext.bindVertexArrayOES(null)
+                  show('切回默认 VAO（null）之后', 'muted')
+                } finally {
+                  release()
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v3'),
+          storageKey: 'lesson-0014-v3',
+          cards: [
+            {
+              title: '第 2 版：同一个模型换一个 program 画',
+              tags: ['假 GL', '第 2 版'],
+              desc: '项目给每个「模型 × program」建一个 VAO。同一个模型换 program Q 来画，就要新建 VAO2，再把同一份索引 I 绑进去。',
+              question: '第 2 版在 VAO2 上 drawElements，结果是？',
+              choices: ['INVALID_OPERATION：VAO2 没有索引', '正常：State 已经绑过 I 了', '画出来的是 VAO1 的内容'],
+              answer: 0,
+              explain: 'State 记得「EBO = I」，那是在 VAO1 里绑的。新建的 VAO2 里 EBO 是 null，可是 bindElementArrayBuffer(I) 被跳过了，于是 drawElements 报 INVALID_OPERATION。第 2 版有 invalidate，但谁也没调用；要调用的话，只能全部忘掉，program 也得重发。',
+              run: () => newVao(StateV2, false)
+            },
+            {
+              title: '第 3 版：同样的剧本，切换 VAO 后只作废 EBO',
+              tags: ['假 GL', '第 3 版'],
+              question: '第 3 版里，draw 3 的 useProgram(Q) 会发命令吗？',
+              choices: ['不会：只有 EBO 被作废了', '会：作废时 program 也清掉了', '会：每次 draw 都必须重发'],
+              answer: 0,
+              explain: '每次绑定 VAO 之后调用 invalidateVertexInputState，它只把 EBO 改回「不知道」。所以配置 VAO2 时 bindElementArrayBuffer(I) 照发，drawElements 正常。program 的缓存不受影响，draw 3 的 useProgram(Q) 照样跳过。如果这里用第 2 版的 invalidate，Q 也得重发。这就是「只作废受影响的那一项」。',
+              run: () => newVao(StateV3, true)
+            }
+          ]
+        })
+
+        // ---------------- 2.5 真实代码 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-final'),
+          storageKey: 'lesson-0014-final',
+          cards: [
+            {
+              title: '真实代码：context 丢了以后',
+              tags: ['假 GL', '项目代码'],
+              desc: '先 useProgram(P)，缓存里记下 P。然后 context 丢失，再调用一次 useProgram(P)。',
+              question: '丢失以后，真实 State 的 useProgram(P) 会怎样？',
+              choices: ['抛 WebGLContextLostError，缓存全部忘掉', '跳过：缓存里已经是 P 了', '照常发命令，浏览器默默丢掉'],
+              answer: 0,
+              explain: 'assertContextAvailable 是每个设置方法的第一行，排在缓存比较之前，所以「缓存里已经是 P」根本轮不到判断。它先 invalidate，再抛 WebGLContextLostError。Backend 自己也会检查生命周期（第 13 课），这一道是补充的防线：浏览器已经丢了 context，生命周期类还没收到 lost 事件的那一小段时间里，也不会往丢失的 context 里发命令。',
+              run: () => {
+                const fake = L.createGL()
+                const t = L.trace(fake)
+                const state = new R.WebGL1State(fake.gl)
+                const P = fake.handle('P')
+                t.step('state.useProgram(P)', () => state.useProgram(P))
+                t.cache(state)
+                t.step('context 丢失（isContextLost() 变成 true）', () => fake.setLost(true))
+                const result = t.step('state.useProgram(P)', () => state.useProgram(P))
+                t.cache(state)
+                t.result(result.thrown ? '抛出 ' + result.thrown.name : '没有抛错')
+                return t.report()
+              }
+            },
+            {
+              title: '真实代码，按 Backend 的接线画两帧 HW2',
+              tags: ['假 GL', '项目代码'],
+              desc: '每帧先画背景（深度写入关、剔除正面），再画 Mary（深度写入开、剔除背面），两个 program 不同。每次 draw 按 Backend 的顺序调用 useProgram、setDepthState、setCullMode，然后顶点输入 bind，它的 finally 里调用钩子，也就是整份 state.invalidate()。',
+              question: '两帧四次 draw，经过 State 的命令一共几条？',
+              choices: ['24 条：和不缓存一样多', '18 条：省掉了重复的几条', '12 条：第 2 帧一条不发'],
+              answer: 0,
+              explain: '每次 draw 结束前缓存都被整份清空，所以每次都从「不知道」开始，6 条全发，四次就是 24 条，等于没有缓存。记录的最后一行是换成 invalidateVertexInputState 的对照：18 条。省下的是第 2 次以后每次 draw 的「打开深度测试」和「深度比较 LEQUAL」：这两项在背景和 Mary 之间不变。剔除模式每次 draw 都在 front、back 之间切换，program 也每次都换，这些照发。HW2 每帧只有两次 draw，差 6 条无所谓；问题在于这段缓存代码看起来在工作，实际上一次也没命中。',
+              run: () => {
+                const real = hw2Frames(false)
+                const fine = hw2Frames(true)
+                real.report.result('按现在的接线：' + real.commands + ' 条命令。换成只作废 EBO：' + fine.commands + ' 条')
+                return real.report.report()
+              }
+            }
+          ]
+        })
+
+        // ---------------- 3.1 深度 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-depth'),
+          storageKey: 'lesson-0014-depth',
+          cards: [
+            {
+              title: '有人直接关掉了深度测试',
+              tags: ['假 GL', '项目代码 vs 每次先问'],
+              desc: '先 setDepthState({ depthTest: true, depthWrite: true, depthFunction: \'less-equal\' })。接着有段代码绕过 State，直接 gl.disable(DEPTH_TEST)，没有调用 invalidate。然后再 setDepthState 同样的值。',
+              question: '真实 State 第二次 setDepthState 会发出 enable(DEPTH_TEST) 吗？',
+              choices: ['不会：缓存说深度测试开着', '会：它每次都会先问 GL', '会抛错：它发现缓存不一致'],
+              answer: 0,
+              explain: '真实 State 只看缓存，缓存记的是 true，三项都跳过，GL 里的深度测试一直关着，后面画出来前后遮挡全乱。「每次先问」的版本查到 DEPTH_TEST 是关的，于是重新 enable。它能发现别人的改动，代价在下一张卡片。真实代码选了信缓存，并要求「谁绕过，谁调用 invalidate」（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:102">WebGL1State.ts:102–106</a>）。',
+              run: () => {
+                const lines = []
+                for (const [label, make] of [['真实 State', (gl) => new R.WebGL1State(gl)], ['每次先问的版本', (gl) => new QueriedDepthState(gl)]]) {
+                  const fake = L.createGL()
+                  const t = L.trace(fake)
+                  const state = make(fake.gl)
+                  t.step(label + '：setDepthState(深度测试开)', () => state.setDepthState(RENDER_STATES.mary))
+                  t.step('别处直接调用 gl.disable(DEPTH_TEST)', () => fake.gl.disable(fake.gl.DEPTH_TEST))
+                  t.step(label + '：再 setDepthState(同样的值)', () => state.setDepthState(RENDER_STATES.mary))
+                  t.actual(['depthTest'])
+                  t.result(label + '：最后 GL 里的深度测试是' + (fake.actual().depthTest ? '开着的' : '关着的'))
+                  lines.push(...t.report().lines)
+                }
+                return { lines }
+              }
+            },
+            {
+              title: '同一个材质画 1000 次',
+              tags: ['假 GL', '项目代码 vs 每次先问'],
+              question: '画 1000 次，「每次先问」的版本一共查询 GL 几次？',
+              choices: ['3000 次：每次调用问 3 项', '3 次：只在第一次调用时问', '0 次：查询结果会被缓存'],
+              answer: 0,
+              explain: '每次调用都要问 DEPTH_TEST、DEPTH_WRITEMASK、DEPTH_FUNC 三项，不管值有没有变，1000 次就是 3000 次。真实 State 一次也不问，只在第一次发 3 条命令。这正是 setDepthState 注释里算的那笔账（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:94">WebGL1State.ts:94–100</a>）。',
+              run: () => {
+                const lines = []
+                for (const [label, make] of [['真实 State', (gl) => new R.WebGL1State(gl)], ['每次先问的版本', (gl) => new QueriedDepthState(gl)]]) {
+                  const fake = L.createGL()
+                  const t = L.trace(fake)
+                  const state = make(fake.gl)
+                  t.step(label + '：setDepthState(同一个值) × 1000', () => { for (let i = 0; i < 1000; i++) state.setDepthState(RENDER_STATES.mary) }, { quiet: true })
+                  lines.push(...t.report().lines, { t: '结果', text: label + '：' + fake.count('cmd') + ' 条命令，' + fake.count('query') + ' 次查询', kind: 'result' })
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 3.3 scope 的查询次数 ----------------
+
+        /** 用项目的 WebGL1SurfaceScope 和 WebGL1State 跑一帧，数查询次数。 */
+        function runScopes(plan) {
+          const fake = L.createGL()
+          const state = new R.WebGL1State(fake.gl)
+          const resources = new Map()
+          const scope = new R.WebGL1SurfaceScope(fake.gl, state, {
+            assertReady: () => undefined,
+            isCurrent: () => true,
+            resolveTarget: (target) => resources.get(target)
+          })
+          const target = (label, size) => {
+            const rt = new R.RenderTarget({ width: size, height: size, colors: [{ format: 'rgba8' }] }, { label })
+            resources.set(rt, { framebuffer: fake.handle('FBO ' + label), width: size, height: size })
+            return rt
+          }
+          const lines = []
+          const before = { cmd: fake.count('cmd'), query: fake.count('query') }
+          plan({ scope, target, fake, lines })
+          const commands = fake.count('cmd') - before.cmd
+          const queries = fake.count('query') - before.query
+          const kinds = {}
+          for (const call of fake.calls) if (call.kind === 'query') {
+            const key = call.method === 'getParameter' ? 'getParameter(' + fake.name(call.args[0]) + ')' : call.method + (call.args.length ? '(' + fake.name(call.args[0]).replace(/^FBO .*/, 'FBO') + ')' : '')
+            kinds[key] = (kinds[key] || 0) + 1
+          }
+          for (const [key, n] of Object.entries(kinds)) lines.push({ text: '　' + key + ' × ' + n, kind: 'muted' })
+          lines.push({ t: '结果', text: '查询 ' + queries + ' 次，命令 ' + commands + ' 条', kind: 'result' })
+          return { lines, queries }
+        }
+
+        const SCOPE_PLANS = {
+          hw2: {
+            title: 'HW2 一帧：ForwardPass 的 1 个 scope，画到屏幕，清颜色和深度',
+            run: ({ scope, fake, lines }) => {
+              const start = fake.calls.length
+              scope.run({ surface: { kind: 'default-framebuffer' }, clear: { color: [0, 0, 0, 1], depth: 1 } }, () => undefined)
+              for (const call of fake.calls.slice(start)) lines.push({ text: L.describeCall(fake, call), kind: call.kind === 'cmd' ? 'server' : 'muted' })
+            }
+          },
+          fftLayer: {
+            title: 'FFT 一层：74 个 scope，每个画到一个 512 × 512 的目标，不清屏',
+            run: ({ scope, target }) => {
+              const ping = target('ping', 512), pong = target('pong', 512)
+              for (let i = 0; i < 74; i++) scope.run({ surface: { kind: 'render-target', target: i % 2 ? pong : ping } }, () => undefined)
+            }
+          },
+          fft: {
+            title: 'FFT 四层：4 × 74 = 296 个 scope，不清屏',
+            run: ({ scope, target }) => {
+              for (let layer = 0; layer < 4; layer++) {
+                const ping = target('ping' + layer, 512), pong = target('pong' + layer, 512)
+                for (let i = 0; i < 74; i++) scope.run({ surface: { kind: 'render-target', target: i % 2 ? pong : ping } }, () => undefined)
+              }
+            }
+          },
+          fftNested: {
+            title: 'FFT 四层，每层套一个外层 scope：4 + 296 个 scope',
+            run: ({ scope, target }) => {
+              for (let layer = 0; layer < 4; layer++) {
+                const outer = target('layer' + layer, 512)
+                const ping = target('ping' + layer, 512), pong = target('pong' + layer, 512)
+                scope.run({ surface: { kind: 'render-target', target: outer } }, () => {
+                  for (let i = 0; i < 74; i++) scope.run({ surface: { kind: 'render-target', target: i % 2 ? pong : ping } }, () => undefined)
+                  return undefined
+                })
+              }
+            }
+          }
+        }
+
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-scope'),
+          storageKey: 'lesson-0014-scope',
+          cards: [
+            {
+              title: 'HW2 每帧的 scope',
+              tags: ['假 GL', '项目代码'],
+              desc: SCOPE_PLANS.hw2.title + '。ForwardPass 就是这样调用的（第 19 课）。',
+              question: '进入、清屏、退出，一共查询 GL 几次？',
+              choices: ['7 次：入口 2 次，清屏 5 次', '2 次：只在入口查一次', '0 次：State 有缓存可用'],
+              answer: 0,
+              explain: '入口 captureSurfaceState 查 FRAMEBUFFER_BINDING 和 VIEWPORT 两项。清颜色和深度，clearAttachments 还要查：有没有深度附件（DEPTH_BITS）、颜色和深度的写掩码（COLOR_WRITEMASK、DEPTH_WRITEMASK）、scissor 和 dithering 开没开（两次 isEnabled）。查到的值用来清完后恢复。一共 7 次。',
+              run: () => runScopes(SCOPE_PLANS.hw2.run)
+            },
+            {
+              title: 'FFT 每帧的 scope',
+              tags: ['假 GL', '项目代码'],
+              desc: SCOPE_PLANS.fft.title + '。每个 scope 里只有一次 draw（这里省略了 draw 本身）。',
+              question: '296 个 scope，一共查询 GL 几次？',
+              choices: ['592 次：每个 scope 2 次', '7 次：只在最外面查一次', '296 次：每个 scope 1 次'],
+              answer: 0,
+              explain: '每个 scope 入口都要 captureSurfaceState，两次查询，296 × 2 = 592。次数随 scope 个数线性增长。旧的 FFT 代码只在 pass 入口查 7 次，因为它是一整块，知道自己的绘制顺序。',
+              run: () => runScopes(SCOPE_PLANS.fft.run)
+            }
+          ]
+        })
+
+        RTeach.traceLab.playground({
+          mount: document.getElementById('lab-scope-play'),
+          title: '自由组合：用项目的 scope 数查询次数',
+          selects: [{ id: 'plan', options: Object.entries(SCOPE_PLANS).map(([id, plan]) => [id, plan.title]) }],
+          run: (values) => runScopes(SCOPE_PLANS[values.plan].run)
+        })
+
+        // ---------------- 3.4 计时 ----------------
+        RTeach.traceLab.playground({
+          mount: document.getElementById('lab-timing'),
+          title: '在你的浏览器里计时（真实 WebGL）',
+          selects: [
+            { id: 'n', options: [['7', '每帧 7 次查询（HW2）'], ['592', '每帧 592 次查询（FFT）'], ['5920', '每帧 5920 次查询（十倍）']] },
+            { id: 'load', options: [['idle', '查询前没有别的命令'], ['busy', '每批查询前先排 300 次 draw']] }
+          ],
+          describe: (values) => '每种做法连跑 60 帧（每帧 5920 次时 getError 只跑 5 帧），取平均。「查询」是交替调用 getParameter(FRAMEBUFFER_BINDING) 和 getParameter(VIEWPORT)；「读 JS 缓存」是读两个普通变量，相当于 State 自己记住；getError 作为对照，MDN 点名它要往返一次。',
+          run: async (values) => {
+            const n = Number(values.n)
+            const frames = 60
+            const { gl, release } = freshContext()
+            try {
+              const program = makeProgram(gl)
+              gl.useProgram(program)
+              const cache = { framebuffer: null, viewport: [0, 0, 4, 4] }
+              let sink = 0
+              const prepare = () => {
+                if (values.load === 'busy') for (let i = 0; i < 300; i++) gl.drawArrays(gl.POINTS, 0, 1)
+              }
+              const measure = (body, frameCount = frames) => {
+                let total = 0
+                for (let f = 0; f < frameCount; f++) {
+                  prepare()
+                  const t0 = performance.now()
+                  body()
+                  total += performance.now() - t0
+                }
+                return total / frameCount
+              }
+              const ways = [
+                ['getParameter 查询', () => { for (let i = 0; i < n; i++) sink += gl.getParameter(i % 2 ? gl.VIEWPORT : gl.FRAMEBUFFER_BINDING) === null ? 1 : 0 }],
+                ['读 JS 缓存', () => { for (let i = 0; i < n; i++) sink += (i % 2 ? cache.viewport : cache.framebuffer) === null ? 1 : 0 }],
+                ['getError（对照）', () => { for (let i = 0; i < n; i++) sink += gl.getError() }]
+              ]
+              measure(ways[0][1]) // 预热一轮，不计入
+              const lines = [{ text: '每帧 ' + n + ' 次，连跑 ' + frames + ' 帧' + (values.load === 'busy' ? '，每帧先排 300 次 draw' : ''), kind: 'user' }]
+              for (const [label, body] of ways) {
+                // getError 每次要几十微秒，十倍查询量下 60 帧要跑十几秒；这一项少跑几帧
+                const ms = measure(body, label.startsWith('getError') && n > 1000 ? 5 : frames)
+                lines.push({ text: label + '：平均每帧 ' + ms.toFixed(3) + ' ms，每次约 ' + ((ms * 1000) / n).toFixed(2) + ' μs', kind: label.startsWith('getParameter') ? 'result' : 'muted' })
+              }
+              lines.push({ text: '一帧的预算是 16.7 ms（60 Hz）。performance.now() 的精度在不同浏览器里不一样，每帧 7 次的结果可能是 0。', kind: 'muted' })
+              if (sink < 0) lines.push({ text: String(sink) })
+              return { lines }
+            } finally {
+              release()
+            }
+          }
+        })
+
+        // ---------------- 检查题 ----------------
+        // ---------------- 2.6 和 Lifecycle 的关系 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-lifecycle'),
+          storageKey: 'lesson-0014-lifecycle',
+          cards: [
+            {
+              title: 'context 丢了：State 怎样反应，新的一代从哪里开始',
+              tags: ['假 GL', '项目代码'],
+              desc: '第 1 步按 Backend 的顺序为 Mary 设一遍状态。第 2 步让假 GL 进入「已经丢失」，lost 事件还在排队，这时又有人调用 setDepthState。第 3 步 lost 事件到达，Backend 调用 invalidate。第 4 步恢复：建第 2 代，一个新的 State，再为 Mary 设一遍。',
+              question: '第 2 步：context 已经丢了，lost 事件还没到，setDepthState(Mary) 会怎样？',
+              choices: ['抛 WebGLContextLostError，缓存全部变成「不知道」', '一条命令也不发：缓存里已经是这个值', '照常发出 3 条命令，等恢复以后生效'],
+              answer: 0,
+              explain:
+                'assertContextAvailable 先问 isContextLost，发现已经丢了：先 invalidate，再抛错，一条命令都不发。第 3 步的 invalidate 也只是忘记，同样不发命令。第 4 步的新 State 全是「不知道」，所以 useProgram、深度、剔除全部重新发出，哪怕值和丢失前一模一样：新 context 里是 GL 的默认值，不能沿用旧的记录。',
+              run: () => {
+                const fake = L.createGL()
+                const t = L.trace(fake)
+                const program1 = fake.handle('P_Mary（第 1 代）')
+                const state = new R.WebGL1State(fake.gl)
+                t.step('第 1 代：useProgram、setDepthState(Mary)、setCullMode(back)', () => {
+                  state.useProgram(program1)
+                  state.setDepthState(RENDER_STATES.mary)
+                  state.setCullMode('back')
+                })
+                t.cache(state)
+                fake.setLost(true)
+                t.note('浏览器收走 GPU：isContextLost 变成 true，lost 事件还在排队', 'abort')
+                t.step('这时有人调用 setDepthState(Mary)', () => state.setDepthState(RENDER_STATES.mary))
+                t.cache(state)
+                t.step('lost 事件到达：onLost → invalidateGeneration → state.invalidate()', () => state.invalidate())
+                fake.setLost(false)
+                t.note('浏览器派发 restored：restore → createGeneration，建第 2 代', 'abort')
+                const program2 = fake.handle('P_Mary（第 2 代，重新编译）')
+                const fresh = new R.WebGL1State(fake.gl)
+                t.cache(fresh)
+                t.step('第 2 代：同样为 Mary 设一遍', () => {
+                  fresh.useProgram(program2)
+                  fresh.setDepthState(RENDER_STATES.mary)
+                  fresh.setCullMode('back')
+                })
+                t.cache(fresh)
+                return t.report()
+              }
+            }
+          ]
+        })
+
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0014"]'), [
+          {
+            q: 'State 刚建好时，programValue 是 undefined 而不是 null，为的是？',
+            opts: ['第一次 useProgram(null) 也能发出', '少占一点 JavaScript 内存', 'TypeScript 不允许初值写 null'],
+            answer: 0,
+            why: 'null 是「解绑」这个合法参数。初值也用 null 的话，第一次解绑会被当成「已经是这样」跳过（2.2 节第二张卡片）。'
+          },
+          {
+            q: 'invalidate() 和 three.js 的 state.reset() 最大的区别是？',
+            opts: ['invalidate 只忘记，不发 GL 命令', 'invalidate 会把 GL 改回默认值', '两者完全一样，只是名字不同'],
+            answer: 0,
+            why: 'invalidate 只把缓存改成「不知道」；reset 发 31 条命令把 GL 设成默认值，再把缓存设成这些值（2.3 节、第 4 节）。'
+          },
+          {
+            q: '切换 VAO 以后，哪一项绑定会跟着变？',
+            opts: ['ELEMENT_ARRAY_BUFFER（EBO）', 'ARRAY_BUFFER（顶点 buffer）', '当前使用的 program'],
+            answer: 0,
+            why: 'EBO 绑定是 VAO 状态的一部分，ARRAY_BUFFER 和 program 是整个 context 的状态（2.4 节的真实 WebGL 卡片）。'
+          },
+          {
+            q: '同一个类里，深度状态信缓存，输出目标却每次都查 GL。主要原因是？',
+            opts: ['framebuffer 绑定还会被别的代码改', 'getParameter 查不到深度方面的状态', '深度状态一旦设好就再也不会改变'],
+            answer: 0,
+            why: '迁移期旧代码共用 context，创建离屏目标时 Manager 也会直接绑定 FBO；深度只有经过 State 的新路径会改（3.2 节）。'
+          },
+          {
+            q: 'HW2 每帧 scope 查询 7 次，FFT 每帧约 592 次。差别主要来自？',
+            opts: ['scope 个数：一次 draw 一个 scope', '每次查询的项目比 HW2 多了很多', 'FFT 用的浮点纹理查询起来更慢'],
+            answer: 0,
+            why: '每个 scope 入口查 2 次，FFT 每次 draw 换目标，296 个 scope 就是 592 次（3.3 节）。'
+          },
+          {
+            q: '按现在的接线，两帧 HW2 经过 State 发出 24 条命令，和不缓存一样多。原因是？',
+            opts: ['顶点输入每次都清空整份缓存', 'State 的比较写错了，永远不相等', '每一帧开始时 Engine 都 reset 一次'],
+            answer: 0,
+            why: '顶点输入的 bind 在 finally 里调用钩子，钩子接的是整份 invalidate（2.5 节第二张卡片、第 19 课卡片 H）。'
+          },
+          {
+            q: 'context 恢复以后，新一代 State 的缓存是什么样？',
+            opts: ['全是「不知道」，第一次设置一定发命令', '沿用旧 State 的缓存，省掉重复的命令', '全是 GL 默认值，和真实状态一一对应'],
+            answer: 0,
+            why: 'createGeneration 新建一个 State，七个字段全是 undefined。新 context 里虽然是默认值，但 State 不去猜，第一次设置就发（2.6 节）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

@@ -1,0 +1,1008 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebGL1 API 速查</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+  </head>
+  <body class="wide">
+    <p class="kicker">参考 · 按 src/rendering/backend/webgl1 的用法组织 · 2026-09-23</p>
+    <h1>WebGL1 API 速查</h1>
+    <p class="lede">
+      后端用到的每一个 <code>gl.*</code> 调用都在这里，外加 Task 15 要用的调用和常见的「相似方法」。每条都写了<strong>失败时 GL 怎么告诉你</strong>和<strong>调用前后要校验什么</strong>，这是你自评里最薄弱的两块。用来查，不用从头读到尾。
+    </p>
+
+    <aside class="note">
+      <strong>怎么读一条：</strong>签名 · <em>作用</em>（读写了状态机的哪一部分）· <em>失败</em>（报告通道和典型错误码）· <em>校验</em>（调用方该检查什么）· <em>本项目</em>（可点击，在 VS Code 里打开源码）· <em>相似</em> · <em>出处</em>。<br />
+      标签：<span class="tag new">新后端独有</span> 旧引擎代码里没有、只出现在 <code>webgl1/</code> 里；<span class="tag t15">T15</span> Task 15 会用到，现在的 <code>webgl1/</code> 里还没有；<span class="tag">实测</span> 备课时在 Chromium 152（与 Mac Edge 同内核）里亲手验证过。
+    </aside>
+
+    <div class="filter">
+      <input id="api-filter" type="search" placeholder="过滤：输入方法名、常量或中文关键词，例如 texImage2D、INVALID_OPERATION、丢失、NPOT" autocomplete="off" />
+      <div class="hint">多个词用空格分隔，条目必须同时包含所有词。</div>
+    </div>
+
+    <nav class="toc">
+      <ol>
+        <li><a href="#channels">五种失败通道</a></li>
+        <li><a href="#measured">实测清单：这样写会得到什么</a></li>
+        <li><a href="#g-context">A. context 与查询</a></li>
+        <li><a href="#g-state">B. 固定功能状态</a></li>
+        <li><a href="#g-program">C. shader 与 program</a></li>
+        <li><a href="#g-reflection">D. 反射</a></li>
+        <li><a href="#g-buffer">E. buffer</a></li>
+        <li><a href="#g-vertex">F. 顶点输入</a></li>
+        <li><a href="#g-texture">G. 纹理</a></li>
+        <li><a href="#g-fbo">H. framebuffer 与 renderbuffer</a></li>
+        <li><a href="#g-t15">I. Task 15 会用到的</a></li>
+        <li><a href="#g-ext">J. 扩展速览</a></li>
+        <li><a href="#by-file">按文件查</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="channels">0. 五种失败通道</h2>
+    <p>WebGL 的失败几乎从不抛 JavaScript 异常。能抛异常的只有参数类型错误（例如 bindBuffer 收到的不是 WebGLBuffer，会抛 TypeError）。其余失败都走下面五条通道之一，所谓校验，就是在每条通道上主动去问。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>通道</th><th>典型 API</th><th>怎么发现</th><th>项目里的对应</th></tr>
+        <tr>
+          <td><strong>① 特殊返回值</strong></td>
+          <td><code>createShader</code> → null、<code>getAttribLocation</code> → -1、<code>getUniformLocation</code> → null、<code>getExtension</code> → null、<code>getActiveAttrib</code> → null</td>
+          <td>判 <code>=== null</code>、<code>&lt; 0</code>；<strong>不要用真假值</strong>，0 是合法的 location</td>
+          <td><a data-src="src/rendering/core/requireNonNull.ts:15">requireNonNull</a>、<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:156">ProgramManager.ts:156</a></td>
+        </tr>
+        <tr>
+          <td><strong>② 状态查询</strong></td>
+          <td><code>COMPILE_STATUS</code>、<code>LINK_STATUS</code>、<code>checkFramebufferStatus</code></td>
+          <td>必须主动问；编译失败时 <code>getError</code> 仍然是 NO_ERROR <span class="tag">实测</span></td>
+          <td>ShaderCompilationError、ProgramLinkError、IncompleteFramebufferError</td>
+        </tr>
+        <tr>
+          <td><strong>③ 错误标志</strong></td>
+          <td>几乎所有调用：参数取值或状态不合法（INVALID_ENUM、INVALID_VALUE、INVALID_OPERATION），以及 OUT_OF_MEMORY</td>
+          <td><code>getError()</code>。它会同步等待 GPU，只放在冷路径；错误会一直攒着，所以开工前先清一次（preflight）</td>
+          <td><code>checkError</code>、<a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:21">assertTextureOperation</a> → WebGLOperationError</td>
+        </tr>
+        <tr>
+          <td><strong>④ context 丢失</strong></td>
+          <td>任何时刻都可能发生；丢失后所有调用变成空操作，返回默认值（null、-1、FRAMEBUFFER_UNSUPPORTED），create* 返回已经作废的对象 <span class="tag">实测</span></td>
+          <td><code>isContextLost()</code> 和 <code>webglcontextlost</code> 事件；跨过一次查询或回调之后要再查一次</td>
+          <td><code>assertAvailable</code> → WebGLContextLostError、<a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:72">WebGLContextLifecycle</a></td>
+        </tr>
+        <tr>
+          <td><strong>⑤ 静默失败</strong></td>
+          <td>纹理不完整（NPOT、缺 mipmap）采样出黑色；attribute 没 enable，读到的是常量；uniform location 为 null 时上传被悄悄忽略；上一个物体留下的状态</td>
+          <td>只能靠事前校验和最终的像素验收（readPixels）</td>
+          <td><a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:203">validateStorage</a>、Manual 策略清理遗留的 location、浏览器 GPU 验收</td>
+        </tr>
+      </table>
+    </div>
+    <p>判断标准（MDN WebGL best practices）：「The only errors a well-formed page generates are OUT_OF_MEMORY and CONTEXT_LOST.」凡是出现 <code>INVALID_*</code>，都说明代码有 bug。</p>
+    <p>还有一条要记住：<strong>报错的地方不一定是犯错的地方。</strong>例如先调用 pointer、后绑定 buffer（offset 为 0 时），错误要到 <code>drawArrays</code> 才出现；给 <code>bufferData</code> 传普通数组，只会得到 0 字节的 buffer，错误同样拖到 draw 时才出现。</p>
+
+    <h2 id="measured">0′. 实测清单：这样写会得到什么 <span class="tag">实测</span></h2>
+    <p>备课时在 Chromium 152（WebGL1）里逐条跑过。和规范有出入时，以规范为准来设计代码，但要知道你的浏览器实际会怎么做。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>写法</th><th>结果</th></tr>
+        <tr><td>依次制造 INVALID_ENUM、INVALID_VALUE、INVALID_OPERATION，再来一次 INVALID_ENUM，然后连续调用 getError</td><td>依次返回 INVALID_ENUM、INVALID_OPERATION、INVALID_VALUE，之后是 NO_ERROR：每种错误只记一次，每次取出一个，<strong>顺序不保证</strong></td></tr>
+        <tr><td>有错误还没取走时 context 丢失</td><td>getError 只返回 CONTEXT_LOST_WEBGL，之后是 NO_ERROR；丢失前的错误被丢弃</td></tr>
+        <tr><td>GLSL 写错一个字（<code>gl_Positon</code>）</td><td>COMPILE_STATUS = false；<code>getError()</code> 仍是 NO_ERROR；info log 形如 <code>ERROR: 0:3: 'gl_Positon' : undeclared identifier</code>，末尾可能带 <code>\0</code></td></tr>
+        <tr><td>fragment 声明了 vertex 里没有的 varying</td><td>两个 shader 都编译成功；LINK_STATUS = false，日志：<code>FRAGMENT varying vColor does not match any VERTEX varying</code></td></tr>
+        <tr><td>shader 声明了 attribute，但没用到</td><td>它不在 ACTIVE_ATTRIBUTES 里，<code>getAttribLocation</code> 返回 -1</td></tr>
+        <tr><td>同一个 program 挂两个 vertex shader，或者同一个 shader 挂两次</td><td>INVALID_OPERATION</td></tr>
+        <tr><td><code>useProgram(没链接过的 program)</code></td><td>INVALID_OPERATION</td></tr>
+        <tr><td><code>useProgram(null)</code> 之后 drawArrays</td><td>INVALID_OPERATION</td></tr>
+        <tr><td>删除正在使用的 program</td><td>延迟删除：CURRENT_PROGRAM 仍然是它，DELETE_STATUS = true</td></tr>
+        <tr><td>删除仍然挂在 program 上的 shader</td><td>只做标记：DELETE_STATUS = true，<code>getAttachedShaders</code> 里还能看到它</td></tr>
+        <tr><td><code>bindBuffer(ARRAY_BUFFER, {})</code></td><td>直接抛 TypeError（参数类型错误）</td></tr>
+        <tr><td><code>bufferData(ARRAY_BUFFER, [1, 2, 3], STATIC_DRAW)</code>（普通数组）</td><td>NO_ERROR，BUFFER_SIZE = 0（匹配到了 size 重载）；错误拖到 draw 时才出现</td></tr>
+        <tr><td>先绑到 ARRAY_BUFFER 的 buffer，再绑到 ELEMENT_ARRAY_BUFFER</td><td>INVALID_OPERATION（WebGL 规定一个 buffer 一辈子只能用于一种 target）</td></tr>
+        <tr><td>ARRAY_BUFFER 为 null 时调用 <code>vertexAttribPointer</code></td><td>offset = 0：NO_ERROR，记下的 buffer 是 null；offset ≠ 0：INVALID_OPERATION</td></tr>
+        <tr><td>某个 location 已经 enable，但没有 buffer，然后 drawArrays</td><td>INVALID_OPERATION</td></tr>
+        <tr><td>drawArrays 读到了 buffer 以外（6 个 float 当 6 个 vec2 顶点）</td><td>INVALID_OPERATION（WebGL 的越界检查）</td></tr>
+        <tr><td><code>vertexAttribPointer</code> 的 size = 5、stride = 256、index ≥ MAX_VERTEX_ATTRIBS</td><td>INVALID_VALUE</td></tr>
+        <tr><td><code>vertexAttribPointer</code> 用 FLOAT 类型，stride = 6（不是 4 的倍数）</td><td>INVALID_OPERATION</td></tr>
+        <tr><td><code>enableVertexAttribArray(-1)</code></td><td>INVALID_VALUE</td></tr>
+        <tr><td><code>uniform1f(null, 1)</code></td><td>NO_ERROR（静默忽略）</td></tr>
+        <tr><td>对 sampler uniform 调用 <code>uniform1f</code> / <code>uniform1i</code></td><td>INVALID_OPERATION / NO_ERROR</td></tr>
+        <tr><td><code>uniformMatrix4fv(loc, true, …)</code></td><td>INVALID_VALUE（WebGL1 的 transpose 必须是 false）</td></tr>
+        <tr><td>新建纹理的默认参数</td><td>MIN_FILTER = NEAREST_MIPMAP_LINEAR（需要 mipmap！），WRAP = REPEAT</td></tr>
+        <tr><td><code>texImage2D</code> 的 internalformat 与 format 不同</td><td>INVALID_OPERATION</td></tr>
+        <tr><td><code>texImage2D</code> 的 type 是 UNSIGNED_BYTE，却传 Float32Array</td><td>INVALID_OPERATION</td></tr>
+        <tr><td>3×2 的 RGB 纹理配 18 字节数据</td><td>UNPACK_ALIGNMENT = 4（默认）：INVALID_OPERATION；设成 1：成功</td></tr>
+        <tr><td><code>pixelStorei(UNPACK_ALIGNMENT, 3)</code></td><td>INVALID_VALUE（只能是 1、2、4、8）</td></tr>
+        <tr><td>3×3（NPOT）纹理调用 <code>generateMipmap</code></td><td>INVALID_OPERATION</td></tr>
+        <tr><td>sRGB 纹理（EXT_sRGB）调用 <code>generateMipmap</code>，2D 或 cube</td><td>INVALID_OPERATION</td></tr>
+        <tr><td>同一个纹理先绑 TEXTURE_2D，再绑 TEXTURE_CUBE_MAP</td><td>INVALID_OPERATION</td></tr>
+        <tr><td><code>activeTexture(TEXTURE0 + MAX_COMBINED_TEXTURE_IMAGE_UNITS)</code></td><td>INVALID_ENUM</td></tr>
+        <tr><td>没启用扩展就 <code>drawElements(…, UNSIGNED_INT, …)</code></td><td>INVALID_ENUM</td></tr>
+        <tr><td>空 FBO 的 <code>checkFramebufferStatus</code></td><td>FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT（0x8CD7）</td></tr>
+        <tr><td>颜色附件 5×3、深度附件 4×4</td><td>FRAMEBUFFER_INCOMPLETE_DIMENSIONS（0x8CD9）</td></tr>
+        <tr><td>对不完整的 FBO 调用 <code>clear</code></td><td>INVALID_FRAMEBUFFER_OPERATION</td></tr>
+        <tr><td>5×3（NPOT）纹理当颜色附件</td><td>COMPLETE（没问题，只要不用 mipmap、不用 REPEAT）</td></tr>
+        <tr><td><code>framebufferTexture2D</code> 的 level = 1（没启用扩展）</td><td>INVALID_VALUE</td></tr>
+        <tr><td>默认 framebuffer 上 <code>drawBuffersWEBGL([COLOR_ATTACHMENT0])</code> / <code>([BACK])</code></td><td>INVALID_OPERATION / NO_ERROR</td></tr>
+        <tr><td><code>clear(0x1)</code>、<code>enable(0x1234)</code>、<code>viewport(0, 0, -1, 4)</code></td><td>INVALID_VALUE、INVALID_ENUM、INVALID_VALUE</td></tr>
+        <tr><td>切到另一个 VAO 再切回来</td><td>ELEMENT_ARRAY_BUFFER 跟着 VAO 一起切换；ARRAY_BUFFER 是全局的，不受影响</td></tr>
+        <tr><td><code>loseContext()</code> 之后</td><td>isContextLost = true；第一次 getError = CONTEXT_LOST_WEBGL，之后是 NO_ERROR；getParameter、getExtension、getShaderParameter、getUniformLocation、getActiveAttrib 返回 null；getAttribLocation 返回 -1；checkFramebufferStatus 返回 FRAMEBUFFER_UNSUPPORTED；<strong>create* 返回对象（不是 null）</strong>，对它调用 isBuffer 得到 false；drawingBufferWidth = 0</td></tr>
+        <tr><td>这台机器的上限</td><td>MAX_VERTEX_ATTRIBS = 16，MAX_TEXTURE_IMAGE_UNITS = 16，MAX_COMBINED_TEXTURE_IMAGE_UNITS = 32（MDN：几乎所有设备至少 16 / 8 / 8）</td></tr>
+      </table>
+    </div>
+
+    <!-- ============================================================ A -->
+    <h2 class="group-title" data-group="context" id="g-context">A. context 与查询</h2>
+
+    <section class="api" data-group="context" id="getContext">
+      <h3>canvas.getContext('webgl')</h3>
+      <p class="sig">canvas.getContext('webgl', attributes?): WebGLRenderingContext | null</p>
+      <dl>
+        <dt>作用</dt><dd>创建（或取回这个 canvas 已有的）WebGL1 context。attributes（alpha、depth、stencil、antialias、premultipliedAlpha、preserveDrawingBuffer、powerPreference……）只在第一次创建时生效。</dd>
+        <dt>失败</dt><dd>返回 null：设备或浏览器不支持、WebGL 被禁用、GPU 进了黑名单；同一个 canvas 已经有别种 context（例如 2d）时也返回 null。</dd>
+        <dt>校验</dt><dd>判 null，抛 <code>WebGLContextCreationError</code>（已在 <a data-src="src/rendering/core/errors/RenderingError.ts:187">RenderingError.ts:187</a> 里定义）。用 <code>getContextAttributes()</code> 读回实际生效的属性。</dd>
+        <dt>本项目</dt><dd>尚未出现：由 <code>WebGL1Backend.create</code> 负责 <span class="tag t15">T15</span>。本课程的沙盒每次运行都会调用一次。</dd>
+        <dt>相似</dt><dd><code>getContext('webgl2')</code> → WebGL2RenderingContext；WebGPU 用 <code>canvas.getContext('webgpu')</code> 加 <code>navigator.gpu.requestAdapter()</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/HTMLCanvasElement/getContext">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="context" id="isContextLost">
+      <h3>isContextLost <span class="tag new">新后端独有</span></h3>
+      <p class="sig">gl.isContextLost(): boolean</p>
+      <dl>
+        <dt>作用</dt><dd>读取「context 丢失」标志。丢失以后，大部分调用变成空操作并返回默认值，不会抛异常。所以它是其它一切校验的前提。</dd>
+        <dt>失败</dt><dd>本身不会失败。</dd>
+        <dt>校验</dt><dd>项目在两种地方查它：① 每个入口（<code>assertAvailable</code>）；② 跨过一次 GL 查询、create* 或外部回调之后再查一次，避免把丢失期间返回的 null 当成「不支持」，或者把作废对象当成正常对象。</dd>
+        <dt>本项目</dt><dd>后端共 34 处。典型：<a data-src="src/rendering/backend/webgl1/WebGL1Capabilities.ts:41">Capabilities.ts:41</a> 和 <a data-src="src/rendering/backend/webgl1/WebGL1Capabilities.ts:53">:53</a>（探测前后各查一次）；<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:283">State.assertContextAvailable</a>；<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:298">ProgramManager.ts:298</a>（紧跟在 createShader 之后）。</dd>
+        <dt>相似</dt><dd><code>webglcontextlost</code> 和 <code>webglcontextrestored</code> 事件（异步通知，见 <a href="#WEBGL_lose_context">WEBGL_lose_context</a>）；WebGPU 用 <code>device.lost</code> Promise。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/isContextLost">MDN</a> · <a href="https://registry.khronos.org/webgl/specs/latest/1.0/">WebGL 1.0 规范（context lost 相关章节）</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="context" id="getError">
+      <h3>getError</h3>
+      <p class="sig">gl.getError(): GLenum</p>
+      <dl>
+        <dt>作用</dt><dd>取出并清除一个错误标志。可能的值：NO_ERROR（0）、INVALID_ENUM（0x500）、INVALID_VALUE（0x501）、INVALID_OPERATION（0x502）、OUT_OF_MEMORY（0x505）、INVALID_FRAMEBUFFER_OPERATION（0x506）、CONTEXT_LOST_WEBGL（0x9242，只在丢失后第一次调用时返回）。</dd>
+        <dt>失败</dt><dd>—（它本身就是报告通道 ③）</dd>
+        <dt>校验</dt><dd>① 它会同步等待 GPU 进程（MDN：会引起 flush 和一次往返），只放在创建、上传这类冷路径，不放在每帧的热路径；② 错误会攒着：开工前先清一次，免得把前面遗留的错误算到自己头上；③ compile/link 失败<strong>不会</strong>在这里出现，要查状态；④ 每种错误各一个标志，每次调用只取出其中一个（顺序不保证），要全部取干净得循环到 NO_ERROR（<a href="https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glGetError.xml">ES 2.0 参考页</a>）<span class="tag">实测</span>。项目的 checkError 只取一次，靠检查点排得密来限制误报（第 2 课讨论）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:324">ProgramManager.checkError</a>（第 99 行是 preflight：「发现既有 GL 错误时停止」）、<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:386">GeometryManager.checkError</a>、<a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:21">assertTextureOperation</a>、<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:165">VertexInputSupport.checkError</a>。四处都是「查 lost → getError → 再查 lost」。</dd>
+        <dt>相似</dt><dd>WebGL2 相同；WebGPU 用 <code>device.pushErrorScope()</code> / <code>popErrorScope()</code>（异步）。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/getError">MDN</a> · <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices">MDN best practices</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="context" id="getParameter">
+      <h3>getParameter</h3>
+      <p class="sig">gl.getParameter(pname: GLenum): any</p>
+      <dl>
+        <dt>作用</dt><dd>读 context 的全局状态或设备上限，返回类型随 pname 而变：
+          <ul>
+            <li>绑定类 → 对象或 null：ARRAY_BUFFER_BINDING、ELEMENT_ARRAY_BUFFER_BINDING（属于当前 VAO）、FRAMEBUFFER_BINDING、RENDERBUFFER_BINDING、CURRENT_PROGRAM、TEXTURE_BINDING_2D / TEXTURE_BINDING_CUBE_MAP（<strong>当前纹理单元</strong>上的绑定）</li>
+            <li>VIEWPORT → Int32Array(4) <span class="tag">实测</span></li>
+            <li>上限 → number：MAX_VERTEX_ATTRIBS、MAX_TEXTURE_IMAGE_UNITS、MAX_TEXTURE_SIZE、MAX_CUBE_MAP_TEXTURE_SIZE、MAX_RENDERBUFFER_SIZE</li>
+            <li>像素存储 → number 或 boolean：UNPACK_ALIGNMENT、UNPACK_FLIP_Y_WEBGL……；ACTIVE_TEXTURE → GLenum</li>
+          </ul></dd>
+        <dt>失败</dt><dd>不认识的 pname → INVALID_ENUM 并返回 null；丢失时返回 null。</dd>
+        <dt>校验</dt><dd>返回值是 <code>any</code>：先放进 <code>unknown</code>，再验证类型和范围（<a data-src="src/rendering/backend/webgl1/WebGL1Capabilities.ts:26">reqiurePositiveLimit</a>、<a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:35">requireTextureLimit</a>）；查完再查一次 lost。它也是同步调用，热路径上不要用来「核对状态」——这正是 WebGL1State 选择用 JS 缓存的原因（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:88">State.ts:88–120 的长注释</a>）。</dd>
+        <dt>本项目</dt><dd>19 处，两种用途：① 查能力上限（Capabilities.ts:50–51、RenderTargetManager.validate）；② 「保存 → 修改 → 恢复」绑定：<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:133">GeometryManager.ts:133–134</a>、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:211">RenderTargetManager.ts:211–212</a>、<a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:67">TextureUploadSupport.ts:67–74</a>、<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:183">State.captureSurfaceState</a>、<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:232">ProgramManager.ts:232</a>（CURRENT_PROGRAM）。</dd>
+        <dt>相似</dt><dd>查某个<em>对象</em>或某个 location 的属性，而不是全局值：<code>getBufferParameter</code>、<code>getTexParameter</code>、<code>getRenderbufferParameter</code>、<code>getFramebufferAttachmentParameter</code>、<code>getVertexAttrib</code>、<code>getShaderParameter</code>、<code>getProgramParameter</code>；查某个开关：<code>isEnabled</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/getParameter">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="context" id="getExtension">
+      <h3>getExtension</h3>
+      <p class="sig">gl.getExtension(name: string): object | null</p>
+      <dl>
+        <dt>作用</dt><dd>查询并<strong>启用</strong>扩展。返回的对象上挂着这个扩展的新函数和常量（例如 <code>createVertexArrayOES</code>、<code>VERTEX_ARRAY_BINDING_OES</code>）。</dd>
+        <dt>失败</dt><dd>不支持时返回 null，这不算错误；context 丢失时也返回 null <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>① 查完再查一次 lost，免得把「丢失」误判成「不支持」（<a data-src="src/rendering/backend/webgl1/WebGL1Capabilities.ts:33">Capabilities.ts:33–38 的注释</a>）；② 扩展对象属于创建它的那一个 context，context 恢复后必须重新 getExtension，不能复用旧对象。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1Capabilities.ts:43">Capabilities.ts:43–48</a>（一次探测 6 个扩展，生成冻结快照）；<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:248">CubeTextureManager.ts:248</a>（EXT_sRGB 用到时才查）。</dd>
+        <dt>相似</dt><dd><code>getSupportedExtensions()</code> 只列名字，不启用。WebGL2 把 VAO、32 位索引、多渲染目标、深度纹理、sRGB 等并进了核心 API。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/getExtension">MDN</a> · 扩展一览见 <a href="#g-ext">J 节</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="context" id="drawingBufferWidth">
+      <h3>drawingBufferWidth / drawingBufferHeight</h3>
+      <p class="sig">gl.drawingBufferWidth: number（只读属性）</p>
+      <dl>
+        <dt>作用</dt><dd>默认 framebuffer 的<strong>实际</strong>像素尺寸。canvas 请求的尺寸太大时，浏览器可能给出更小的缓冲。</dd>
+        <dt>失败</dt><dd>丢失时是 0 <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>默认目标的 viewport 用它，而不是 CSS 尺寸或 canvas.width（webglfundamentals 的 anti-patterns 一文同样这么建议）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1State.ts:207">State.bindSurface</a>（null 目标，也就是默认 framebuffer 时用它）。</dd>
+        <dt>相似</dt><dd><code>canvas.width</code> / <code>height</code>（请求的尺寸）；<code>canvas.clientWidth</code> / <code>clientHeight</code>（CSS 显示尺寸）；<code>RenderBackend.resizeDrawingBuffer</code> 负责在两者之间换算 <span class="tag t15">T15</span>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/drawingBufferWidth">MDN</a> · <a href="https://webglfundamentals.org/webgl/lessons/webgl-anti-patterns.html">WebGL Anti-Patterns</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="context" id="WEBGL_lose_context">
+      <h3>WEBGL_lose_context.loseContext / restoreContext 与两个事件</h3>
+      <p class="sig">ext.loseContext(): void · ext.restoreContext(): void
+canvas.addEventListener('webglcontextlost', e =&gt; e.preventDefault())
+canvas.addEventListener('webglcontextrestored', rebuild)</p>
+      <dl>
+        <dt>作用</dt><dd>用来测试的扩展：主动模拟丢失和恢复。真实的丢失（GPU 重置、切换显卡、驱动崩溃）走的是同样两个事件。</dd>
+        <dt>失败</dt><dd>—</dd>
+        <dt>校验</dt><dd>① 在 lost 事件里调用 <code>preventDefault()</code>，才表示「我希望恢复」；② restored 只说明 context 回来了，旧的 handle 全部作废，所有 GPU 资源都要重建；③ 恢复要重新探测能力（扩展对象也要重新取）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:169">Lifecycle.handleLost</a>（第 172 行 preventDefault）、<a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:227">handleRestored</a>；第 5 课会在沙盒里用 loseContext 实际演练。</dd>
+        <dt>相似</dt><dd>three.js：<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1013">onContextLost</a> / <a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1023">onContextRestore</a>、<code>renderer.forceContextLoss()</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WEBGL_lose_context">MDN</a></dd>
+      </dl>
+    </section>
+
+    <!-- ============================================================ B -->
+    <h2 class="group-title" data-group="state" id="g-state">B. 固定功能状态</h2>
+
+    <section class="api" data-group="state" id="enable">
+      <h3>enable / disable</h3>
+      <p class="sig">gl.enable(cap: GLenum): void · gl.disable(cap: GLenum): void</p>
+      <dl>
+        <dt>作用</dt><dd>打开或关闭一项固定功能：DEPTH_TEST、CULL_FACE、BLEND、SCISSOR_TEST、STENCIL_TEST、POLYGON_OFFSET_FILL、SAMPLE_COVERAGE、SAMPLE_ALPHA_TO_COVERAGE、DITHER。默认只有 DITHER 是开着的 <span class="tag">实测</span>。</dd>
+        <dt>失败</dt><dd>不认识的 cap → INVALID_ENUM <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>它改的是全局状态，会一直保持到下次修改。所以下一个物体会继承上一个物体的设置，除非有人每次都显式地设一遍，或者用缓存去掉重复的调用（WebGL1State 的做法）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1State.ts:126">State.setDepthState</a>（DEPTH_TEST）、<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:144">State.setCullMode</a>（CULL_FACE）。</dd>
+        <dt>相似</dt><dd><code>isEnabled(cap)</code> 查询（同步）；three.js <a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:470">WebGLState.enable</a> 同样带缓存。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/enable">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="state" id="depthFunc">
+      <h3>depthFunc</h3>
+      <p class="sig">gl.depthFunc(func: GLenum): void</p>
+      <dl>
+        <dt>作用</dt><dd>深度测试怎么比较：NEVER、LESS（默认）、EQUAL、LEQUAL、GREATER、NOTEQUAL、GEQUAL、ALWAYS。只在 DEPTH_TEST 开着时起作用。</dd>
+        <dt>失败</dt><dd>INVALID_ENUM。</dd>
+        <dt>校验</dt><dd>逻辑值和 GL 常量之间的映射要穷尽：新增一个逻辑值，却忘了在映射里补上对应分支，TypeScript 应该报错（<code>assertNever</code>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1State.ts:138">State.ts:138</a>；Material 的逻辑值 'less' / 'less-equal' / 'always' 经 <a data-src="src/rendering/backend/webgl1/WebGL1State.ts:291">toDepthFunction</a> 映射。</dd>
+        <dt>相似</dt><dd><code>stencilFunc</code>、<code>blendFunc</code>（同样是「比较或混合规则」类的状态）。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/depthFunc">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="state" id="depthMask">
+      <h3>depthMask <span class="tag new">新后端独有</span></h3>
+      <p class="sig">gl.depthMask(flag: boolean): void</p>
+      <dl>
+        <dt>作用</dt><dd>通过测试的片元是否写入深度缓冲（默认 true）。设成 false 就是「只测不写」，常用于天空盒和透明物体。</dd>
+        <dt>失败</dt><dd>—</dd>
+        <dt>校验</dt><dd>写掩码 (write mask) 同样作用于 <code>clear</code>：depthMask(false) 时，<code>clear(DEPTH_BUFFER_BIT)</code> 清不掉深度。Task 15 实现 clear 时要注意这一点。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1State.ts:133">State.ts:133</a>（对应 RenderState.depthWrite）。</dd>
+        <dt>相似</dt><dd><code>colorMask(r, g, b, a)</code>、<code>stencilMask(mask)</code>，同属写掩码。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/depthMask">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="state" id="cullFace">
+      <h3>cullFace <span class="tag new">新后端独有</span></h3>
+      <p class="sig">gl.cullFace(mode: GLenum): void</p>
+      <dl>
+        <dt>作用</dt><dd>剔除哪一面：BACK（默认）、FRONT、FRONT_AND_BACK。只在 CULL_FACE 开着时起作用。哪一面算「正面」由 <code>frontFace</code> 决定（默认 CCW，也就是逆时针为正面）<span class="tag">实测</span>。</dd>
+        <dt>失败</dt><dd>INVALID_ENUM。</dd>
+        <dt>校验</dt><dd>剔除模式 'none' 对应的是 <code>disable(CULL_FACE)</code>，不是某个 cullFace 的值。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1State.ts:144">State.setCullMode</a>（第 156、161 行）。</dd>
+        <dt>相似</dt><dd><code>frontFace(CW | CCW)</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/cullFace">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="state" id="viewport">
+      <h3>viewport</h3>
+      <p class="sig">gl.viewport(x: number, y: number, width: number, height: number): void</p>
+      <dl>
+        <dt>作用</dt><dd>设定 NDC 的 [-1, 1] 映射到哪块像素矩形（原点在左下角）。它不是裁剪工具：矩形裁剪用 <code>scissor</code>，而且 <code>clear</code> 不受 viewport 限制（只受 scissor 限制）。</dd>
+        <dt>失败</dt><dd>宽或高为负 → INVALID_VALUE <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>① 默认值是创建 context 时的 canvas 尺寸，之后改 canvas 尺寸<strong>不会</strong>自动更新 viewport；② viewport 是全局状态，不跟着 framebuffer 走——切换输出目标时必须一起设（State.bindSurface 每次都同时发这两条命令）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1State.ts:211">State.ts:211</a>（bindSurface）、<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:262">:262</a>（restoreSurfaceState）。</dd>
+        <dt>相似</dt><dd><code>scissor(x, y, w, h)</code> 配合 <code>enable(SCISSOR_TEST)</code>；<code>getParameter(VIEWPORT)</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/viewport">MDN</a></dd>
+      </dl>
+    </section>
+
+    <!-- ============================================================ C -->
+    <h2 class="group-title" data-group="program" id="g-program">C. shader 与 program</h2>
+
+    <section class="api" data-group="program" id="createShader">
+      <h3>createShader</h3>
+      <p class="sig">gl.createShader(type: VERTEX_SHADER | FRAGMENT_SHADER): WebGLShader | null</p>
+      <dl>
+        <dt>作用</dt><dd>创建一个空的 shader 对象。</dd>
+        <dt>失败</dt><dd>规范和 TypeScript 的签名都是 <code>| null</code>，是 create* 里唯一还可能返回 null 的；type 错误 → INVALID_ENUM。Chromium 在 context 丢失时返回一个作废的对象 <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>① 判 null（<code>requireNonNull</code>）；② 紧接着查一次 lost；③ 拿到 handle 就立刻登记进本次构建的 owned 清单，这样后面任何一步失败都能找到它、把它删掉。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:296">ProgramManager.ts:296–305</a>（三步都有）。</dd>
+        <dt>相似</dt><dd>createProgram、createBuffer、createTexture、createFramebuffer、createRenderbuffer：现行规范里这几个都<strong>不</strong>返回 null，丢失时返回作废对象；它们从不抛异常。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/createShader">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="shaderSource">
+      <h3>shaderSource</h3>
+      <p class="sig">gl.shaderSource(shader: WebGLShader, source: string): void</p>
+      <dl>
+        <dt>作用</dt><dd>把 GLSL 字符串交给 shader 对象（会替换旧源码），不会编译。</dd>
+        <dt>失败</dt><dd>shader 不是本 context 的有效对象 → INVALID_OPERATION 或 INVALID_VALUE。</dd>
+        <dt>校验</dt><dd>保留原始文本：不要 trim 之后再存，否则编译日志里的行号就对不上了（<a data-src="src/rendering/resources/ShaderModule.ts:102">ShaderModule.ts:102–117</a>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:307">ProgramManager.ts:307</a>。</dd>
+        <dt>相似</dt><dd><code>getShaderSource(shader)</code> 读回源码。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/shaderSource">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="compileShader">
+      <h3>compileShader</h3>
+      <p class="sig">gl.compileShader(shader: WebGLShader): void</p>
+      <dl>
+        <dt>作用</dt><dd>编译。<strong>不返回结果，也不抛异常</strong>；成败只能用 <code>getShaderParameter(shader, COMPILE_STATUS)</code> 去问（通道 ②）。编译失败时 getError 仍是 NO_ERROR <span class="tag">实测</span>。</dd>
+        <dt>失败</dt><dd>COMPILE_STATUS = false，原因在 info log 里。</dd>
+        <dt>校验</dt><dd>取舍：MDN best practices 建议「只在 link 失败时才去查 compile status」，因为这个查询是同步的，会打断浏览器的并行编译（有 KHR_parallel_shader_compile 时更明显）。项目选择每编译完一个就查，换来带 stage 的 ShaderCompilationError；第 6 课讨论这个取舍。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:308">ProgramManager.ts:308–316</a>。</dd>
+        <dt>相似</dt><dd><code>linkProgram</code>（同样是「做完不告诉你结果」）。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/compileShader">MDN</a> · <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices">MDN best practices</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="getShaderParameter">
+      <h3>getShaderParameter</h3>
+      <p class="sig">gl.getShaderParameter(shader, pname: COMPILE_STATUS | SHADER_TYPE | DELETE_STATUS): any</p>
+      <dl>
+        <dt>作用</dt><dd>查询 shader 的状态：COMPILE_STATUS（boolean）、SHADER_TYPE、DELETE_STATUS。</dd>
+        <dt>失败</dt><dd>丢失时返回 null <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>用 <code>!== true</code> 判断，不要用真假值：null 和 false 含义不同，而且返回类型是 any。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:310">ProgramManager.ts:310–316</a>。</dd>
+        <dt>相似</dt><dd><a href="#getProgramParameter">getProgramParameter</a>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/getShaderParameter">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="getShaderInfoLog">
+      <h3>getShaderInfoLog</h3>
+      <p class="sig">gl.getShaderInfoLog(shader): string | null</p>
+      <dl>
+        <dt>作用</dt><dd>编译日志：行号和原因，例如 <code>ERROR: 0:3: 'gl_Positon' : undeclared identifier</code> <span class="tag">实测</span>。</dd>
+        <dt>失败</dt><dd>丢失时返回 null。</dd>
+        <dt>校验</dt><dd>把它放进错误对象，而不只是 console.log：<code>ShaderCompilationError(name, stage, infoLog)</code>；null 时用空字符串代替（<code>?? ''</code>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:315">ProgramManager.ts:315</a>。</dd>
+        <dt>相似</dt><dd><a href="#getProgramInfoLog">getProgramInfoLog</a>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/getShaderInfoLog">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="deleteShader">
+      <h3>deleteShader</h3>
+      <p class="sig">gl.deleteShader(shader): void</p>
+      <dl>
+        <dt>作用</dt><dd>删除 shader。如果它还挂在某个 program 上，只会被<strong>标记为待删除</strong>，等 detach 之后才真正删除（ES 2.0 refpage；<span class="tag">实测</span>：DELETE_STATUS = true，仍然处于挂载状态）。</dd>
+        <dt>失败</dt><dd>—</dd>
+        <dt>校验</dt><dd>丢失时不要再对它调用 delete（这一代的对象已经全部作废）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:193">ProgramManager.ts:193–196</a>：finally 里删掉本次创建的所有 shader；成功路径上会先 detach（第 136–137 行）。</dd>
+        <dt>相似</dt><dd><a href="#deleteProgram">deleteProgram</a>：「正在使用就延后删除」的语义相同。</dd>
+        <dt>出处</dt><dd><a href="https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glDeleteShader.xml">ES 2.0 glDeleteShader</a> · <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/deleteShader">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="createProgram">
+      <h3>createProgram</h3>
+      <p class="sig">gl.createProgram(): WebGLProgram</p>
+      <dl>
+        <dt>作用</dt><dd>创建一个空的 program 对象，之后把 shader 挂上去、链接。</dd>
+        <dt>失败</dt><dd>现行规范里不返回 null；丢失时返回作废对象 <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>项目仍然用 <code>requireNonNull</code> 包一层（防旧实现和测试替身），并在调用后立刻查 lost（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:108">ProgramManager.ts:108–114</a>）。</dd>
+        <dt>本项目</dt><dd>同上。</dd>
+        <dt>相似</dt><dd><code>isProgram(p)</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/createProgram">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="attachShader">
+      <h3>attachShader</h3>
+      <p class="sig">gl.attachShader(program, shader): void</p>
+      <dl>
+        <dt>作用</dt><dd>把 shader 挂到 program 上。vertex 和 fragment 各挂一个。</dd>
+        <dt>失败</dt><dd>同一个 shader 挂两次，或者挂第二个同类型的 shader → INVALID_OPERATION <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>一个 program 里每种类型只能有一个 shader。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:116">ProgramManager.ts:116–117</a>。</dd>
+        <dt>相似</dt><dd><a href="#detachShader">detachShader</a>、<code>getAttachedShaders(program)</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/attachShader">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="linkProgram">
+      <h3>linkProgram</h3>
+      <p class="sig">gl.linkProgram(program): void</p>
+      <dl>
+        <dt>作用</dt><dd>把 vertex 和 fragment 链接成可执行的程序，并给 active attribute、uniform 分配 location。之后 location 保持不变，直到再次 link。</dd>
+        <dt>失败</dt><dd>不返回结果，要查 LINK_STATUS。常见原因：varying 不匹配（两个 shader 都能编译通过，链接才失败 <span class="tag">实测</span>）、attribute 超过上限、shader 没编译成功。</dd>
+        <dt>校验</dt><dd>compile 全部通过也<strong>必须</strong>查 LINK_STATUS。反射结果可以按 program 缓存，前提是没有人重新链接一个已经发布出去的 program（<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:177">VertexInputSupport.ts:177–183</a>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:118">ProgramManager.ts:118–125</a>。</dd>
+        <dt>相似</dt><dd><code>bindAttribLocation(program, index, name)</code>：<strong>链接前</strong>指定 attribute 的 location，可以让多个 program 共用同一套布局（本项目没有用）；<code>validateProgram</code>：调试用，检查在当前状态下能不能执行。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/linkProgram">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="getProgramParameter">
+      <h3>getProgramParameter</h3>
+      <p class="sig">gl.getProgramParameter(program, pname): any</p>
+      <dl>
+        <dt>作用</dt><dd>pname 可以是 LINK_STATUS、ACTIVE_ATTRIBUTES、ACTIVE_UNIFORMS、ATTACHED_SHADERS、DELETE_STATUS、VALIDATE_STATUS。</dd>
+        <dt>失败</dt><dd>丢失时返回 null <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>计数先放进 <code>unknown</code>，验证是非负的安全整数之后再用于循环（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:276">readCount</a>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:120">ProgramManager.ts:120</a>、<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:277">:277</a>；<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:190">VertexInputSupport.ts:190</a>。</dd>
+        <dt>相似</dt><dd><a href="#getShaderParameter">getShaderParameter</a>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/getProgramParameter">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="getProgramInfoLog">
+      <h3>getProgramInfoLog <span class="tag new">新后端独有</span></h3>
+      <p class="sig">gl.getProgramInfoLog(program): string | null</p>
+      <dl>
+        <dt>作用</dt><dd>链接日志，例如 <code>FRAGMENT varying vColor does not match any VERTEX varying</code> <span class="tag">实测</span>。</dd>
+        <dt>失败</dt><dd>丢失时返回 null。</dd>
+        <dt>校验</dt><dd>放进 <code>ProgramLinkError(name, infoLog)</code>。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:124">ProgramManager.ts:124</a>。</dd>
+        <dt>相似</dt><dd><a href="#getShaderInfoLog">getShaderInfoLog</a>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/getProgramInfoLog">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="detachShader">
+      <h3>detachShader <span class="tag new">新后端独有</span></h3>
+      <p class="sig">gl.detachShader(program, shader): void</p>
+      <dl>
+        <dt>作用</dt><dd>解除 shader 和 program 的挂载关系。链接成功后，program 已经持有可执行的结果，shader 可以解除挂载再删除，释放内存。</dd>
+        <dt>失败</dt><dd>shader 没有挂在这个 program 上 → INVALID_OPERATION。</dd>
+        <dt>校验</dt><dd>先 detach 再 deleteShader，才会真正删除（见 <a href="#deleteShader">deleteShader</a>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:136">ProgramManager.ts:136–137</a>（只在成功路径上做；失败路径靠 deleteProgram 一并解除）。</dd>
+        <dt>相似</dt><dd><code>getAttachedShaders(program)</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/detachShader">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="deleteProgram">
+      <h3>deleteProgram</h3>
+      <p class="sig">gl.deleteProgram(program): void</p>
+      <dl>
+        <dt>作用</dt><dd>删除 program。如果它是当前 program，只会被标记为待删除，要等它不再被使用时才删除 <span class="tag">实测</span>。</dd>
+        <dt>失败</dt><dd>—</dd>
+        <dt>校验</dt><dd>项目的 release 顺序：先让依赖它的 VAO 失效（beforeDelete）→ 如果它是当前 program，先 <code>useProgram(null)</code> → 删除 → 通知状态缓存失效（因为缓存里可能还记着这个 program）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:209">ProgramManager.release</a>（第 232–237 行）；<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:190">:190</a>（创建失败时回滚）。</dd>
+        <dt>相似</dt><dd>deleteBuffer、deleteTexture、deleteFramebuffer：删除正处于绑定状态的对象，会自动解除<strong>当前 context</strong> 上的这个绑定 <span class="tag">实测</span>（buffer）。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/deleteProgram">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="program" id="useProgram">
+      <h3>useProgram</h3>
+      <p class="sig">gl.useProgram(program: WebGLProgram | null): void</p>
+      <dl>
+        <dt>作用</dt><dd>设为当前 program；之后的 <code>uniform*</code> 和 draw 都作用于它。传 null 表示不使用任何 program。</dd>
+        <dt>失败</dt><dd>program 没有链接成功 → INVALID_OPERATION；没有 program 时 draw → INVALID_OPERATION <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>缓存去重的前提：缓存用 <code>undefined</code> 表示「不知道」，用 <code>null</code> 表示「明确没有绑定」。如果把两者混为一谈，第一次调用 <code>useProgram(null)</code> 就可能被错误地省略。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1State.ts:47">State.useProgram</a>（缓存）、<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:233">ProgramManager.ts:233</a>（删除前先解绑）。</dd>
+        <dt>相似</dt><dd>three.js <a data-src="node_modules/three/src/renderers/webgl/WebGLState.js:575">WebGLState.useProgram</a>（同样带缓存，返回是否真的切换了）；WebGPU 没有「当前 program」，每次 <code>setPipeline</code> 时显式指定。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/useProgram">MDN</a></dd>
+      </dl>
+    </section>
+
+    <!-- ============================================================ D -->
+    <h2 class="group-title" data-group="reflection" id="g-reflection">D. 反射（问 program 里有什么）</h2>
+
+    <section class="api" data-group="reflection" id="getActiveAttrib">
+      <h3>getActiveAttrib</h3>
+      <p class="sig">gl.getActiveAttrib(program, index: number): WebGLActiveInfo { name, size, type } | null</p>
+      <dl>
+        <dt>作用</dt><dd>列出第 index 个<strong>活跃 (active)</strong> attribute，也就是 shader 真正用到的那些；声明了却没用到的，会被编译器优化掉，不在其中 <span class="tag">实测</span>。index 只是枚举的序号，<strong>不是 location</strong>。</dd>
+        <dt>失败</dt><dd>index 越界 → INVALID_VALUE，返回 null <span class="tag">实测</span>；丢失时也返回 null。</dd>
+        <dt>校验</dt><dd>分清三个数：<code>size</code> 是数组长度（非数组时为 1，不是分量数）；<code>type</code> 是 shader 里的变量类型（FLOAT_VEC3），不是 buffer 里单个分量的类型（FLOAT）；location 要另外查。项目拒绝 size ≠ 1 和矩阵类型，因为当前的接线算法每个 attribute 只占一个 location。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:147">ProgramManager.ts:147–159</a>（记录 name → location）；<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:207">VertexInputSupport.ts:207–242</a>（查类型和 size，检查 location 唯一且小于上限）。</dd>
+        <dt>相似</dt><dd><a href="#getActiveUniform">getActiveUniform</a>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/getActiveAttrib">MDN</a> · <a href="https://raw.githubusercontent.com/KhronosGroup/OpenGL-Refpages/main/es2.0/glGetActiveAttrib.xml">ES 2.0 refpage</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="reflection" id="getActiveUniform">
+      <h3>getActiveUniform</h3>
+      <p class="sig">gl.getActiveUniform(program, index: number): WebGLActiveInfo | null</p>
+      <dl>
+        <dt>作用</dt><dd>列出活跃的 uniform。数组 uniform 返回的名字带 <code>[0]</code>，size 等于数组长度（例如 <code>uLights[0]</code>，size = 3 <span class="tag">实测</span>）。type 可能是 FLOAT_MAT4、SAMPLER_2D、SAMPLER_CUBE、BOOL、INT……</dd>
+        <dt>失败</dt><dd>同 getActiveAttrib。</dd>
+        <dt>校验</dt><dd>项目按驱动返回的名字原样保存，不另外添加数组的别名（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:20">ProgramManager.ts:20</a>）。上传 uniform 时要检查类型匹配，这一步在 <code>TODO(material-uniform-reflection)</code> 里，还没做。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:161">ProgramManager.ts:161–172</a>。</dd>
+        <dt>相似</dt><dd><a href="#getActiveAttrib">getActiveAttrib</a>、<a href="#getUniformLocation">getUniformLocation</a>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/getActiveUniform">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="reflection" id="getAttribLocation">
+      <h3>getAttribLocation</h3>
+      <p class="sig">gl.getAttribLocation(program, name: string): number</p>
+      <dl>
+        <dt>作用</dt><dd>查询 attribute 在链接后分到的 location。</dd>
+        <dt>失败</dt><dd>找不到（名字拼错、没用到被优化掉、context 丢失）→ <strong>-1</strong> <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>用 <code>&lt; 0</code> 判断。<strong>0 是合法值</strong>，<code>if (!location)</code> 会把它当成失败。拿 -1 去调用 pointer 或 enable 会得到 INVALID_VALUE，然后画面空白。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:154">ProgramManager.ts:154–156</a>（它查的是已经列举出来的 active attribute，所以查到负数说明反射结果自相矛盾，直接报错）。</dd>
+        <dt>相似</dt><dd><code>bindAttribLocation</code>（链接前指定）；<a href="#getUniformLocation">getUniformLocation</a>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/getAttribLocation">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="reflection" id="getUniformLocation">
+      <h3>getUniformLocation</h3>
+      <p class="sig">gl.getUniformLocation(program, name: string): WebGLUniformLocation | null</p>
+      <dl>
+        <dt>作用</dt><dd>取得 uniform 的「位置对象」（不是数字），只对这个 program 有效。数组可以查 <code>'uLights'</code>，也可以查 <code>'uLights[2]'</code> <span class="tag">实测</span>。</dd>
+        <dt>失败</dt><dd>名字不存在或没有被用到 → null。把 null 传给 uniform* 是<strong>合法的空操作</strong>（静默！）<span class="tag">实测</span>——这就是为什么 uniform 名字拼错不会报错，只是「没效果」。</dd>
+        <dt>校验</dt><dd>要不要把「材质提供了参数，shader 里却没有对应的 uniform」当成错误，是一个需要明确做出的契约决定。项目目前只保存非 null 的 location，更严格的检查属于 TODO。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:168">ProgramManager.ts:168–171</a>。</dd>
+        <dt>相似</dt><dd><a href="#uniform">uniform*</a>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/getUniformLocation">MDN</a></dd>
+      </dl>
+    </section>
+
+    <!-- ============================================================ E -->
+    <h2 class="group-title" data-group="buffer" id="g-buffer">E. buffer</h2>
+
+    <section class="api" data-group="buffer" id="createBuffer">
+      <h3>createBuffer</h3>
+      <p class="sig">gl.createBuffer(): WebGLBuffer</p>
+      <dl>
+        <dt>作用</dt><dd>创建一个空的 buffer 对象（还没有分配存储）。</dd>
+        <dt>失败</dt><dd>旧版规范规定丢失时返回 null；现行规范和 TypeScript 的签名都是非 null，Chromium 在丢失时返回作废对象（对它调用 isBuffer 得到 false）<span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>两道防线：<code>requireNonNull</code>（挡旧实现和测试替身）加上紧跟着的 isContextLost 检查（挡作废对象）；拿到之后立刻登记进 owned 清单。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:321">GeometryManager.upload</a>（第 321–327 行）。</dd>
+        <dt>相似</dt><dd><code>isBuffer(b)</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/createBuffer">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="buffer" id="bindBuffer">
+      <h3>bindBuffer</h3>
+      <p class="sig">gl.bindBuffer(target: ARRAY_BUFFER | ELEMENT_ARRAY_BUFFER, buffer: WebGLBuffer | null): void</p>
+      <dl>
+        <dt>作用</dt><dd>让某个绑定点 (binding point) 指向这个 buffer，之后的 <code>bufferData</code> 等调用就作用于它。ARRAY_BUFFER 放顶点数据，是<strong>全局</strong>绑定点；ELEMENT_ARRAY_BUFFER 放索引，<strong>属于当前 VAO</strong> <span class="tag">实测</span>。</dd>
+        <dt>失败</dt><dd>WebGL 规定一个 buffer 一辈子只能用于一种 target：先绑到 ARRAY_BUFFER 的，再绑 ELEMENT_ARRAY_BUFFER → INVALID_OPERATION <span class="tag">实测</span>；传入的不是 WebGLBuffer → 直接抛 TypeError <span class="tag">实测</span>；传 null 合法（等于解绑）。</dd>
+        <dt>校验</dt><dd>每个 buffer 一开始就按真实用途绑定（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:311">GeometryManager.ts:311–312 的注释</a>）；临时改了绑定就要恢复原值，或者让状态缓存失效。</dd>
+        <dt>本项目</dt><dd>11 处：上传（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:329">GeometryManager.ts:329</a>）、恢复（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:166">:166–167</a>）、接线（<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:116">VertexInputSupport.ts:116</a>、<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:131">:131</a>）、缓存（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:57">State.ts:57–74</a>）、Manual 策略的重置（<a data-src="src/rendering/backend/webgl1/WebGL1ManualVertexInputManager.ts:177">:177–178</a>）、OES 策略恢复 ARRAY_BUFFER（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:107">:107</a>）。</dd>
+        <dt>相似</dt><dd>bindTexture、bindFramebuffer、bindRenderbuffer、bindVertexArrayOES：都是「先绑定，后续调用作用于绑定点上的对象」这一模式。WebGL2 增加了 COPY_READ_BUFFER、UNIFORM_BUFFER 等 target。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/bindBuffer">MDN</a> · <a href="https://registry.khronos.org/webgl/specs/latest/1.0/">WebGL 1.0 规范 §6（buffer 绑定限制）</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="buffer" id="bufferData">
+      <h3>bufferData</h3>
+      <p class="sig">gl.bufferData(target, data: ArrayBufferView | ArrayBuffer | null, usage): void
+gl.bufferData(target, size: number, usage): void</p>
+      <dl>
+        <dt>作用</dt><dd>给绑定点上的 buffer 分配存储并（可选）写入数据；再次调用会整体重新分配。usage 只是提示：STATIC_DRAW（写一次、画很多次）、DYNAMIC_DRAW（经常改）、STREAM_DRAW（改一次、画几次）。</dd>
+        <dt>失败</dt><dd>target 上没有绑定 buffer → INVALID_OPERATION；显存不够 → OUT_OF_MEMORY（函数返回 void，只能靠 getError 发现）。<strong>陷阱</strong>：传普通 JS 数组不会报错——它匹配到的是 size 重载，结果分配了 0 字节，错误拖到 draw 时才出现 <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>数据必须是正确类型的 TypedArray（顶点属性支持的类型见 <a data-src="src/rendering/resources/VertexAttribute.ts:10">VertexAttributeData</a>）；上传后跑一次 checkError（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:332">GeometryManager.ts:332 的注释</a>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:330">GeometryManager.ts:330</a>（静态几何一律用 STATIC_DRAW）。</dd>
+        <dt>相似</dt><dd><code>bufferSubData(target, offset, data)</code>：只改一段，不重新分配（动态几何、粒子会用到；three.js 的 <a data-src="node_modules/three/src/renderers/webgl/WebGLAttributes.js:76">WebGLAttributes.updateBuffer</a> 就这样做局部更新）；WebGL2 的 <code>copyBufferSubData</code>、<code>getBufferSubData</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/bufferData">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="buffer" id="deleteBuffer">
+      <h3>deleteBuffer</h3>
+      <p class="sig">gl.deleteBuffer(buffer): void</p>
+      <dl>
+        <dt>作用</dt><dd>删除 buffer。如果它正绑在当前 context 的某个绑定点上，那个绑定会被自动解除 <span class="tag">实测</span>。</dd>
+        <dt>失败</dt><dd>—</dd>
+        <dt>校验</dt><dd>项目规定：<strong>先</strong>让借用它的 VAO 失效（beforeDelete → <code>vertexInputs.releaseGeometry</code>），<strong>再</strong>删 buffer，保证任何时刻都不存在指向已删除对象的记录。three.js 的顺序正好相反（见 <a href="architecture-map.html#threejs">架构地图 §8</a>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:212">GeometryManager.release</a>（第 235–241 行）；<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:195">:195</a>（创建失败时回滚）。</dd>
+        <dt>相似</dt><dd>其它 delete*。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/deleteBuffer">MDN</a></dd>
+      </dl>
+    </section>
+
+    <!-- ============================================================ F -->
+    <h2 class="group-title" data-group="vertex" id="g-vertex">F. 顶点输入</h2>
+
+    <section class="api" data-group="vertex" id="vertexAttribPointer">
+      <h3>vertexAttribPointer</h3>
+      <p class="sig">gl.vertexAttribPointer(index, size: 1..4, type, normalized: boolean, stride: 0..255, offset): void</p>
+      <dl>
+        <dt>作用</dt><dd>告诉 GPU：location = index 的 attribute，从<strong>此刻绑在 ARRAY_BUFFER 上的 buffer</strong> 里读数据，每个顶点读 size 个分量，每个分量的存储类型是 type（FLOAT、BYTE、UNSIGNED_BYTE、SHORT、UNSIGNED_SHORT）。normalized 把整数映射到 [0, 1] 或 [-1, 1]；stride 是相邻两个顶点之间的字节距离（0 表示紧密排列）；offset 是起始字节。这组设置记进 attribute 状态，有 VAO 时记进 VAO。</dd>
+        <dt>失败</dt><dd>size 不在 1..4、stride &gt; 255、index ≥ MAX_VERTEX_ATTRIBS → INVALID_VALUE；stride 或 offset 不是分量大小的倍数 → INVALID_OPERATION；ARRAY_BUFFER 为 null 且 offset ≠ 0 → INVALID_OPERATION，而 offset = 0 时<strong>不报错</strong>，要到 draw 时才出错 <span class="tag">实测</span>（MDN 的写法没有区分这两种情况）。</dd>
+        <dt>校验</dt><dd>分清三种数：shader 变量类型（FLOAT_VEC3，来自反射）、分量的存储类型（FLOAT，也就是这里的 type）、每个顶点的分量数（3，也就是这里的 size）。项目要求 itemSize 在 1..4，但不要求它等于 shader 向量的宽度——缺少的分量按 GL 规则补齐。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:112">VertexInputSupport.apply</a>（第 118 行；每个属性一个紧密排列的 buffer，stride 和 offset 都是 0）。</dd>
+        <dt>相似</dt><dd><code>vertexAttrib1f</code> … <code>vertexAttrib4fv</code>：给<em>没有启用数组</em>的 location 设一个常量值；<code>getVertexAttrib(index, pname)</code>：查询；WebGL2 增加了 <code>vertexAttribIPointer</code>（整数 attribute）、<code>vertexAttribDivisor</code>（实例化）；矩阵 attribute 要按列拆成 4 个连续的 location（见 <code>docs/vertex-input-strategies.zh-CN.md</code>）。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/vertexAttribPointer">MDN</a> · <a href="https://raw.githubusercontent.com/KhronosGroup/OpenGL-Refpages/main/es2.0/glVertexAttribPointer.xml">ES 2.0 refpage</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="vertex" id="enableVertexAttribArray">
+      <h3>enableVertexAttribArray</h3>
+      <p class="sig">gl.enableVertexAttribArray(index): void</p>
+      <dl>
+        <dt>作用</dt><dd>让这个 location 从数组（buffer）读数据。不启用时，读到的是一个常量值（默认 (0, 0, 0, 1)），所以忘了 enable 通常不会报错，只会画错。</dd>
+        <dt>失败</dt><dd>index 越界或为 -1 → INVALID_VALUE <span class="tag">实测</span>；启用了却没有给它 buffer，draw 时 → INVALID_OPERATION <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>enable 的状态也属于 VAO（没有 VAO 时属于默认 VAO），会一直留给后面的物体。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:127">VertexInputSupport.ts:127</a>。</dd>
+        <dt>相似</dt><dd><a href="#disableVertexAttribArray">disableVertexAttribArray</a>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/enableVertexAttribArray">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="vertex" id="disableVertexAttribArray">
+      <h3>disableVertexAttribArray</h3>
+      <p class="sig">gl.disableVertexAttribArray(index): void</p>
+      <dl>
+        <dt>作用</dt><dd>关闭从数组读取，回到常量值。它<strong>不</strong>清除 pointer 的设置。</dd>
+        <dt>失败</dt><dd>index 越界 → INVALID_VALUE。</dd>
+        <dt>校验</dt><dd>为什么要清理遗留的 location：上一个物体用了 {0, 2}，下一个只用 {0}。如果 2 还开着，而它指向的 buffer 已经被删除了，draw 就会 INVALID_OPERATION（「启用了却没有 buffer」）；就算 buffer 还在，上一个物体的接线也还留在状态里。第一次接管时不知道之前开了哪些，所以要把 0..MAX-1 全部扫一遍。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1ManualVertexInputManager.ts:67">ManualVertexInputManager.ts:67–75</a>（关掉集合里多出来的）、<a data-src="src/rendering/backend/webgl1/WebGL1ManualVertexInputManager.ts:167">resetBindings</a>（失败后保守地全部关掉）。</dd>
+        <dt>相似</dt><dd><a href="#enableVertexAttribArray">enableVertexAttribArray</a>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/disableVertexAttribArray">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="vertex" id="OES_vertex_array_object">
+      <h3>OES_vertex_array_object：createVertexArrayOES / bindVertexArrayOES / deleteVertexArrayOES</h3>
+      <p class="sig">ext.createVertexArrayOES(): WebGLVertexArrayObjectOES
+ext.bindVertexArrayOES(vao | null): void
+ext.deleteVertexArrayOES(vao): void
+gl.getParameter(ext.VERTEX_ARRAY_BINDING_OES)</p>
+      <dl>
+        <dt>作用</dt><dd>VAO 把「所有 attribute 的 pointer 和 enable 设置，加上 ELEMENT_ARRAY_BUFFER 绑定」保存成一个对象，之后 bind 一次就能恢复全部接线。它<strong>不</strong>保存当前的 ARRAY_BUFFER 绑定（扩展原文：state vector… except ARRAY_BUFFER_BINDING）<span class="tag">实测</span>。bind null 表示回到 context 自带的默认 VAO。</dd>
+        <dt>失败</dt><dd>扩展不存在时 getExtension 返回 null，这时要改走手动接线。TypeScript 签名里 createVertexArrayOES 是非 null 的；项目仍然保留对 null 的防御（针对旧实现和测试替身，见 <a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:91">OES.ts:91 的注释</a>）。</dd>
+        <dt>校验</dt><dd>① cache key 必须同时包含 Geometry 和<strong>真实的 WebGLProgram</strong>：同一个 Geometry 配不同的 program，location 可能不同；② 切换 VAO 会改变 ELEMENT_ARRAY_BUFFER，所以状态缓存里记的 EBO 必须失效；③ 配置到一半失败，要恢复进入前的 VAO 和 ARRAY_BUFFER，并删掉这个半成品 VAO；④ 删除当前正在用的 VAO 之前，先解绑。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:58">OESVertexInputManager.bind</a>（第 69 行：缓存命中时只 bind；第 79–128 行：新建、配置、回滚）、<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:143">unbind</a>、<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:238">deleteEntry</a>；<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:84">State.invalidateVertexInputState</a>。</dd>
+        <dt>相似</dt><dd>WebGL2 核心 API：<code>createVertexArray</code> / <code>bindVertexArray</code>（three.js r177 直接用它们：<a data-src="node_modules/three/src/renderers/webgl/WebGLBindingStates.js:52">WebGLBindingStates.js:52</a>）；WebGPU 没有 VAO，顶点布局写在 pipeline 里。</dd>
+        <dt>出处</dt><dd><a href="https://registry.khronos.org/OpenGL/extensions/OES/OES_vertex_array_object.txt">扩展原文（GLES）</a> · <a href="https://developer.mozilla.org/en-US/docs/Web/API/OES_vertex_array_object">MDN</a></dd>
+      </dl>
+    </section>
+
+    <!-- ============================================================ G -->
+    <h2 class="group-title" data-group="texture" id="g-texture">G. 纹理</h2>
+
+    <section class="api" data-group="texture" id="createTexture">
+      <h3>createTexture</h3>
+      <p class="sig">gl.createTexture(): WebGLTexture</p>
+      <dl>
+        <dt>作用</dt><dd>创建一个空的纹理对象。它是 2D 还是 cube，由<strong>第一次绑定</strong>时的 target 决定。</dd>
+        <dt>失败</dt><dd>同 <a href="#createBuffer">createBuffer</a>。</dd>
+        <dt>校验</dt><dd>拿到之后立刻记下来，保证任何失败路径都能删掉它（CubeTextureManager 用 <code>handle</code> 变量，RenderTargetManager 用 <code>colors</code> 数组）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:116">CubeTextureManager.ts:116–119</a>、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:230">RenderTargetManager.ts:230–234</a>。</dd>
+        <dt>相似</dt><dd><code>isTexture(t)</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/createTexture">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="texture" id="activeTexture">
+      <h3>activeTexture <span class="tag t15">T15</span></h3>
+      <p class="sig">gl.activeTexture(TEXTURE0 + i): void</p>
+      <dl>
+        <dt>作用</dt><dd>选定「当前纹理单元 (texture unit)」，之后的 bindTexture 作用于这个单元。shader 里的 sampler uniform 存的是<strong>单元号 i</strong>（用 <code>uniform1i</code> 设置），而不是纹理对象本身。</dd>
+        <dt>失败</dt><dd>i ≥ MAX_COMBINED_TEXTURE_IMAGE_UNITS → INVALID_ENUM <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>它也是全局状态：上传纹理时不要偷偷切换单元，要么保持不变，要么切完再恢复。</dd>
+        <dt>本项目</dt><dd>只在恢复时用到：<a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:86">TextureUploadSupport.ts:86</a>（上传作用域不切换单元，只把进入前的单元恢复回去）。Task 15 的 draw 会给每个 sampler 分配单元：activeTexture → bindTexture → uniform1i。</dd>
+        <dt>相似</dt><dd>WebGL2 的 sampler 对象（<code>createSampler</code>、<code>bindSampler</code>）把过滤和环绕参数从纹理对象里分离出来。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/activeTexture">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="texture" id="bindTexture">
+      <h3>bindTexture</h3>
+      <p class="sig">gl.bindTexture(target: TEXTURE_2D | TEXTURE_CUBE_MAP, texture | null): void</p>
+      <dl>
+        <dt>作用</dt><dd>把纹理绑到「当前单元 × target」这个绑定点上；之后的 texImage2D、texParameteri 作用于它。</dd>
+        <dt>失败</dt><dd>纹理的 target 在第一次绑定时就定下了：先绑 2D 再绑 CUBE_MAP → INVALID_OPERATION <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>临时绑定要恢复：先用 getParameter(TEXTURE_BINDING_2D 或 TEXTURE_BINDING_CUBE_MAP) 保存，结束后恢复。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:120">CubeTextureManager.ts:120</a>、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:235">RenderTargetManager.ts:235</a>、<a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:87">TextureUploadSupport.ts:87</a>（恢复）。</dd>
+        <dt>相似</dt><dd><a href="#bindBuffer">bindBuffer</a> 的同一种「绑定点」模式。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/bindTexture">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="texture" id="texImage2D">
+      <h3>texImage2D</h3>
+      <p class="sig">// 像素数组版本
+gl.texImage2D(target, level, internalformat, width, height, border: 0, format, type, pixels: ArrayBufferView | null)
+// 浏览器图像版本
+gl.texImage2D(target, level, internalformat, format, type, source: HTMLImageElement | HTMLCanvasElement | HTMLVideoElement | ImageBitmap | ImageData)</p>
+      <dl>
+        <dt>作用</dt><dd>给当前绑定纹理的某一级 level（或 cube 的某一个面）分配存储并上传像素；<code>pixels = null</code> 表示只分配、不上传——离屏渲染的颜色附件就是这样分配的。cube 的六个面用 <code>TEXTURE_CUBE_MAP_POSITIVE_X + i</code>，i = 0..5 依次是 +X −X +Y −Y +Z −Z。</dd>
+        <dt>失败</dt><dd>INVALID_VALUE：尺寸超出上限或为负、border ≠ 0；INVALID_ENUM：format 或 type 不认识；INVALID_OPERATION：internalformat ≠ format、数组类型和 type 不匹配、数据量不够（按 UNPACK_ALIGNMENT 计算行对齐）<span class="tag">实测</span>；还有 OUT_OF_MEMORY。</dd>
+        <dt>校验</dt><dd>WebGL1 规则：internalformat 必须等于 format；UNSIGNED_BYTE 配 Uint8Array；FLOAT 配 Float32Array，并且需要 OES_texture_float；sRGB 需要 EXT_sRGB，而且这时 format 也要写成 SRGB_EXT 或 SRGB_ALPHA_EXT。图片要先检查已经加载完成，尺寸用 naturalWidth，不要用 CSS 宽度（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:40">imageDimensions</a>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:126">CubeTextureManager.ts:126</a>（数组）和 <a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:128">:128</a>（图片）；<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:237">RenderTargetManager.ts:237</a>（null，只分配）。</dd>
+        <dt>相似</dt><dd><code>texSubImage2D</code>：更新一部分，不重新分配；<code>copyTexImage2D</code>：从当前 framebuffer 复制；<code>compressedTexImage2D</code>：压缩格式；WebGL2 的 <code>texStorage2D</code>：一次性分配、之后尺寸不可变。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/texImage2D">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="texture" id="texParameteri">
+      <h3>texParameteri</h3>
+      <p class="sig">gl.texParameteri(target, pname, param): void</p>
+      <dl>
+        <dt>作用</dt><dd>设置采样参数。TEXTURE_MIN_FILTER：NEAREST、LINEAR，或 4 种 *_MIPMAP_*；TEXTURE_MAG_FILTER：NEAREST、LINEAR；TEXTURE_WRAP_S / TEXTURE_WRAP_T：REPEAT（默认）、CLAMP_TO_EDGE、MIRRORED_REPEAT。</dd>
+        <dt>失败</dt><dd>INVALID_ENUM。更要命的是<strong>静默失败</strong>：MIN_FILTER 的默认值是 NEAREST_MIPMAP_LINEAR <span class="tag">实测</span>，它需要完整的 mipmap 链。只上传了 level 0 却没改 MIN_FILTER，纹理就处于「不完整 (incomplete)」状态，采样结果是黑色，而且不报任何错。</dd>
+        <dt>校验</dt><dd>WebGL1 的 NPOT 规则：宽或高不是 2 的幂时，必须用 CLAMP_TO_EDGE，MIN_FILTER 只能是 NEAREST 或 LINEAR，而且不能有 mipmap，否则采样失败（MDN）。项目在上传前就拒绝不合规的组合（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:217">CubeTextureManager.ts:217–225</a>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:148">CubeTextureManager.ts:148–159</a>（按 sampler 描述映射）；<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:249">RenderTargetManager.ts:249–252</a>（颜色附件固定用 LINEAR 加 CLAMP_TO_EDGE，所以 NPOT 尺寸的目标也能用）。</dd>
+        <dt>相似</dt><dd><code>texParameterf</code>、<code>getTexParameter</code>；WebGL2 去掉了大部分 NPOT 限制；EXT_texture_filter_anisotropic。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/texParameter">MDN</a> · <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/Tutorial/Using_textures_in_WebGL">MDN：NPOT 规则</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="texture" id="pixelStorei">
+      <h3>pixelStorei</h3>
+      <p class="sig">gl.pixelStorei(pname, param): void</p>
+      <dl>
+        <dt>作用</dt><dd>决定上传时怎样解释 CPU 内存里的像素（这些都是全局状态）：
+          <ul>
+            <li><strong>UNPACK_ALIGNMENT</strong>（默认 4，只能取 1、2、4、8）：每一行的起始地址按几个字节对齐。宽 3 像素的 RGB 图每行 9 字节，按默认的 4 字节对齐会被当成每行 12 字节，于是数据不够（INVALID_OPERATION）或者错位 <span class="tag">实测</span>。</li>
+            <li><strong>UNPACK_FLIP_Y_WEBGL</strong>（默认 false）：上传时上下翻转（图片的原点在左上角，纹理坐标的原点在左下角）。</li>
+            <li><strong>UNPACK_PREMULTIPLY_ALPHA_WEBGL</strong>（默认 false）：上传时把 alpha 乘进 RGB。</li>
+            <li><strong>UNPACK_COLORSPACE_CONVERSION_WEBGL</strong>（默认 BROWSER_DEFAULT_WEBGL，可以设成 NONE）：是否让浏览器做颜色空间转换。</li>
+            <li>PACK_ALIGNMENT（默认 4）：readPixels 读回方向的对齐。</li>
+          </ul></dd>
+        <dt>失败</dt><dd>对齐值不是 1、2、4、8 → INVALID_VALUE <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>因为是全局状态，上一次谁设成了什么都会影响这一次上传：要么每次都显式设成确定的值（three.js 的做法），要么「保存 → 设成确定值 → finally 恢复」（本项目的做法）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:62">withTextureUploadState</a>（第 79–82 行设成 1 / false / false / NONE，第 88–91 行恢复）。</dd>
+        <dt>相似</dt><dd>three.js <a data-src="node_modules/three/src/renderers/webgl/WebGLTextures.js:851">uploadTexture</a>（每次按纹理的属性设置）；WebGL2 增加了 UNPACK_ROW_LENGTH、UNPACK_SKIP_PIXELS 等参数。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/pixelStorei">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="texture" id="generateMipmap">
+      <h3>generateMipmap</h3>
+      <p class="sig">gl.generateMipmap(target: TEXTURE_2D | TEXTURE_CUBE_MAP): void</p>
+      <dl>
+        <dt>作用</dt><dd>根据 level 0 自动生成整条 mipmap 链。</dd>
+        <dt>失败</dt><dd>WebGL1 中，以下情况都会产生 INVALID_OPERATION：NPOT 纹理 <span class="tag">实测</span>；cube 的六个面不是同样大小的正方形；<strong>sRGB 纹理</strong>（EXT_sRGB 的规定）<span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>在上传之前把「能不能生成 mipmap」判断清楚，并给出精确的错误类型，不要等 GL 事后报出一个泛化的错误码。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:161">CubeTextureManager.ts:161</a>（紧接着 <code>assertTextureOperation</code>）。</dd>
+        <dt>相似</dt><dd>手工逐级上传（<code>texImage2D</code> 配 level &gt; 0），环境贴图的 prefilter 链就是这样做的；WebGL2 的 texStorage2D 可以一次分配多级。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/generateMipmap">MDN</a> · <a href="https://registry.khronos.org/OpenGL/extensions/EXT/EXT_sRGB.txt">EXT_sRGB（GLES）</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="texture" id="deleteTexture">
+      <h3>deleteTexture</h3>
+      <p class="sig">gl.deleteTexture(texture): void</p>
+      <dl>
+        <dt>作用</dt><dd>删除纹理。它在当前 context 里的绑定会被解除；如果它正挂在当前绑定的 FBO 上，也会被解除挂载。</dd>
+        <dt>失败</dt><dd>—</dd>
+        <dt>校验</dt><dd>先从缓存里移除、取消订阅，再删除；context 丢失时只丢弃记录，不调用 delete。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:265">CubeTextureManager.release</a>；<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:312">RenderTargetManager.deleteResource</a>。</dd>
+        <dt>相似</dt><dd>其它 delete*。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/deleteTexture">MDN</a></dd>
+      </dl>
+    </section>
+
+    <!-- ============================================================ H -->
+    <h2 class="group-title" data-group="fbo" id="g-fbo">H. framebuffer 与 renderbuffer</h2>
+
+    <section class="api" data-group="fbo" id="createFramebuffer">
+      <h3>createFramebuffer</h3>
+      <p class="sig">gl.createFramebuffer(): WebGLFramebuffer</p>
+      <dl>
+        <dt>作用</dt><dd>创建一个 FBO：它本身不存储像素，只是一组「附着点 (attachment point)」，指向真正存储像素的纹理或 renderbuffer。</dd>
+        <dt>失败</dt><dd>同 <a href="#createBuffer">createBuffer</a>。</dd>
+        <dt>校验</dt><dd>在同一个构建事务里记下它，失败时连同已经创建的颜色纹理、深度 renderbuffer 一起删掉。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:223">RenderTargetManager.ts:223–227</a>。</dd>
+        <dt>相似</dt><dd><code>isFramebuffer</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/createFramebuffer">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="fbo" id="bindFramebuffer">
+      <h3>bindFramebuffer</h3>
+      <p class="sig">gl.bindFramebuffer(FRAMEBUFFER, framebuffer | null): void</p>
+      <dl>
+        <dt>作用</dt><dd>决定之后的 draw、clear、readPixels 写到哪里（或从哪里读）；null 表示默认 framebuffer，也就是 canvas。WebGL1 只有 FRAMEBUFFER 这一个 target。注意 viewport 不会跟着改变。</dd>
+        <dt>失败</dt><dd>target 错误 → INVALID_ENUM。</dd>
+        <dt>校验</dt><dd>切换输出目标之前，先捕获<strong>真实</strong>的 FRAMEBUFFER_BINDING 和 VIEWPORT，放进 try/finally，结束后恢复——进入前绑定的也可能是另一个 FBO，不能一律绑回 null（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:219">State.ts:219–254 的注释</a>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:227">RenderTargetManager.ts:227</a>（创建时临时绑定）和 <a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:305">:305</a>（finally 里恢复）；<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:210">State.ts:210</a>（bindSurface）、<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:261">:261</a>（restoreSurfaceState）。</dd>
+        <dt>相似</dt><dd>WebGL2 的 DRAW_FRAMEBUFFER、READ_FRAMEBUFFER，以及 <code>blitFramebuffer</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/bindFramebuffer">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="fbo" id="framebufferTexture2D">
+      <h3>framebufferTexture2D</h3>
+      <p class="sig">gl.framebufferTexture2D(FRAMEBUFFER, attachment, textarget, texture, level: 0): void</p>
+      <dl>
+        <dt>作用</dt><dd>把纹理挂到 FBO 的附着点上：COLOR_ATTACHMENT0（有 WEBGL_draw_buffers 时可以用到 COLOR_ATTACHMENTi）、DEPTH_ATTACHMENT（深度纹理需要 WEBGL_depth_texture）、STENCIL_ATTACHMENT、DEPTH_STENCIL_ATTACHMENT。</dd>
+        <dt>失败</dt><dd>WebGL1 里 level 必须是 0，否则 INVALID_VALUE <span class="tag">实测</span>（OES_fbo_render_mipmap 扩展可以放宽这一点）。</dd>
+        <dt>校验</dt><dd>挂完所有附件之后，一定要用 <a href="#checkFramebufferStatus">checkFramebufferStatus</a> 检查。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:254">RenderTargetManager.ts:254</a>（COLOR_ATTACHMENT0 + index）。</dd>
+        <dt>相似</dt><dd><a href="#framebufferRenderbuffer">framebufferRenderbuffer</a>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/framebufferTexture2D">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="fbo" id="checkFramebufferStatus">
+      <h3>checkFramebufferStatus</h3>
+      <p class="sig">gl.checkFramebufferStatus(FRAMEBUFFER): GLenum</p>
+      <dl>
+        <dt>作用</dt><dd>问「这个 FBO 现在能不能画」（通道 ②）。返回值：FRAMEBUFFER_COMPLETE（0x8CD5）；INCOMPLETE_ATTACHMENT（0x8CD6）；INCOMPLETE_MISSING_ATTACHMENT（0x8CD7，一个附件都没有）<span class="tag">实测</span>；INCOMPLETE_DIMENSIONS（0x8CD9，附件尺寸不一致）<span class="tag">实测</span>；UNSUPPORTED（0x8CDD，这种格式组合不支持；context 丢失时也返回这个值）<span class="tag">实测</span>。</dd>
+        <dt>失败</dt><dd>不完整时，对它 draw、clear、readPixels → INVALID_FRAMEBUFFER_OPERATION <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>不是 COMPLETE 就抛出带 status 的错误，并删除本次创建的所有对象。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:282">RenderTargetManager.ts:282–285</a> → IncompleteFramebufferError。</dd>
+        <dt>相似</dt><dd>COMPILE_STATUS、LINK_STATUS：同属「状态查询」这条通道。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/checkFramebufferStatus">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="fbo" id="deleteFramebuffer">
+      <h3>deleteFramebuffer</h3>
+      <p class="sig">gl.deleteFramebuffer(framebuffer): void</p>
+      <dl>
+        <dt>作用</dt><dd>删除 FBO（不会删除挂在上面的纹理和 renderbuffer，它们要另外删）。如果它当前正处于绑定状态，绑定会回到默认 framebuffer。</dd>
+        <dt>失败</dt><dd>—</dd>
+        <dt>校验</dt><dd>revision 变化时的替换顺序：新的一整套建好 → 发布到缓存 → 再删旧的；不能先删旧的再建新的，否则新的一旦建失败就什么都没有了（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:39">RenderTargetManager.ts:39–52 的注释</a>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:298">RenderTargetManager.ts:298</a>（回滚）、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:313">:313</a>（deleteResource）。</dd>
+        <dt>相似</dt><dd>其它 delete*。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/deleteFramebuffer">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="fbo" id="renderbuffer">
+      <h3>createRenderbuffer / bindRenderbuffer / renderbufferStorage / deleteRenderbuffer</h3>
+      <p class="sig">gl.createRenderbuffer(): WebGLRenderbuffer
+gl.bindRenderbuffer(RENDERBUFFER, rb | null): void
+gl.renderbufferStorage(RENDERBUFFER, internalformat, width, height): void
+gl.deleteRenderbuffer(rb): void</p>
+      <dl>
+        <dt>作用</dt><dd>renderbuffer 是<strong>只能当附件、不能被 shader 采样</strong>的存储，这是它和纹理的根本区别。WebGL1 可用的格式：RGBA4、RGB565、RGB5_A1、DEPTH_COMPONENT16、STENCIL_INDEX8、DEPTH_STENCIL（WebGL 专有）；EXT_sRGB 再加上 SRGB8_ALPHA8_EXT。</dd>
+        <dt>失败</dt><dd>尺寸超过 MAX_RENDERBUFFER_SIZE → INVALID_VALUE；还有 OUT_OF_MEMORY。</dd>
+        <dt>校验</dt><dd>分配前先按 MAX_RENDERBUFFER_SIZE 和 MAX_TEXTURE_SIZE 检查尺寸（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:156">RenderTargetManager.validate</a>）。也因为「不能采样」，逻辑层的 depth16 附件引用不能拿去当 sampler2D 用（<a data-src="src/rendering/resources/RenderTarget.ts:66">RenderTarget.ts:66</a>）。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:266">RenderTargetManager.ts:266–273</a>（DEPTH_COMPONENT16）、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:306">:306</a>（恢复 RENDERBUFFER_BINDING）、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:315">:315</a>（删除）。</dd>
+        <dt>相似</dt><dd>需要深度可采样时用 WEBGL_depth_texture 配深度纹理（阴影贴图就是这样）；WebGL2 有 <code>renderbufferStorageMultisample</code>（MSAA）。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/renderbufferStorage">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="fbo" id="framebufferRenderbuffer">
+      <h3>framebufferRenderbuffer</h3>
+      <p class="sig">gl.framebufferRenderbuffer(FRAMEBUFFER, attachment, RENDERBUFFER, renderbuffer): void</p>
+      <dl>
+        <dt>作用</dt><dd>把 renderbuffer 挂到 FBO 的附着点上（通常是 DEPTH_ATTACHMENT）。</dd>
+        <dt>失败</dt><dd>INVALID_ENUM；尺寸和其它附件不一致时，要到 checkFramebufferStatus 才会发现（INCOMPLETE_DIMENSIONS）。</dd>
+        <dt>校验</dt><dd>同 <a href="#framebufferTexture2D">framebufferTexture2D</a>。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:272">RenderTargetManager.ts:272</a>。</dd>
+        <dt>相似</dt><dd><a href="#framebufferTexture2D">framebufferTexture2D</a>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/framebufferRenderbuffer">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="fbo" id="drawBuffersWEBGL">
+      <h3>WEBGL_draw_buffers.drawBuffersWEBGL</h3>
+      <p class="sig">ext.drawBuffersWEBGL(buffers: GLenum[]): void
+gl.getParameter(ext.MAX_COLOR_ATTACHMENTS_WEBGL) · gl.getParameter(ext.MAX_DRAW_BUFFERS_WEBGL)</p>
+      <dl>
+        <dt>作用</dt><dd>声明 fragment shader 的 <code>gl_FragData[i]</code> 写到哪个颜色附件（多渲染目标，MRT）。这个状态<strong>属于每个 FBO 自己</strong>（EXT_draw_buffers 原文）。</dd>
+        <dt>失败</dt><dd>对 FBO 来说，第 i 项必须是 COLOR_ATTACHMENTi 或 NONE；对默认 framebuffer 来说，只能传 [BACK] 或 [NONE]，传 [COLOR_ATTACHMENT0] → INVALID_OPERATION <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>附件数量不能超过 MAX_COLOR_ATTACHMENTS 和 MAX_DRAW_BUFFERS 中较小的那个（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:171">RenderTargetManager.ts:171–194</a>）；只在新 FBO 绑定期间设置，不去碰外层 FBO 的配置。</dd>
+        <dt>本项目</dt><dd><a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:275">RenderTargetManager.ts:275–279</a>。</dd>
+        <dt>相似</dt><dd>WebGL2 核心的 <code>gl.drawBuffers</code>；GLSL ES 3.00 用 <code>layout(location = i) out</code> 代替 gl_FragData。</dd>
+        <dt>出处</dt><dd><a href="https://registry.khronos.org/OpenGL/extensions/EXT/EXT_draw_buffers.txt">EXT_draw_buffers（GLES）</a> · <a href="https://developer.mozilla.org/en-US/docs/Web/API/WEBGL_draw_buffers/drawBuffersWEBGL">MDN</a></dd>
+      </dl>
+    </section>
+
+    <!-- ============================================================ I -->
+    <h2 class="group-title" data-group="t15" id="g-t15">I. Task 15 会用到的（现在的 webgl1/ 里还没有）</h2>
+
+    <section class="api" data-group="t15" id="uniform">
+      <h3>uniform1f / uniform1i / uniform2fv / uniform3fv / uniform4fv / uniformMatrix3fv / uniformMatrix4fv <span class="tag t15">T15</span></h3>
+      <p class="sig">gl.uniform1f(location, x) · gl.uniform1i(location, n) · gl.uniform3fv(location, Float32Array | number[])
+gl.uniformMatrix4fv(location, transpose: false, Float32Array(16))</p>
+      <dl>
+        <dt>作用</dt><dd>给<strong>当前 program</strong> 的 uniform 赋值（所以要先 useProgram）。这个值保存在 program 对象里，切换 program 之后也不会丢——反过来说，A 材质设的值会一直留给下一个使用同一 program 的 B 材质（<a data-src="src/rendering/resources/Material.ts:178">Material.ts:178 的 TODO</a> 说的就是这个风险；WebGL1 后端已经按它做了：缺值就拒绝这次 draw，<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:156">WebGL1Uniforms.ts:156–158</a>）。</dd>
+        <dt>失败</dt><dd>location 不属于当前 program，或者调用的函数和 uniform 类型不匹配（例如对 sampler 用 uniform1f）→ INVALID_OPERATION <span class="tag">实测</span>；transpose = true → INVALID_VALUE（WebGL1 必须传 false）<span class="tag">实测</span>；location 为 null → 静默忽略 <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>按类型选函数：float → uniform1f；int、bool、sampler → uniform1i（sampler 的值是纹理单元号）；vec3 → uniform3f 或 uniform3fv；mat4 → uniformMatrix4fv（列主序，16 个数）。Material 的参数都带 type 标签（<a data-src="src/rendering/resources/materialParameters.ts:41">MaterialParameter</a>），就是为了让 Backend 知道该用哪一个函数。内建矩阵用 builtInUniforms 映射出来的实际名字（<a data-src="src/rendering/resources/ShaderModule.ts:57">ShaderModule.ts:57–91</a>）。</dd>
+        <dt>本项目</dt><dd>还没有实现。旧引擎在 <code>src/materials</code>、<code>src/renderers</code> 里用过。</dd>
+        <dt>相似</dt><dd>WebGL2 的 uniform buffer object（<code>uniformBlockBinding</code>、<code>bindBufferBase</code>）；WebGPU 的 bind group。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/uniform">MDN uniform[1234][fi][v]</a> · <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/uniformMatrix">MDN uniformMatrix</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="t15" id="drawArrays">
+      <h3>drawArrays <span class="tag t15">T15</span></h3>
+      <p class="sig">gl.drawArrays(mode, first, count): void</p>
+      <dl>
+        <dt>作用</dt><dd>从第 first 个顶点开始，按 mode 组装 count 个顶点：POINTS、LINES、LINE_LOOP、LINE_STRIP、TRIANGLES、TRIANGLE_STRIP、TRIANGLE_FAN。项目目前只支持其中 4 种（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:358">GeometryManager.primitiveMode</a>）。</dd>
+        <dt>失败</dt><dd>count &lt; 0 → INVALID_VALUE；mode 不认识 → INVALID_ENUM；没有 program、启用了的 attribute 没有 buffer、读到 buffer 以外 → INVALID_OPERATION；FBO 不完整 → INVALID_FRAMEBUFFER_OPERATION <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>draw 之前，前面几段（program、状态、uniform、接线）都必须成功；任何一段失败，就跳过这次 draw（VertexInputManager 的契约：「bind 失败时调用者不得继续 draw」）。</dd>
+        <dt>本项目</dt><dd><span class="tag t15">T15</span>：非索引 Geometry 用 <code>drawArrays(primitiveMode, 0, drawCount)</code>。</dd>
+        <dt>相似</dt><dd><a href="#drawElements">drawElements</a>；ANGLE_instanced_arrays 的 <code>drawArraysInstancedANGLE</code>；WEBGL_multi_draw。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/drawArrays">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="t15" id="drawElements">
+      <h3>drawElements <span class="tag t15">T15</span></h3>
+      <p class="sig">gl.drawElements(mode, count, type: UNSIGNED_BYTE | UNSIGNED_SHORT | UNSIGNED_INT, offset): void</p>
+      <dl>
+        <dt>作用</dt><dd>从当前（VAO 里的）ELEMENT_ARRAY_BUFFER 读 count 个索引来组装图元；offset 以字节为单位。</dd>
+        <dt>失败</dt><dd>没有绑定 EBO → INVALID_OPERATION；UNSIGNED_INT 却没有启用 OES_element_index_uint → INVALID_ENUM <span class="tag">实测</span>；offset 不是 type 大小的倍数、索引越界 → INVALID_OPERATION。</dd>
+        <dt>校验</dt><dd>indexType、drawCount、primitiveMode 都已经由 GeometryManager 算好并放在 WebGL1GeometryResource 里；没有扩展时，Uint32 索引已经安全地降成了 Uint16（最大值 ≤ 65535 时），否则在上传阶段就报错（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:290">prepareIndices</a>）。</dd>
+        <dt>本项目</dt><dd><span class="tag t15">T15</span>：索引 Geometry 用 <code>drawElements(primitiveMode, drawCount, indexType, 0)</code>。</dd>
+        <dt>相似</dt><dd>WebGL2 的 <code>drawRangeElements</code>、<code>drawElementsInstanced</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/drawElements">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="t15" id="clear">
+      <h3>clearColor / clearDepth / clearStencil / clear <span class="tag t15">T15</span></h3>
+      <p class="sig">gl.clearColor(r, g, b, a) · gl.clearDepth(d) · gl.clearStencil(s)
+gl.clear(COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT | STENCIL_BUFFER_BIT)</p>
+      <dl>
+        <dt>作用</dt><dd>clear* 三个函数只设置「清成什么值」（它们也是状态）；<code>clear(mask)</code> 才真正清除当前 framebuffer。</dd>
+        <dt>失败</dt><dd>mask 里有未定义的位 → INVALID_VALUE <span class="tag">实测</span>；FBO 不完整 → INVALID_FRAMEBUFFER_OPERATION <span class="tag">实测</span>。</dd>
+        <dt>校验</dt><dd>clear 受 scissor（启用时）和写掩码（colorMask、depthMask、stencilMask）限制，<strong>不</strong>受 viewport 限制。RenderBackend 的约定：ClearDescriptor 里省略的字段表示「不清除这个缓冲」，不等于「清成 0」；数值要是有限数、深度在 [0, 1] 内、stencil 是整数（<a data-src="src/rendering/backend/RenderSurface.ts:14">RenderSurface.ts:14–26</a>）。</dd>
+        <dt>本项目</dt><dd><span class="tag t15">T15</span>：清除并入作用域入口，由 <a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:320">WebGL1SurfaceScope.clearAttachments</a> 执行：临时打开写掩码、关闭 scissor 和 dithering，清完再恢复。</dd>
+        <dt>相似</dt><dd><a href="#depthMask">depthMask</a>、<code>colorMask</code>、<code>scissor</code>。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/clear">MDN</a></dd>
+      </dl>
+    </section>
+
+    <section class="api" data-group="t15" id="readPixels">
+      <h3>readPixels <span class="tag t15">T15</span></h3>
+      <p class="sig">gl.readPixels(x, y, width, height, RGBA, UNSIGNED_BYTE, out: Uint8Array): void</p>
+      <dl>
+        <dt>作用</dt><dd>把当前 framebuffer 的像素读回 CPU，原点在<strong>左下角</strong>。WebGL1 保证支持 RGBA 加 UNSIGNED_BYTE 这一组合。</dd>
+        <dt>失败</dt><dd>out 的类型或大小不对 → INVALID_OPERATION；FBO 不完整 → INVALID_FRAMEBUFFER_OPERATION。</dd>
+        <dt>校验</dt><dd>它会同步等待 GPU 画完，所以只用于验收和调试。canvas 在合成之后内容可能被清掉，要么在同一个任务里读，要么创建 context 时设 preserveDrawingBuffer。</dd>
+        <dt>本项目</dt><dd>Task 15 的浏览器验收（画一个三角形，然后 readPixels）；本课程的沙盒判分用的就是它。</dd>
+        <dt>相似</dt><dd>WebGL2 的 PIXEL_PACK_BUFFER 加 fence，可以异步读回。</dd>
+        <dt>出处</dt><dd><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/readPixels">MDN</a></dd>
+      </dl>
+    </section>
+
+    <!-- ============================================================ J -->
+    <h2 class="group-title" data-group="ext" id="g-ext">J. 扩展速览</h2>
+    <section class="api" data-group="ext" id="extensions">
+      <h3>后端探测或用到的扩展</h3>
+      <div class="table-scroll">
+        <table>
+          <tr><th>扩展</th><th>提供什么</th><th>WebGL2 里</th><th>本项目用途</th></tr>
+          <tr><td>OES_vertex_array_object</td><td>VAO</td><td>核心</td><td>选择顶点输入策略（<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputManager.ts:62">工厂函数</a>）</td></tr>
+          <tr><td>OES_element_index_uint</td><td>drawElements 可以用 UNSIGNED_INT</td><td>核心</td><td>GeometryManager 判断要不要降级</td></tr>
+          <tr><td>WEBGL_draw_buffers</td><td>多渲染目标（MRT）</td><td>核心（drawBuffers）</td><td>RenderTargetManager 的多颜色附件</td></tr>
+          <tr><td>WEBGL_depth_texture</td><td>深度纹理，可以被采样</td><td>核心</td><td>已探测，还没用到（depth16 用的是 renderbuffer）</td></tr>
+          <tr><td>OES_texture_float</td><td>FLOAT 纹理</td><td>核心（可采样）</td><td>CubeTextureManager 的 float32 存储</td></tr>
+          <tr><td>OES_texture_float_linear</td><td>FLOAT 纹理可以线性过滤</td><td>仍然是扩展</td><td>CubeTextureManager 用 linear 过滤时检查</td></tr>
+          <tr><td>EXT_sRGB</td><td>sRGB 格式（采样时自动解码成线性值）</td><td>核心（SRGB8_ALPHA8）</td><td>CubeTextureManager，用到时才查</td></tr>
+          <tr><td>WEBGL_lose_context</td><td>模拟丢失和恢复</td><td>同左</td><td>测试、课程沙盒</td></tr>
+          <tr><td>KHR_parallel_shader_compile</td><td>非阻塞地查询编译是否完成（COMPLETION_STATUS_KHR）</td><td>同左</td><td>还没用到；第 6 课讨论</td></tr>
+        </table>
+      </div>
+    </section>
+
+    <!-- ============================================================ by file -->
+    <h2 id="by-file">按文件查</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th>文件</th><th>用到的 GL API</th></tr>
+        <tr><td>WebGL1Capabilities</td><td><a href="#isContextLost">isContextLost</a>、<a href="#getExtension">getExtension</a>、<a href="#getParameter">getParameter</a></td></tr>
+        <tr><td>WebGLContextLifecycle</td><td>不直接调用 gl：只用 <a href="#WEBGL_lose_context">webglcontextlost / webglcontextrestored 事件</a></td></tr>
+        <tr><td>WebGL1State</td><td><a href="#useProgram">useProgram</a>、<a href="#bindBuffer">bindBuffer</a>、<a href="#enable">enable/disable</a>、<a href="#depthMask">depthMask</a>、<a href="#depthFunc">depthFunc</a>、<a href="#cullFace">cullFace</a>、<a href="#getParameter">getParameter</a>、<a href="#bindFramebuffer">bindFramebuffer</a>、<a href="#viewport">viewport</a>、<a href="#drawingBufferWidth">drawingBufferWidth</a>、<a href="#isContextLost">isContextLost</a></td></tr>
+        <tr><td>WebGL1ProgramManager</td><td><a href="#createShader">createShader</a>、<a href="#shaderSource">shaderSource</a>、<a href="#compileShader">compileShader</a>、<a href="#getShaderParameter">getShaderParameter</a>、<a href="#getShaderInfoLog">getShaderInfoLog</a>、<a href="#createProgram">createProgram</a>、<a href="#attachShader">attachShader</a>、<a href="#linkProgram">linkProgram</a>、<a href="#getProgramParameter">getProgramParameter</a>、<a href="#getProgramInfoLog">getProgramInfoLog</a>、<a href="#detachShader">detachShader</a>、<a href="#getActiveAttrib">getActiveAttrib</a>、<a href="#getAttribLocation">getAttribLocation</a>、<a href="#getActiveUniform">getActiveUniform</a>、<a href="#getUniformLocation">getUniformLocation</a>、<a href="#deleteShader">deleteShader</a>、<a href="#deleteProgram">deleteProgram</a>、<a href="#useProgram">useProgram</a>、<a href="#getParameter">getParameter</a>、<a href="#getError">getError</a></td></tr>
+        <tr><td>WebGL1GeometryManager</td><td><a href="#getParameter">getParameter</a>、<a href="#createBuffer">createBuffer</a>、<a href="#bindBuffer">bindBuffer</a>、<a href="#bufferData">bufferData</a>、<a href="#deleteBuffer">deleteBuffer</a>、<a href="#getError">getError</a></td></tr>
+        <tr><td>WebGL1VertexInputSupport</td><td><a href="#getProgramParameter">getProgramParameter</a>、<a href="#getActiveAttrib">getActiveAttrib</a>、<a href="#bindBuffer">bindBuffer</a>、<a href="#vertexAttribPointer">vertexAttribPointer</a>、<a href="#enableVertexAttribArray">enableVertexAttribArray</a>、<a href="#getError">getError</a></td></tr>
+        <tr><td>WebGL1OESVertexInputManager</td><td><a href="#OES_vertex_array_object">create/bind/deleteVertexArrayOES</a>、<a href="#getParameter">getParameter</a>、<a href="#bindBuffer">bindBuffer</a></td></tr>
+        <tr><td>WebGL1ManualVertexInputManager</td><td><a href="#disableVertexAttribArray">disableVertexAttribArray</a>、<a href="#bindBuffer">bindBuffer</a></td></tr>
+        <tr><td>WebGL1TextureUploadSupport</td><td><a href="#getParameter">getParameter</a>、<a href="#pixelStorei">pixelStorei</a>、<a href="#activeTexture">activeTexture</a>、<a href="#bindTexture">bindTexture</a>、<a href="#getError">getError</a></td></tr>
+        <tr><td>WebGL1CubeTextureManager</td><td><a href="#createTexture">createTexture</a>、<a href="#bindTexture">bindTexture</a>、<a href="#texImage2D">texImage2D</a>、<a href="#texParameteri">texParameteri</a>、<a href="#generateMipmap">generateMipmap</a>、<a href="#deleteTexture">deleteTexture</a>、<a href="#getExtension">getExtension</a>（EXT_sRGB）</td></tr>
+        <tr><td>WebGL1RenderTargetManager</td><td><a href="#createFramebuffer">createFramebuffer</a>、<a href="#bindFramebuffer">bindFramebuffer</a>、<a href="#createTexture">createTexture</a>、<a href="#texImage2D">texImage2D</a>、<a href="#texParameteri">texParameteri</a>、<a href="#framebufferTexture2D">framebufferTexture2D</a>、<a href="#renderbuffer">create/bind/renderbufferStorage/deleteRenderbuffer</a>、<a href="#framebufferRenderbuffer">framebufferRenderbuffer</a>、<a href="#drawBuffersWEBGL">drawBuffersWEBGL</a>、<a href="#checkFramebufferStatus">checkFramebufferStatus</a>、<a href="#deleteFramebuffer">deleteFramebuffer</a>、<a href="#deleteTexture">deleteTexture</a>、<a href="#getParameter">getParameter</a></td></tr>
+        <tr><td>WebGL1ResourceManager</td><td>只有 <a href="#isContextLost">isContextLost</a>（其余都交给子 Manager）</td></tr>
+        <tr><td><code>WebGL1Backend</code> <span class="tag t15">T15</span></td><td><a href="#getContext">getContext</a>、<a href="#uniform">uniform*</a>、<a href="#activeTexture">activeTexture</a>、<a href="#drawArrays">drawArrays</a>、<a href="#drawElements">drawElements</a>、<a href="#clear">clear*</a>、<a href="#readPixels">readPixels</a>（验收）</td></tr>
+      </table>
+    </div>
+
+    <div class="nav">
+      <a href="../index.html">← 课程首页</a>
+      <a href="architecture-map.html">架构地图 →</a>
+    </div>
+    <footer>WebGL1 API 速查 · 2026-09-23 · 实测环境：Chromium 152 / macOS · 行号对应 dev-dual-webgl-backend-refactor 当时的 working tree</footer>
+
+    <script>
+      RTeach.attachFilter(document.getElementById('api-filter'))
+    </script>
+  </body>
+</html>

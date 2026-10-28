@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 43 课 · 每帧先抄一份</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/code-view.js"></script>
+    <script src="../assets/shadow-raw.js"></script>
+    <script src="../assets/shadow-41.js"></script>
+    <script src="../assets/shadow-42.js"></script>
+    <script src="../assets/shadow-43.js"></script>
+  </head>
+  <body>
+    <p class="kicker">系列「带阴影的三角形：从一个函数到 src/rendering」4/7 · 约 25 分钟</p>
+    <h1>每帧先抄一份：两遍必须看同一个场景</h1>
+    <p class="lede">
+      第 44 课要把两遍拆成两个独立的 Pass。这一课先在第 42 课的 drawScene 上试着切开：切开以后，每一半只能自己去读场景，于是两遍读到的可能不是同一个场景——影子和物体对不上，而且不报错。办法是每帧开始时把要用的东西抄一份：物体列表、相机矩阵、灯的快照；两遍只读这一份。这就是 <code>frame/</code> 里 RenderListBuilder 做的事。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 阴影是「两遍必须看同一个场景」最直接的例子：阴影图照第一遍看到的场景画，第二遍拿它来比。两遍看到的物体位置或灯的方向不一样，影子就错位。HW1 阴影设计文档里的 <code>DirectionalLightSnapshot</code>，就是这一课的「灯的快照」。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 第 42 课的 drawScene、Mesh、Scene、灯和阴影设置；② <code>Object.freeze</code>（第 42 课用过）。第 31 课第 6、7 节从真实代码讲过「拍一张照」和复制、冻结两条规则；这一课换成阴影场景，看不这样做时画面怎样错。<br />
+      <strong>这一课讲的</strong>：把 drawScene 切成两半；谁能在两遍之间改场景；先抄一份；抄什么、借什么；冻结；只在开头检查一次；代价；对照 <code>src/rendering</code>。<br />
+      <strong>在一帧里的位置和寿命</strong>：快照在每帧开头建一次，所有 Pass 用完就扔，下一帧重新建；它不拥有任何资源，只借用。<br />
+      <strong>页面会用到你的显卡</strong>：一块 480 × 300 的画布，外加检查卡片里临时建的几块。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">把 drawScene 切成两半</a></li>
+        <li><a href="#s2">两遍之间有人改了场景</a></li>
+        <li><a href="#s3">先抄一份</a></li>
+        <li><a href="#s4">抄什么，借什么</a></li>
+        <li><a href="#s5">冻结：别让一个 Pass 改掉下一个 Pass 的输入</a></li>
+        <li><a href="#s6">只在开头检查一次</a></li>
+        <li><a href="#s7">代价</a></li>
+        <li><a href="#s8">对照 src/rendering</a></li>
+        <li><a href="#s9">检查题</a></li>
+        <li><a href="#s10">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 把 drawScene 切成两半</h2>
+    <p>第 42 课的 drawScene 在开头算好灯和相机的矩阵，然后两遍都用它们。第 44 课要把第一遍、第二遍拆成两个独立的对象，各自的 <code>execute</code> 被依次调用。拆开以后，开头那几行算给谁？只能每一半自己算。先不加任何新东西，原样切开：</p>
+    <div id="cv-live"></div>
+    <p>点「读场景」：两半一共有 15 行去读 <code>scene</code>、<code>light</code>、<code>mesh</code>、<code>camera</code>。前一半在一个时刻读，后一半在稍后的另一个时刻读。只要这两个时刻之间场景没变，结果就和第 42 课一样——备课时实测，切开后的画面和第 40 课逐像素相同。</p>
+
+    <h2 id="s2">2. 两遍之间有人改了场景</h2>
+    <p>两遍之间谁能改场景？<strong>不会是浏览器事件。</strong>JavaScript 的一段同步代码一旦开始，就会一直跑完，中途不会被别的代码打断（<a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Execution_model#run-to-completion">MDN · JavaScript execution model · Run-to-completion</a>）；拖动滑块、移动鼠标的回调，只能在这一帧跑完之后才运行（显示器的刷新、浏览器和 rAF 怎样配合，为什么事件插不进来，见<a href="0048-who-runs-between-passes.html">第 48 课</a>）。能插进两遍之间的，只有<strong>这一帧里自己运行的代码</strong>：</p>
+    <ul>
+      <li><strong>其他 Pass。</strong>第 44 课以后，场景会把自己要的 Pass 交给引擎（HW2 的 PRT、FFT 的十几步计算）。哪个 Pass 顺手改了场景——比如 HW1 想让三角形随时间移动，有人把这一步写进了排在中间的某个 Pass——排在它后面的 Pass 就看到另一个场景。</li>
+      <li><strong>回调。</strong>three.js 在画每个物体之前调用 <code>object.onBeforeRender</code>（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:2003">WebGLRenderer.js:2003</a>），在阴影那一遍里调用的是另一个 <code>onBeforeShadow</code>（<a data-src="node_modules/three/src/renderers/webgl/WebGLShadowMap.js:360">WebGLShadowMap.js:360</a>）。在其中一个回调里挪动物体，只有那一遍看得到。</li>
+    </ul>
+    <p>下面这块画布可以在两遍之间插一步。先用「第 42 课切开的两半」，选「三角形右移 0.8」，点「画一帧」：</p>
+    <div class="gl-stage">
+      <canvas width="480" height="300" id="g-canvas"></canvas>
+      <div class="gl-controls">
+        <label><input type="radio" name="g-mode" value="live" checked /> 第 42 课切开的两半（每一半自己读场景）</label>
+        <label><input type="radio" name="g-mode" value="snapshot" /> 第 43 课：先抄一份</label>
+      </div>
+      <div class="gl-controls">
+        <label>两遍之间
+          <select id="g-step">
+            <option value="move">三角形右移 0.8（再选一次移回来）</option>
+            <option value="light">灯从 35° 转到 60°（再选一次转回来）</option>
+          </select>
+        </label>
+        <button type="button" id="g-step-frame">画一帧（两遍之间执行这一步）</button>
+        <button type="button" id="g-plain-frame">再画一帧（两遍之间什么都不做）</button>
+        <button type="button" id="g-reset">重新开始</button>
+      </div>
+      <p class="gl-readout" id="g-readout"></p>
+    </div>
+    <pre id="g-code"></pre>
+    <p class="lab-note">上面两个函数是课程写的：把第 42 课切开的两半（或第 43 课的两遍）按顺序调用，中间插一步改场景。读数也是课程写的：页面记下每一遍实际上传给显卡的 <code>uModel</code> 和 <code>uLightVP</code>（项目源码里没有这层记录）。</p>
+    <p>备课时实测（无界面 Chrome，软件渲染 SwiftShader）：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>两遍之间</th><th>第 42 课切开的两半</th><th>第 43 课先抄一份</th></tr>
+        <tr><td>三角形右移 0.8</td><td>第一遍上传三角形的 x = 0，第二遍 x = 0.8。三角形画在新位置，影子还在旧位置。和「三角形在 0」「三角形在 0.8」两个正确画面比，分别有 2249、1902 个像素不同——哪个都不是</td><td>两遍都是 x = 0，画面和「三角形在 0」的正确画面逐像素相同。下一帧两遍都是 0.8，和「三角形在 0.8」的正确画面逐像素相同</td></tr>
+        <tr><td>灯转到 60°</td><td>阴影图按 35° 的灯画，第二遍按 60° 的灯去查。半块地面被判成阴影，三角形自己身上也出现了阴影。和 60° 的正确画面有 20016 个像素不同</td><td>两遍上传的 uLightVP 完全相同（35°）；下一帧两遍都是 60°</td></tr>
+      </table>
+    </div>
+    <p>两种写法的差别不在于「改动有没有生效」——两种写法里改动都生效了，只是第 43 课的晚一帧。差别在于<strong>一帧之内是不是同一个场景</strong>。晚一帧看不出来；对不上的影子一眼就看得出来，而且没有任何报错。</p>
+
+    <h2 id="s3">3. 先抄一份</h2>
+    <p>每帧开始时调用一次 <code>buildFrame</code>：把这一帧要用的东西从场景里抄出来，冻结，交给两遍。两遍只读它，不再碰 <code>scene</code>、<code>camera</code>、<code>light</code>：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 640 230" role="img" aria-label="两条时间线。上面一条是切开的两半：第一遍在时刻 t0 读场景，然后有人改了场景，第二遍在 t1 读到改过的场景，两遍看到的不是同一个场景。下面一条是先抄一份：buildFrame 在 t0 读场景、抄成 frame，第一遍和第二遍都读 frame；中间有人改了场景，改动要到下一帧的 buildFrame 才被读到。">
+          <defs>
+            <marker id="f43a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+            <marker id="f43b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip bad" /></marker>
+          </defs>
+          <text x="20" y="22" class="title">切开的两半</text>
+          <line x1="20" y1="70" x2="620" y2="70" class="line" marker-end="url(#f43a)" />
+          <text x="612" y="88" text-anchor="end" class="small">时间</text>
+          <rect x="60" y="54" width="120" height="32" rx="4" class="box" /><text x="120" y="74" text-anchor="middle">第一遍</text>
+          <rect x="250" y="54" width="120" height="32" rx="4" class="box bad" /><text x="310" y="74" text-anchor="middle">有人改了场景</text>
+          <rect x="440" y="54" width="120" height="32" rx="4" class="box" /><text x="500" y="74" text-anchor="middle">第二遍</text>
+          <path d="M120 54 L120 36" class="line" marker-end="url(#f43a)" /><text x="128" y="40" class="small">读场景（改之前）</text>
+          <path d="M500 54 L500 36" class="line bad" marker-end="url(#f43b)" /><text x="508" y="40" class="small bad">读场景（改之后）</text>
+          <text x="310" y="110" text-anchor="middle" class="bad">两遍看到两个场景：影子和物体对不上</text>
+
+          <text x="20" y="142" class="title">先抄一份</text>
+          <line x1="20" y1="190" x2="620" y2="190" class="line" marker-end="url(#f43a)" />
+          <rect x="30" y="174" width="110" height="32" rx="4" class="box hl" /><text x="85" y="194" text-anchor="middle">buildFrame</text>
+          <rect x="170" y="174" width="110" height="32" rx="4" class="box" /><text x="225" y="194" text-anchor="middle">第一遍</text>
+          <rect x="310" y="174" width="120" height="32" rx="4" class="box bad" /><text x="370" y="194" text-anchor="middle">有人改了场景</text>
+          <rect x="460" y="174" width="110" height="32" rx="4" class="box" /><text x="515" y="194" text-anchor="middle">第二遍</text>
+          <path d="M85 174 L85 156" class="line accent" marker-end="url(#f43a)" /><text x="93" y="160" class="small accent">读场景一次 → frame</text>
+          <path d="M225 206 Q225 222 155 222 Q85 222 85 208" class="line accent dash" marker-end="url(#f43a)" />
+          <path d="M515 206 Q515 226 300 226 Q85 226 85 208" class="line accent dash" marker-end="url(#f43a)" />
+          <text x="575" y="160" text-anchor="end" class="small">两遍都只读 frame；改动下一帧才被抄进来</text>
+        </svg>
+      </div>
+      <figcaption>图 1　上：切开的两半各自读场景，中间的改动只被第二遍看到。下：buildFrame 在开头读一次，两遍读同一份 frame（虚线），中间的改动等到下一帧开头才被读到。</figcaption>
+    </figure>
+    <div id="cv-frame"></div>
+    <p>几处要点：</p>
+    <ul>
+      <li><strong>灯的矩阵不放进快照</strong>，而是由 <code>lightViewProjection(light)</code> 从灯的快照算出来：输入是冻结的快照，所以同一帧里两遍各算一次，得到的 16 个数完全相同（实测两次结果逐项相等）。HW1 设计文档里的 <code>createDirectionalShadowView</code> 就是这样一个纯函数（<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:246">设计 §3.7</a>）。第 45 课会看到：真正需要它的只有阴影那一遍，第二遍会从别处拿到它。</li>
+      <li><strong>两遍的参数只剩 <code>frame</code></strong>（加上画图要的 <code>gl</code> 和 Manager）。它们不知道场景是什么形状——有没有父子层级、哪些物体不可见、灯挂在哪里——这些都由 buildFrame 处理完，交出来的是一张平的列表。</li>
+      <li>每帧 GL 命令数没变：仍是 48 条、0 次查询。抄一份只花 CPU 时间，不多发任何 GL 命令。</li>
+    </ul>
+
+    <h2 id="s4">4. 抄什么，借什么</h2>
+    <p>快照不是把场景整个深拷贝一遍。规则是：<strong>值抄下来，资源借用</strong>。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>东西</th><th>快照里放什么</th><th>为什么</th></tr>
+        <tr><td>物体的位置（model 矩阵）、相机的 视图×投影</td><td>复制 16 个数，冻结</td><td>每帧都可能变；16 个数，复制很便宜</td></tr>
+        <tr><td>灯的方向、bias、正交范围</td><td>复制数值，冻结</td><td>同上。设计文档的 <code>DirectionalShadowSnapshot</code> 也是复制数值（<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:218">设计 §3.6</a>）</td></tr>
+        <tr><td>Geometry、Material、阴影图（RenderTarget）</td><td>借用同一个对象</td><td>Manager 按对象身份查表：要是每帧复制出新对象，表里每帧多一条（第 41 课第 5 节的「每帧新建描述对象」）。借用<strong>不要求对象不会变</strong>：三样里只有 Geometry 不能变（第 42 课），另外两样哪些部分会变、怎么处理，见表下面</td></tr>
+        <tr><td>材质参数（<code>uColor</code>）</td><td>不抄，第二遍现读 <code>getParameters()</code></td><td>小引擎和真实代码都没有给材质拍快照。所以「Pass 执行期间不要调 setParameter」只是约定，没有东西强制（真实代码的注释写明了这一点：<a data-src="src/rendering/frame/RenderItem.ts:11">RenderItem.ts:11–12</a>、<a data-src="src/rendering/frame/RenderList.ts:20">RenderList.ts:20</a>）。阴影参数要被好几个材质读，不能只靠约定——这是第 45 课的事</td></tr>
+      </table>
+    </div>
+    <p><strong>借用的三样，哪些部分会变。</strong>快照冻结的是「这一帧用哪个对象」，不冻结对象自己的状态。每一种会变的部分，都要有一个确定的生效时刻：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>借用的对象</th><th>不能变的</th><th>会变的</th><th>变了以后怎样</th></tr>
+        <tr><td>Geometry</td><td>全部（顶点数据构造后冻结）</td><td>—</td><td>要换形状就新建一个 Geometry，让 Mesh 换引用</td></tr>
+        <tr><td>Material</td><td>shader、借用的参数块列表</td><td>参数的值（<code>setParameter</code>）</td><td>不抄，每次 draw 现读：上表最后一行。同一帧两遍读到同一个值，靠的是「Pass 执行期间不调 setParameter」这条约定</td></tr>
+        <tr><td>阴影图（RenderTarget）</td><td>身份、附件格式</td><td>① 像素：第一遍每帧重画；② 尺寸：<code>resize</code></td><td>① 正是借用的目的：第二遍要看到第一遍这一帧刚画的像素，抄一份反而拿到旧像素；② 对象不换，<code>revision</code> 加 1，Manager 下次查表时发现版本不同，整套重建纹理和 framebuffer（<a data-src="src/rendering/resources/RenderTarget.ts:481">RenderTarget.ts:481–499</a>、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:78">RenderTargetManager.ts:78–129</a>）</td></tr>
+      </table>
+    </div>
+    <p>改尺寸的时机要紧。备课时用真实代码量过（4×4 的目标，第一遍清成 1，第二遍读一个像素，第 2 帧改成 8×8）：两帧之间改，第二遍读到 1，正确；两遍之间改，第二遍读到 0，不报错——第二遍查表时 Manager 重建出一张全是 0 的新纹理，第一遍画的那张已经删了，下一帧恢复；在第一遍写它的作用域里改，出作用域时抛 <code>RenderTargetUnavailableError</code>「target was disposed or resized」（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:318">WebGL1SurfaceScope.ts:318–333</a>），整帧作废。所以规矩和材质参数一样：<strong>设置在帧外改，帧内只读</strong>。GUI 的回调本来就只能在两帧之间运行，为什么，见<a href="0048-who-runs-between-passes.html">第 48 课</a>。</p>
+
+    <h2 id="s5">5. 冻结：别让一个 Pass 改掉下一个 Pass 的输入</h2>
+    <p>快照只有一份，所有 Pass 共用。如果某个 Pass 改了它，排在后面的 Pass 就拿到被改过的输入。比如写第一遍的人想「地面不投影子，第一遍跳过它」，图省事直接从 <code>frame.items</code> 里把地面删掉。下面的卡片 A 用一份不冻结的副本跑这段代码，卡片 B 用真正冻结的 frame：</p>
+    <pre id="splice-code"></pre>
+    <div id="cards-freeze"></div>
+    <p>正确写法是 <code>frame.items.filter(…)</code>：得到一个新数组，只给自己用。HW1 的设计里，RenderItem 会多一个从 Mesh 抄来的 <code>castShadow</code>，ShadowMapPass 按它过滤（<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:73">设计 §2 每帧数据流</a>）。第 31 课第 7.3 节用「按离灯远近排序」演示过同一件事。</p>
+    <p>还有一个细节：矩阵为什么抄成普通数组，而不是 <code>Float32Array</code>？因为带元素的 TypedArray 冻结不了——<code>Object.freeze(new Float32Array(16))</code> 直接抛 <code>TypeError: Cannot freeze array buffer views with elements</code>（实测）。所以 <code>snapshotMatrix</code> 用 <code>Array.from</code> 复制成普通数组再冻结；之后谁写 <code>modelMatrix[12] = 5</code>，都会抛 <code>Cannot assign to read only property '12'</code>。真实代码的 <code>copyMat4Snapshot</code> 也是这样做的。</p>
+
+    <h2 id="s6">6. 只在开头检查一次</h2>
+    <p>把相机放在它看着的那个点上（eye 和 target 重合），视线方向是零向量，<code>lookAt</code> 算出来的矩阵全是 NaN。两张卡片：</p>
+    <div id="cards-check"></div>
+    <aside class="note">
+      <strong>这里的检查</strong>（校验三层里的第 ② 层「每帧提取时」）：只看这一帧的组合——相机矩阵、每个物体的矩阵是不是 16 个有限的数（真实代码还检查相机的世界矩阵可逆）。<strong>之后可以放心</strong>：所有 Pass 拿到的是同一份冻结的、有限的值；错误在 buildFrame 一处报出来，带着是哪个矩阵、第几个数。<strong>这时还不知道</strong>：shader 要的值材质给没给、设备支不支持——留给第 ③ 层。见 <a href="../reference/validation-map.html">校验地图</a>「frame/RenderListBuilder」一行。
+    </aside>
+
+    <h2 id="s7">7. 代价</h2>
+    <p>抄一份要时间。备课时在无界面 Chrome 里量 <code>buildFrame</code>：这个场景（2 个物体、1 盏灯）每次约 0.003 毫秒；1000 个物体每次约 0.70 毫秒（100 次的平均）。一帧的预算是 16.7 毫秒。第 31 课第 7.7 节在真实的 RenderListBuilder 上量过 1000 个 Mesh，多花约 0.4 毫秒。场景大到几万个物体时才需要考虑别的做法（例如跨帧复用数组），真实代码现在明确不这样做（<a data-src="src/rendering/frame/RenderList.ts:14">RenderList.ts:14</a>「不会跨帧复用内部数组」）。</p>
+
+    <h2 id="s8">8. 对照 src/rendering</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th>小引擎</th><th>真实代码</th><th>真实代码多了什么</th></tr>
+        <tr><td><code>buildFrame</code></td><td><a data-src="src/rendering/frame/RenderListBuilder.ts:42">RenderListBuilder.build</a>：复制相机 :68，检查 :82–85，ViewState :91–95，更新世界矩阵 :97，遍历可见物体 :103–119</td><td>场景是树：先更新整棵树的世界矩阵，再只遍历可见节点；按材质的队列分成 background、opaque</td></tr>
+        <tr><td><code>snapshotMatrix</code></td><td><a data-src="src/rendering/frame/copyMat4Snapshot.ts:11">copyMat4Snapshot.ts:11–41</a></td><td>—</td></tr>
+        <tr><td><code>frame.items</code> 冻结</td><td><a data-src="src/rendering/frame/RenderList.ts:5">RenderList.ts:5–11</a>（snapshotItem）、:27–32</td><td>两个队列</td></tr>
+        <tr><td><code>frame.view.cameraVP</code></td><td><a data-src="src/rendering/frame/ViewState.ts:13">ViewState.ts:13–20</a></td><td>视图矩阵、投影矩阵分开存，另有相机位置</td></tr>
+        <tr><td><code>frame.lights</code>、<code>snapshotLight</code></td><td>还没有：<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:218">设计 §3.6</a> 的 DirectionalLightSnapshot</td><td>灯的世界位置、目标点、颜色强度；阴影快照借用 DirectionalLightShadow</td></tr>
+        <tr><td><code>lightViewProjection</code>（快照的纯函数）</td><td>还没有：<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:246">设计 §3.7</a> createDirectionalShadowView</td><td>退化输入（eye 与 target 重合、up 与视线平行）明确报错</td></tr>
+        <tr><td><code>renderFrame</code></td><td><a data-src="src/rendering/Renderer.ts:44">Renderer.render</a>：抄帧号、时间等六个数 :58–65，提取一次 :67，冻结的 context :69–74，交给 Pipeline :76</td><td>状态检查（运行中、关闭中）、不可重入；Backend 没准备好就整帧跳过</td></tr>
+        <tr><td>两遍只读 <code>frame</code></td><td><a data-src="src/rendering/passes/RenderPassContext.ts:10">RenderPassContext</a>；Pipeline 把同一个 context 依次交给每个 Pass（<a data-src="src/rendering/passes/RenderPipeline.ts:96">RenderPipeline.ts:96–97</a>）；ForwardPass 注明「不遍历 Scene、不计算矩阵」（<a data-src="src/rendering/passes/ForwardPass.ts:13">ForwardPass.ts:13</a>）</td><td>第 44 课</td></tr>
+      </table>
+    </div>
+    <p><strong>架构视角：three.js 靠约定，本项目靠快照。</strong>three.js r177 的 <code>render</code> 开头也只更新一次世界矩阵（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1537">WebGLRenderer.js:1537</a>），再遍历一次场景生成渲染列表（:1582）。但列表里的项引用的是活的物体，不是矩阵的副本；阴影图那一遍（:1607）不读这张列表，而是自己从场景根节点再递归一遍（<a data-src="node_modules/three/src/renderers/webgl/WebGLShadowMap.js:390">WebGLShadowMap.js:390</a>），现读 <code>object.matrixWorld</code>（:342）。所以只要没人在 <code>onBeforeRender</code>、<code>onBeforeShadow</code> 里改物体，两遍看到的就是同一个场景——这是约定，不是保证。本项目把它变成了保证：Pass 根本拿不到场景。</p>
+
+    <h2 id="s9">9. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0043"></div>
+
+    <h2 id="s10">10. 延伸阅读</h2>
+    <ul>
+      <li><strong>首选（约 15 分钟）</strong>：<a href="https://gameprogrammingpatterns.com/double-buffer.html">Game Programming Patterns · Double Buffer</a>（Robert Nystrom）。讲的正是这一课的问题：一次更新的前半段改了状态，后半段读到的就是改过的。书里的意图一句话是「让一连串按顺序执行的操作，看起来是同时发生的」。快照是同一个想法的只读版本：读的一方只看开头那一刻的副本。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Execution_model#run-to-completion">MDN · Run-to-completion</a>：为什么浏览器事件插不进一帧中间。</li>
+      <li><a href="0031-frame-overview.html">第 31 课</a>第 6、7 节：真实 RenderListBuilder 的逐行讲解，复制与冻结两条规则的「去掉它」实验。</li>
+      <li><a href="../reference/validation-map.html">校验地图</a>：第 ② 层检查什么、之后放心什么。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：检查题错了哪几题；画布上「灯转到 60°」那一格的画面，你能不能说出为什么半块地面变暗了。看不懂的代码，把行号贴给我。下一课把两遍做成两个 Pass，把「画到哪」变成进门、出门，再让场景自己交出要用的 Pass。
+    </aside>
+
+    <div class="nav">
+      <a href="0042-what-to-draw-as-data.html">← 第 42 课：画什么写成数据</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0044-passes-and-surface-scope.html">第 44 课：两遍变成两个 Pass →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 43 课 · 2026-10-17</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+        const S = RTeach.shadow43
+        const S42 = RTeach.shadow42
+        const M = RTeach.shadowRaw.M
+
+        function dedent(text) {
+          const lines = text.split('\n')
+          const indents = lines.slice(1).filter((l) => l.trim()).map((l) => l.match(/^ */)[0].length)
+          const cut = indents.length ? Math.min(...indents) : 0
+          return [lines[0], ...lines.slice(1).map((l) => l.slice(Math.min(cut, l.match(/^ */)[0].length)))].join('\n')
+        }
+        const show = (...parts) => parts.map((p) => dedent(p.toString())).join('\n\n')
+        const ERRORS = { 0: '0（没有错误）', 1280: 'INVALID_ENUM', 1281: 'INVALID_VALUE', 1282: 'INVALID_OPERATION' }
+        const pixel = (gl, x, y) => {
+          const p = new Uint8Array(4)
+          gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p)
+          return Array.from(p.slice(0, 3))
+        }
+        const toLightAt = (degrees) => {
+          const a = (degrees * Math.PI) / 180
+          return M.normalize([Math.sin(a), Math.cos(a), 0.35])
+        }
+
+        // ---------------- 代码视图 ----------------
+        window.__cv43 = {}
+        window.__cv43.live = RTeach.codeView({
+          mount: document.getElementById('cv-live'),
+          caption: 'assets/shadow-43.js：第 42 课的 drawScene 原样切成两半。唯一的变化是开头那几行（灯和相机的矩阵）现在每一半各算一次。',
+          code: show(S.shadowPassLive, S.mainPassLive),
+          groups: [
+            { label: '读场景', test: (line) => /scene\.|light\.|mesh\.|\(camera,/.test(line), note: '每一半在自己运行的那一刻读' },
+            { label: '各算一次灯的矩阵', test: (line) => /liveLightViewProjection\(light\)|cameraViewProjection\(camera/.test(line), note: '切开以前在 drawScene 开头算一次' }
+          ]
+        })
+        const frameParts = [S.snapshotMatrix, S.snapshotLight, S.buildFrame, S.lightViewProjection, S.shadowPass, S.mainPass, S.renderFrame]
+        // snapshotLight、buildFrame 两段所在的行号范围：「读场景」只算这两段
+        const partLines = frameParts.map((p) => dedent(p.toString()).split('\n').length)
+        const readFrom = partLines[0] + 1
+        const readTo = readFrom + partLines[1] + 1 + partLines[2]
+        window.__cv43.frame = RTeach.codeView({
+          mount: document.getElementById('cv-frame'),
+          caption: 'assets/shadow-43.js：buildFrame 和只读 frame 的两遍。',
+          code: show(...frameParts),
+          groups: [
+            { label: '读场景', test: (line, i) => i >= readFrom && i < readTo && /scene\.|mesh\.|light\.|\(camera,/.test(line), note: '只剩 snapshotLight 和 buildFrame 里这几行；两遍里的 light 是 frame.lights[0]，是快照' },
+            { label: '复制并冻结（值）', test: (line) => /Object\.freeze|Array\.from|\[\.\.\.light/.test(line) },
+            { label: '借用（资源）', test: (line) => /借用/.test(line), note: '资源按身份借用，Manager 照常查表' },
+            { label: '两遍只读 frame', test: (line) => /frame\.(items|lights|view)/.test(line) },
+            { label: '检查', test: (line) => /throw new Error|isFinite/.test(line), note: '第 6 节' }
+          ]
+        })
+        document.getElementById('splice-code').textContent = dedent(function shadowPassSkippingFloor(gl, managers, frame) {
+          // 想让第一遍跳过不投影子的地面，图省事直接改了共享的列表
+          const floorIndex = frame.items.findIndex(
+            (item) => item.geometry === floorGeometry)
+          frame.items.splice(floorIndex, 1)
+          shadowPass(gl, managers, frame)
+        }.toString())
+
+        // ---------------- 画布 G：两遍之间插一步 ----------------
+        function liveWithStep(gl, managers, app, step) {
+          S.shadowPassLive(gl, managers, app.scene)
+          step() // 两遍之间有人改了场景
+          S.mainPassLive(gl, managers, app.scene, app.camera)
+        }
+        function snapshotWithStep(gl, managers, app, step) {
+          const aspect = gl.canvas.width / gl.canvas.height
+          const frame = S.buildFrame(app.scene, app.camera, aspect)
+          S.shadowPass(gl, managers, frame)
+          step() // 两遍之间有人改了场景
+          S.mainPass(gl, managers, frame)
+        }
+        document.getElementById('g-code').textContent = show(liveWithStep, snapshotWithStep)
+        {
+          let canvas = document.getElementById('g-canvas')
+          let gl
+          let managers
+          let app
+          let record
+          let frames
+          let angle
+          const readout = document.getElementById('g-readout')
+          const mode = () => document.querySelector('input[name="g-mode"]:checked').value
+          function start() {
+            if (gl) {
+              const lose = gl.getExtension('WEBGL_lose_context')
+              if (lose) lose.loseContext()
+              const fresh = document.createElement('canvas')
+              fresh.width = 480
+              fresh.height = 300
+              fresh.id = 'g-canvas'
+              canvas.replaceWith(fresh)
+              canvas = fresh
+            }
+            gl = canvas.getContext('webgl', { preserveDrawingBuffer: true })
+            // 课程写的记录：每一遍实际上传的 uModel（x 平移）和 uLightVP
+            record = { names: new Map(), program: null, uploads: [] }
+            const getLocation = gl.getUniformLocation.bind(gl)
+            gl.getUniformLocation = (program, name) => {
+              const location = getLocation(program, name)
+              record.names.set(location, name)
+              return location
+            }
+            const useProgram = gl.useProgram.bind(gl)
+            gl.useProgram = (program) => {
+              record.program = program
+              return useProgram(program)
+            }
+            const uniformMatrix = gl.uniformMatrix4fv.bind(gl)
+            gl.uniformMatrix4fv = (location, transpose, value) => {
+              record.uploads.push({ program: record.program, name: record.names.get(location), value: Array.from(value) })
+              return uniformMatrix(location, transpose, value)
+            }
+            managers = S42.createManagers(gl)
+            app = S42.createShadowScene(35)
+            angle = 35
+            frames = 0
+            draw(() => {}, '第 1 帧，两遍之间什么都不做。')
+          }
+          function draw(step, note) {
+            record.uploads = []
+            let error = null
+            try {
+              if (mode() === 'live') liveWithStep(gl, managers, app, step)
+              else snapshotWithStep(gl, managers, app, step)
+            } catch (e) {
+              error = e
+            }
+            frames++
+            const depthProgram = managers.programs.entries.get(S42.depthShader).program
+            const pass = (u) => (u.program === depthProgram ? 0 : 1)
+            const models = [[], []]
+            const lightVPs = [null, null]
+            for (const u of record.uploads) {
+              if (u.name === 'uModel') models[pass(u)].push(u.value[12].toFixed(1))
+              if (u.name === 'uLightVP' && !lightVPs[pass(u)]) lightVPs[pass(u)] = JSON.stringify(u.value)
+            }
+            const sameLight = lightVPs[0] === lightVPs[1]
+            const triangle = [models[0][1], models[1][1]]
+            readout.textContent =
+              (note ? note + '\n' : '') +
+              '写法：' + (mode() === 'live' ? '第 42 课切开的两半' : '第 43 课先抄一份') + '；已画 ' + frames + ' 帧。场景现在：三角形 x = ' + app.triangle.position[0].toFixed(1) + '，灯 ' + angle + '°。\n' +
+              '这一帧上传的三角形 uModel 平移 x：第一遍 ' + triangle[0] + '，第二遍 ' + triangle[1] + (triangle[0] === triangle[1] ? '（一致）' : '（不一致：影子和物体对不上）') + '。\n' +
+              '两遍上传的 uLightVP：' + (sameLight ? '完全相同' : '不同（阴影图按一盏灯画，第二遍按另一盏灯查）') + '。' +
+              (error ? '\n抛错：' + error.message : '') + '  getError：' + ERRORS[gl.getError()]
+          }
+          function step() {
+            if (document.getElementById('g-step').value === 'move') {
+              app.triangle.position[0] = app.triangle.position[0] === 0 ? 0.8 : 0
+            } else {
+              angle = angle === 35 ? 60 : 35
+              app.light.toLight = toLightAt(angle)
+            }
+          }
+          document.getElementById('g-step-frame').addEventListener('click', () => draw(step, '画了一帧，两遍之间执行了「' + document.getElementById('g-step').selectedOptions[0].textContent.replace(/（.*/, '') + '」。'))
+          document.getElementById('g-plain-frame').addEventListener('click', () => draw(() => {}, '画了一帧，两遍之间什么都不做。'))
+          document.getElementById('g-reset').addEventListener('click', start)
+          for (const radio of document.querySelectorAll('input[name="g-mode"]')) radio.addEventListener('change', start)
+          start()
+          window.__stageG = { start, get app() { return app } }
+        }
+
+        // ---------------- 检查卡片 ----------------
+        function tempCanvas() {
+          const canvas = document.createElement('canvas')
+          canvas.width = 480
+          canvas.height = 300
+          return canvas.getContext('webgl', { preserveDrawingBuffer: true })
+        }
+        function done(gl) {
+          const lose = gl.getExtension('WEBGL_lose_context')
+          if (lose) lose.loseContext()
+        }
+        const describe = (p) => '(' + p.join(', ') + ')'
+        RTeach.traceLab.cards({
+          mount: document.getElementById('cards-freeze'),
+          storageKey: 'lesson-0043-freeze',
+          cards: [
+            {
+              title: '卡片 A：frame 没有冻结',
+              desc: '把 buildFrame 的结果复制成一份不冻结的（items 是普通数组），先跑上面的 shadowPassSkippingFloor，再跑 mainPass。',
+              note: 'shadowPassSkippingFloor 和「不冻结的副本」是课程写的；shadowPass、mainPass 是 assets/shadow-43.js 的小引擎。',
+              question: '第二遍画出来的画面：',
+              choices: ['地面不见了，只剩三角形', '和平常一样，地面和影子都在', '地面还在，但影子不见了'],
+              answer: 0,
+              explain: 'splice 改的是两遍共用的那一个数组，第二遍拿到的列表里已经没有地面。没有任何报错，删东西的代码在第一遍，症状出现在第二遍。',
+              run: async () => {
+                const gl = tempCanvas()
+                const managers = S42.createManagers(gl)
+                const app = S42.createShadowScene(35)
+                const floorGeometry = app.scene.meshes[0].geometry
+                const frame = S.buildFrame(app.scene, app.camera, 1.6)
+                const loose = { ...frame, items: [...frame.items] }
+                loose.items.splice(loose.items.findIndex((item) => item.geometry === floorGeometry), 1)
+                S.shadowPass(gl, managers, loose)
+                S.mainPass(gl, managers, loose)
+                const lines = [
+                  { text: '没有抛错；第二遍收到 ' + loose.items.length + ' 个物体' },
+                  { text: '原本亮的地面 (349, 88)：' + describe(pixel(gl, 349, 88)) + '，是背景色' },
+                  { text: '三角形 (240, 162)：' + describe(pixel(gl, 240, 162)) },
+                  { text: 'getError：' + ERRORS[gl.getError()] }
+                ]
+                done(gl)
+                return { lines }
+              }
+            },
+            {
+              title: '卡片 B：frame 冻结了',
+              desc: '同样的 shadowPassSkippingFloor，这次传进去的是 buildFrame 原样返回的 frame。',
+              note: 'shadowPassSkippingFloor 是课程写的；buildFrame 是 assets/shadow-43.js 的小引擎。',
+              question: '会发生什么？',
+              choices: ['splice 那一行抛 TypeError', '地面同样不见了，也不报错', 'splice 静默失败，什么都没删'],
+              answer: 0,
+              explain: '冻结的数组不能删元素，严格模式下 splice 抛 TypeError，错误停在真正犯错的那一行。真实代码的 RenderList 同样冻结两个队列（RenderList.ts:28–29）。',
+              run: async () => {
+                const app = S42.createShadowScene(35)
+                const frame = S.buildFrame(app.scene, app.camera, 1.6)
+                try {
+                  frame.items.splice(0, 1)
+                  return { lines: [{ text: '没有抛错' }] }
+                } catch (error) {
+                  return { lines: [{ text: error.constructor.name + ': ' + error.message, kind: 'abort' }, { text: 'frame.items 仍有 ' + frame.items.length + ' 个物体' }] }
+                }
+              }
+            }
+          ]
+        })
+        const badCamera = { eye: [0, 0.4, 0], target: [0, 0.4, 0], fovY: Math.PI / 4 }
+        RTeach.traceLab.cards({
+          mount: document.getElementById('cards-check'),
+          storageKey: 'lesson-0043-check',
+          cards: [
+            {
+              title: '卡片 C：第 42 课的 drawScene，相机放在目标点上',
+              desc: "camera = { eye: [0, 0.4, 0], target: [0, 0.4, 0], fovY: π/4 }，然后 drawScene 画一帧。",
+              note: 'drawScene 是第 42 课课程写的小引擎（assets/shadow-42.js）。',
+              question: '会发生什么？',
+              choices: ['不抛错，画面只剩背景，getError 为 0', '抛错，说相机矩阵不是有限的数', 'getError 报 INVALID_VALUE，画面不变'],
+              answer: 0,
+              explain: 'NaN 一路传进 uniform，GL 不检查 uniform 的值；每个顶点的位置都是 NaN，什么三角形也画不出来。错误源头在相机，症状是空白画面，中间没有任何提示。',
+              run: async () => {
+                const gl = tempCanvas()
+                const app = S42.createShadowScene(35)
+                let threw = '没有抛错'
+                try {
+                  S42.drawScene(gl, S42.createManagers(gl), app.scene, badCamera)
+                } catch (error) {
+                  threw = '抛错：' + error.message
+                }
+                const lines = [
+                  { text: threw },
+                  { text: '原本亮的地面 (349, 88)：' + describe(pixel(gl, 349, 88)) },
+                  { text: '三角形 (240, 162)：' + describe(pixel(gl, 240, 162)) },
+                  { text: 'getError：' + ERRORS[gl.getError()] }
+                ]
+                done(gl)
+                return { lines }
+              }
+            },
+            {
+              title: '卡片 D：第 43 课的 renderFrame，同一个相机',
+              desc: '同样的相机，换成 renderFrame（先 buildFrame，再两遍）。',
+              note: 'renderFrame、buildFrame 是 assets/shadow-43.js 的小引擎。',
+              question: '会发生什么？',
+              choices: ['buildFrame 抛错，指出哪个矩阵的第几个数', '第一遍抛错，第二遍照常画背景', '不抛错，画面同样只剩背景'],
+              answer: 0,
+              explain: 'snapshotMatrix 逐个检查 16 个数，第一个 NaN 就抛错；两遍一个都没开始。真实代码在 RenderListBuilder.ts:82（有限数）和 :84–85（可逆）检查相机。',
+              run: async () => {
+                const gl = tempCanvas()
+                const app = S42.createShadowScene(35)
+                let lines
+                try {
+                  S.renderFrame(gl, S42.createManagers(gl), app.scene, badCamera)
+                  lines = [{ text: '没有抛错' }]
+                } catch (error) {
+                  lines = [{ text: '抛错：' + error.message, kind: 'abort' }]
+                }
+                done(gl)
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0043"]'), [
+          {
+            q: '两遍之间，下面哪一种代码有机会改场景？',
+            opts: ['排在两遍之间的另一个 Pass', '用户拖动滑块触发的 input 回调', '浏览器窗口尺寸变化的 resize 回调'],
+            answer: 0,
+            why: '同步代码一旦开始就跑到底（run-to-completion），事件回调只能等这一帧跑完；能插进来的只有这一帧里自己运行的代码（第 2 节）。从显示器的节拍讲起的完整解释见第 48 课。'
+          },
+          {
+            q: '切开的两半之间把三角形右移 0.8，这一帧的画面是：',
+            opts: ['三角形在新位置，影子还在旧位置', '三角形和影子都还在旧位置', '三角形和影子都已经在新位置'],
+            answer: 0,
+            why: '第一遍照移动前的场景画阴影图，第二遍照移动后的场景画三角形（实测上传的 x 是 0 和 0.8）。'
+          },
+          {
+            q: '改用先抄一份，同样在两遍之间右移，这一帧和下一帧：',
+            opts: ['这一帧都在旧位置，下一帧都在新位置', '这一帧都在新位置，下一帧也在新位置', '这一帧影子在旧位置，下一帧才一致'],
+            answer: 0,
+            why: '两遍都读开头抄的 frame；改动等下一帧的 buildFrame 才被抄进来。晚一帧，但一帧之内一致。'
+          },
+          {
+            q: '快照里的 Geometry 为什么借用原对象，而不是复制一份？',
+            opts: ['Manager 按对象查表，复制会每帧多一条', 'Geometry 太小，复制没有意义', '复制 Geometry 会让它在场景里被释放'],
+            answer: 0,
+            why: '第 41 课第 5 节：key 是对象本身，每帧的新对象都查不到；Geometry 又不能改（第 42 课），借用就够了。'
+          },
+          {
+            q: '某个 Pass 对 frame.items 调用 splice，在第 43 课的小引擎里会：',
+            opts: ['在 splice 那一行抛 TypeError', '删掉元素，后面的 Pass 少画一个', '静默失败，数组保持原样不报错'],
+            answer: 0,
+            why: 'buildFrame 冻结了 items；严格模式下改冻结数组抛 TypeError（卡片 B）。'
+          },
+          {
+            q: '为什么矩阵抄成冻结的普通数组，而不是 Float32Array？',
+            opts: ['带元素的 Float32Array 冻结不了', '普通数组传给 GL 比较快', 'Float32Array 存不下 16 个数'],
+            answer: 0,
+            why: 'Object.freeze(new Float32Array(16)) 抛 TypeError；真实代码的 copyMat4Snapshot 也是复制成普通数组再冻结（第 5 节）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

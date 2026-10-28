@@ -1,0 +1,711 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 45 课 · 阴影值怎样送进 shader</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/code-view.js"></script>
+    <script src="../assets/shadow-raw.js"></script>
+    <script src="../assets/shadow-41.js"></script>
+    <script src="../assets/shadow-42.js"></script>
+    <script src="../assets/shadow-43.js"></script>
+    <script src="../assets/shadow-44.js"></script>
+    <script src="../assets/shadow-45.js"></script>
+  </head>
+  <body>
+    <p class="kicker">系列「带阴影的三角形：从一个函数到 src/rendering」6/7 · 约 35 分钟</p>
+    <h1>阴影值怎样送进 shader：四种办法，为什么选参数块</h1>
+    <p class="lede">
+      第 44 课的 ForwardPass 里还剩三行：阴影图、灯的矩阵、bias。画屏幕的那一遍本不该懂阴影，可这三个值总得有人交给 shader。这一课在同一个小引擎里把四种交法各写一遍——A「draw 时带上」、B「后端认识灯光」、three.js「引擎数灯、替 shader 拼代码」、C「参数块」——用同一组需求去试，看 HW1 设计为什么选 C。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 这就是 HW1 设计的第 2 项决定（<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:9">设计 §0</a>）：阴影参数用参数块按引用送到 shader。10 月 19 日你已经把第 2 批录完了：<a data-src="src/rendering/resources/ParameterBlock.ts:27">ParameterBlock.ts</a>、共用模块 <a data-src="src/rendering/resources/materialParameters.ts:1">materialParameters.ts</a>、Material 的 blocks、后端的第三处取值都在工作区里。这一课先在小引擎里把它们跑一遍，第 9 节再逐行对照真实代码。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 第 42 课的 Resource、Material（参数每次 draw 现读）、RenderTarget；② 第 43 课的快照：数值抄一份，资源只借用；③ 第 44 课的 Backend、ShadowMapPass、ForwardPass、RenderPipeline。<br />
+      <strong>这一课讲的</strong>：五条需求；第 0 种「抄进材质」为什么不行；A、B、three.js、C 各自的写法和代价；并排跑一遍；C 的合同；对照 src/rendering 和 three.js。<br />
+      <strong>在一帧里的位置和寿命</strong>：值由 ShadowMapPass 在第一遍里产生，ForwardPass 每画一个物体时读一次。灯的矩阵只活一帧；阴影图活得和灯的阴影设置一样长；bias 是设置，GUI 随时改。<br />
+      <strong>页面会用到你的显卡</strong>：一块 480 × 300 的画布（上面同时住着五套引擎），外加两块不显示的对照画布和检查卡片里临时建的几块。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">那三行，和五条需求</a></li>
+        <li><a href="#s2">第 0 种：建场景时抄进材质</a></li>
+        <li><a href="#s3">A：draw 时带上</a></li>
+        <li><a href="#s4">B：后端认识灯光</a></li>
+        <li><a href="#s5">three.js：引擎数灯、替 shader 拼代码</a></li>
+        <li><a href="#s6">C：参数块</a></li>
+        <li><a href="#s7">并排跑一遍</a></li>
+        <li><a href="#s8">为什么选 C，C 的代价</a></li>
+        <li><a href="#s9">对照 src/rendering</a></li>
+        <li><a href="#s10">检查题</a></li>
+        <li><a href="#s11">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 那三行，和五条需求</h2>
+    <p>第 44 课 ForwardPass 的这几行：</p>
+<pre>const light = frame.lights[0]
+// 和阴影有关的三项：第 45 课要处理的就是这几行
+const shadowValues = light.shadow === null ? {} : {
+  uLightVP: lightViewProjection(light),
+  uShadowBias: light.shadow.bias,
+  uShadowMap: light.shadow.target
+}</pre>
+    <p>三个值的性质各不相同：<strong>阴影图</strong>是一张 GPU 纹理，内容由 ShadowMapPass 每帧重画；<strong>灯的矩阵</strong>（视图 × 正交投影，16 个数）灯一动就变；<strong>bias</strong> 是一个设置，GUI 随时可能改。怎样交给 shader，用下面五条需求去试。每一条都有一个能跑的场景：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>需求</th><th>具体场景</th><th>做对了是什么样</th></tr>
+        <tr><td>R1 灯会动</td><td>灯从 35° 转到 −30°</td><td>影子从 (200, 150) 一带挪到 (270, 150) 一带，和第 40 课同角度的画面逐像素相同</td></tr>
+        <tr><td>R2 关掉投影</td><td><code>light.castShadow = false</code></td><td>画面变成「没有阴影」：和不带阴影的正确画面逐像素相同；不报错、不变黑</td></tr>
+        <tr><td>R3 作业往后走</td><td>PCF、PCSS 要多送几项（阴影图尺寸、光源大小……）</td><td>改动只落在阴影自己的代码和 shader 里</td></tr>
+        <tr><td>R4 一个名字一个来源</td><td>有人也给材质设了 <code>uShadowBias</code></td><td>当场报错，不能悄悄「谁压过谁」</td></tr>
+        <tr><td>R5 别人不认识阴影</td><td>HW2、FFT 也用同一个 ForwardPass 和后端</td><td>ForwardPass、后端里没有阴影的词</td></tr>
+      </table>
+    </div>
+    <p>先说不比的一项：<strong>速度</strong>。备课时实测，五种写法每帧都是 58 条 GL 命令、4 次查询（和第 44 课一样）。在 WebGL1 上，值最后都是一条条 <code>uniform*</code> 命令传上去，差别全在「谁知道什么、改一处要动几处」。</p>
+
+    <h2 id="s2">2. 第 0 种：建场景时抄进材质</h2>
+    <p>最直接的想法：Material 本来就有参数，建场景时把三个值写进接收者（地面、三角形）的材质，ForwardPass 就一行阴影都不用写了（这一课的 ForwardPass 只给相机、物体位置和灯的方向，见第 6 节）。</p>
+    <div id="cv-copy"></div>
+    <div id="cards-copy"></div>
+    <p>阴影图和矩阵是<strong>一件产品的两半</strong>：深度图，加上「怎样在深度图上找到自己」的那个矩阵。材质对阴影图存的是<strong>引用</strong>（ShadowMapPass 重画，材质自动看到新像素），对矩阵存的是建场景那一刻的 16 个数的<strong>副本</strong>。灯一动，两半对不上。HW1 设计写下的第一个原型就是这样失败的（<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:21">设计 §1.1</a>）。</p>
+    <p>出路只有两条：要么<strong>每帧重新送一次</strong>矩阵（A、B、three.js 的表面做法），要么让材质对矩阵也<strong>存引用</strong>，由产生它的人原地更新（three.js 的底层、C）。</p>
+
+    <h2 id="s3">3. A：draw 时带上</h2>
+    <p>第 44 课其实已经是 A：ForwardPass 每帧算出三个值，跟相机、物体位置一起放进 <code>draw</code> 的 <code>uniforms</code>。codex 2026-10-15 的方案 A 是同一个形状，只是起了名字：<code>DrawSubmission.parameterOverrides</code>（<code>codex-workspace/…/2026-10-15-hw1-draw-parameters-vs-lighting-semantics.zh-CN.md</code> 第 4 节）。</p>
+    <div id="cv-a"></div>
+    <ul>
+      <li><strong>R1 ✓</strong>：每帧现算现送。</li>
+      <li><strong>R2 ✗</strong>：<code>castShadow = false</code> 时快照里的 <code>shadow</code> 是 null，<code>shadowValues</code> 是空对象，带阴影的 shader 缺了三个值，第一次 draw 就抛「uniform uLightVP 没有值」（第 7 节可以试）。要不抛错，ForwardPass 还得知道「没有阴影时每一项填什么」。</li>
+      <li><strong>R3 ✗</strong>：PCSS 多一项光源大小，就要改 ForwardPass。下一项效果（雾、SSAO）再改一次。</li>
+      <li><strong>R4 ✗</strong>：两个来源同名时，后展开的赢，没有任何提示。下面的卡片就是这件事。</li>
+      <li><strong>R5 ✗</strong>：ForwardPass 认识阴影，而且只认 <code>lights[0]</code>。</li>
+    </ul>
+    <div id="cards-a"></div>
+
+    <h2 id="s4">4. B：后端认识灯光</h2>
+    <p>B 把「灯光」做成后端认识的词：<code>draw</code> 多收一个 <code>lighting</code>，后端知道其中每一项该叫哪个 uniform。这是 codex 文档的方案 B（第 5 节的 <code>LightingFrameData</code>），小引擎照它的原形写：四项都是必填。</p>
+    <div id="cv-b"></div>
+    <ul>
+      <li><strong>R1 ✓</strong>：每帧现算现送。</li>
+      <li><strong>R2 ✗</strong>：没有阴影时 lighting 缺三项，后端抛「lighting.shadowMap 必须有」。codex 文档自己也写了：<code>lighting?</code> 只能整块可选，表达不了「有光照、没有阴影」（第 5.3 节第 1 条）。</li>
+      <li><strong>R3 ✗</strong>：多一项光源大小，要改后端的字段表和名字映射，还要改 ForwardPass 的翻译。</li>
+      <li><strong>R5 ✗</strong>：后端认识了灯光、阴影。HW2 的 PRT、FFT 海面都不用它；以后来个 <code>ocean?</code>、<code>ssr?</code>，后端的词越来越多（第 5.3 节第 3 条）。</li>
+    </ul>
+
+    <h2 id="s5">5. three.js：引擎数灯、替 shader 拼代码</h2>
+    <p>three.js r177 把灯光做成一整套协议，分三层：</p>
+    <ol>
+      <li><strong>引擎每帧数灯。</strong><code>WebGLLights.setup</code> 把每盏投影子的方向光的 <code>shadowBias</code> 等设置、阴影图、<code>light.shadow.matrix</code> 放进几个数组（<a data-src="node_modules/three/src/renderers/webgl/WebGLLights.js:266">WebGLLights.js:266–280</a>）。</li>
+      <li><strong>材质的 uniform 指向这些数组。</strong>需要灯光的材质第一次编译时，渲染器把它的 <code>directionalShadowMap.value</code>、<code>directionalShadowMatrix.value</code> 直接设成那几个数组本身（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:2110">WebGLRenderer.js:2110–2126</a>）——这是<strong>按引用</strong>：之后数组里的值变了，材质不用动。</li>
+      <li><strong>shader 由引擎拼。</strong>材质的 shader 里只写 <code>#include &lt;shadowmap_pars_fragment&gt;</code>，引擎把片段换进去，再把 <code>NUM_DIR_LIGHT_SHADOWS</code> 换成灯数（<a data-src="node_modules/three/src/renderers/webgl/WebGLProgram.js:242">WebGLProgram.js:242</a>；片段见 <a data-src="node_modules/three/src/renderers/shaders/ShaderChunk/shadowmap_pars_fragment.glsl.js:16">shadowmap_pars_fragment.glsl.js:16–29</a>）。灯数是 program 参数之一（<a data-src="node_modules/three/src/renderers/webgl/WebGLPrograms.js:326">WebGLPrograms.js:326</a>）；灯数一变，灯光状态的版本号加 1（<a data-src="node_modules/three/src/renderers/webgl/WebGLLights.js:425">WebGLLights.js:425–468</a>），用灯的材质就要换 program（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:2236">WebGLRenderer.js:2236</a>）。</li>
+    </ol>
+    <p>小引擎按这三层写了一个缩小版：<code>LightsState</code> 是第 1 层，<code>ThreeBackend</code> 每次 draw 接上数组是第 2 层，<code>expandShader</code> 和 <code>variantOf</code> 是第 3 层。ForwardPass 用的是 C 的那一个（一行阴影都没有）。</p>
+    <div id="cv-three"></div>
+    <ul>
+      <li><strong>R1 ✓</strong>、<strong>R2 ✓</strong>：关掉投影，灯数从 1 变 0，引擎拼出一份不含阴影代码的 shader，画面和不带阴影的正确画面逐像素相同。代价是<strong>多编译一个 program</strong>（第 7 节实测 2 → 3）；再打开时用缓存里的那份，不再编译。</li>
+      <li><strong>R3 ✗</strong>：shader 里的阴影代码属于引擎，结构体里只有 bias、半径、阴影图尺寸这几项。PCSS 要的光源大小不在里面。three.js 官方的 PCSS 示例是用字符串替换改写 <code>THREE.ShaderChunk.shadowmap_pars_fragment</code>，再用 <code>#define LIGHT_WORLD_SIZE</code> 等把光源参数写死进 shader（<a href="https://github.com/mrdoob/three.js/blob/r177/examples/webgl_shadowmap_pcss.html">r177 的 webgl_shadowmap_pcss.html</a>）。GAMES202 的 HW1 正好要从硬阴影走到 PCF、PCSS。</li>
+      <li><strong>R4 ✓</strong>：名字由引擎定，材质不会去设这几个名字。</li>
+      <li><strong>R5 ✗</strong>：引擎、后端都认识灯光；要照搬，还得先让后端支持 uniform 数组（真实代码现在明确拒绝，<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:235">WebGL1Uniforms.ts:235–237</a>）和 shader 变体系统。</li>
+    </ul>
+    <p>它的长处是灯数变了、材质和 shader 一个字不用改。可 GAMES202 里 HW1、HW3 都只有一盏灯，HW2 不用实时灯光。值得拿走的是第 2 层：<strong>按引用接线</strong>。</p>
+
+    <h2 id="s6">6. C：参数块</h2>
+    <p>C 只拿 three.js 的第 2 层，做成一个和阴影无关的通用零件：<strong>参数块（ParameterBlock）</strong>——一组有名字的值，名字和种类构造时定死，之后只能原地改值。它和 Texture、RenderTarget 是同一种模式：CPU 资源有身份，材质借用，拥有者更新，后端读取。</p>
+
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 300" role="img" aria-label="C 的数据流。DirectionalLightShadow 拥有阴影图和一个参数块。ShadowMapPass 每帧画深度进阴影图，并按快照把 uLightVP、uShadowBias 写进块。地面和三角形的材质都借用这个块。ForwardPass 只把相机矩阵、物体位置、灯的方向交给后端；后端 draw 时按名字依次在 Pass 给的值、材质自己的参数、材质借用的块里查。">
+          <defs>
+            <marker id="c45a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+            <marker id="c45b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <rect x="240" y="16" width="290" height="120" rx="6" class="box" />
+          <text x="252" y="34" class="title">DirectionalLightShadow（拥有）</text>
+          <rect x="252" y="44" width="266" height="26" rx="4" class="box" />
+          <text x="385" y="62" text-anchor="middle">阴影图 RenderTarget</text>
+          <rect x="252" y="78" width="266" height="48" rx="4" class="box hl" />
+          <text x="385" y="96" text-anchor="middle">参数块 block</text>
+          <text x="385" y="116" text-anchor="middle" class="small">uShadowMap · uLightVP · uShadowBias</text>
+
+          <rect x="16" y="40" width="170" height="60" rx="6" class="box" />
+          <text x="101" y="64" text-anchor="middle">ShadowMapPass</text>
+          <text x="101" y="84" text-anchor="middle" class="small">第一遍，每帧</text>
+          <path d="M186 58 L248 58" class="line" marker-end="url(#c45a)" />
+          <text x="216" y="50" text-anchor="middle" class="small">画深度</text>
+          <path d="M186 88 L248 100" class="line accent" marker-end="url(#c45b)" />
+          <text x="214" y="116" text-anchor="middle" class="small accent">写（按快照）</text>
+
+          <rect x="566" y="30" width="178" height="40" rx="6" class="box" />
+          <text x="655" y="55" text-anchor="middle">地面的 Material</text>
+          <rect x="566" y="86" width="178" height="40" rx="6" class="box" />
+          <text x="655" y="111" text-anchor="middle">三角形的 Material</text>
+          <path d="M564 50 L522 92" class="line dash" marker-end="url(#c45a)" />
+          <path d="M564 106 L522 104" class="line dash" marker-end="url(#c45a)" />
+          <text x="548" y="152" text-anchor="middle" class="small">借用（不拥有）</text>
+
+          <rect x="16" y="200" width="170" height="60" rx="6" class="box" />
+          <text x="101" y="224" text-anchor="middle">ForwardPass</text>
+          <text x="101" y="244" text-anchor="middle" class="small">第二遍</text>
+          <path d="M186 230 L328 230" class="line" marker-end="url(#c45a)" />
+          <text x="257" y="218" text-anchor="middle" class="small">相机、物体位置、灯方向</text>
+          <rect x="330" y="200" width="250" height="60" rx="6" class="box" />
+          <text x="455" y="224" text-anchor="middle">Backend.draw</text>
+          <text x="455" y="244" text-anchor="middle" class="small">按名字查：Pass 给的 → 材质 → 块</text>
+          <path d="M640 128 L560 198" class="line accent" marker-end="url(#c45b)" />
+          <text x="668" y="170" text-anchor="middle" class="small accent">draw 时读</text>
+          <text x="16" y="290" class="small">ForwardPass 和 Backend 里没有「阴影」这个词；阴影的知识只在 DirectionalLightShadow 和 ShadowMapPass 里</text>
+        </svg>
+      </div>
+      <figcaption>图 1　C 的数据流。值只有一个写的人（ShadowMapPass），两个借用的材质，一个读的人（后端）。块的身份从建场景起就不变，变的只是块里的值。</figcaption>
+    </figure>
+
+    <h3 id="s6-1">6.1 块和借用它的材质</h3>
+    <div id="cv-c-block"></div>
+    <ul>
+      <li><strong>块的 <code>set</code></strong>：名字必须已有、种类必须相同，先检查、复制，再替换，失败时旧值不变（实测：往 <code>uLightVP</code> 里塞 3 个数，抛「uLightVP 必须是 mat4，收到 vec3」，块还是全零矩阵、version 没变）。</li>
+      <li><strong>材质构造时</strong>查一遍名字：块与块之间、块与材质自己的参数之间不能同名；之后 <code>setParameter</code> 也不能设块已经提供的名字。</li>
+      <li><strong><code>copyValue</code> 和 <code>kindOf</code> 是材质和块共用的一套规则</strong>，不写两份。真实代码的共用模块是 <a data-src="src/rendering/resources/materialParameters.ts:1">materialParameters.ts</a>：<code>copyParameter</code>（<a data-src="src/rendering/resources/materialParameters.ts:141">:141</a>）和 <code>assertValidParameterName</code>（<a data-src="src/rendering/resources/materialParameters.ts:227">:227</a>）已经从 Material.ts 搬到这里。Material 和 ParameterBlock 都调用它们，各自传一个 <code>createError</code>，所以同一条规则失败时，一个报 InvalidMaterialError，一个报 InvalidParameterBlockError。</li>
+    </ul>
+
+    <h3 id="s6-2">6.2 后端多找一处，ForwardPass 少三行</h3>
+    <div id="cv-c-backend"></div>
+    <p>后端给一个 uniform 找值，按顺序看三处：Pass 给的（相机、物体位置）、材质自己的参数、材质借用的块。因为构造时保证了一个名字只有一个来源，这里是<strong>查找</strong>，不是「谁压过谁」——Pass 给的名字和材质撞了，draw 时直接抛错。材质参数也改由后端去材质里取（第 44 课是 ForwardPass 自己展开），真实代码本来就是这样，现在也多了块这一处：<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:149">WebGL1Uniforms.prepare</a> 对每个 active uniform，内建语义取内建值，否则先找 Material 自己的参数，再找借用的块（:149–154；块的查找在 <a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:252">blockParameter，:252–270</a>）。块的值每次 draw 重新读，不按 program 缓存。</p>
+
+    <h3 id="s6-3">6.3 谁写块：只有 ShadowMapPass</h3>
+    <div id="cv-c-shadow"></div>
+    <ul>
+      <li><strong>DirectionalLightShadow 拥有阴影图和块</strong>，块里的 <code>uShadowMap</code> 构造时就指向阴影图，之后不变。改尺寸（第 42 课的 <code>resize</code>）不换身份，借用它的材质不用动。</li>
+      <li><strong><code>setBias</code> 只改设置，不碰块。</strong>块里的值只由 ShadowMapPass 按这一帧的快照写（<code>publish</code>）。这样 GUI 在两遍之间改 bias，同一帧的两遍也不会读到不同的值（卡片 E）。</li>
+      <li><strong>没有阴影 = 全零矩阵。</strong>块的初值、<code>castShadow = false</code>、灯被移出场景，ShadowMapPass 都发布全零矩阵（<code>publishNoShadow</code>）。接收者 shader 里点乘全零矩阵得到 w = 0，<code>if (vLightClip.w &gt; 0.0)</code> 不成立，visible 保持 1：画面是「没有阴影」，不是全黑，也不是除以 0 得到的不确定值。这是接收者 shader 和第 42 课唯一的差别。</li>
+    </ul>
+<pre id="receiver-glsl"></pre>
+    <div id="cards-c"></div>
+    <aside class="note">
+      <strong>这里的检查</strong>（第 ① 层，构造和 set 时）：块的名字和种类固定，<code>set</code> 先检查后替换；材质构造时一个名字只有一个来源。<strong>之后可以放心</strong>：后端找值时最多找到一个，不需要优先级；块里的值永远是合法的、完整的一组。shader 里有没有这些名字，仍然要等第一次 draw 才知道（第 ③ 层）。见 <a href="../reference/validation-map.html">校验地图</a>。
+    </aside>
+
+    <h2 id="s7">7. 并排跑一遍</h2>
+    <p>同一块画布上住着五套引擎，每套有自己的 Manager、自己的场景。选一种写法，拖灯、开关投影。读数里「正确画面」是：投影开着时，第 40 课同角度的画面（这里用第 44 课的引擎画，它和第 40 课逐像素相同）；投影关着时，同一场景只用漫反射 shader 画的画面。</p>
+    <div class="gl-stage">
+      <canvas width="480" height="300" id="s-canvas"></canvas>
+      <div class="gl-controls" id="s-approaches"></div>
+      <div class="gl-controls">
+        <label>灯 <input type="range" min="-60" max="60" value="35" id="s-angle" /></label>
+        <span id="s-angle-text">35°</span>
+        <label><input type="checkbox" id="s-cast" checked /> 投影子（castShadow）</label>
+      </div>
+      <p class="gl-readout" id="s-readout"></p>
+    </div>
+    <p>备课时实测（依次：35°、转到 −30°、关掉投影、再打开、转回 35°）：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>写法</th><th>35°</th><th>−30°</th><th>−30°，关掉投影</th><th>再打开</th><th>program 数</th></tr>
+        <tr><td>第 0 种</td><td>相同</td><td>差 11389 像素：影子还在 (204, 150)</td><td>影子还在（关不掉）</td><td>差 11389</td><td>2</td></tr>
+        <tr><td>A</td><td>相同</td><td>相同</td><td>抛「uniform uLightVP 没有值」，画布只剩背景</td><td>相同</td><td>2</td></tr>
+        <tr><td>B</td><td>相同</td><td>相同</td><td>抛「lighting.shadowMap 必须有」，画布只剩背景</td><td>相同</td><td>2</td></tr>
+        <tr><td>three.js</td><td>相同</td><td>相同</td><td>和不带阴影的正确画面相同</td><td>相同</td><td>2 → 关掉时 3，之后不变</td></tr>
+        <tr><td>C</td><td>相同</td><td>相同</td><td>和不带阴影的正确画面相同</td><td>相同</td><td>2，始终不变</td></tr>
+      </table>
+    </div>
+    <p>「相同」都是逐像素相同。A、B 抛错时画布只剩背景色：ForwardPass 进门先清了屏，画第一个物体时才抛错；出门照样换回（第 44 课）。</p>
+
+    <h2 id="s8">8. 为什么选 C，C 的代价</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th></th><th>第 0 种</th><th>A</th><th>B</th><th>three.js</th><th>C</th></tr>
+        <tr><td>R1 灯会动</td><td>✗</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+        <tr><td>R2 关掉投影</td><td>✗ 关不掉</td><td>✗ 抛错</td><td>✗ 抛错</td><td>✓ 多编译一个</td><td>✓</td></tr>
+        <tr><td>R3 加一项要改哪</td><td>建场景处、shader</td><td>ForwardPass、shader</td><td>后端、ForwardPass、shader</td><td>引擎的状态表和 shader 片段</td><td>阴影块的定义、shader</td></tr>
+        <tr><td>R4 同名</td><td>—</td><td>✗ 悄悄覆盖</td><td>同 A</td><td>✓ 名字归引擎</td><td>✓ 构造时报错</td></tr>
+        <tr><td>R5 谁认识阴影</td><td>建场景的代码</td><td>ForwardPass</td><td>后端、ForwardPass</td><td>引擎、后端</td><td>只有 shadows/ 的两个类</td></tr>
+      </table>
+    </div>
+    <p>C 不是「为阴影开的口子」：块本身不认识阴影，阴影的知识只在定义那个块的 <code>DirectionalLightShadow</code> 里。同一个零件以后还能放 FFT 海面每帧的 <code>uTime</code>、延迟光照的 GBuffer 附件（<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:58">设计 §1.4</a>）。块的 <code>version</code> 在 WebGL1 用不到，以后 WebGL2 可以按它决定要不要重传一个 uniform buffer，WebGPU 对应一个 bind group——这也是延伸阅读首选那一节讲的东西。</p>
+    <p>C 的代价也写清楚：</p>
+    <ul>
+      <li><strong>材质多了一个借用列表</strong>，构造时多查一轮名字。列表构造后不能改，要换就建新材质（设计 D3）。</li>
+      <li><strong>一个材质接收两盏灯的阴影</strong>，两个块都叫 <code>uLightVP</code>，构造时就撞名报错。v1 不支持；需要时给块的名字加前缀，或者那时再做整套协议（设计 D5）。</li>
+      <li><strong>「只有 ShadowMapPass 写块」是合同，不是运行时拦截。</strong>谁违反了，值会闪一帧又被下一帧的发布冲掉（卡片 E 的第二行），不会报错（设计 D7）。</li>
+      <li><strong>接收者 shader 必须把 w ≤ 0 当作受光</strong>，否则全零矩阵会除以 0。</li>
+    </ul>
+    <aside class="note">
+      <strong>想一想</strong>：这一课的 ForwardPass 还在交 <code>uToLight</code>（灯的方向）。它和阴影值是同一个问题吗？如果也放进块，应该由谁拥有那个块、谁写？想好了在对话里告诉我。
+    </aside>
+
+    <h2 id="s9">9. 对照 src/rendering</h2>
+    <aside class="note"><strong>10 月 19 日晚更新</strong>：这张表写的时候 ParameterBlock 还没录。你录完以后，前四行改成了现在的代码，小引擎和真实代码的设计没有冲突；DirectionalLightShadow、ShadowMapPass、快照那三行还是设计。</aside>
+    <div class="table-scroll">
+      <table>
+        <tr><th>小引擎</th><th>真实代码</th><th>真实代码多了什么</th></tr>
+        <tr><td><code>ParameterBlock</code></td><td><a data-src="src/rendering/resources/ParameterBlock.ts:27">resources/ParameterBlock.ts</a>（<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:102">设计 §3.1</a>）；报错类型 <a data-src="src/rendering/core/errors/InvalidParameterBlockError.ts:4">InvalidParameterBlockError</a></td><td>值是带类型标签的 <code>{ type: 'mat4', value }</code>，不靠长度猜；<code>label</code> 必填（<a data-src="src/rendering/resources/ParameterBlock.ts:48">:48–49</a>）；<code>get</code>、<code>getEntries</code> 都给副本，读到纹理项时再查它还活着；version 到了最大安全整数就拒绝再写（<a data-src="src/rendering/resources/ParameterBlock.ts:125">:125–126</a>）；注释写明块不保证「矩阵 + 阴影图」一起原子更新，生产者要在消费者 draw 之前写完（<a data-src="src/rendering/resources/ParameterBlock.ts:23">:23–25</a>）</td></tr>
+        <tr><td><code>kindOf</code>、<code>copyValue</code></td><td><a data-src="src/rendering/resources/materialParameters.ts:141">materialParameters.ts</a> 的 <code>copyParameter</code>（:141）和参数类型（:41）；Material 和 ParameterBlock 共用，各自传 <code>createError</code> 决定报哪种错</td><td>int、bool、vec2、vec4、mat3、cubeTexture；附件地址的复制</td></tr>
+        <tr><td><code>Material</code> 的 <code>blocks</code></td><td><a data-src="src/rendering/resources/Material.ts:236">Material.ts:236–268</a>（构造时登记块的名字）、<a data-src="src/rendering/resources/Material.ts:344">:344–346</a>（<code>setParameter</code> 拒绝块的名字）；<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:126">设计 §3.2</a></td><td>块的名字也不能和 shader 的内建 uniform 名同名（构造时就能查，小引擎要等 draw）；同一个块借两次直接报错；<code>getParameter</code> 只看本地参数，不去块里找</td></tr>
+        <tr><td>后端按三处找值</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:149">WebGL1Uniforms.ts:149–154</a>：内建、材质参数、块；块在 <a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:252">blockParameter（:252–270）</a>；<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:142">设计 §3.3</a></td><td>只遍历 active uniform，块里 shader 不用的项被忽略，那一项的纹理就算已经释放也不报错（卡片 D；测试 <a data-src="tests/unit/rendering/backend/webgl1/WebGL1ParameterBlocks.test.ts:149">WebGL1ParameterBlocks.test.ts:149</a>）；纹理项照样过反馈环检查</td></tr>
+        <tr><td><code>ForwardPass</code>（没有阴影）</td><td><a data-src="src/rendering/passes/ForwardPass.ts:15">ForwardPass.ts:15–49</a>：本来就只交 <code>item</code> 和 <code>view</code></td><td>灯的方向这类值也不在 ForwardPass 里</td></tr>
+        <tr><td><code>DirectionalLightShadow</code></td><td>还没有：<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:176">设计 §3.5</a>；现有的 <a data-src="src/rendering/shadows/setShadowBias.ts:22">setShadowBias.ts</a> 是「对材质设 bias」，设计建议把它的校验规则抽给 <code>setBias</code>（D6）。等 <code>uShadowBias</code> 搬进块，对借用这个块的材质调 setShadowBias 会被 setParameter 拒绝（<a data-src="src/rendering/resources/Material.ts:344">Material.ts:344–346</a>）</td><td>near、far、up、mapSize 都是设置；<code>setMapSize</code> 改尺寸不换附件身份</td></tr>
+        <tr><td><code>ShadowMapPass</code> 的 <code>publish</code></td><td>还没有：<a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:260">设计 §3.8</a></td><td>只画 <code>castShadow</code> 的物体；深度材质 <code>dither: false</code></td></tr>
+        <tr><td>快照多抄 <code>castShadow</code>、借用阴影资源</td><td><a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:218">设计 §3.6</a></td><td>RenderItem 也多一个 <code>castShadow</code>，<code>snapshotItem</code> 要记得复制它</td></tr>
+      </table>
+    </div>
+    <p><strong>架构视角</strong>：three.js 的灯光协议、本项目的参数块，底下都是同一件事——<strong>材质对会变的值存引用，产生值的人原地更新</strong>。区别在于引用指向谁：three.js 指向引擎的全局灯光状态，名字和结构由引擎定；C 指向场景里一个普通资源，名字由定义它的模块定，后端只负责按名字查。</p>
+
+    <h2 id="s10">10. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0045"></div>
+
+    <h2 id="s11">11. 延伸阅读</h2>
+    <ul>
+      <li><strong>首选（约 15 分钟）</strong>：<a href="https://learnopengl.com/Advanced-OpenGL/Advanced-GLSL">LearnOpenGL · Advanced GLSL</a> 的「Uniform buffer objects」一节。它解决的正是参数块的问题：同一组值（那里是投影和视图矩阵）要给好几个 shader，不想每个 shader 各设一遍，就放进一块，各 shader 声明同样的块来读。WebGL1 没有这个功能，小引擎和设计里的块是在 CPU 侧做同一件事；换到 WebGL2，块可以直接变成一个 uniform buffer。</li>
+      <li><a href="https://github.com/mrdoob/three.js/blob/r177/examples/webgl_shadowmap_pcss.html">three.js r177 · webgl_shadowmap_pcss.html</a>：看它怎样用字符串替换改写引擎的阴影片段，体会第 5 节说的 R3。</li>
+      <li><a data-main="claude-workspace/hw1-shadow/2026-10-16-hw1-shadow-design.zh-CN.md:329">HW1 设计 §4 合同清单</a>：这一课的规则在正式代码里的写法。</li>
+      <li><a href="0042-what-to-draw-as-data.html">第 42 课</a>（材质参数每次 draw 现读）、<a href="0043-snapshot-each-frame.html">第 43 课</a>（数值抄、资源借）。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：检查题错了哪几题；五张卡片里哪个结果和你猜的不一样；第 8 节「想一想」的答案。哪种写法的代码看不懂，把行号贴给我。下一课是系列最后一课：出错、设备丢失的时候，三层检查和这套结构怎样兜底，再把小引擎的每个零件对回 src/rendering。
+    </aside>
+
+    <div class="nav">
+      <a href="0044-passes-and-surface-scope.html">← 第 44 课：两遍变成两个 Pass</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0046-when-things-go-wrong.html">第 46 课：不正常的时候 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 45 课 · 2026-10-19</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+        const S = RTeach.shadow45
+        const S44 = RTeach.shadow44
+        const S42 = RTeach.shadow42
+        const S41 = RTeach.shadow41
+
+        function dedent(text) {
+          const lines = text.split('\n')
+          const indents = lines.slice(1).filter((l) => l.trim()).map((l) => l.match(/^ */)[0].length)
+          const cut = indents.length ? Math.min(...indents) : 0
+          return [lines[0], ...lines.slice(1).map((l) => l.slice(Math.min(cut, l.match(/^ */)[0].length)))].join('\n')
+        }
+        const show = (...parts) => parts.map((p) => dedent(p.toString())).join('\n\n')
+        const glsl = (title, text) => '// ' + title + '\n' + dedent(text)
+        const pixel = (gl, x, y) => {
+          const p = new Uint8Array(4)
+          gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p)
+          return Array.from(p.slice(0, 3))
+        }
+        const describe = (p) => '(' + p.join(', ') + ')'
+        const ERRORS = { 0: '0（没有错误）', 1280: 'INVALID_ENUM', 1281: 'INVALID_VALUE', 1282: 'INVALID_OPERATION' }
+        const W = 480
+        const H = 300
+        const grab = (gl) => {
+          const p = new Uint8Array(W * H * 4)
+          gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, p)
+          return p
+        }
+        const diff = (a, b) => {
+          let n = 0
+          for (let i = 0; i < a.length; i += 4) if (a[i] !== b[i] || a[i + 1] !== b[i + 1] || a[i + 2] !== b[i + 2]) n++
+          return n
+        }
+
+        // ---------------- 代码视图 ----------------
+        window.__cv45 = {}
+        window.__cv45.copy = RTeach.codeView({
+          mount: document.getElementById('cv-copy'),
+          caption: 'assets/shadow-45.js：第 0 种的建场景函数。ForwardPass、后端用 C 的那一套（第 6 节）。',
+          code: show(S.createCopySetup),
+          groups: [
+            { label: '引用：阴影图', test: (line) => /uShadowMap: shadow\.target/.test(line), note: 'ShadowMapPass 重画，材质看到新像素' },
+            { label: '副本：矩阵', test: (line) => /const lightVP|uLightVP: lightVP|抄：/.test(line), note: '建场景这一刻的 16 个数' },
+            { label: '副本：bias', test: (line) => /uShadowBias: shadow\.settings\.bias/.test(line) }
+          ]
+        })
+        window.__cv45.a = RTeach.codeView({
+          mount: document.getElementById('cv-a'),
+          caption: 'assets/shadow-44.js：第 44 课的 ForwardPass，原样。',
+          code: show(S44.ForwardPass),
+          groups: [
+            { label: '阴影三行', test: (line) => /shadowValues|uLightVP: lightViewProjection|uShadowBias|uShadowMap|light\.shadow === null \? \{\}/.test(line), note: 'R3：每加一项都改这里' },
+            { label: '只看第一盏灯', test: (line) => /frame\.lights\[0\]/.test(line) },
+            { label: '谁压过谁', test: (line) => /\.\.\.shadowValues|\.\.\.item\.material\.getParameters/.test(line), note: '后展开的赢，不提示（卡片 B）' }
+          ]
+        })
+        window.__cv45.b = RTeach.codeView({
+          mount: document.getElementById('cv-b'),
+          caption: 'assets/shadow-45.js：B 的后端和 ForwardPass。',
+          code: show(S.LightingBackend, S.LightingForwardPass),
+          groups: [
+            { label: '后端认识的词', test: (line) => /directionToLight|shadowMap|lightViewProjection|shadowBias|fields/.test(line) && !/const on|: on \?/.test(line), note: '每加一项效果，后端多认识一个词' },
+            { label: '四项必填', test: (line) => /必须有|for \(const field|必填/.test(line), note: 'R2：没有阴影就抛错' },
+            { label: 'ForwardPass 的翻译', test: (line) => /const on|: on \?|light\.toLight/.test(line) }
+          ]
+        })
+        const chunkText = Object.entries(S.SHADOW_CHUNKS).map(([name, text]) => glsl('#include <' + name + '>：引擎拥有的片段', text)).join('\n\n')
+        window.__cv45.three = RTeach.codeView({
+          mount: document.getElementById('cv-three'),
+          caption: 'assets/shadow-45.js：材质的 shader（只写 #include）、引擎的片段、数灯、拼 shader、接数组。',
+          code: [glsl('材质的 vertex shader', S.THREE_GLSL.vertex), glsl('材质的 fragment shader', S.THREE_GLSL.fragment), chunkText, show(S.expandShader, S.LightsState, S.ThreeBackend, S.ThreeRenderer)].join('\n\n'),
+          groups: [
+            { label: '① 引擎数灯', test: (line) => /setup\(frame\)|count\+\+|let count|values\['directional|this\.lights\.setup/.test(line), note: 'WebGLLights.setup' },
+            { label: '② 接上数组', test: (line) => /this\.lights\.values/.test(line), note: 'three.js 是让材质的 uniform 指向数组' },
+            { label: '③ 拼 shader', test: (line) => /#include|NUM_DIR_LIGHT_SHADOWS|expandShader|variantOf|byCount/.test(line), note: '灯数写进源码：灯数变 → 换 program' },
+            { label: '灯数变了', test: (line) => /version|shadowCount/.test(line) }
+          ]
+        })
+        window.__cv45.cBlock = RTeach.codeView({
+          mount: document.getElementById('cv-c-block'),
+          caption: 'assets/shadow-45.js：共用的值规则、ParameterBlock、带 blocks 的 Material。',
+          code: show(S.kindOf, S.copyValue, S.ParameterBlock, S.Material),
+          groups: [
+            { label: '名字和种类定死', test: (line) => /this\.names|没有 '|必须是 ' \+ expected|const expected|名字和种类/.test(line) },
+            { label: '先检查后替换', test: (line) => /const next = copyValue|this\.#values\.set\(name, next\)|this\.#version\+\+|失败时旧值不变/.test(line) },
+            { label: '一个名字一个来源', test: (line) => /#blockOf|同时来自块|已经由块/.test(line), note: 'R4：构造和 setParameter 时就报错' },
+            { label: '借用', test: (line) => /借用|this\.blocks =/.test(line) }
+          ]
+        })
+        window.__cv45.cBackend = RTeach.codeView({
+          mount: document.getElementById('cv-c-backend'),
+          caption: 'assets/shadow-45.js：C 的 Backend.draw 和 ForwardPass。',
+          code: show(S.Backend, S.ForwardPass),
+          groups: [
+            { label: '三处找值', test: (line) => /const values = \{ \.\.\.uniforms|sources|material\.blocks|block\.get/.test(line) },
+            { label: '撞名就报错', test: (line) => /name in values|都给了值/.test(line) },
+            { label: 'ForwardPass 交的', test: (line) => /uCameraVP|uModel|uToLight/.test(line), note: '没有一项和阴影有关' }
+          ]
+        })
+        window.__cv45.cShadow = RTeach.codeView({
+          mount: document.getElementById('cv-c-shadow'),
+          caption: 'assets/shadow-45.js：DirectionalLightShadow、快照、ShadowMapPass（继承 ShadowDepthPass 的画法）。',
+          code: show(S.DirectionalLightShadow, S.snapshotLight, S.ShadowDepthPass, S.ShadowMapPass),
+          groups: [
+            { label: '拥有', test: (line) => /new RenderTarget|new ParameterBlock|this\.block\.dispose|this\.target\.dispose|自己拥有/.test(line) },
+            { label: '写块（只有这里）', test: (line) => /publish|block\.set/.test(line), note: '只由 ShadowMapPass 调用' },
+            { label: '没有阴影', test: (line) => /NO_SHADOW|publishNoShadow|没有阴影|!light\.castShadow/.test(line), note: '全零矩阵；shader 里 w ≤ 0 当受光' },
+            { label: '设置不碰块', test: (line) => /setBias|#settings/.test(line) }
+          ]
+        })
+        document.getElementById('receiver-glsl').textContent = glsl('C 的接收者 fragment shader（vertex 用第 42 课的 mainVertex）', S.GLSL.receiverFragment)
+
+        // ---------------- 检查卡片 ----------------
+        function tempGL() {
+          const canvas = document.createElement('canvas')
+          canvas.width = W
+          canvas.height = H
+          return canvas.getContext('webgl', { preserveDrawingBuffer: true })
+        }
+        function done(gl) {
+          const lose = gl.getExtension('WEBGL_lose_context')
+          if (lose) lose.loseContext()
+        }
+        /** 用某种写法建一套、画一帧；tweak 在装 Pipeline 之前改场景 */
+        function runApproach(gl, key, angle, tweak) {
+          const approach = S.APPROACHES[key]
+          const renderer = approach.makeRenderer(gl)
+          const setup = approach.makeSetup(angle)
+          if (tweak) tweak(setup)
+          renderer.replacePipeline(new S44.RenderPipeline(setup.passes))
+          renderer.render(setup.scene, setup.camera)
+          return { renderer, setup }
+        }
+        /** 第 44 课的引擎画的正确画面（和第 40 课逐像素相同） */
+        function referenceImage(angle) {
+          const gl = tempGL()
+          runApproach(gl, 'A', angle)
+          const image = grab(gl)
+          done(gl)
+          return image
+        }
+
+        RTeach.traceLab.cards({
+          mount: document.getElementById('cards-copy'),
+          storageKey: 'lesson-0045-copy',
+          cards: [
+            {
+              title: '卡片 A：抄进材质以后，灯转了',
+              desc: '第 0 种写法：灯在 35° 时建好场景、画一帧。然后把灯转到 −30°，再画一帧。',
+              note: 'createCopySetup、ShadowDepthPass、这一课的 ForwardPass 和后端都在 assets/shadow-45.js；正确画面用第 44 课的引擎画。',
+              question: '第二帧，原来 35° 的影子所在的点 (204, 150) 是什么样？',
+              choices: ['还是暗的：影子留在原地', '变亮了：影子跟着挪到了右边', '整块地面都变暗了'],
+              answer: 0,
+              explain: '阴影图按 −30° 重画了（ShadowDepthPass 每帧从快照算灯的矩阵），可材质里的 uLightVP 还是 35° 时抄的那 16 个数，拿旧矩阵去查新阴影图，查到的位置是错的。备课时这一帧和 −30° 的正确画面差 11389 个像素，(204, 150) 还是 (48, 48, 48)。',
+              run: async () => {
+                const gl = tempGL()
+                const { renderer, setup } = runApproach(gl, 'copy', 35)
+                setup.light.toLight = S.toLightAt(-30)
+                renderer.render(setup.scene, setup.camera)
+                const lines = [
+                  { text: '(204, 150)：' + describe(pixel(gl, 204, 150)) + '；(270, 150)：' + describe(pixel(gl, 270, 150)) },
+                  { text: '和 −30° 的正确画面差 ' + diff(grab(gl), referenceImage(-30)) + ' 个像素' }
+                ]
+                done(gl)
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        RTeach.traceLab.cards({
+          mount: document.getElementById('cards-a'),
+          storageKey: 'lesson-0045-a',
+          cards: [
+            {
+              title: '卡片 B：材质里也有一个 uShadowBias',
+              desc: 'A（第 44 课的引擎），35°。有人给地面的材质也设了 uShadowBias = 0.5（比如照现有的 setShadowBias 的用法，对材质设 bias）。ForwardPass 照常交 0.005。',
+              note: '场景来自 assets/shadow-44.js 的 createShadowSetup；「给地面材质设 0.5」是课程加的一行。',
+              question: '会怎样？',
+              choices: ['地面上的影子消失，不报错', 'draw 抛错：uShadowBias 有两个值', '照常：ForwardPass 交的 0.005 生效'],
+              answer: 0,
+              explain: 'ForwardPass 先展开 shadowValues、后展开材质参数，后展开的赢：地面用的是 0.5。比较式 p.z − 0.5 ≤ stored 对影子里的点也成立，影子没了。备课时 (204, 150) 从 (48, 48, 48) 变成 (159, 159, 159)，和不带阴影的画面在影子区域完全一样，getError 0。',
+              run: async () => {
+                const gl = tempGL()
+                runApproach(gl, 'A', 35, (setup) => setup.scene.meshes[0].material.setParameter('uShadowBias', 0.5))
+                const lines = [
+                  { text: '(204, 150)：' + describe(pixel(gl, 204, 150)) + '（正确是 (48, 48, 48)）' },
+                  { text: '和 35° 的正确画面差 ' + diff(grab(gl), referenceImage(35)) + ' 个像素；getError：' + ERRORS[gl.getError()] }
+                ]
+                done(gl)
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        RTeach.traceLab.cards({
+          mount: document.getElementById('cards-c'),
+          storageKey: 'lesson-0045-c',
+          cards: [
+            {
+              title: '卡片 C：C 里做同一件事',
+              desc: '和卡片 B 同样的意图：建一个借用灯的阴影块的材质，参数里也写 uShadowBias: 0.5。再建一个正常的，之后对它 setParameter("uShadowBias", 0.5)。',
+              note: 'Material、DirectionalLightShadow 在 assets/shadow-45.js。',
+              question: '会怎样？',
+              choices: ['两次都当场抛错，指出块已经提供', '材质的 0.5 生效，影子消失', '块的值生效，材质的 0.5 被忽略'],
+              answer: 0,
+              explain: '材质构造时先登记块提供的名字，再逐个设参数；setParameter 碰到块已经提供的名字就抛错。错误发生在建场景时（第 ① 层），而不是画出一个少了影子的画面。真实代码一样：构造时报「uniform must have exactly one source」（<a data-src="src/rendering/resources/Material.ts:254">Material.ts:254–263</a>），setParameter 报「is provided by a ParameterBlock」（:344–346）。',
+              run: async () => {
+                const shadow = S.newShadow()
+                const shader = new S42.ShaderModule({ name: 'receiver', vertexSource: S42.GLSL.mainVertex, fragmentSource: S.GLSL.receiverFragment })
+                const lines = []
+                try {
+                  new S.Material({ shaderModule: shader, parameters: { uColor: S41.SCENE.floorColor, uShadowBias: 0.5 }, blocks: [shadow.block] })
+                  lines.push({ text: '构造：没有抛错' })
+                } catch (error) {
+                  lines.push({ text: '构造：抛错「' + error.message + '」' })
+                }
+                const material = new S.Material({ shaderModule: shader, parameters: { uColor: S41.SCENE.floorColor }, blocks: [shadow.block] })
+                try {
+                  material.setParameter('uShadowBias', 0.5)
+                  lines.push({ text: 'setParameter：没有抛错' })
+                } catch (error) {
+                  lines.push({ text: 'setParameter：抛错「' + error.message + '」' })
+                }
+                return { lines }
+              }
+            },
+            {
+              title: '卡片 D：给 PCSS 预留的一项',
+              desc: 'C，35°。另建一个块 { uLightWorldSize: 0.5 }，让地面和三角形的材质也借用它。接收者 shader 还没有声明 uLightWorldSize。ForwardPass、后端一个字不改。',
+              note: '「pcss」这个块是课程建的；其余来自 assets/shadow-45.js。',
+              question: '画面会怎样？',
+              choices: ['和正确画面逐像素相同', 'draw 抛错：shader 里没有这个 uniform', '影子变软：shader 自动用上了它'],
+              answer: 0,
+              explain: '后端只给 shader 里真有的（active）uniform 找值，块里多出来的项没人问，也就没人用。所以加新项的顺序可以是：先在块里加，再改 shader 去用它；中间每一步都能画。真实代码也是只遍历 active uniform，只读用到的那几项（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:252">WebGL1Uniforms.ts:252–270</a>）；测试还确认块里没用到的那一项纹理已经释放，draw 也不报错（<a data-src="tests/unit/rendering/backend/webgl1/WebGL1ParameterBlocks.test.ts:149">WebGL1ParameterBlocks.test.ts:149</a>）。',
+              run: async () => {
+                const gl = tempGL()
+                const extra = new S.ParameterBlock({ label: 'pcss', entries: { uLightWorldSize: 0.5 } })
+                const shadow = S.newShadow()
+                const shader = new S42.ShaderModule({ name: 'receiver', vertexSource: S42.GLSL.mainVertex, fragmentSource: S.GLSL.receiverFragment })
+                const setup = S.buildScene(35, shadow, (color) => new S.Material({ shaderModule: shader, parameters: { uColor: color }, blocks: [shadow.block, extra] }))
+                const renderer = new S.Renderer(gl)
+                renderer.replacePipeline(new S44.RenderPipeline([new S.ShadowMapPass(), new S.ForwardPass()]))
+                renderer.render(setup.scene, setup.camera)
+                const lines = [{ text: '和 35° 的正确画面差 ' + diff(grab(gl), referenceImage(35)) + ' 个像素；getError：' + ERRORS[gl.getError()] }]
+                done(gl)
+                return { lines }
+              }
+            },
+            {
+              title: '卡片 E：两遍之间，GUI 改了 bias',
+              desc: 'C，35°。在 ShadowMapPass 和 ForwardPass 之间插一个「GUI」Pass，只在第 1 帧调用一次 shadow.setBias(0.5)。连画两帧。',
+              note: '「GUI」Pass 是课程写的；对照组把 setBias 换成直接 shadow.block.set("uShadowBias", 0.5)（违反合同）。',
+              question: '第 1 帧的画面是：',
+              choices: ['和正确画面相同；第 2 帧影子才消失', '影子立刻消失；第 2 帧也没有影子', '影子立刻消失；第 2 帧影子又回来了'],
+              answer: 0,
+              explain: 'setBias 只改设置；这一帧块里的 bias 是 ShadowMapPass 按快照发布的 0.005，ForwardPass 读到的也是它。第 2 帧的快照抄到 0.5，影子才消失。对照组直接写块：第 1 帧 ForwardPass 立刻读到 0.5，影子消失；第 2 帧 ShadowMapPass 又按快照发布 0.005，把它冲掉，影子回来——直接写块的值只活一帧，所以合同规定只有 ShadowMapPass 写块。真实的 ParameterBlock 注释写的是同一条：生产者要在消费者 draw 之前写完，不要在一组消费者的绘制之间写块（<a data-src="src/rendering/resources/ParameterBlock.ts:23">ParameterBlock.ts:23–25</a>）。',
+              run: async () => {
+                const reference = referenceImage(35)
+                const lines = []
+                for (const mode of ['setBias', 'block.set']) {
+                  const gl = tempGL()
+                  const renderer = new S.Renderer(gl)
+                  const setup = S.createBlockSetup(35)
+                  const shadow = setup.light.shadow
+                  let armed = true
+                  const gui = {
+                    name: 'GUI',
+                    execute() {
+                      if (!armed) return
+                      armed = false
+                      if (mode === 'setBias') shadow.setBias(0.5)
+                      else shadow.block.set('uShadowBias', 0.5)
+                    },
+                    dispose() {}
+                  }
+                  renderer.replacePipeline(new S44.RenderPipeline([setup.passes[0], gui, setup.passes[1]]))
+                  renderer.render(setup.scene, setup.camera)
+                  const first = diff(grab(gl), reference)
+                  renderer.render(setup.scene, setup.camera)
+                  const second = diff(grab(gl), reference)
+                  lines.push({ text: mode + '：第 1 帧和正确画面差 ' + first + ' 像素，第 2 帧差 ' + second + ' 像素（块里的 bias 现在是 ' + shadow.block.get('uShadowBias') + '）' })
+                  done(gl)
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 画布：五种写法并排 ----------------
+        {
+          const canvas = document.getElementById('s-canvas')
+          const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true })
+          const angleInput = document.getElementById('s-angle')
+          const castInput = document.getElementById('s-cast')
+          const readout = document.getElementById('s-readout')
+          const engines = {}
+          let current = 'C'
+
+          // 两张对照画面：带阴影（第 44 课的引擎）、不带阴影（只有漫反射的 shader）
+          const refGL = tempGL()
+          const withShadow = S.APPROACHES.A.makeRenderer(refGL)
+          const withShadowSetup = S.APPROACHES.A.makeSetup(35)
+          withShadow.replacePipeline(new S44.RenderPipeline(withShadowSetup.passes))
+          const plainShader = new S42.ShaderModule({ name: 'plain', vertexSource: S44.PLAIN_GLSL.vertex, fragmentSource: S44.PLAIN_GLSL.fragment })
+          const plainMaterial = (color) => new S42.Material({ shaderModule: plainShader, parameters: { uColor: color } })
+          const plainScene = new S42.Scene()
+          plainScene.add(new S42.Mesh(new S42.Geometry({ positions: S41.SCENE.floorPositions }), plainMaterial(S41.SCENE.floorColor)))
+          plainScene.add(new S42.Mesh(new S42.Geometry({ positions: S41.SCENE.trianglePositions }), plainMaterial(S41.SCENE.triangleColor)))
+          const plainLight = plainScene.add(new S42.DirectionalLight({ toLight: S.toLightAt(35) }))
+          const plain = new S44.Renderer(refGL)
+          plain.replacePipeline(new S44.RenderPipeline([new S44.ForwardPass()]))
+          function reference(angle, cast) {
+            if (cast) {
+              withShadowSetup.light.toLight = S.toLightAt(angle)
+              withShadow.render(withShadowSetup.scene, withShadowSetup.camera)
+            } else {
+              plainLight.toLight = S.toLightAt(angle)
+              plain.render(plainScene, S.CAMERA)
+            }
+            return grab(refGL)
+          }
+
+          function engineFor(key) {
+            if (!engines[key]) {
+              const approach = S.APPROACHES[key]
+              const renderer = approach.makeRenderer(gl)
+              const setup = approach.makeSetup(35)
+              renderer.replacePipeline(new S44.RenderPipeline(setup.passes))
+              engines[key] = { renderer, setup }
+            }
+            return engines[key]
+          }
+
+          const bar = document.getElementById('s-approaches')
+          const buttons = {}
+          for (const [key, approach] of Object.entries(S.APPROACHES)) {
+            const button = document.createElement('button')
+            button.type = 'button'
+            button.className = 'cv-button'
+            button.textContent = approach.label
+            button.addEventListener('click', () => {
+              current = key
+              draw()
+            })
+            bar.append(button)
+            buttons[key] = button
+          }
+
+          function draw() {
+            for (const [key, button] of Object.entries(buttons)) button.setAttribute('aria-pressed', String(key === current))
+            const angle = Number(angleInput.value)
+            const cast = castInput.checked
+            document.getElementById('s-angle-text').textContent = angle + '°'
+            const { renderer, setup } = engineFor(current)
+            setup.light.toLight = S.toLightAt(angle)
+            setup.light.castShadow = cast
+            let result = '画出来了'
+            try {
+              renderer.render(setup.scene, setup.camera)
+            } catch (error) {
+              result = '抛错：' + error.message
+            }
+            const image = grab(gl)
+            const spots = '(204, 150) ' + describe(pixel(gl, 204, 150)) + '，(270, 150) ' + describe(pixel(gl, 270, 150))
+            const programs = renderer.backend.managers.programs.entries.size
+            const lines = [
+              S.APPROACHES[current].label + '；灯 ' + angle + '°；投影' + (cast ? '开' : '关') + '。',
+              '结果：' + result + '。getError：' + ERRORS[gl.getError()],
+              '和' + (cast ? '带阴影' : '不带阴影') + '的正确画面差 ' + diff(image, reference(angle, cast)) + ' 个像素。',
+              '两个点：' + spots + '。',
+              '这套写法建过的 program：' + programs + ' 个' + (renderer.lights ? '（灯光状态版本 ' + renderer.lights.version + '，投影灯 ' + renderer.lights.shadowCount + ' 盏）' : '') + '。'
+            ]
+            readout.textContent = lines.join('\n')
+          }
+          angleInput.addEventListener('input', draw)
+          castInput.addEventListener('change', draw)
+          draw()
+          window.__stage45 = { engines, draw, select: (key) => { current = key; draw() } }
+        }
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0045"]'), [
+          {
+            q: '第 0 种写法里，灯转了以后影子为什么不跟着走？',
+            opts: ['材质里的矩阵是建场景时抄的副本', '阴影图停在建场景那一刻没有重画', 'ForwardPass 没把灯的新方向交出去'],
+            answer: 0,
+            why: '阴影图是引用，每帧重画；矩阵是副本，停在 35°。两半对不上（第 2 节、卡片 A）。'
+          },
+          {
+            q: '关掉投影以后，C 的画面为什么是「没有阴影」而不是报错？',
+            opts: ['发布了全零矩阵，shader 把 w ≤ 0 当受光', '后端发现块里没有值，就跳过那几个 uniform', 'ForwardPass 看到 castShadow 是 false 就换 shader'],
+            answer: 0,
+            why: 'ShadowMapPass 调用 publishNoShadow；接收者 shader 里 w = 0，visible 保持 1（第 6.3 节）。ForwardPass 和后端都不知道这件事。'
+          },
+          {
+            q: 'three.js 写法里关掉投影，为什么多编译了一个 program？',
+            opts: ['灯数是写进 shader 源码的常量', '阴影图的尺寸跟着变成了零', '材质的参数被引擎全部清空了'],
+            answer: 0,
+            why: 'NUM_DIR_LIGHT_SHADOWS 被替换成灯数，1 和 0 是两份不同的源码（第 5 节；WebGLProgram.js:242）。'
+          },
+          {
+            q: 'C 里，材质参数也写了 uShadowBias，而材质借用的阴影块里也有它，会怎样？',
+            opts: ['构造材质时就抛错', '材质自己的值压过块里的值', '块里的值压过材质自己的值'],
+            answer: 0,
+            why: '一个名字只能有一个来源，构造时检查（卡片 C）。A 里同样的事会悄悄覆盖（卡片 B）。'
+          },
+          {
+            q: 'PCSS 要多送一项光源大小，C 要改哪里？',
+            opts: ['阴影块的定义和接收者 shader', 'ForwardPass 和后端的取值代码', '引擎的灯光状态表和 shader 片段'],
+            answer: 0,
+            why: '后端按名字查、只问 active uniform，ForwardPass 不碰阴影值（第 8 节表格，卡片 D）。第三个选项是 three.js 的做法。'
+          },
+          {
+            q: '两遍之间 GUI 调用 shadow.setBias(0.5)，这一帧 ForwardPass 读到的 bias 是：',
+            opts: ['0.005，第 2 帧才是 0.5', '0.5，立刻生效', '读不到，draw 抛错'],
+            answer: 0,
+            why: 'setBias 只改设置；块里的值只由 ShadowMapPass 按这一帧的快照发布（卡片 E）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

@@ -1,0 +1,833 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 47 课 · 一次 draw 怎样接起三样东西</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/step-view.js"></script>
+    <script src="../assets/draw-sources.js"></script>
+    <script>
+      // 只为课程演示：SceneNode 用 crypto.randomUUID 生成 UUID，它要求安全上下文。
+      // 个别浏览器在 file:// 下没有这个函数，这里用 getRandomValues 补一个同格式的实现。
+      if (window.crypto && typeof window.crypto.randomUUID !== 'function') {
+        Object.defineProperty(window.crypto, 'randomUUID', {
+          value() {
+            const b = window.crypto.getRandomValues(new Uint8Array(16))
+            b[6] = (b[6] & 0x0f) | 0x40
+            b[8] = (b[8] & 0x3f) | 0x80
+            const h = [...b].map((x) => x.toString(16).padStart(2, '0')).join('')
+            return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20)
+          }
+        })
+      }
+    </script>
+    <script src="../assets/draw-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">带阴影的三角形 · 接回真实代码（重写第 19 课）· 约 50 分钟</p>
+    <h1>一次 draw 怎样把 CPU 资源、Pass 和 GPU 资源接起来</h1>
+    <p class="lede">
+      第 40–46 课在小引擎里一步步推出了每个零件。这一课把它们接回真实的 <code>src/rendering</code>：顺着一次 <code>draw</code>，从 Pass 交出要画的东西开始，到 <code>gl.drawArrays</code> 为止，看清三样东西在哪几行接上、为什么要这样接。最后用真实代码画两帧，数每一步发了哪些 GL 调用。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW1、HW2 的每一帧都走这条路。以后加阴影 Pass、GBuffer Pass，或者 FLIP 结果的可视化 Pass，都只是在这条路上多一个 Pass；判断一段新代码该放在 Pass、Material 还是 Backend 里，靠的就是这一课的三处接口。WebGPU 后端（路线 B）要实现的也是同一个 <code>draw</code> 合同。
+    </div>
+
+    <aside class="note">
+      <strong>和第 19 课的关系</strong>：这一课重写第 19 课。旧课停在 9 月 30 日的代码，正文把调用链拆成十几段代码，校验和主线混在一起。旧课保留（别的课里有「第 19 课 x.y 节」的引用指向它），以后读这一课就行。<br />
+      <strong>默认你已经会的</strong>：① 第 30 课：Renderer 每帧抄快照、Pipeline 依次跑 Pass；② 第 40–46 课的小引擎：按对象查表（41）、画什么写成数据（42）、每帧先抄一份（43）、Pass 和进门出门（44）、值从三处找（45）、一代与丢失（46）。<br />
+      <strong>在一帧里的位置和寿命</strong>：每帧 <code>Renderer.render</code> 抄一次快照 → Pipeline 依次跑每个 Pass → 每个 Pass 进一次或几次门 → 门里每个物体调一次 <code>draw</code>。<code>draw</code> 只活一次调用；它用到的 GPU 对象活一「代」（直到 context 丢失或 Backend 释放）；CPU 资源活在场景里，由 Scene 登记。<br />
+      <strong>页面会用到你的显卡</strong>：第 4 节一块 360 × 270 的画布，第 5 节的卡片各自临时建一块，卡片 E 会让它自己那块画布丢失再恢复。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">一次 draw 要三样东西</a></li>
+        <li><a href="#s2">为什么这样接：七条需求</a></li>
+        <li><a href="#s3">一次 draw，逐步走（真实代码和小引擎对照）</a></li>
+        <li><a href="#s4">用真实代码画两帧，数每一步的 GL 调用</a></li>
+        <li><a href="#s5">先猜后跑：五张卡片</a></li>
+        <li><a href="#s6">对照 three.js</a></li>
+        <li><a href="#s7">检查题</a></li>
+        <li><a href="#s8">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 一次 draw 要三样东西</h2>
+    <p>拿第 40 课的场景说：地面上悬着一个三角形，一盏方向光，两遍画完（先画进阴影图，再画到屏幕）。要画出地面，GPU 需要 program、装着顶点的 buffer、画到哪个 framebuffer，以及一组 uniform 的值。这些东西来自三个地方：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 16%">哪一样</th><th style="width: 30%">具体是什么</th><th style="width: 22%">谁建、在哪</th><th>活多久；知不知道 gl</th></tr>
+        <tr><td>CPU 资源</td><td>Geometry（地面、三角形的顶点）、ShaderModule、Material、ParameterBlock（阴影值）、RenderTarget（阴影图的尺寸和格式）</td><td>写场景的人建，Scene 登记</td><td>跟着场景；不知道 gl</td></tr>
+        <tr><td>Pass</td><td>ShadowMapPassV1（画进阴影图）、ForwardPass（画到屏幕）</td><td>装进 RenderPipeline</td><td>每帧跑一次；不知道 gl</td></tr>
+        <tr><td>GPU 资源</td><td>program、buffer、VAO、纹理、framebuffer</td><td>Backend 的各个 Manager，第一次用到时建</td><td>跟着 context 的一代；只有它们知道 gl</td></tr>
+      </table>
+    </div>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 380" role="img" aria-label="左边是场景里的 CPU 资源，中间上方是 Pass，中间下方是 Backend.draw，右边是这一代 Manager 的表。Pass 进门定下画到哪，再把 item 和 view 交给 draw；item 里的 geometry 和 material 指向左边的原件；draw 拿原件当钥匙去右边的表里换出 GPU 对象，最后发 gl 调用">
+          <defs>
+            <marker id="d1-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+          </defs>
+          <rect x="16" y="40" width="210" height="262" rx="6" class="box" />
+          <text x="30" y="64" class="title">CPU 资源（场景里）</text>
+          <text x="30" y="90" class="small">Geometry：地面、三角形</text>
+          <text x="30" y="114" class="small">ShaderModule：着色器源码</text>
+          <text x="30" y="138" class="small">Material × 2：颜色、状态</text>
+          <text x="30" y="162" class="small">ParameterBlock：阴影值</text>
+          <text x="30" y="186" class="small">RenderTarget：阴影图的描述</text>
+          <text x="30" y="226" class="small">不知道 gl</text>
+          <text x="30" y="248" class="small">Scene 登记，跟着场景活</text>
+
+          <rect x="276" y="40" width="210" height="96" rx="6" class="box hl" />
+          <text x="290" y="64" class="title">Pass（每帧一次）</text>
+          <text x="290" y="90" class="small">ShadowMapPassV1：画进阴影图</text>
+          <text x="290" y="114" class="small">ForwardPass：画到屏幕</text>
+
+          <rect x="276" y="206" width="196" height="96" rx="6" class="box hl" />
+          <text x="290" y="230" class="title">Backend.draw</text>
+          <text x="290" y="254" class="small">③ 门口　⑤⑥ 查表、找值</text>
+          <text x="290" y="278" class="small">⑧⑨⑩ 设状态、上传、画</text>
+
+          <rect x="552" y="40" width="196" height="262" rx="6" class="box" />
+          <text x="564" y="64" class="title">GPU 资源（这一代的表）</text>
+          <text x="564" y="90" class="small">ShaderModule → program</text>
+          <text x="564" y="114" class="small">Geometry → buffer</text>
+          <text x="564" y="138" class="small">（Geometry, program）→ VAO</text>
+          <text x="564" y="162" class="small">RenderTarget → FBO、纹理</text>
+          <text x="564" y="226" class="small">只有这里知道 gl</text>
+          <text x="564" y="248" class="small">context 丢了就整张作废</text>
+
+          <line x1="374" y1="136" x2="374" y2="204" class="line" marker-end="url(#d1-tip)" />
+          <text x="383" y="160" class="small">① 进门：画到哪</text>
+          <text x="383" y="182" class="small">② draw({ item, view })</text>
+
+          <line x1="276" y1="100" x2="228" y2="120" class="line dash" marker-end="url(#d1-tip)" />
+          <text x="236" y="146" class="small halo">item 借用原件</text>
+
+          <line x1="472" y1="236" x2="550" y2="236" class="line accent" marker-end="url(#d1-tip)" />
+          <text x="482" y="228" class="small accent">原件当钥匙</text>
+          <line x1="550" y1="272" x2="474" y2="272" class="line" marker-end="url(#d1-tip)" />
+          <text x="486" y="292" class="small">GPU 对象</text>
+
+          <line x1="374" y1="302" x2="374" y2="338" class="line" marker-end="url(#d1-tip)" />
+          <rect x="309" y="340" width="130" height="30" rx="5" class="box" />
+          <text x="374" y="360" text-anchor="middle" class="small">gl.*（GL context）</text>
+        </svg>
+      </div>
+      <figcaption>图 1 · 三样东西和三处接口。① Pass 定下画到哪（交的是 CPU 的 RenderTarget 或「屏幕」）；② Pass 交出要画的东西（item 里的 geometry、material 指向场景里的原件，不复制）；⑤⑥ draw 拿原件当钥匙去这一代的表里换出 GPU 对象。Pass 和 CPU 资源都不知道 gl；GL 调用只从 Backend 发出去。</figcaption>
+    </figure>
+
+    <h2 id="s2">2. 为什么这样接：七条需求</h2>
+    <p>这样接不是凭空定的。第 41–46 课每一课解决一个需求，结论合起来就是 draw 现在的样子：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 30%">需求</th><th style="width: 26%">做法</th><th style="width: 12%">小引擎</th><th>真实代码</th></tr>
+        <tr><td>GPU 对象只建一次，之后每帧只查表</td><td>Manager 拿 CPU 对象当钥匙查表，第一次才建</td><td>第 41 课</td><td>draw 的 <a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:208">:208–209</a>；<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:80">ProgramManager.get</a></td></tr>
+        <tr><td>写场景的人只描述「画什么」，不碰 gl</td><td>Geometry、Material 等是纯数据</td><td>第 42 课</td><td><code>resources/</code></td></tr>
+        <tr><td>两遍看到同一份场景</td><td>每帧开头抄快照：RenderItem、ViewState</td><td>第 43 课</td><td><a data-src="src/rendering/Renderer.ts:67">Renderer.ts:67</a>、<a data-src="src/rendering/frame/RenderListBuilder.ts:42">RenderListBuilder.build</a></td></tr>
+        <tr><td>画到哪由 Pass 决定，出门一定换回</td><td>withRenderSurface 作用域</td><td>第 44 课</td><td><a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:191">WebGL1SurfaceScope.run</a></td></tr>
+        <tr><td>每次 draw 不信别人留下的状态</td><td>draw 自己把状态设全</td><td>第 44 课</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:317">applyDrawState</a></td></tr>
+        <tr><td>uniform 的值按名字找，一个名字一个来源</td><td>内建、材质参数、参数块三处找</td><td>第 45 课</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:149">WebGL1Uniforms.ts:149–154</a></td></tr>
+        <tr><td>设备会丢，GPU 对象只能活一代</td><td>每次用之前取「这一代」</td><td>第 46 课</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:351">requireGeneration</a></td></tr>
+      </table>
+    </div>
+    <p>前三条决定了 Pass 交出去的东西只能是 CPU 数据（第 ② 步），中间两条决定了「画到哪」和「怎样画」分开（第 ①、⑧ 步），最后两条决定了 draw 里先查表、找值，再动 GL（第 ⑤–⑩ 步）。</p>
+
+    <h2 id="s3">3. 一次 draw，逐步走</h2>
+    <p>下面这一个代码框里是整条路：ForwardPass 的 <code>execute</code>、Backend 的 <code>withRenderSurface</code> 和 <code>draw</code>，以及 <code>draw</code> 调用的 <code>applyDrawState</code>，都是原文，行号是文件里的真实行号。点 ①–⑪，左边高亮这一步的行，右边讲这一步：做什么、检查什么之后放心什么、为什么在这个位置、实测发了哪些 GL 调用。被调用的函数只讲它的合同，细节链接到讲它的课。</p>
+    <p>校验行默认调暗，先读主线。点「小引擎」切到第 44、45 课的写法，同一步对照着看；小引擎里没有的步骤，状态行会说明。</p>
+    <div id="steps"></div>
+    <p>十一步里，三处接口是 ①（画到哪）、②（画什么）、⑤⑥（换成 GPU 对象、接上 uniform 的值）。其余几步不是检查（③④⑦）就是执行（⑧⑨⑩⑪），只负责让前三处接得稳。</p>
+
+    <h2 id="s4">4. 用真实代码画两帧，数每一步的 GL 调用</h2>
+    <p>下面这块画布用的是真实的 Renderer、RenderPipeline、ForwardPass、WebGL1Backend 和资源类，打包自 10 月 20 日的工作区。课程只写了四样东西（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/draw-course.ts:1">draw-course.ts</a>）：第一遍 ShadowMapPassV1（src 里还没有 ShadowMapPass）、两段着色器、一个给每条 GL 调用记账的包装，以及给 Backend 内部几个调用贴「第几步」标签的包装。页面打开时自动画第 1、2 帧。</p>
+    <div class="gl-stage">
+      <div class="dt-stage">
+        <div id="dt-canvas-box"></div>
+        <div>
+          <table class="dt-table" id="dt-table"></table>
+          <p class="gl-readout" id="dt-readout"></p>
+          <div class="gl-controls"><button type="button" id="dt-again">从头再来（新建 Backend）</button></div>
+        </div>
+      </div>
+      <details>
+        <summary>第 1 帧的每一条 GL 调用（不含 isContextLost）</summary>
+        <pre class="dt-calls" id="dt-calls-1"></pre>
+      </details>
+      <details>
+        <summary>第 2 帧的每一条 GL 调用（不含 isContextLost）</summary>
+        <pre class="dt-calls" id="dt-calls-2"></pre>
+      </details>
+    </div>
+    <p>我在这台 Mac 的无界面 Chrome（SwiftShader）上测到：</p>
+    <ul>
+      <li><strong>画面和第 40 课一样</strong>：受光的地面 159，影子 48，三角形 (201, 116, 32)，就是第 40 课记下的三个值。背景是黑色，因为 ForwardPass 清屏用的是黑色。</li>
+      <li><strong>第 1 帧 209 条命令、126 次查询，第 2 帧 120 条、14 次。</strong>多出来的都在第 ①、⑤、⑥、⑨ 步：第一次建阴影图的 FBO、编译 2 个 program（4 个 shader）、上传 2 个 buffer、反射 uniform、建 4 个 VAO。第 2 帧这几步只剩查表。</li>
+      <li><strong>每帧都发的，是第 ⑧ 步的 64 条</strong>（4 次 draw，每次 16 条）和第 ⑨ 步的上传。State 缓存本该省掉其中的 10 条，但被 OES 顶点输入清掉了（第 ⑧ 步的说明）。</li>
+      <li><strong>isContextLost 每帧调了 159 次</strong>，平均每次 draw 将近 40 次。它只读 context 上的一个标志，不算命令也不算查询（第 39 课），所以表里单独一行。</li>
+    </ul>
+    <p>你的浏览器有没有 OES_vertex_array_object、要不要多问几次状态，可能和我这里不同，表里的数字以你看到的为准。</p>
+
+    <h2 id="s5">5. 先猜后跑：五张卡片</h2>
+    <p>每张卡片新建一块画布、一个真实的 Backend，从头搭场景。卡片 E 会让它自己那块画布的设备丢失再恢复，不影响别的画布。</p>
+    <div id="cards"></div>
+
+    <h2 id="s6">6. 对照 three.js</h2>
+    <p>three.js 的旧渲染器 WebGLRenderer 也要把同样的三样东西接起来，接法不同：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 16%"></th><th style="width: 42%">three.js r177 的 WebGLRenderer</th><th>本项目</th></tr>
+        <tr><td>一次 draw 收什么</td><td><code>renderBufferDirect(camera, scene, geometry, material, object, group)</code>（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1096">WebGLRenderer.js:1096</a>）：直接收场景里的对象和相机</td><td><code>draw({ item, view })</code>：这一帧的快照</td></tr>
+        <tr><td>画到哪</td><td><code>setRenderTarget(target)</code>（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:2683">:2683</a>）改的是渲染器的当前目标，之后所有 draw 都画到那里，换回要调用者自己记着</td><td>withRenderSurface 作用域：回调结束、抛错都自动换回</td></tr>
+        <tr><td>CPU → GPU</td><td><code>properties</code> 是 WeakMap，按对象身份存每个材质、几何的 GPU 信息（<a data-src="node_modules/three/src/renderers/webgl/WebGLProperties.js:3">WebGLProperties.js:3</a>）；<code>setProgram</code>（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:2179">:2179</a>）按材质参数算出 program 的 key 再去缓存找；<code>bindingStates.setup</code>（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1154">:1154</a>）建、绑 VAO</td><td>按对象身份：ShaderModule → program，Geometry → buffer，（Geometry, program）→ VAO</td></tr>
+        <tr><td>设状态</td><td><code>state.setMaterial(material, frontFaceCW)</code>（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1104">:1104</a>），经过 WebGLState 缓存</td><td>applyDrawState，经过 WebGL1State 缓存</td></tr>
+        <tr><td>画</td><td><code>renderer.render(drawStart, drawCount)</code>（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1260">:1260</a>）</td><td>drawArrays、drawElements</td></tr>
+      </table>
+    </div>
+    <p>最大的差别在第一行和第二行：three.js 的 draw 直接读活的场景对象，「画到哪」是渲染器身上的一个全局状态；本项目的 draw 只读快照，「画到哪」是一个有进有出的作用域。前者写起来短，后者让两遍之间改场景、Pass 忘了换回目标这两类错误没有机会发生（第 43、44 课）。</p>
+
+    <h2 id="s7">7. 检查题</h2>
+    <p>凭记忆作答，错了回到对应的步骤重读。</p>
+    <div class="quiz" data-quiz="lesson-0047"></div>
+
+    <h2 id="s8">8. 延伸阅读</h2>
+    <p>
+      <strong>首选（约 15 分钟）：</strong>WebGL Fundamentals 的 <a href="https://webglfundamentals.org/webgl/lessons/webgl-drawing-multiple-things.html">WebGL - Drawing Multiple Things</a>。它把画很多个物体分成两段：初始化时建好 shader、program、buffer、纹理；每次画每个物体时 useProgram、设 attribute、设 uniform、绑纹理、drawArrays。对照这一课：第 ⑤⑥ 步第一次走冷路径，就是它的「初始化」，只是推迟到第一次用到时才做；第 ⑧⑨⑩ 步就是它的「每次画」。
+    </p>
+    <p>
+      补充：three.js 的 <a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1096">renderBufferDirect</a>，从 setProgram 读到 renderer.render，对照第 6 节的表。想看 scope 进门出门的全部细节，读 <a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:191">WebGL1SurfaceScope.run</a>，第 14 课讲过它记下和换回的状态。
+    </p>
+
+    <aside class="ask">
+      做完告诉我：检查题错了哪几题、五张卡片哪张和你猜的不一样。读第 3 节时哪一步还是没接上，直接说是第几步，我在对话里接着讲。
+    </aside>
+
+    <div class="nav">
+      <a href="0046-when-things-go-wrong.html">← 第 46 课：不正常的时候</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0022-code-review-for-simulation.html">下一课：第 22 课 拿仿真需求审 src/rendering →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 47 课 · 2026-10-20</footer>
+
+    <script>
+      ;(function () {
+        const S = window.RTeachDrawSources
+        const FP = 'src/rendering/passes/ForwardPass.ts'
+        const BE = 'src/rendering/backend/webgl1/WebGL1Backend.ts'
+        const S44 = 'assets/shadow-44.js'
+        const S45 = 'assets/shadow-45.js'
+        if (!S) {
+          document.getElementById('steps').textContent = '没有加载到 assets/draw-sources.js，代码框无法显示。'
+          return
+        }
+        window.__steps47 = RTeach.stepView({
+          mount: document.getElementById('steps'),
+          route: [
+            { key: 'cpu', label: 'CPU 资源（场景里）' },
+            { key: 'renderer', label: 'Renderer：抄快照' },
+            { key: 'pass', label: 'Pass' },
+            { key: 'scope', label: '进门出门' },
+            { key: 'draw', label: 'Backend.draw' },
+            { key: 'manager', label: 'Manager：查表' },
+            { key: 'gl', label: 'gl.*' }
+          ],
+          versions: [
+            {
+              key: 'real',
+              label: '真实代码',
+              segments: S.real,
+              dim: [[BE, 195, 195], [BE, 197, 204], [BE, 212, 212], [BE, 219, 219], [BE, 224, 226], [BE, 231, 231]]
+            },
+            {
+              key: 'mini',
+              label: '小引擎（第 44、45 课）',
+              segments: S.mini,
+              dim: [[S44, 54, 56], [S44, 67, 69], [S45, 160, 163]]
+            }
+          ],
+          steps: [
+            {
+              mark: '①',
+              title: 'Pass 进门：定下画到哪',
+              route: ['pass', 'scope'],
+              lines: { real: [[FP, 18, 27], [FP, 43, 44], [BE, 179, 182]], mini: [[S45, 179, 180], [S45, 191, 191], [S44, 23, 43]] },
+              html: `
+<h4>这一步做什么</h4>
+<p>ForwardPass 只说三件事：画到默认的 framebuffer（屏幕）、颜色清成黑色、深度清成 1，然后把「这次要画的东西」写成一个回调交给 Backend。它不碰 gl，也不知道 framebuffer 是什么。第一遍 ShadowMapPassV1 说的是「画到阴影图这个 RenderTarget、清成白色」。</p>
+<p>Backend 的 <code>withRenderSurface</code> 只有一行（:181）：取当前这一代，把描述和回调交给这一代的 SurfaceScope。</p>
+<h4>SurfaceScope.run 的合同（第 44 课的小引擎、第 14 课）</h4>
+<ul>
+<li>进门：先记下现在绑的 framebuffer 和 viewport，再把描述里的 RenderTarget 换成 GPU 的 framebuffer（RenderTargetManager 查表，第一次在这里建 FBO），绑上、设 viewport、清屏，然后跑回调。</li>
+<li>出门：回调返回或抛错，都换回进门时记下的值（第 ⑪ 步）。</li>
+</ul>
+<h4>这里检查什么，之后放心什么</h4>
+<p>检查描述的形状、目标还活着、尺寸没变。之后放心：回调里的每次 draw 都画到这个目标，viewport 就是这个目标的尺寸，Pass 不用自己设。</p>
+<h4>接上的第一处</h4>
+<p>Pass 定「画到哪」，交的是 CPU 的 RenderTarget（或「屏幕」）；换成 GPU 的 framebuffer 是 Backend 的事。</p>
+<h4>实测（两个 Pass，各进一次门）</h4>
+<p>第 1 帧 47 条命令、30 次查询，大部分是阴影图第一次被用到、在这里建 FBO。第 2 帧 20 条命令、14 次查询：每次进门 2 次查询记下入口，5 次查询看清屏要动的写掩码和开关，再绑定、设 viewport、清屏。</p>`
+            },
+            {
+              mark: '②',
+              title: 'Pass 交出要画的东西：submission',
+              route: ['pass', 'draw', 'renderer'],
+              lines: { real: [[FP, 28, 40]], mini: [[S45, 181, 190]] },
+              html: `
+<h4>这一步做什么</h4>
+<p>回调里，ForwardPass 先画 background 队列，再画 opaque 队列，每个物体调一次 <code>backend.draw({ item, view })</code>。交出去的这个对象叫 submission（提交）。</p>
+<h4>item 和 view 是什么</h4>
+<ul>
+<li><code>item</code> 是 RenderListBuilder 在这一帧开头抄好的 RenderItem：<code>{ geometry, material, worldMatrix }</code>（<a data-src="src/rendering/frame/RenderItem.ts:15">RenderItem.ts:15–20</a>）。geometry、material 是场景里的原件，只借用身份、不复制；worldMatrix 是这一帧的矩阵快照（第 30、43 课）。</li>
+<li><code>view</code> 是这一帧的相机快照 ViewState：视图矩阵、投影矩阵、相机位置。</li>
+</ul>
+<h4>接上的第二处</h4>
+<p>Pass 交给 Backend 的只有「画什么」，全是 CPU 数据，没有一个 GL 对象。所以同一个 Pass 能交给任何实现了 <a data-src="src/rendering/backend/RenderBackend.ts:18">RenderBackend</a> 的后端，将来的 WebGPU 后端收到的也是这两样。</p>
+<h4>小引擎里</h4>
+<p>第 44 课的 ForwardPass 还要自己交 uniforms（相机矩阵、物体矩阵、阴影值）。第 45 课把阴影值交给参数块，Pass 只剩三项。真实代码连这三项也不用交：相机、物体矩阵由后端按内建映射从 item、view 里取（第 ⑥ 步），灯的方向是材质参数。</p>
+<h4>实测</h4>
+<p>这一步本身不发 GL 调用。</p>`
+            },
+            {
+              mark: '③',
+              title: 'draw 的门口：这一代、在门里',
+              route: ['draw'],
+              lines: { real: [[BE, 193, 195]], mini: [[S44, 52, 56]] },
+              html: `
+<h4>逐行</h4>
+<ul>
+<li><code>requireGeneration('draw')</code>：Backend 没释放、context 没丢、不在恢复中，然后交回「这一代」(generation)：一份 State、一套 Manager、一个 Uniforms、一个 Scope，只对当前这个 context 有效（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:351">:351–368</a>，第 46 课）。下面每一步用的部件都从这个变量里取。</li>
+<li><code>generation.scope.assertDrawable()</code>：确认在门里，进门时的目标没被改尺寸、没被释放（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:254">WebGL1SurfaceScope.ts:254–260</a>）。</li>
+</ul>
+<h4>这里检查什么，之后放心什么</h4>
+<p>检查设备还在、在门里。之后放心：这次 draw 用的 GPU 对象都属于同一代，画到的就是第 ① 步绑好的目标。不进门就 draw，在这里被拦住（卡片 B）。</p>
+<h4>小引擎里</h4>
+<p>第 44 课只查「在门里」（栈是空的就抛错）。设备丢失在第 46 课由 Renderer 整帧跳过；真实代码两处都查：Renderer 先看 <code>backend.ready</code>，draw 自己再查一次。</p>
+<h4>实测</h4>
+<p>不发 GL 命令，只调 isContextLost。它只读 context 上的一个标志，不算命令也不算查询（第 39 课）。</p>`
+            },
+            {
+              mark: '④',
+              title: '提交的形状对不对',
+              route: ['draw'],
+              lines: { real: [[BE, 197, 206]], mini: [] },
+              html: `
+<h4>这一步做什么</h4>
+<p>确认 <code>item.geometry</code> 是 Geometry、<code>item.material</code> 是 Material、<code>view</code> 是对象，否则抛 InvalidMaterialError；然后把 geometry、material 取出来（:206）。</p>
+<h4>这里检查什么，之后放心什么</h4>
+<p>检查形状。之后放心：第 ⑤ 步可以拿它们当钥匙查表。</p>
+<h4>为什么还要查</h4>
+<p>RenderBackend 是公开接口，测试和自己写的 Pass 都能直接调 draw，Backend 不能假设 item 一定来自 RenderListBuilder（第 31 课第 8 节）。这是校验行，默认调暗；小引擎没有这一步。</p>`
+            },
+            {
+              mark: '⑤',
+              title: '查表：CPU 对象换成 GPU 对象',
+              route: ['draw', 'manager', 'cpu'],
+              lines: { real: [[BE, 189, 190], [BE, 208, 209]], mini: [[S44, 57, 58]] },
+              html: `
+<h4>逐行</h4>
+<ul>
+<li><code>programs.get(material.shaderModule)</code>：拿 ShaderModule 当钥匙，去这一代的 ProgramManager 换出 program，连同 attribute、uniform 的位置表（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:80">WebGL1ProgramManager.ts:80</a>，第 15 课）。</li>
+<li><code>geometries.get(geometry)</code>：拿 Geometry 当钥匙，换出 buffer 和画法：primitiveMode、drawCount、有没有索引（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:104">WebGL1GeometryManager.ts:104</a>，第 16 课）。</li>
+</ul>
+<h4>接上的第三处，也是这一课的核心</h4>
+<p>CPU 对象就是钥匙，表属于这一代的 Manager。第一次查不到，走冷路径：编译链接或上传，记进表，并订阅原件的释放事件。之后每次：一次 Map 查找。钥匙比的是对象身份，不是内容（卡片 A）。</p>
+<h4>这里检查什么，之后放心什么</h4>
+<p>Manager 检查语言、编译链接结果、数据完整，失败就回滚，不留半成品。之后放心：拿到的 GPU 对象完整可用（第 4 课「只发布完整结果」）。</p>
+<h4>为什么在设状态之前</h4>
+<p>高亮的两行注释（:189–190）说：冷路径可能让 State 缓存失效，所以先解析资源，再应用这次 draw 的状态。另一个好处：编译失败时，GL 的状态还一点没动（卡片 D）。</p>
+<h4>实测</h4>
+<p>第 1 帧这一步 38 条命令、54 次查询：编译 2 个 program（4 个 shader），上传 2 个 buffer。第 2 帧 0 条、0 次，全是查表。</p>`
+            },
+            {
+              mark: '⑥',
+              title: '准备 uniform：三处找值，只验证不写',
+              route: ['draw', 'manager', 'cpu'],
+              lines: { real: [[BE, 210, 210]], mini: [[S45, 148, 167], [S44, 59, 74]] },
+              html: `
+<h4>这一步做什么</h4>
+<p><code>uniforms.prepare(program, submission)</code> 给 program 实际用到的每个 uniform 找值（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:106">WebGL1Uniforms.ts:106–191</a>，第 11、45 课）：</p>
+<ul>
+<li>内建的 uModel、uView、uProjection 从 submission 取：item.worldMatrix 和 view 的两个矩阵。</li>
+<li>其余先找材质自己的参数（uColor、uToLight），再找材质借用的参数块（uLightVP、uShadowMap、uShadowBias）。</li>
+<li>纹理参数也在这里查表：uShadowMap 指向阴影图的颜色附件，先确认不是正在写的目标（反馈环），再由 RenderTargetManager 换成 WebGLTexture。</li>
+</ul>
+<h4>只验证，不写</h4>
+<p>它交回一组还没执行的命令（闭包），一个 uniform 都不写。</p>
+<h4>这里检查什么，之后放心什么</h4>
+<p>检查每个 active uniform 都有值、类型对、量化成 Float32 后仍是有限数、sampler 不超过纹理单元上限。之后放心：第 ⑨ 步上传不会写到一半失败（卡片 C）。</p>
+<h4>接上</h4>
+<p>shader 里的名字在这里接上三处来源：这一次 draw（内建）、共享的外观（材质参数）、生产者写的值（参数块）。</p>
+<h4>实测</h4>
+<p>第 1 帧 12 次查询：每个 program 第一次用到时反射一次 active uniform（深度 program 2 个，主 program 8 个），之后缓存。第 2 帧 0。</p>`
+            },
+            {
+              mark: '⑦',
+              title: '再查一次：冷路径之后设备还在吗',
+              route: ['draw'],
+              lines: { real: [[BE, 212, 212]], mini: [] },
+              html: `
+<p><code>assertCurrentDraw(generation)</code>：还是同一代、还在门里（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:370">:370–376</a>）。</p>
+<h4>为什么还要查</h4>
+<p>第 ⑤、⑥ 步可能走了冷路径（编译、上传、建 FBO），时间长，期间设备可能丢、目标可能被改。之后放心：下面的命令发给的是活着的 context，画到的还是那个目标。校验行，默认调暗。</p>
+<h4>实测</h4>
+<p>只调 isContextLost。</p>`
+            },
+            {
+              mark: '⑧',
+              title: '设状态：program、深度、剔除和其余开关',
+              route: ['draw', 'gl'],
+              lines: { real: [[BE, 214, 215], [BE, 307, 342]], mini: [[S44, 75, 76]] },
+              html: `
+<h4>逐行</h4>
+<ul>
+<li><code>state.useProgram(program.program)</code>：选用这个 program，经过 State 缓存（第 14 课）：和上次一样就不发。</li>
+<li><code>applyDrawState(material, state)</code>（:317–342）：不支持的功能（blend、stencil、scissor、polygon offset、两种 sample coverage）每次都关；dither 按材质开关；colorMask、depthRange、frontFace、lineWidth 每次都设；深度测试、深度写入、深度函数、剔除按材质设，经过 State 缓存。</li>
+</ul>
+<h4>为什么每次都设</h4>
+<p>每次 draw 自己设好要用的状态，不信前面谁留下的（第 44 课）。不能信的不只是别的 Pass，还有第 ① 步的清屏：它会临时改写掩码和 dither。</p>
+<h4>为什么在这里</h4>
+<p>在 ⑤⑥ 之后：见第 ⑤ 步。在 ⑨ 之前：upload 写的是「当前 program」的 uniform，必须先 useProgram。</p>
+<h4>实测：State 缓存一条也没省下</h4>
+<p>每次 draw 16 条命令，第 1、2 帧都是 64 条（4 次 draw）。同一个 Pass 里前后两次 draw 的 program 和深度、剔除状态都一样，按设计后一次能省掉 5 条（useProgram、深度三项、剔除），实测一条也没省：第 ⑨ 步的 OES 顶点输入在 finally 里清空了 State 缓存，热路径也走这里（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:136">WebGL1OESVertexInputManager.ts:136–139</a>）。第 31 课 11.1 公开过，第 22 课再讨论该怎样改。</p>`
+            },
+            {
+              mark: '⑨',
+              title: '上传 uniform，绑顶点输入',
+              route: ['draw', 'gl'],
+              lines: { real: [[BE, 191, 191], [BE, 216, 217]], mini: [[S44, 77, 77]] },
+              html: `
+<h4>逐行</h4>
+<ul>
+<li><code>uniforms.upload(commands)</code>：执行第 ⑥ 步准备好的命令。画地面时是 4 次 uniformMatrix4fv（uModel、uView、uProjection、uLightVP）、2 次 uniform3fv（uColor、uToLight）、1 次 uniform1f（uShadowBias），再用 activeTexture、bindTexture、uniform1i 把阴影图接到 0 号纹理单元。</li>
+<li><code>vertexInputs.bind(geometry, buffers, program)</code>：把 Geometry 的 buffer 接到 program 的 attribute 上。浏览器有 OES_vertex_array_object 时，第一次为（geometry, program）这一对建一个 VAO，之后只发一条 bindVertexArrayOES（第 16 课）。</li>
+</ul>
+<h4>为什么顶点输入最后绑</h4>
+<p>高亮的注释（:191）：避免先前的 buffer 上传扰乱索引来源。上传 buffer 要绑 ELEMENT_ARRAY_BUFFER，而这个绑定记在当前 VAO 里。</p>
+<h4>实测</h4>
+<p>第 1 帧 52 条命令、30 次查询，其中建了 4 个 VAO（2 个几何 × 2 个 program）。第 2 帧 28 条：画到屏幕的两次各 11 条，画进阴影图的两次各 3 条（2 个矩阵加绑 VAO）。</p>
+<h4>小引擎里</h4>
+<p>第 44 课的 setUniforms 每次按名字查位置再上传；drawPositions 把绑 buffer、设 attribute 和画写在一起（第 41 课）。</p>`
+            },
+            {
+              mark: '⑩',
+              title: '画',
+              route: ['draw', 'gl'],
+              lines: { real: [[BE, 219, 231]], mini: [[S44, 78, 78]] },
+              html: `
+<h4>逐行</h4>
+<ul>
+<li>先查一次（:219）：状态都设好了，设备还在。</li>
+<li>没有索引就 <code>drawArrays(mode, 0, drawCount)</code>，有索引就 <code>drawElements</code>；画法来自第 ⑤ 步。这个场景的两个物体都没有索引。</li>
+<li>有索引却没有索引类型，说明 Manager 交回的结果不完整，抛错（校验）。</li>
+<li>画完再查一次（:231）。注释说得清楚：成功返回不代表 GPU 已经画完（:185）。</li>
+</ul>
+<h4>实测</h4>
+<p>每次 draw 1 条：画地面是 drawArrays(TRIANGLES, 0, 6)，画三角形是 (TRIANGLES, 0, 3)。一帧 4 条。</p>`
+            },
+            {
+              mark: '⑪',
+              title: '出门：换回进门时的目标',
+              route: ['scope', 'pass'],
+              lines: { real: [[FP, 42, 44], [BE, 181, 181]], mini: [[S44, 44, 48]] },
+              html: `
+<h4>这一步做什么</h4>
+<p>回调返回（:42），SurfaceScope.run 在 finally 里把 framebuffer 和 viewport 换回进门时记下的值（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:230">WebGL1SurfaceScope.ts:230–243</a>）。回调里抛错也照样换回，然后把错误原样抛出去（卡片 C）。</p>
+<h4>不换回的情况</h4>
+<p>设备已经丢了、或者已经换了一代：旧的快照属于旧的一代，不能拿来绑，只把 State 缓存清掉（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:294">:294–308</a>）。</p>
+<h4>实测</h4>
+<p>每次出门 2 条命令：bindFramebuffer、viewport。一帧出两次门，4 条。</p>
+<h4>一帧合起来</h4>
+<p>第 2 帧一共 120 条命令、14 次查询；第 1 帧多出的 89 条命令、112 次查询，都是第一次建 GPU 对象（第 4 节的表）。</p>`
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <script>
+      ;(function () {
+        const R = window.RTeachDraw
+        const box = document.getElementById('dt-canvas-box')
+        const readout = document.getElementById('dt-readout')
+        if (!R || !R.course) {
+          readout.textContent = '没有加载到 assets/draw-bundle.js，演示无法运行。按 MAINTENANCE.md「真实代码打包」重新构建。'
+          return
+        }
+        const C = R.course
+        const ROWS = [
+          ['帧开头', 'Renderer 问 backend.ready'],
+          ['①', '进门'],
+          ['②', '交出 submission'],
+          ['③', '门口'],
+          ['④', '形状'],
+          ['⑤', '查表'],
+          ['⑥', '准备 uniform'],
+          ['⑦', '再查一次'],
+          ['⑧', '设状态'],
+          ['⑨', '上传、绑定'],
+          ['⑩', '画'],
+          ['⑪', '出门']
+        ]
+        const count = (calls, step, kind) => calls.filter((c) => c.step === step && c.kind === kind).length
+        const total = (calls, kind) => calls.filter((c) => c.kind === kind).length
+        const created = (calls) => {
+          const names = { createProgram: 'program', createShader: 'shader', createBuffer: 'buffer', createTexture: '纹理', createRenderbuffer: 'renderbuffer', createFramebuffer: 'framebuffer', 'vertex_array_object.createVertexArrayOES': 'VAO' }
+          const tally = {}
+          for (const c of calls) if (names[c.name]) tally[names[c.name]] = (tally[names[c.name]] || 0) + 1
+          const parts = Object.entries(tally).map(([k, v]) => k + ' ' + v)
+          return parts.length ? parts.join('、') : '没有'
+        }
+        function listing(calls) {
+          const lines = []
+          let last = ''
+          for (const c of calls) {
+            if (c.kind === 'lost') continue
+            const head = (c.pass || '（Pass 之外）') + (c.draw ? ' · 第 ' + c.draw + ' 次 draw' : '')
+            if (head !== last) {
+              lines.push('—— ' + head)
+              last = head
+            }
+            lines.push('  ' + c.step + '  ' + c.text)
+          }
+          return lines.join('\n')
+        }
+        let demo = null
+        function run() {
+          if (demo) {
+            try { demo.dispose() } catch (error) { /* 演示用：重来时旧的释放失败不影响新的 */ }
+          }
+          box.replaceChildren()
+          const canvas = document.createElement('canvas')
+          canvas.width = 360
+          canvas.height = 270
+          box.append(canvas)
+          try {
+            demo = C.createDemo(canvas)
+          } catch (error) {
+            readout.textContent = '建不起来：' + error.message
+            return
+          }
+          const f1 = demo.frame()
+          const f2 = demo.frame()
+          const table = document.getElementById('dt-table')
+          table.replaceChildren()
+          const head = document.createElement('tr')
+          head.innerHTML = '<th rowspan="2">步骤</th><th class="num" colspan="2">第 1 帧</th><th class="num" colspan="2">第 2 帧</th>'
+          const sub = document.createElement('tr')
+          sub.innerHTML = '<th class="num">命令</th><th class="num">查询</th><th class="num">命令</th><th class="num">查询</th>'
+          table.append(head, sub)
+          for (const [step, label] of ROWS) {
+            const row = document.createElement('tr')
+            row.innerHTML = '<td>' + step + ' ' + label + '</td>' +
+              [count(f1.calls, step, 'command'), count(f1.calls, step, 'query'), count(f2.calls, step, 'command'), count(f2.calls, step, 'query')]
+                .map((n) => '<td class="num">' + n + '</td>').join('')
+            table.append(row)
+          }
+          const sum = document.createElement('tr')
+          sum.innerHTML = '<td><strong>合计</strong></td>' +
+            [total(f1.calls, 'command'), total(f1.calls, 'query'), total(f2.calls, 'command'), total(f2.calls, 'query')]
+              .map((n) => '<td class="num"><strong>' + n + '</strong></td>').join('')
+          table.append(sum)
+          const lost = document.createElement('tr')
+          lost.innerHTML = '<td>isContextLost（另算）</td><td class="num" colspan="2">' + total(f1.calls, 'lost') + '</td><td class="num" colspan="2">' + total(f2.calls, 'lost') + '</td>'
+          table.append(lost)
+          readout.textContent =
+            (f1.error || f2.error ? '出错了：' + (f1.error || f2.error).message + '\n' : '') +
+            '第 1 帧新建：' + created(f1.calls) + '\n第 2 帧新建：' + created(f2.calls)
+          document.getElementById('dt-calls-1').textContent = listing(f1.calls)
+          document.getElementById('dt-calls-2').textContent = listing(f2.calls)
+          window.__stage47 = { demo, f1, f2 }
+        }
+        document.getElementById('dt-again').addEventListener('click', run)
+        // 建 context、编译 shader 要一点时间（软件渲染时 1–2 秒），等正文显示出来再画
+        readout.textContent = '正在画第 1、2 帧……'
+        window.addEventListener('load', () => setTimeout(run, 0))
+      })()
+    </script>
+
+    <div id="card-canvases" aria-hidden="true" style="position: absolute; left: -10000px; top: 0; width: 1px; height: 1px; overflow: hidden"></div>
+    <script>
+      ;(function () {
+        const R = window.RTeachDraw
+        if (!R || !R.course) {
+          document.getElementById('cards').textContent = '没有加载到 assets/draw-bundle.js，卡片无法运行。'
+          return
+        }
+        const C = R.course
+        const holder = document.getElementById('card-canvases')
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+        function canvas() {
+          const c = document.createElement('canvas')
+          c.width = 360
+          c.height = 270
+          holder.append(c)
+          return c
+        }
+        /** 每一步多少条命令；只数这个 Pass 的（不给 pass 就数全部） */
+        function steps(rec, pass) {
+          const tally = {}
+          for (const c of rec.calls) {
+            if (c.kind !== 'command' || (pass && c.pass !== pass)) continue
+            tally[c.step] = (tally[c.step] || 0) + 1
+          }
+          return Object.entries(tally).map(([k, v]) => k + ' ' + v).join('，') || '一条都没有'
+        }
+        function creates(rec) {
+          const n = (name) => rec.calls.filter((c) => c.name === name).length
+          return 'buffer ' + n('createBuffer') + '、VAO ' + n('vertex_array_object.createVertexArrayOES') + '、program ' + n('createProgram')
+        }
+        function picture(gl) {
+          const all = new Uint8Array(360 * 270 * 4)
+          gl.readPixels(0, 0, 360, 270, gl.RGBA, gl.UNSIGNED_BYTE, all)
+          let floor = 0, shadow = 0, triangle = 0
+          for (let i = 0; i < all.length; i += 4) {
+            if (all[i] === 159 && all[i + 1] === 159) floor++
+            else if (all[i] === 48 && all[i + 1] === 48) shadow++
+            else if (all[i] === 201 && all[i + 1] === 116) triangle++
+          }
+          return '受光地面 ' + floor + ' 像素、影子 ' + shadow + '、三角形 ' + triangle
+        }
+        const err = (rec) => (rec.error ? rec.error.name + '：' + rec.error.message : '没有错误')
+        const NOTE = '记账、步骤标签、ShadowMapPassV1 和场景是课程写的（assets/build/draw-course.ts）；Renderer、Pipeline、ForwardPass、WebGL1Backend 和资源类是真实代码。'
+
+        RTeach.traceLab.cards({
+          mount: document.getElementById('cards'),
+          storageKey: 'lesson-0047',
+          cards: [
+            {
+              title: 'A · 换成内容相同的新 Geometry，第 2 帧还要重新上传吗？',
+              tags: ['第 ⑤ 步', '按身份查表'],
+              desc: '第 1 帧照常画。然后把地面和三角形换成新的 Mesh：新的 Geometry 对象，顶点数据一模一样，材质不变。再画第 2、3 帧。',
+              note: 'swapInEqualGeometries 也是课程写的：从场景里拿掉旧 Mesh、加入新 Mesh，旧 Geometry 仍由 Scene 登记。' + NOTE,
+              question: '第 2 帧的 ⑤ 查表，会不会再建 GPU 对象？',
+              choices: [
+                '会：又建 2 个 buffer 和新的 VAO，表按对象身份查',
+                '不会：内容一样，Manager 认出来直接用旧的',
+                '不会建新的，只把旧 buffer 的数据重传一遍'
+              ],
+              answer: 0,
+              explain: '表的钥匙是对象身份（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:104">WebGL1GeometryManager.ts:104</a>）。新 Geometry 是新钥匙，第 2 帧查不到，就上传 2 个新 buffer；它和两个 program 配成新的一对，所以又建了 4 个 VAO（第 ⑨ 步）。第 3 帧又全是查表。画面不变。旧的两个 buffer 也还在：旧 Geometry 仍由 Scene 登记着，只有它被释放时，GeometryManager 收到释放事件才删（第 4 课）。',
+              async run() {
+                const demo = C.createDemo(canvas())
+                const f1 = demo.frame()
+                C.swapInEqualGeometries(demo.world)
+                const f2 = demo.frame()
+                const f3 = demo.frame()
+                const lines = [
+                  { t: '第 1 帧', text: '新建 ' + creates(f1) },
+                  { t: '第 2 帧', text: '换上新 Geometry 以后：新建 ' + creates(f2), kind: 'result' },
+                  { t: '第 2 帧', text: '⑤ 查表发了 ' + f2.calls.filter((c) => c.step === '⑤' && c.kind === 'command').length + ' 条命令' },
+                  { t: '第 3 帧', text: '新建 ' + creates(f3) },
+                  { t: '画面', text: picture(demo.gl) }
+                ]
+                demo.dispose()
+                return { lines }
+              }
+            },
+            {
+              title: 'B · 一个 Pass 忘了进门，直接 draw',
+              tags: ['第 ③ 步', '门口'],
+              desc: '在两个 Pass 中间插一个 NoScopePassV1：对每个物体直接调用 backend.draw，不调用 withRenderSurface。',
+              note: 'NoScopePassV1 是课程写的。' + NOTE,
+              question: '会怎样？',
+              choices: [
+                '在门口被拦住：抛 WebGLOperationError，这个 Pass 一条 GL 命令都没发',
+                '画到屏幕上：没进门，就画到默认的 framebuffer',
+                '画进阴影图：沿用上一个 Pass 出门前绑的目标'
+              ],
+              answer: 0,
+              explain: '第 ③ 步的 assertDrawable 发现不在门里（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:254">WebGL1SurfaceScope.ts:254–260</a>），在任何 GL 命令之前就抛错。错误从 renderer.render 抛出来，ForwardPass 没轮到跑，所以画布是黑的。第三个选项也不可能：上一个 Pass 出门时已经换回了屏幕。留一个问题到第 22 课：报错信息开头的「enter surface scope」是 invalid 这个小函数写死的操作名（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:39">WebGL1SurfaceScope.ts:39–41</a>），可这次根本没人进门，它准确吗？',
+              async run() {
+                const demo = C.createDemo(canvas(), { between: new C.NoScopePassV1() })
+                const f1 = demo.frame()
+                const lines = [
+                  { t: '第 1 帧', text: err(f1), kind: 'late' },
+                  { t: '命令', text: 'ShadowMapPassV1：' + steps(f1, 'ShadowMapPassV1') },
+                  { t: '命令', text: 'NoScopePassV1：' + steps(f1, 'NoScopePassV1'), kind: 'result' },
+                  { t: '命令', text: 'ForwardPass：' + steps(f1, 'ForwardPass') },
+                  { t: '画面', text: picture(demo.gl) }
+                ]
+                demo.dispose()
+                return { lines }
+              }
+            },
+            {
+              title: 'C · 三角形的材质少给了 uColor',
+              tags: ['第 ⑥ 步', '只验证不写'],
+              desc: '三角形的材质不给 uColor，可 shader 用到了它。地面照常。画一帧。',
+              note: NOTE,
+              question: '画完这一帧，画布上有什么？',
+              choices: [
+                '地面和影子画上了，三角形没有；照样出门换回，错误从 render 抛出',
+                '什么都没画：Material 构造时就会拒绝少给的参数',
+                '三角形画成了黑色：uColor 沿用了初始值 0'
+              ],
+              answer: 0,
+              explain: '第 ⑥ 步找不到 uColor 的值就抛 InvalidMaterialError（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:156">WebGL1Uniforms.ts:156–158</a>），这时一个 uniform 都还没写。ForwardPass 里只有地面那次 draw 发了 ⑧⑨⑩ 的命令；三角形那次 draw 停在 ⑥。出门照样做：⑪ 的 2 条命令还在，之后 framebuffer 是屏幕、viewport 是整块画布。Material 构造时为什么不拒绝？它不知道 shader 里用了哪些 uniform，要等 program 链接后反射才知道（第 31 课第 8 节）。',
+              async run() {
+                const demo = C.createDemo(canvas(), { omitTriangleColor: true })
+                const f1 = demo.frame()
+                const gl = demo.gl
+                const viewport = Array.from(gl.getParameter(gl.VIEWPORT)).join(', ')
+                const lines = [
+                  { t: '第 1 帧', text: err(f1), kind: 'late' },
+                  { t: '命令', text: 'ForwardPass：' + steps(f1, 'ForwardPass'), kind: 'result' },
+                  { t: '出门后', text: 'FRAMEBUFFER_BINDING = ' + String(gl.getParameter(gl.FRAMEBUFFER_BINDING)) + '，VIEWPORT = ' + viewport },
+                  { t: '画面', text: picture(gl) }
+                ]
+                demo.dispose()
+                return { lines }
+              }
+            },
+            {
+              title: 'D · 把「设状态」挪到「查表」前面',
+              tags: ['第 ⑤、⑧ 步', '顺序'],
+              desc: 'StateFirstBackend 照抄真实的 draw，只把 applyDrawState 挪到 programs.get 前面。三角形换成一个编译不过的 shader，它的状态故意和地面不同：剔除背面、深度永远通过、不抖动。只跑 ForwardPass：先画地面，再画三角形。两种顺序各跑一次。',
+              note: 'StateFirstBackend 是课程写的变体，项目里只有真实顺序。' + NOTE,
+              question: '三角形编译失败以后，GL 里的剔除、深度函数、抖动是谁的？',
+              choices: [
+                '真实顺序还是地面的；挪过以后，变成了失败那次 draw 的',
+                '两种顺序都还是地面的：失败的 draw 什么也没改',
+                '两种顺序都变成了失败那次 draw 的'
+              ],
+              answer: 0,
+              explain: '真实顺序里，编译在第 ⑤ 步就失败了，第 ⑧ 步还没执行，GL 的状态还是画地面时设的。挪过以后，applyDrawState 先执行，把剔除、深度函数、抖动设成了三角形材质的值，然后才发现编译不过：这次 draw 失败了，却改掉了状态。下一次 draw 会重新设全部状态，所以画面不会因此画错，但「抛错的 draw 什么也没改」这条性质没了。注释给的另一个理由是冷路径会让 State 缓存失效（:189–190）。正常场景下两种顺序画面一样、命令数也一样（两帧都是 335 和 134 条调用）：OES 顶点输入每次 draw 都清空缓存，这个理由在现在的代码里看不出差别（第 ⑧ 步）。',
+              async run() {
+                const gl = (d) => d.gl
+                const status = (d) => {
+                  const g = gl(d)
+                  const func = g.getParameter(g.DEPTH_FUNC)
+                  return '剔除 ' + (g.isEnabled(g.CULL_FACE) ? '开' : '关') + '，深度函数 ' + (func === g.ALWAYS ? 'ALWAYS' : func === g.LEQUAL ? 'LEQUAL' : func) + '，抖动 ' + (g.isEnabled(g.DITHER) ? '开' : '关')
+                }
+                const real = C.createDemo(canvas(), { brokenTriangle: true, withoutShadowPass: true })
+                const r1 = real.frame()
+                const swapped = C.createDemo(canvas(), { brokenTriangle: true, withoutShadowPass: true, Backend: C.StateFirstBackend })
+                const s1 = swapped.frame()
+                const lines = [
+                  { t: '真实顺序', text: err(r1).slice(0, 80), kind: 'late' },
+                  { t: '真实顺序', text: '失败以后：' + status(real), kind: 'result' },
+                  { t: '先设状态', text: err(s1).slice(0, 80), kind: 'late' },
+                  { t: '先设状态', text: '失败以后：' + status(swapped), kind: 'result' },
+                  { t: '对照', text: '地面的材质：剔除关、LEQUAL、抖动开；三角形的：剔除开、ALWAYS、抖动关', kind: 'muted' }
+                ]
+                real.dispose()
+                swapped.dispose()
+                return { lines }
+              }
+            },
+            {
+              title: 'E · 设备在两遍之间丢了',
+              tags: ['第 ③ 步', '一代'],
+              desc: '在 ShadowMapPassV1 和 ForwardPass 之间插一个 LoseContextPassV1：第一次运行时调用 WEBGL_lose_context 的 loseContext()。画第 1 帧；等丢失事件派发后画第 2 帧；然后 restoreContext()，等 Backend 准备好，再画第 3、4 帧。',
+              note: 'LoseContextPassV1 是课程写的。' + NOTE,
+              question: '第 2 帧、第 3 帧各发了多少 GL 命令？',
+              choices: [
+                '第 2 帧 0 条，整帧跳过；第 3 帧把所有 GPU 对象重建一遍',
+                '第 2 帧照常画，只是没有阴影；第 3 帧和平时一样',
+                '第 2 帧抛同样的错误；第 3 帧只重建阴影图'
+              ],
+              answer: 0,
+              explain: '第 1 帧：ForwardPass 进门时 requireGeneration 发现 context 丢了，作废这一代并抛 WebGLContextLostError。第 2 帧：Renderer 先问 <code>backend.ready</code>，得到 false 就整帧返回（<a data-src="src/rendering/Renderer.ts:51">Renderer.ts:51</a>），一条 GL 调用都没有，只调了一次 isContextLost。恢复以后是新的一代，表是空的，第 3 帧照着场景里的原件把 program、buffer、VAO、阴影图全部重建，第 4 帧又只剩查表。CPU 资源一个都没变，这就是 GPU 对象只活一代、CPU 资源活在场景里的意思（第 46 课）。',
+              async run() {
+                const c = canvas()
+                const raw = c.getContext('webgl', { alpha: false, depth: true })
+                const extension = raw && raw.getExtension('WEBGL_lose_context')
+                if (!extension) return { lines: [{ text: '这个浏览器没有 WEBGL_lose_context，跑不了这张卡片。', kind: 'late' }] }
+                const demo = C.createDemo(c, { between: new C.LoseContextPassV1(extension) })
+                const tally = (rec) => rec.calls.filter((x) => x.kind === 'command').length + ' 条命令、' + rec.calls.filter((x) => x.kind === 'query').length + ' 次查询'
+                const f1 = demo.frame()
+                await sleep(100)
+                const f2 = demo.frame()
+                extension.restoreContext()
+                for (let i = 0; i < 100 && !demo.backend.ready; i++) await sleep(50)
+                const f3 = demo.frame()
+                const f4 = demo.frame()
+                const lines = [
+                  { t: '第 1 帧', text: err(f1), kind: 'late' },
+                  { t: '第 2 帧', text: tally(f2) + '，isContextLost ' + f2.calls.filter((x) => x.kind === 'lost').length + ' 次', kind: 'result' },
+                  { t: '恢复', text: 'backend.ready = ' + demo.backend.ready },
+                  { t: '第 3 帧', text: tally(f3) + '；新建 ' + creates(f3), kind: 'result' },
+                  { t: '第 4 帧', text: tally(f4) + '；新建 ' + creates(f4) },
+                  { t: '画面', text: picture(demo.gl) }
+                ]
+                demo.dispose()
+                return { lines }
+              }
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0047"]'), [
+        {
+          q: '一次 draw 里，CPU 的 Geometry 怎样变成 GPU 的 buffer？',
+          opts: [
+            '拿 Geometry 当钥匙查这一代的表，第一次查不到才上传',
+            'Pass 先把 Geometry 上传好，再把 buffer 交给 draw',
+            'Geometry 构造时就为每个 context 上传了一份 buffer'
+          ],
+          answer: 0,
+          why: '第 ⑤ 步；第 41 课。Pass 和 Geometry 都不知道 gl。'
+        },
+        {
+          q: 'ForwardPass 交给 draw 的 submission 里，有没有 WebGL 对象？',
+          opts: [
+            '没有：只有借用原件的 RenderItem 和相机快照 ViewState',
+            '有：program 和 buffer 由 Pass 先取好再交出去',
+            '有：画到哪的 framebuffer 放在 submission 里交出去'
+          ],
+          answer: 0,
+          why: '第 ② 步。画到哪在第 ① 步由 withRenderSurface 定。'
+        },
+        {
+          q: '为什么 draw 先查表、准备 uniform，再 useProgram、设状态？',
+          opts: [
+            '冷路径会让状态缓存失效；编译失败时状态也还没被改动',
+            'WebGL 规定 useProgram 必须在编译 shader 之前调用',
+            '先上传 uniform 再选 program，才能写进正确的 program'
+          ],
+          answer: 0,
+          why: '第 ⑤、⑧ 步；卡片 D。upload 写的是当前 program，所以 useProgram 在 upload 之前。'
+        },
+        {
+          q: '第 2 帧，第 ⑤ 步查表一共发了几条 GL 命令？',
+          opts: [
+            '0 条：GPU 对象都已在表里，查表只是一次 Map 查找',
+            '和第 1 帧一样多：每帧都要重新上传顶点数据',
+            '只少了编译那部分，buffer 照样每帧上传一次'
+          ],
+          answer: 0,
+          why: '第 4 节的表；卡片 A 说明钥匙是对象身份。'
+        },
+        {
+          q: 'scope 的回调里有一次 draw 抛错了，出门那一步还做吗？',
+          opts: [
+            '做：run 的 finally 换回入口的目标，再把错误抛出去',
+            '不做：错误直接抛出，目标停在 Pass 绑的那一个上',
+            '不做：Renderer 捕获错误以后会自己把目标换回来'
+          ],
+          answer: 0,
+          why: '第 ⑪ 步；卡片 C 实测出门后 framebuffer 是屏幕。'
+        },
+        {
+          q: '设备在两遍之间丢了。恢复以后的第一帧，阴影图和 program 从哪来？',
+          opts: [
+            '新的一代表是空的，照着场景里的原件全部重建',
+            '浏览器把丢失前的 GPU 对象原样还了回来',
+            'Backend 在丢失前把 GPU 对象备份在了内存里'
+          ],
+          answer: 0,
+          why: '卡片 E；第 46 课。CPU 资源一直在场景里，GPU 对象只活一代。'
+        }
+      ])
+    </script>
+  </body>
+</html>

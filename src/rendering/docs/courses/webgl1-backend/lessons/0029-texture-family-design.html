@@ -1,0 +1,1849 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 29 课 · 纹理一族的设计思路</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/texture-design-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 设计专题 · 纹理一族 · 约 75 分钟</p>
+    <h1>纹理一族为什么这样分：resources 与 backend 的设计思路</h1>
+    <p class="lede">
+      第 12 课逐行读了 CPU 这一半的纹理类，第 17 课读了 CubeTextureManager。这一课不再逐行读，而是退一步问：如果从零开始设计，为什么会得到现在这些文件、这样的分工？从引擎真正要采样的五种图出发，先写出旧引擎的第 1 版，再一步一步推出：描述和 GPU 表示拆开、按像素来源分类、GPU 画的图单独成类、Material 记地址而不记 handle、检查分层、三个 Manager 共用一个支撑模块。每一步都用实测说明不这样做会怎样。你正在写的 Texture2DManager 和 Texture2DSamplingSource 在这张图里的位置、sampler2D 接到 draw 还差什么，也在这一课里。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW1 的阴影（阴影 pass 画、主 pass 采样）、HW3 的 GBuffer、将来的 IBL，都要「采样一张 GPU 自己画出来的图」。这一课讲的附件地址、按 revision 换新、反馈环检查，就是为它们准备的。Texture2DManager 是这张分工图里正在补上的一块。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 纹理的三个调用 createTexture → bindTexture → texImage2D（第 17 课 2.1 节；本课 3.2 节的代码会再逐行注释一遍）；② Resource.onDispose：CPU 资源释放时同步通知订阅者，各 Manager 用它删自己的 GPU 对象（第 15、16 课）；③「一代」：context 丢了以后整代 Manager 作废，恢复后新建一代（第 13 课第 2 节、第 16 课 4.6 节）。第 12、17 课的细节不需要记得，用到的地方当场再讲。如果这三条里哪一条其实没懂，告诉我，我先补那一块。<br />
+      <strong>这一课从零讲的</strong>：五种图的原始数据；从需求推出六个设计问题；旧引擎的写法和它的四个问题；拆成「描述 + 每个 context 一份 GPU 表示」；借用图片与复制数组；为什么 RenderTarget 不是 Texture；附件地址；检查放在哪一层、哪个时刻；三个 Manager 共用什么、还重复什么；sampler2D 接线的现状；和 Lifecycle 的关系。<br />
+      <strong>工作区版本</strong>：WebGL1Texture2DManager.ts、Texture2DSamplingSource.ts 还没提交，RenderTargetManager.ts、RenderTarget.ts、Material.ts 有未提交的改动。本课按 2026-10-11 工作区里的版本讲，行号以后可能会变。<br />
+      <strong>10 月 12 日更新</strong>：sampler2D 已经接通（工作区，未提交）。ResourceManager 持有了 Texture2DManager，Uniforms 把 SAMPLER_2D 和 SAMPLER_CUBE 一起计入单元上限，并经 Backend 的闭包解析 Texture2D 和附件地址，解析附件之前先由 SurfaceScope.assertCanSample 做反馈环检查。本页图 1 的虚线、8.3 节表的最后一行、图 4 的「还没实现」、8.4 节末段、9.3 节的节选和表，描述的都是 10 月 11 日的状态；现在的接线见第 27 课 4.2 节。<br />
+      <strong>页面会用到你的显卡</strong>：卡片都在你的浏览器里创建真实的 WebGL context，用完释放。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">原始输入：引擎要采样的五种图</a></li>
+        <li><a href="#s2">从需求到六个设计问题</a>（含图 1：最后的样子）</li>
+        <li><a href="#s3">第 1 版：旧引擎的写法</a></li>
+        <li><a href="#s4">第 2 版：描述和 GPU 表示拆开</a>（问题 1）</li>
+        <li><a href="#s5">像素从哪来，决定类怎么分</a>（问题 2）：<a href="#s5-1">借用图片</a> <a href="#s5-2">复制数组</a> <a href="#s5-3">子类还是 kind</a></li>
+        <li><a href="#s6">GPU 画的图不是 Texture</a>（问题 3）</li>
+        <li><a href="#s7">Material 记地址，不记 handle</a>（问题 4）</li>
+        <li><a href="#s8">检查放在哪一层、哪个时刻</a>（问题 5）</li>
+        <li><a href="#s9">三个 Manager 共用什么</a>（问题 6）：<a href="#s9-3">sampler2D 还差什么</a></li>
+        <li><a href="#s10">和 Lifecycle 的关系</a></li>
+        <li><a href="#s11">架构视角：对照 three.js r177</a></li>
+        <li><a href="#s12">审查视角</a></li>
+        <li><a href="#s13">检查题</a></li>
+        <li><a href="#s14">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 原始输入：引擎要采样的五种图</h2>
+    <p>
+      设计从「要处理的东西」开始。下面五种图，前四种在仓库里都能找到原始数据或旧代码，第五种是延迟渲染要用的。尺寸用 sips 实测，字节数按「宽 × 高 × 每像素字节」算：
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>例子</th><th>原始数据</th><th>像素从哪来</th><th>会不会变</th><th>context 丢了以后</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>① Mary 的颜色贴图（HW1，<a data-src="public/assets/models/hw1/mary/Marry.mtl:13">Marry.mtl:13</a> 的 <code>map_Kd</code>）</td>
+          <td>MC003_Kozakura_Mari.png，文件 526,931 字节；2048 × 1024，解码成 RGBA 后 2048 × 1024 × 4 = 8,388,608 字节（8 MiB）</td>
+          <td>下载文件，浏览器解码成一个图片对象</td>
+          <td>不变</td>
+          <td>图片对象还在，再传一次</td>
+        </tr>
+        <tr>
+          <td>② HW2 背景（第 17 课）</td>
+          <td>CornellBox 六张 JPEG，各 128 × 128；解码后 6 × 128 × 128 × 4 = 393,216 字节</td>
+          <td>同上，六个图片对象</td>
+          <td>不变</td>
+          <td>同上</td>
+        </tr>
+        <tr>
+          <td>③ 没有贴图时的 1 × 1 纯色兜底（旧引擎 <a data-src="src/renderers/factories/deferred/fromOBJ/createGBufferRendererFromOBJ.ts:42">createGBufferRendererFromOBJ.ts:42–60</a>）；将来 HDR 文件解码出的 Float32Array</td>
+          <td>Kd = 0.8 按 gamma 2.2 编码成 230，像素 [230, 230, 230, 255]；法线兜底 (0.5, 0.5, 1.0) 存成 [127, 127, 255, 255]</td>
+          <td>程序在 CPU 上算出来的数组</td>
+          <td>不变</td>
+          <td>CPU 那份数组还在，再传一次</td>
+        </tr>
+        <tr>
+          <td>④ HW1 的阴影贴图（旧引擎 <a data-src="src/renderers/passes/shadow/ShadowRenderPass.ts:204">ShadowRenderPass.ts:204–207</a> 交给 uShadowMap）</td>
+          <td>默认 2048 × 2048（<a data-src="src/lights/directionalLight/DirectionalLight-refactor.ts:143">DirectionalLight-refactor.ts:143</a>），一个 RGBA8 颜色附件就是 16,777,216 字节（16 MiB）</td>
+          <td>GPU 在阴影 pass 里画出来；CPU 上一个像素都没有</td>
+          <td>每帧重画；阴影分辨率一改就要换尺寸</td>
+          <td>CPU 没有原料，只能重画</td>
+        </tr>
+        <tr>
+          <td>⑤ 延迟渲染的 GBuffer（旧引擎 <a data-src="src/framebuffers/FBO.ts:89">FBO.ts:89–100</a> 的多颜色附件）</td>
+          <td>几张和画布一样大的图，一次 draw 同时写</td>
+          <td>同上</td>
+          <td>画布一变就换尺寸</td>
+          <td>只能重画</td>
+        </tr>
+      </tbody>
+    </table></div>
+    <p>第 ① 种的原始字节长这样（<code>xxd -l 32</code>）。GPU 不认 PNG，texImage2D 要的是解码后的 8 MiB 像素，解码由浏览器做：</p>
+    <pre><code>89 50 4e 47 0d 0a 1a 0a  // PNG 文件签名
+00 00 00 0d 49 48 44 52  // 第一个块 IHDR，长 13 字节
+00 00 08 00              // 宽 0x800 = 2048
+00 00 04 00              // 高 0x400 = 1024
+08 06                    // 每通道 8 位；颜色类型 6 = RGBA
+                         // 文件只有 515 KiB：后面的像素是压缩过的</code></pre>
+    <p>把五行按三个方向分一分，后面每个设计决定都对应其中一个方向：</p>
+    <ul>
+      <li><strong>像素从哪来</strong>：浏览器的图片对象（①②）、CPU 上的数组（③）、GPU 画出来的（④⑤）。</li>
+      <li><strong>形状</strong>：一张二维图（①③④⑤），还是 cubemap 的六个面（②）。</li>
+      <li><strong>会不会变</strong>：静态（①②③），还是会换尺寸（④⑤）。</li>
+    </ul>
+
+    <h2 id="s2">2. 从需求到六个设计问题</h2>
+    <p>从表里能读出六条需求，每条都有一个具体的起因：</p>
+    <ol>
+      <li><strong>丢了 context 要能重建。</strong>①②③ 能重传，前提是 CPU 上还留着原料；④⑤ 只能重画。</li>
+      <li><strong>一份图可能用在两个 context 里。</strong>handle 只属于创建它的那个 context（第 4 课实测：跨 context 绑定报 INVALID_OPERATION），而 Backend 将来有 WebGL1、WebGL2 两种。</li>
+      <li><strong>来源的「复制」规则不同。</strong>8 MiB 的图片对象没法、也不该深拷贝；CPU 数组不复制的话，调用者事后一改，重传的就不是原图了。</li>
+      <li><strong>④⑤ 会换尺寸。</strong>换尺寸就要重建 GPU 存储，handle 跟着变；正在用它的材质不能拿着旧 handle。</li>
+      <li><strong>设备做不到时要早报错。</strong>WebGL1 的 NPOT 纹理用了 REPEAT，采样悄悄变黑，没有错误码（第 17 课 2.4 节）。</li>
+      <li><strong>采样 GPU 画的图，要防「边写边读」。</strong>主 pass 采样阴影贴图没问题；如果某个 pass 采样的正是它自己正在写的那张，WebGL 拒绝这次 draw（8.4 节实测）。</li>
+    </ol>
+    <p>六条需求变成六个设计问题。先把答案列在这里，后面各节一个一个推出来：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>问题</th><th>现在的答案</th><th>在哪</th><th>本课</th></tr></thead>
+      <tbody>
+        <tr><td>1. GPU handle 放在哪？</td><td>不放进 CPU 对象；每个 context 一个 Manager，用 <code>Map&lt;CPU 对象, handle&gt;</code> 记</td><td>三个 Manager 的 <code>entries</code></td><td>第 4 节</td></tr>
+        <tr><td>2. 来源不同的纹理怎么分类？</td><td>二维：两个子类（借用图片 / 复制数组）；cubemap：一个类，<code>source.kind</code> 二选一</td><td>Texture2D.ts、CubeTexture.ts</td><td>第 5 节</td></tr>
+        <tr><td>3. GPU 画的图算不算 Texture？</td><td>不算。RenderTarget 直接继承 Resource，带 revision</td><td>RenderTarget.ts</td><td>第 6 节</td></tr>
+        <tr><td>4. Material 怎么说「采样那张阴影贴图」？</td><td>记一个地址 <code>{ target, kind, index }</code>，draw 时再解析成这一刻的 handle</td><td>Texture2DSamplingSource.ts</td><td>第 7 节</td></tr>
+        <tr><td>5. 检查放在哪？</td><td>和后端无关的规则在 CPU 资源构造时查；WebGL1 的限制在 Manager 上传前查；输出目标相关的在 draw 时查</td><td>各处，8.3 节有总表</td><td>第 8 节</td></tr>
+        <tr><td>6. 三个 Manager 的共同部分怎么共享？</td><td>抽成一个函数模块，不用基类</td><td>WebGL1TextureUploadSupport.ts</td><td>第 9 节</td></tr>
+      </tbody>
+    </table></div>
+    <p>最后的样子，先看一眼：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 392" role="img" aria-label="左边是 resources 目录里的 CPU 资源：Texture2D 一族、CubeTexture、RenderTarget、Texture2DSamplingSource、Material 参数，都不认识 gl。右边是 backend/webgl1 目录里一个 context 一代的对象：Texture2DManager、CubeTextureManager、RenderTargetManager 各自按 CPU 对象缓存 GPU 表示，共用 TextureUploadSupport；Uniforms 在 draw 时把纹理放进单元，cubemap 已接通，sampler2D 还没接。">
+          <defs>
+            <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+            <marker id="f1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+            <marker id="f1c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip bad" /></marker>
+          </defs>
+          <text x="20" y="20" class="title">resources/：CPU，不认识 gl</text>
+          <text x="405" y="20" class="title">backend/webgl1/：一个 context 一代</text>
+          <path d="M385 30 L385 356" class="line dash" />
+
+          <rect x="20" y="34" width="345" height="52" class="box" />
+          <text x="192" y="55" text-anchor="middle">Texture2D 一族</text>
+          <text x="192" y="73" text-anchor="middle" class="small">ImageTexture2D 借用图片 · DataTexture2D 复制数组</text>
+          <rect x="20" y="100" width="345" height="52" class="box" />
+          <text x="192" y="121" text-anchor="middle">CubeTexture</text>
+          <text x="192" y="139" text-anchor="middle" class="small">source.kind：'images' | 'data'</text>
+          <rect x="20" y="166" width="345" height="52" class="box" />
+          <text x="192" y="187" text-anchor="middle">RenderTarget</text>
+          <text x="192" y="205" text-anchor="middle" class="small">不是 Texture：descriptor + revision</text>
+          <rect x="20" y="232" width="345" height="52" class="box hl" />
+          <text x="192" y="253" text-anchor="middle">Texture2DSamplingSource *</text>
+          <text x="192" y="271" text-anchor="middle" class="small">Texture2D | { target, kind, index }</text>
+          <rect x="20" y="298" width="345" height="52" class="box" />
+          <text x="192" y="319" text-anchor="middle">Material 参数</text>
+          <text x="192" y="337" text-anchor="middle" class="small">texture2D → 上一格 · cubeTexture → CubeTexture</text>
+
+          <rect x="405" y="34" width="300" height="52" class="box" />
+          <text x="555" y="55" text-anchor="middle">WebGL1Texture2DManager *</text>
+          <text x="555" y="73" text-anchor="middle" class="small">Map&lt;Texture2D, handle&gt;</text>
+          <rect x="405" y="100" width="300" height="52" class="box" />
+          <text x="555" y="121" text-anchor="middle">WebGL1CubeTextureManager</text>
+          <text x="555" y="139" text-anchor="middle" class="small">Map&lt;CubeTexture, handle&gt;</text>
+          <rect x="405" y="166" width="300" height="52" class="box" />
+          <text x="555" y="187" text-anchor="middle">WebGL1RenderTargetManager</text>
+          <text x="555" y="205" text-anchor="middle" class="small">Map&lt;RenderTarget, FBO…&gt;，还比 revision</text>
+          <rect x="405" y="232" width="300" height="52" class="box" />
+          <text x="555" y="253" text-anchor="middle">WebGL1TextureUploadSupport</text>
+          <text x="555" y="271" text-anchor="middle" class="small">上面三个 Manager 共用的函数</text>
+          <rect x="405" y="298" width="300" height="52" class="box hl" />
+          <text x="555" y="319" text-anchor="middle">WebGL1Uniforms</text>
+          <text x="555" y="337" text-anchor="middle" class="small">draw 时把纹理放进纹理单元</text>
+
+          <path d="M365 60 L403 60" class="line" marker-end="url(#f1a)" />
+          <path d="M365 126 L403 126" class="line" marker-end="url(#f1a)" />
+          <path d="M365 192 L403 192" class="line" marker-end="url(#f1a)" />
+          <text x="385" y="54" text-anchor="middle" class="small halo">get</text>
+          <text x="385" y="120" text-anchor="middle" class="small halo">get</text>
+          <text x="385" y="186" text-anchor="middle" class="small halo">get</text>
+          <path d="M365 324 L403 324" class="line" marker-end="url(#f1a)" />
+          <text x="385" y="318" text-anchor="middle" class="small halo">参数</text>
+
+          <path d="M705 316 L735 316 L735 126 L707 126" class="line accent" marker-end="url(#f1b)" />
+          <path d="M705 328 L720 328 L720 192 L707 192" class="line bad dash" marker-end="url(#f1c)" />
+          <path d="M705 340 L750 340 L750 60 L707 60" class="line bad dash" marker-end="url(#f1c)" />
+
+          <text x="20" y="376" class="small">→ 实线：已接通（resolveCube）　虚线：还没接，Uniforms 对 sampler2D 抛错　* 工作区版本，未提交</text>
+        </svg>
+      </div>
+      <figcaption>图 1　文件地图与谁调谁。左边的对象可以在没有 WebGL 的 Node 里构造和测试；右边每个对象只属于一个 context 的一代，context 丢了整排作废。三个 Manager 都以左边的 CPU 对象为 key。右侧的三条竖线是 Uniforms 在 draw 时找 GPU 纹理的路：只有到 CubeTextureManager 的那条接通了（9.3 节）。</figcaption>
+    </figure>
+
+    <h2 id="s3">3. 第 1 版：旧引擎的写法</h2>
+    <h3 id="s3-1">3.1 旧引擎的 Texture 和阴影贴图</h3>
+    <p>旧引擎的二维纹理是一个类，里面放着 gl 和 handle：</p>
+    <pre><code>// 旧引擎 src/textures/Texture.ts:6–126（节选；注释是课程加的）
+export class Texture {
+  // 用字符串当 key 的缓存（相关代码已注释掉，见 :36–49）
+  private static cache = new Map&lt;string, Texture&gt;()
+
+  // ① 一个对象绑死一个 context
+  private gl: WebGLRenderingContext
+
+  // ② GPU handle 放在 CPU 对象里
+  private handle: WebGLTexture | null = null
+
+  constructor(gl: WebGLRenderingContext) {
+    this.gl = gl
+  }
+
+  // …（省略两个取 handle 的 getter，:17–30）
+
+  createFromImage(image: TextureImageSource): void {
+    const gl = this.gl
+
+    this.handle = gl.createTexture()
+    if (!this.handle) {
+      throw new TextureCreationError(&#x27;TEXTURE_2D&#x27;)
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, this.handle)
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image)
+
+    // ③ 采样参数按尺寸自动决定：2 的幂就 generateMipmap（:76–92），
+    //    调用者没法说「这张不要 mipmap」；也没有「颜色空间」这一项
+    this.setupFiltering(image.width, image.height)
+
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
+    gl.bindTexture(gl.TEXTURE_2D, null)
+    // ④ image 没有存下来：context 丢了以后，这个对象拿不出像素重传
+  }
+
+  // …（省略 setupFiltering、createFromColor、dispose，:76–125）
+}</code></pre>
+    <p>阴影贴图由 FBO 类自己建、自己拿着纹理；阴影 pass 每帧把纹理 handle 推给材质：</p>
+    <pre><code>// 旧引擎 src/renderers/passes/shadow/ShadowRenderPass.ts:204–207（每帧都调用）
+uniforms[&#x27;uShadowMap&#x27;] = {
+  type: UniformType.TEXTURE_2D,
+  // 交给材质的是「这一刻」的 WebGLTexture。FBO 一旦重建（换尺寸、context 恢复），
+  // 这个 handle 就作废了，所以只能每帧重新取、重新推
+  value: this.shadowMapFBO.getShadowMapTexture()
+}</code></pre>
+    <p>对照第 2 节的六条需求，问题出在四处：</p>
+    <ul>
+      <li><strong>① 一个对象只能在一个 context 里用</strong>（需求 2）。要在第二个 context 里用同一张图，只能再 <code>new Texture(gl2)</code>，再传一遍图片：两个对象各管各的，谁也不知道它们是「同一张图」。</li>
+      <li><strong>④ 没留原料</strong>（需求 1）。createFromImage 用完 image 就丢了。context 丢了以后，handle 死了，这个对象也拿不出像素重传。</li>
+      <li><strong>③ 描述不全</strong>（需求 5）。采样方式由尺寸自动决定：2048 × 1024 是 2 的幂，就自动 generateMipmap。一张 128 × 128 的查找表（LUT）不想要 mipmap，没有办法说；也没有颜色空间这一项，sRGB 的颜色贴图和线性的法线贴图分不开（旧引擎只在 createFromColor 里用一个 gamma 布尔值区分）。</li>
+      <li><strong>阴影贴图交的是 handle</strong>（需求 4）。FBO 一重建，handle 就换了；旧引擎的对策是每帧重新取、重新推，所以 uShadowMap 只能放在「每帧调用」的函数里。</li>
+    </ul>
+    <p>还有一个小地方：被注释掉的缓存用字符串当 key（<code>Map&lt;string, Texture&gt;</code>）。两张不同的图如果起了同一个名字，会被当成一张。4.2 节会实测现在的做法。</p>
+
+    <h3 id="s3-2">3.2 课程写的第 1 版</h3>
+    <p>为了能在卡片里跑，把旧引擎的形状改写成一个最小的类。它和旧引擎一样：handle 在对象里，像素用完不留：</p>
+    <pre><code>// 第 1 版：照旧引擎 src/textures/Texture.ts 的形状改写（课程写的，只留和本课有关的部分）
+// 一个对象 = 一个 gl + 一个 handle；像素只在上传那一刻经过，用完不留
+class TextureV1 {
+  // GPU handle 直接放在 CPU 对象里（旧引擎 Texture.ts:11）
+  handle: WebGLTexture | null = null
+
+  // 构造时就绑死一个 context（旧引擎 Texture.ts:13–15）
+  constructor(private readonly gl: WebGLRenderingContext) {}
+
+  // 旧引擎是 createFromImage(image)；这里换成像素数组，卡片好造数据
+  createFromPixels(width: number, height: number, pixels: Uint8Array): void {
+    const gl = this.gl
+    this.handle = gl.createTexture()
+    if (this.handle === null) throw new Error(&#x27;createTexture failed&#x27;)
+
+    gl.bindTexture(gl.TEXTURE_2D, this.handle)
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels
+    )
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+    gl.bindTexture(gl.TEXTURE_2D, null)
+    // pixels 没有存下来：函数一返回，这个对象手里只剩 handle
+  }
+}</code></pre>
+    <p>卡片在你的浏览器里真的让 context 丢一次、再恢复：</p>
+    <div id="lab-v1"></div>
+
+    <h2 id="s4">4. 第 2 版：描述和 GPU 表示拆开（问题 1）</h2>
+    <h3 id="s4-1">4.1 拆成两半</h3>
+    <p>
+      第 1 版的毛病都来自一件事：「这张图是什么」和「它在某个 context 里的 GPU 副本」被放进了同一个对象。把它们拆开：CPU 这一半只描述、只留原料，不认识 gl；GPU 这一半每个 context 一个 Manager，手里一张表，key 是 CPU 对象，value 是这个 context 里的 handle。
+    </p>
+    <pre><code>// 第 2 版：拆成两半（课程写的）
+// CPU 这一半：只描述「是什么」，手里一直留着像素，不认识 gl
+class TextureV2 {
+  constructor(
+    readonly label: string, // 只给人看的名字，不当 key
+    readonly width: number,
+    readonly height: number,
+    readonly pixels: Uint8Array // 例：2 × 1 → [255,0,0,255, 0,0,255,255]
+  ) {}
+}
+
+// GPU 这一半：一个 context 一个 Manager，按 CPU 对象查「我这里的 handle」
+class TextureManagerV2 {
+  // key 是 CPU 对象本身；value 是这个 context 里的 handle
+  private readonly handles = new Map&lt;TextureV2, WebGLTexture&gt;()
+
+  constructor(private readonly gl: WebGLRenderingContext) {}
+
+  get(texture: TextureV2): WebGLTexture {
+    const cached = this.handles.get(texture)
+    if (cached !== undefined) return cached // 第二次起：0 条 GL 命令
+
+    const gl = this.gl
+    const handle = gl.createTexture()
+    if (handle === null) throw new Error(&#x27;createTexture failed: &#x27; + texture.label)
+
+    gl.bindTexture(gl.TEXTURE_2D, handle)
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA, texture.width, texture.height, 0,
+      gl.RGBA, gl.UNSIGNED_BYTE, texture.pixels // 像素从 CPU 对象里拿，随时能再拿一次
+    )
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+    gl.bindTexture(gl.TEXTURE_2D, null)
+
+    this.handles.set(texture, handle)
+    return handle
+  }
+}</code></pre>
+    <p>同样丢一次 context，再看两个 context 共用一张图：</p>
+    <div id="lab-v2"></div>
+    <p>
+      这就是第 4 课讲的「一份 CPU 资源，每个 context 一份 GPU 表示」，纹理只是又一个例子。好处都来自拆分：Manager 丢了，CPU 对象还在，原料还在；换一个 context，只是多一个 Manager、多一张表。
+    </p>
+
+    <h3 id="s4-2">4.2 真实代码里的对应</h3>
+    <ul>
+      <li><strong>CPU 这一半不放 handle。</strong>Texture 基类的注释（<a data-src="src/rendering/resources/Texture.ts:233">Texture.ts:233–244</a>）写明：它「不保存 WebGLTexture，也不执行 WebGL1 NPOT 验证」，WebGL1 和 WebGL2 的 Manager 可以为同一个 Texture 各建一份 GPU 表示。</li>
+      <li><strong>GPU 这一半是三张表。</strong><code>Map&lt;Texture2D, Entry&gt;</code>（<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:89">Texture2DManager.ts:89</a>）、<code>Map&lt;CubeTexture, Entry&gt;</code>（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:66">CubeTextureManager.ts:66</a>）、<code>Map&lt;RenderTarget, Entry&gt;</code>（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:57">RenderTargetManager.ts:57</a>）。Entry 比第 2 版多一个 <code>unsubscribe</code>：Manager 订阅了 CPU 对象的 dispose，CPU 对象释放时 Manager 删自己的 GPU 对象（第 15、16 课的同一套）。</li>
+      <li><strong>key 是对象身份，不是 label。</strong>label 只用于报错时让人认出是哪张图（<a data-src="src/rendering/resources/Texture.ts:73">Texture.ts:73–79</a>）。下面这张卡片用真实的 Texture2DManager 验证：</li>
+    </ul>
+    <div id="lab-identity"></div>
+    <p>拆开以后，每样东西归谁管，可以列成一张账本：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>东西</th><th>谁创建</th><th>谁释放</th><th>怎样知道该释放了</th></tr></thead>
+      <tbody>
+        <tr><td>CPU 纹理对象（Texture2D、CubeTexture）</td><td>加载代码，例如 createHW2Scene</td><td>Scene 的引用数归零，或调用者 dispose</td><td>Resource 的引用计数（第 5 课）</td></tr>
+        <tr><td>DataTexture2D 里的像素快照</td><td>构造时复制一份</td><td>DataTexture2D 自己（disposeCPUData 断开引用，<a data-src="src/rendering/resources/Texture2D.ts:151">Texture2D.ts:151–154</a>）</td><td>上面那个对象被 dispose</td></tr>
+        <tr><td>浏览器图片、ImageBitmap</td><td>加载代码</td><td>加载代码（ImageBitmap 由它 close）；纹理<strong>不</strong> close（<a data-src="src/rendering/resources/Texture2D.ts:94">Texture2D.ts:94–99</a>）</td><td>加载代码自己决定，要等到不再需要重传</td></tr>
+        <tr><td>WebGLTexture</td><td>Texture2DManager / CubeTextureManager 的 get</td><td>同一个 Manager 的 release 或 dispose</td><td>onDispose 通知；或这一代结束</td></tr>
+        <tr><td>FBO、颜色纹理、深度 renderbuffer</td><td>RenderTargetManager 的 get</td><td>同一个 Manager：release、dispose，或 revision 变了换新时删旧的</td><td>onDispose 通知；revision 比对</td></tr>
+        <tr><td>附件地址 <code>{ target, kind, index }</code></td><td>Material 复制一份（第 7 节）</td><td>没人管，垃圾回收</td><td>它不拥有任何东西</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3 id="s4-3">4.3 第 2 版还缺什么</h3>
+    <ol>
+      <li>TextureV2 直接存了调用者的数组。调用者事后改一个数，第 2 代重传的就不是原图了；图片对象又不能这样随便存。→ 第 5 节。</li>
+      <li>④⑤ 没有 <code>pixels</code> 可存。→ 第 6 节。</li>
+      <li>Material 要采样阴影贴图时，参数里写什么？→ 第 7 节。</li>
+      <li>它什么都不查：300 × 300 用 REPEAT 也照传，在 WebGL1 上悄悄采样出黑色。→ 第 8 节。</li>
+      <li>它直接 bindTexture，会弄乱别人的绑定，也受别人留下的上传设置影响（第 17 课 3.1、3.2 节）。→ 第 9 节，三个 Manager 共用的上传作用域。</li>
+    </ol>
+
+    <h2 id="s5">5. 像素从哪来，决定类怎么分（问题 2）</h2>
+    <p>先看现在的类层次。每个叶子类最重要的区别，是它手里的像素归不归它：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 292" role="img" aria-label="Resource 下面有 Texture 和 RenderTarget。Texture 是抽象类，保存五项描述，下面有 Texture2D 和 CubeTexture。Texture2D 也是抽象类，下面是借用图片的 ImageTexture2D 和复制数组的 DataTexture2D。CubeTexture 用 source.kind 区分借用六张图还是复制六个数组。RenderTarget 不继承 Texture，没有像素，GPU 画出来，换尺寸时 revision 加一。">
+          <rect x="290" y="10" width="180" height="40" class="box" />
+          <text x="380" y="28" text-anchor="middle">Resource</text>
+          <text x="380" y="43" text-anchor="middle" class="small">dispose、onDispose、引用计数</text>
+          <path d="M380 50 L235 80" class="line" />
+          <path d="M380 50 L615 80" class="line" />
+
+          <rect x="70" y="80" width="330" height="46" class="box" />
+          <text x="235" y="99" text-anchor="middle">Texture（抽象）</text>
+          <text x="235" y="116" text-anchor="middle" class="small">label、sampler、storage、colorSpace、mipmap</text>
+          <rect x="480" y="80" width="270" height="46" class="box hl" />
+          <text x="615" y="99" text-anchor="middle">RenderTarget</text>
+          <text x="615" y="116" text-anchor="middle" class="small accent">不继承 Texture（第 6 节）</text>
+
+          <path d="M235 126 L150 152" class="line" />
+          <path d="M235 126 L390 152" class="line" />
+          <rect x="20" y="152" width="260" height="46" class="box" />
+          <text x="150" y="171" text-anchor="middle">Texture2D（抽象）</text>
+          <text x="150" y="188" text-anchor="middle" class="small">只是分类，没有来源</text>
+          <rect x="300" y="152" width="180" height="46" class="box" />
+          <text x="390" y="171" text-anchor="middle">CubeTexture</text>
+          <text x="390" y="188" text-anchor="middle" class="small">source.kind 二选一</text>
+          <path d="M615 126 L615 152" class="line" />
+          <rect x="500" y="152" width="230" height="46" class="box" />
+          <text x="615" y="171" text-anchor="middle">像素：一个都没有</text>
+          <text x="615" y="188" text-anchor="middle" class="small">GPU 画；换尺寸 revision + 1</text>
+
+          <path d="M150 198 L82 224" class="line" />
+          <path d="M150 198 L217 224" class="line" />
+          <rect x="20" y="224" width="125" height="52" class="box" />
+          <text x="82" y="244" text-anchor="middle">ImageTexture2D</text>
+          <text x="82" y="262" text-anchor="middle" class="small">借用一张图</text>
+          <rect x="155" y="224" width="125" height="52" class="box" />
+          <text x="217" y="244" text-anchor="middle">DataTexture2D</text>
+          <text x="217" y="262" text-anchor="middle" class="small">复制一个数组</text>
+          <path d="M390 198 L390 224" class="line" />
+          <rect x="300" y="224" width="180" height="52" class="box" />
+          <text x="390" y="244" text-anchor="middle" class="small">images：借用六张图</text>
+          <text x="390" y="262" text-anchor="middle" class="small">data：复制六个数组</text>
+        </svg>
+      </div>
+      <figcaption>图 2　类层次和像素归属。「借用」= 只存引用，不复制、不关闭；「复制」= 构造时拷一份自己的，读取时再拷一份给调用者。二维用两个子类区分来源，cubemap 用一个类加 kind 区分（5.3 节）。</figcaption>
+    </figure>
+
+    <h3 id="s5-1">5.1 图片：借用，不复制</h3>
+    <p>
+      为什么不复制图片？HTMLImageElement 没有通用的深拷贝；ImageBitmap 可以画到 canvas 上再取出来，但 Mary 那张就要再占 8 MiB，而且创建者可能想在合适的时候 close 它。所以 ImageTexture2D 只存引用，dispose 时只断开引用、不调用 close（<a data-src="src/rendering/resources/Texture2D.ts:55">Texture2D.ts:55–100</a>）。
+    </p>
+    <p>借用带来两个后果。第一个：构造时只能查「是个对象」，图片加载完没有、真实尺寸多大，要等上传那一刻才查。这件事在 Texture2DManager 的 readSource 里：</p>
+    <pre><code>// WebGL1Texture2DManager.ts:51–73（注释是课程加的）
+function readSource(texture: Texture2D): UploadSource {
+  // 数组来源：拿一份副本（DataTexture2D 不把内部数组交出去）
+  if (texture instanceof DataTexture2D) {
+    return { kind: &#x27;data&#x27;, ...texture.copySource() }
+  }
+  // Texture2D 是抽象类，谁都能再派生一个子类；这里只认识两种，
+  // 第三种明确拒绝，而不是走进下面的图片分支出怪错误
+  if (!(texture instanceof ImageTexture2D)) {
+    throw new UnsupportedRenderFeatureError(
+      &#x27;texture2D &#x27; + texture.label,
+      &#x27;unknown source class&#x27;
+    )
+  }
+
+  const image = texture.source
+  // 图片来源：构造时只检查过「是个对象」，加载状态、尺寸到上传这一刻才查
+  if (typeof HTMLImageElement !== &#x27;undefined&#x27; &amp;&amp; image instanceof HTMLImageElement) {
+    if (!image.complete) {
+      throw new InvalidTextureSourceError(
+        texture.label,
+        &#x27;image has not finished loading&#x27;
+      )
+    }
+    // 用像素尺寸 naturalWidth，不用 CSS 显示尺寸 width
+    return {
+      kind: &#x27;image&#x27;,
+      image,
+      width: image.naturalWidth,
+      height: image.naturalHeight
+    }
+  }
+  if (typeof ImageBitmap !== &#x27;undefined&#x27; &amp;&amp; image instanceof ImageBitmap) {
+    return { kind: &#x27;image&#x27;, image, width: image.width, height: image.height }
+  }
+  throw new InvalidTextureSourceError(
+    texture.label,
+    &#x27;expected HTMLImageElement or ImageBitmap in this realm&#x27;
+  )
+}</code></pre>
+    <p>三种「不能用的图」，看它们分别在哪一步被拦下：</p>
+    <div id="lab-image"></div>
+    <p>
+      第二个后果：借用是一份约定。纹理不关闭图片，那创建者就不能早早把它关掉：context 恢复以后，新一代的 Manager 要从同一个图片对象重新上传（第 10 节）。上面第三行就是违约的样子：ImageBitmap 被创建者 close 以后宽高变成 0，重新上传会被拒绝。约定写在注释里（Texture2D.ts:61–63），代码没法强制。
+    </p>
+
+    <h3 id="s5-2">5.2 数组：复制进来，复制出去</h3>
+    <p>
+      CPU 数组为什么要复制？TypeScript 的 <code>readonly data</code> 只禁止给 <code>data</code> 这个属性重新赋值，不禁止改数组里的元素；<code>Object.freeze</code> 也冻不住 TypedArray（Node 实测：<code>Object.freeze(new Uint8Array(4))</code> 抛 <code>TypeError: Cannot freeze array buffer views with elements</code>）。唯一可靠的办法是拿一份别人碰不到的：
+    </p>
+    <ul>
+      <li>构造时，createTexturePixelSnapshot2D 先查长度，再复制（<a data-src="src/rendering/resources/texturePixelSnapshot.ts:116">texturePixelSnapshot.ts:116–132</a>）。长度 = 宽 × 高 × 通道数：2 × 1 的 rgba 要恰好 8 个数。</li>
+      <li>读取时，copySource 再复制一份交出去（<a data-src="src/rendering/resources/Texture2D.ts:145">Texture2D.ts:145–149</a>），内部那份永远不外泄。</li>
+      <li>Texture2DManager 上传时调用的就是 copySource（readSource 第一个分支）。</li>
+    </ul>
+    <div id="lab-copy"></div>
+    <p>代价是内存。一个纹理占多少字节：</p>
+    <pre><code>字节数 = 宽 × 高 × 通道数 × 每个数的字节数
+// uint8 每个数 1 字节，float32 每个数 4 字节
+// 1024 × 1024 的 rgba float32（HDR 环境图常见尺寸）：
+//   1024 × 1024 × 4 × 4 = 16,777,216 字节 = 16 MiB</code></pre>
+    <p>
+      这张图从解码到上传，CPU 上最多同时有三份：调用者自己的那份（如果它还留着）16 MiB、DataTexture2D 的快照 16 MiB、上传时 copySource 的临时副本 16 MiB，峰值 48 MiB。上传结束后临时副本就成了垃圾。这是「内部数组绝不外泄」的价格，12.2 节的想一想会问能不能便宜一点。
+    </p>
+
+    <h3 id="s5-3">5.3 二维用子类，cubemap 用 kind：两种分法</h3>
+    <p>同样是「图片还是数组」两种来源，二维和 cubemap 用了不同的分法：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th></th><th>Texture2D</th><th>CubeTexture</th></tr></thead>
+      <tbody>
+        <tr><td>怎样区分来源</td><td>两个子类：ImageTexture2D、DataTexture2D</td><td>一个类，<code>source.kind</code> 是 <code>'images'</code> 或 <code>'data'</code></td></tr>
+        <tr><td>两种来源的公开接口</td><td>不同：Data 有 width、height、copySource；Image 只有 source（尺寸要上传时问图片）</td><td>相同：sourceKind、copySource（返回带 kind 的联合）</td></tr>
+        <tr><td>Manager 怎样分支</td><td><code>instanceof</code>，第三种子类要在运行时拒绝（readSource 的 <code>'unknown source class'</code>）</td><td><code>switch (kind)</code>，漏了分支编译器会报（<a data-src="src/rendering/resources/CubeTexture.ts:330">CubeTexture.ts:330–331</a> 的 assertNever）</td></tr>
+        <tr><td>加第三种来源（比如视频）</td><td>新写一个子类就能构造出来；但每个 Manager 都要记得加分支，否则运行时才报错</td><td>改联合类型；所有没处理新 kind 的 switch 编译不过</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      这是「开放的类层次」和「封闭的联合类型」的取舍。二维这边接口确实不同（Data 能直接报宽高，Image 不能），用子类让类型更准；代价是 Texture2D 是抽象类、构造函数是 protected，任何人都能再派生一个，Manager 只好在运行时把不认识的拒掉（你的测试「明确拒绝未知 Texture2D 子类」就是测这个）。cubemap 两种来源接口一样，用一个类加 kind 更省事，而且编译器能检查分支是否写全。两种都说得通，但同一个模块里用了两种分法，第 12 节会请你想一想要不要统一。
+    </p>
+
+    <h2 id="s6">6. GPU 画的图不是 Texture（问题 3）</h2>
+    <h3 id="s6-1">6.1 为什么不继承 Texture</h3>
+    <p>
+      最省事的做法是让阴影贴图也当一个 Texture2D：Material 收 Texture2D 就够了。但对照一下两边的性质，几乎每一行都不一样：
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th></th><th>Texture 一族</th><th>RenderTarget</th></tr></thead>
+      <tbody>
+        <tr><td>像素从哪来</td><td>CPU：图片或数组</td><td>GPU 的生产 pass（例如阴影 pass）</td></tr>
+        <tr><td>context 丢了以后</td><td>新 Manager 用 CPU 原料重传</td><td>新存储是空的，要由拥有它的 pass 重画（<a data-src="src/rendering/resources/RenderTarget.ts:399">RenderTarget.ts:399–409</a>）</td></tr>
+        <tr><td>会不会变</td><td>不变：要换图就新建一个 Texture</td><td>会换尺寸：<code>resize</code> 让 revision 加一</td></tr>
+        <tr><td>采样设置</td><td>wrapS、wrapT、min、mag 全套，加 mipmap 策略</td><td>只有 min、mag；固定 clamp-to-edge、没有 mipmap（<a data-src="src/rendering/resources/RenderTarget.ts:30">RenderTarget.ts:30–46</a>）</td></tr>
+        <tr><td>GPU 表示</td><td>一个 WebGLTexture</td><td>一个 FBO + 每个颜色槽一个纹理 + 可选的深度 renderbuffer</td></tr>
+        <tr><td>Manager 的缓存</td><td>对象身份</td><td>对象身份，再比 revision</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      如果硬把它当 Texture2D，Texture2DManager 会去找它的像素上传（找不到），丢了 context 会以为能重传（不能），resize 以后缓存也不会失效（静态纹理没有 revision）。每一处都要加「如果是 GPU 画的就……」的特判。所以 RenderTarget 直接继承 Resource：用同一套 dispose 和引用计数，其余自成一类。
+    </p>
+
+    <h3 id="s6-2">6.2 revision：会变的东西怎样缓存</h3>
+    <p>
+      第 12 课讲过 resize 的规则：尺寸真的变了才提交，revision 只增不减。RenderTargetManager 用它判断缓存是否过期。和静态纹理比，get 只多了「比 revision」和「换新」两件事：
+    </p>
+    <pre><code>// WebGL1RenderTargetManager.ts:72–124（节选；注释是课程加的；工作区版本）
+get(target: RenderTarget): WebGL1RenderTargetResource {
+  this.assertReady()
+  target.assertUsable()
+
+  // 和静态纹理的唯一区别在这一行：缓存要「同一个对象」而且「同一个 revision」才算命中
+  const old = this.entries.get(target)
+  const revision = target.revision
+  if (old?.resource.revision === revision) return old.resource
+
+  // …（省略：拼诊断用的 label，:80–86）
+  let next: WebGL1RenderTargetResource | undefined
+
+  try {
+    assertTextureOperation(this.gl, &#x27;begin render target creation&#x27;, label)
+
+    // 正绑着旧 FBO 时不能重建：画到一半的输出目标不能被删掉
+    if (
+      old !== undefined &amp;&amp;
+      this.gl.getParameter(this.gl.FRAMEBUFFER_BINDING) === old.resource.framebuffer
+    ) {
+      throw new RenderTargetUnavailableError(
+        label,
+        &#x27;cannot rebuild the currently bound framebuffer; leave its surface scope first&#x27;
+      )
+    }
+
+    // 先建新的（全部成功才有 next），再替换缓存里的条目；订阅只建一次
+    this.validate(target.descriptor)
+    next = this.create(target.descriptor, revision, label)
+    assertTextureOperation(this.gl, &#x27;finish render target creation&#x27;, label)
+
+    target.assertUsable()
+
+    const unsubscribe = old?.unsubscribe ?? target.onDispose(() =&gt; this.release(target))
+    this.entries.set(target, { resource: next, unsubscribe })
+  } catch (error: unknown) {
+    if (this.lost || this.gl.isContextLost()) {
+      this.invalidateForContextLoss()
+      throw new WebGLContextLostError(&#x27;create render target&#x27;)
+    }
+    // 新的建失败：删掉新的半成品；旧的原封不动，还在缓存里
+    if (next !== undefined) this.deleteResource(next)
+    throw error
+  } finally {
+    this.hooks.invalidateState()
+  }
+
+  // 新的已经发布，最后才删旧的
+  if (old !== undefined) this.deleteResource(old.resource)
+  this.hooks.invalidateState()
+  return next
+}</code></pre>
+    <p>
+      顺序是「先建新的、发布新的、最后删旧的」。为什么不先删旧的？因为新的可能建失败（显存不够、FBO 不完整）。先删再建，失败时新旧都没了；先建再删，失败时旧的原封不动还在缓存里，调用者拿到一个错误，但没有拿到半成品。FBO 组装的细节留到第 27 课。
+    </p>
+    <div id="lab-rt"></div>
+
+    <h2 id="s7">7. Material 记地址，不记 handle（问题 4）</h2>
+    <h3 id="s7-1">7.1 四个候选</h3>
+    <p>主 pass 的材质要采样阴影贴图，<code>parameters.uShadowMap</code> 的值应该是什么？</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>候选</th><th>问题</th></tr></thead>
+      <tbody>
+        <tr><td>(a) WebGLTexture（旧引擎的做法）</td><td>Material 在 CPU 这一层，不该认识某个 context 的 handle；resize、context 恢复以后它就是死的，只能像旧引擎那样每帧重新推</td></tr>
+        <tr><td>(b) RenderTarget 本身</td><td>说不清是哪一张：GBuffer 有好几个颜色槽，还可能有深度</td></tr>
+        <tr><td>(c) 把附件包成一个 Texture2D 子类</td><td>6.1 节的每一行问题都会回来：它没有 CPU 像素，却要冒充有</td></tr>
+        <tr><td>(d) 地址 <code>{ target, kind, index }</code></td><td>「哪个目标的第几个颜色槽（或深度）」。不含 handle，不含 revision；draw 时再按目标当前的 revision 解析成 handle</td></tr>
+      </tbody>
+    </table></div>
+    <p>(a) 和 (d) 在 resize 前后的差别：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 256" role="img" aria-label="左边旧引擎：材质拿着 handle T0，阴影贴图换尺寸时 FBO 重建，T0 被删、换成 T1，还拿着 T0 的人会采到已删除的纹理，所以只能每帧重新推。右边现在：材质一直拿着地址 shadow 的 color 0，resize 让 revision 从 0 变 1，地址不变；draw 时 Manager 按 revision 1 解析出 T1，先建 T1 再删 T0。">
+          <defs>
+            <marker id="f3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+          </defs>
+          <text x="20" y="20" class="title">旧引擎：材质拿 handle</text>
+          <text x="400" y="20" class="title">现在：材质拿地址</text>
+          <rect x="20" y="34" width="340" height="50" class="box" />
+          <text x="190" y="55" text-anchor="middle">uShadowMap = T0</text>
+          <text x="190" y="72" text-anchor="middle" class="small">第 1 帧，阴影 pass 推进来</text>
+          <path d="M190 84 L190 108" class="line" marker-end="url(#f3a)" />
+          <rect x="20" y="110" width="340" height="50" class="box" />
+          <text x="190" y="131" text-anchor="middle">阴影分辨率 2048 → 4096</text>
+          <text x="190" y="148" text-anchor="middle" class="small">FBO 重建：删 T0，建 T1</text>
+          <path d="M190 160 L190 184" class="line" marker-end="url(#f3a)" />
+          <rect x="20" y="186" width="340" height="50" class="box bad" />
+          <text x="190" y="207" text-anchor="middle" class="bad">谁还拿着 T0，就采到删掉的纹理</text>
+          <text x="190" y="224" text-anchor="middle" class="small">所以只能每帧重新取、重新推</text>
+
+          <path d="M380 30 L380 240" class="line dash" />
+
+          <rect x="400" y="34" width="340" height="50" class="box hl" />
+          <text x="570" y="55" text-anchor="middle">uShadowMap = { shadow, 'color', 0 }</text>
+          <text x="570" y="72" text-anchor="middle" class="small">建材质时写一次，以后不用动</text>
+          <path d="M570 84 L570 108" class="line" marker-end="url(#f3a)" />
+          <rect x="400" y="110" width="340" height="50" class="box" />
+          <text x="570" y="131" text-anchor="middle">shadow.resize(4096, 4096)</text>
+          <text x="570" y="148" text-anchor="middle" class="small">revision 0 → 1；地址一个字都没变</text>
+          <path d="M570 160 L570 184" class="line" marker-end="url(#f3a)" />
+          <rect x="400" y="186" width="340" height="50" class="box ok" />
+          <text x="570" y="207" text-anchor="middle" class="ok">draw 时解析：revision 1 → T1</text>
+          <text x="570" y="224" text-anchor="middle" class="small">Manager 先建 T1，再删 T0</text>
+        </svg>
+      </div>
+      <figcaption>图 3　同一次 resize，两种参数值。左边的 handle 是「某一刻的结果」，会过期；右边的地址是「去哪里找」，不会过期，每次 draw 由 RenderTargetManager 按当前 revision 找到当前的 handle。</figcaption>
+    </figure>
+
+    <h3 id="s7-2">7.2 copyTexture2DSamplingSource：Material 这一侧</h3>
+    <p>Material 的 <code>texture2D</code> 参数现在收两种值（<a data-src="src/rendering/resources/materialParameters.ts:50">materialParameters.ts:50</a>），写入时都经过这个函数：</p>
+    <pre><code>// Texture2DSamplingSource.ts:16、:40–95（注释是课程加的；工作区版本，还没提交）
+export type Texture2DSamplingSource = Texture2D | RenderTargetAttachmentRef
+
+export function copyTexture2DSamplingSource(
+  value: unknown, // 可能来自 JavaScript，不信 TypeScript 类型
+  fieldName: string // 诊断路径，例：&#x27;parameters.uShadowMap&#x27;
+): Texture2DSamplingSource {
+  // 情况 1：CPU 纹理。原样返回同一个对象（身份就是 Manager 的缓存 key）
+  if (value instanceof Texture2D) {
+    value.assertUsable()
+    return value
+  }
+
+  // 情况 2：附件地址。先确认是个对象，再逐个字段查
+  assertNonArrayObject(
+    value,
+    () =&gt;
+      new InvalidMaterialError(
+        fieldName,
+        &#x27;must reference a Texture2D or a RenderTarget attachment&#x27;
+      )
+  )
+
+  const input = value as Readonly&lt;Record&lt;string, unknown&gt;&gt;
+  const target = input.target
+  const kind = input.kind
+  const index = input.index
+
+  // target 必须是活着的 RenderTarget；WebGLTexture、普通对象都不行
+  if (!(target instanceof RenderTarget))
+    throw new InvalidMaterialError(
+      fieldName + &#x27;.target&#x27;,
+      &#x27;must reference a RenderTarget&#x27;
+    )
+
+  target.assertUsable()
+
+  if (kind !== &#x27;color&#x27; &amp;&amp; kind !== &#x27;depth&#x27;)
+    throw new InvalidMaterialError(fieldName + &#x27;.kind&#x27;, &#x27;must be color or depth&#x27;, {
+      received: kind
+    })
+
+  if (typeof index !== &#x27;number&#x27; || !Number.isSafeInteger(index) || index &lt; 0)
+    throw new InvalidMaterialError(
+      fieldName + &#x27;.index&#x27;,
+      &#x27;must be a non-negative safe integer&#x27;,
+      { received: index }
+    )
+
+  // 槽位要真的存在：一个颜色槽的目标，index 只能是 0
+  const descriptor = target.descriptor
+  if (kind === &#x27;color&#x27; &amp;&amp; index &gt;= descriptor.colors.length)
+    throw new InvalidMaterialError(
+      fieldName + &#x27;.index&#x27;,
+      &#x27;must name an existing color slot&#x27;,
+      {
+        received: index,
+        colorCount: descriptor.colors.length,
+        targetLabel: target.label
+      }
+    )
+
+  // depth 只有 0 号，而且目标得配了 depth。注意：这里只证明「地址存在」，
+  // 能不能采样（WebGL1 的 depth16 是 renderbuffer，不能）由 Backend 判断
+  if (kind === &#x27;depth&#x27; &amp;&amp; (index !== 0 || descriptor.depth === undefined))
+    throw new InvalidMaterialError(
+      fieldName + &#x27;.index&#x27;,
+      &#x27;must name an existing depth[0]&#x27;,
+      { received: index, targetLabel: target.label }
+    )
+
+  // 新建一个三字段包装并冻结：调用者之后改自己的对象，影响不到 Material。
+  // target 还是原来那个 RenderTarget（不复制目标），也不记 revision
+  return Object.freeze({
+    target,
+    kind,
+    index
+  })
+}</code></pre>
+    <aside class="note"><strong>10 月 19 日更新</strong>：新的参数块 ParameterBlock 也要用这套规则，所以函数多了第三个参数 <code>createError</code>（错误工厂）：上面每处 <code>new InvalidMaterialError(…)</code> 现在写成 <code>createError(…)</code>，不传时默认仍造 InvalidMaterialError（<a data-src="src/rendering/resources/Texture2DSamplingSource.ts:19">Texture2DSamplingSource.ts:19–28</a>）。规则一条没变；行号变了，类型在 :17，函数在 <a data-src="src/rendering/resources/Texture2DSamplingSource.ts:53">:53–107</a>。</aside>
+    <p>三个决定，各有理由：</p>
+    <ul>
+      <li><strong>Texture2D 原样返回。</strong>它的身份就是 Manager 的缓存 key，复制一个就成了另一张图。</li>
+      <li><strong>地址复制一份再冻结。</strong>调用者手里的 <code>{ target, kind, index }</code> 是个普通对象，事后改了 index，不能影响已经写进 Material 的那份。</li>
+      <li><strong>target 不复制，revision 不记。</strong>地址要跟着目标走：resize 以后同一个地址解析出新 handle。记了 revision 反而会让地址「过期」。</li>
+    </ul>
+    <div id="lab-source"></div>
+
+    <h3 id="s7-3">7.3 Backend 这一侧：再查一遍，再决定能不能采样</h3>
+    <pre><code>// WebGL1RenderTargetManager.ts:154–164（注释是课程加的；工作区版本）
+resolveSampledColor(ref: RenderTargetAttachmentRef): WebGLTexture {
+  this.assertReady()
+  // 再查一遍地址：Material 查过，但 TypeScript 接口不是可信凭证，
+  // 调用者可能绕过 Material 直接传进来（RenderTarget.ts:129）
+  const address = this.validateAttachment(ref)
+  // 先拒绝不能采样的，再 get：免得为一个注定失败的请求分配 FBO
+  if (address.kind === &#x27;depth&#x27;) {
+    throw new UnsupportedRenderFeatureError(
+      &#x27;sample depth attachment &#x27; + address.target.label,
+      &#x27;depth16 is a renderbuffer, not a sampleable texture&#x27;
+    )
+  }
+  // get 按当前 revision 返回；resize 过就是新建的那一份
+  return this.get(address.target).colorTextures[address.index]!
+}</code></pre>
+    <p>
+      为什么 Material 查过了，这里还查？地址的类型是一个 TypeScript 接口，任何人都能手写一个对象传进来，不一定经过 Material（<a data-src="src/rendering/resources/RenderTarget.ts:129">RenderTarget.ts:129</a>：「TypeScript 接口不是可信凭证」）。另外，两边查的不是同一件事：Material 证明「地址存在」，Backend 判断「这台设备上能不能采样」。depth16 在本项目的 WebGL1 实现里是 renderbuffer，不是纹理，shader 采样不了；换一个后端（或用上 WEBGL_depth_texture）就可能可以，所以这条不写进 CPU 资源。
+    </p>
+
+    <h2 id="s8">8. 检查放在哪一层、哪个时刻（问题 5）</h2>
+    <h3 id="s8-1">8.1 三个问题</h3>
+    <p>10 月 10 日答疑 GeometryManager.get 的时候讲过「要查的东西从哪来」（GL 调用的前提、下游的假设、生命周期……）。纹理这一族多了一个维度：同一条规则可以放在不同的层、不同的时刻。判断时问三个问题：</p>
+    <ol>
+      <li><strong>换一个后端，这条规则还成立吗？</strong>成立（比如「mipmap 过滤要有 mipmap」，任何 API 都一样），放进 CPU 资源；只在 WebGL1 成立（比如 NPOT），放进 WebGL1 的 Manager。</li>
+      <li><strong>查它要的信息，什么时候才有？</strong>数组长度构造时就有；图片加载完没有、设备上限，要到上传时才知道；「这次 draw 的输出目标是谁」只有 draw 时才知道。</li>
+      <li><strong>最早能查的时刻是哪个？</strong>就在那里查，而且要在任何副作用（createTexture、上传）之前。</li>
+    </ol>
+
+    <h3 id="s8-2">8.2 三个时刻</h3>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 196" role="img" aria-label="三个检查时刻。第一，构造 CPU 资源时，没有 gl：label、枚举值、mipmap 过滤要配 generate、数组长度、cube 数据六面同尺寸、附件地址存在。第二，Manager 第一次 get、上传之前，有 gl：图片加载完和真实尺寸、设备尺寸上限、NPOT、r/rg、float 与 sRGB 扩展、深度附件不能被 shader 读（depth16 存在 renderbuffer 里）。第三，每次 draw：纹理单元够不够、不能采样正在写的附件。">
+          <defs>
+            <marker id="f4a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+          </defs>
+          <rect x="20" y="14" width="220" height="168" class="box" />
+          <text x="130" y="36" text-anchor="middle">① 构造 CPU 资源</text>
+          <text x="130" y="54" text-anchor="middle" class="small">没有 gl，Node 里也能跑</text>
+          <text x="34" y="80" class="small">· label、枚举值</text>
+          <text x="34" y="98" class="small">· mipmap 过滤要配 generate</text>
+          <text x="34" y="116" class="small">· 数组长度 = 宽×高×通道</text>
+          <text x="34" y="134" class="small">· cube 数据：六面同尺寸</text>
+          <text x="34" y="152" class="small">· 附件地址存在</text>
+          <path d="M240 98 L268 98" class="line" marker-end="url(#f4a)" />
+          <rect x="270" y="14" width="220" height="168" class="box" />
+          <text x="380" y="36" text-anchor="middle">② 第一次 get，上传前</text>
+          <text x="380" y="54" text-anchor="middle" class="small">有 gl；图片该加载完了</text>
+          <text x="284" y="80" class="small">· 图片加载完、真实尺寸</text>
+          <text x="284" y="98" class="small">· 设备尺寸上限</text>
+          <text x="284" y="116" class="small">· NPOT、r/rg</text>
+          <text x="284" y="134" class="small">· float、sRGB 要扩展</text>
+          <text x="284" y="152" class="small">· 深度附件不能被 shader 读</text>
+          <path d="M490 98 L518 98" class="line" marker-end="url(#f4a)" />
+          <rect x="520" y="14" width="220" height="168" class="box" />
+          <text x="630" y="36" text-anchor="middle">③ 每次 draw</text>
+          <text x="630" y="54" text-anchor="middle" class="small">知道这次画到哪、用几个单元</text>
+          <text x="534" y="80" class="small">· 纹理单元够不够</text>
+          <text x="534" y="98" class="small">· 不能采样正在写的附件</text>
+          <text x="534" y="116" class="small accent">（这一条还没实现）</text>
+        </svg>
+      </div>
+      <figcaption>图 4　三个检查时刻。越靠左越早、越便宜；一条规则能在哪个时刻查，就在哪个时刻查。② 里的检查全部在 createTexture 之前，所以被拒的请求不会留下 GPU 对象。</figcaption>
+    </figure>
+
+    <h3 id="s8-3">8.3 总表</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>检查</th><th>时刻</th><th>在哪</th><th>为什么在这里</th></tr></thead>
+      <tbody>
+        <tr><td>label 非空、枚举值合法</td><td>①</td><td><a data-src="src/rendering/resources/Texture.ts:144">Texture.ts:144–206</a></td><td>和后端无关，构造时就有</td></tr>
+        <tr><td>mipmap 过滤器要配 <code>'generate'</code></td><td>①</td><td><a data-src="src/rendering/resources/Texture.ts:208">Texture.ts:208–210</a></td><td>任何 API 里，没有 mipmap 却用 mipmap 过滤都是错的</td></tr>
+        <tr><td>数组长度 = 宽 × 高 × 通道数，类型对得上</td><td>①</td><td><a data-src="src/rendering/resources/texturePixelSnapshot.ts:91">texturePixelSnapshot.ts:91–126</a></td><td>数组构造时就在手里</td></tr>
+        <tr><td>cube 数据：六面正方形、同尺寸</td><td>①</td><td><a data-src="src/rendering/resources/CubeTexture.ts:207">CubeTexture.ts:207–210</a></td><td>cubemap 的定义，和后端无关</td></tr>
+        <tr><td>cube 图片：六面正方形、同尺寸</td><td>②</td><td><a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:106">CubeTextureManager.ts:106–109</a></td><td>同一条规则（同一个函数），但图片尺寸要上传时才可靠</td></tr>
+        <tr><td>图片加载完、尺寸是正整数</td><td>②</td><td>Texture2DManager.ts:51–73、:183–194</td><td>借用的图片构造后还可能变（5.1 节）</td></tr>
+        <tr><td>附件地址：target 活着、槽位存在</td><td>①，② 再查</td><td><a data-src="src/rendering/resources/Texture2DSamplingSource.ts:53">Texture2DSamplingSource.ts:53–107</a>；<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:167">RenderTargetManager.ts:167–188</a></td><td>接口不是可信凭证（7.3 节）</td></tr>
+        <tr><td>尺寸不超过设备上限</td><td>②</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:195">Texture2DManager.ts:195–196</a></td><td>要问 gl</td></tr>
+        <tr><td>NPOT 只能 clamp、不能 mipmap</td><td>②</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:198">Texture2DManager.ts:198–207</a></td><td>只有 WebGL1 有这条；WebGL2 没有</td></tr>
+        <tr><td>r、rg 不支持</td><td>②</td><td>Texture2DManager.ts:209–212</td><td>WebGL1 没有一通道、两通道格式；LUMINANCE 会把值抄到 r、g、b，语义不同</td></tr>
+        <tr><td>float32 要扩展，线性过滤要另一个扩展</td><td>②</td><td>Texture2DManager.ts:213–224</td><td>扩展是这台设备、这个 context 的事</td></tr>
+        <tr><td>sRGB 要 EXT_sRGB，没有就报错</td><td>②</td><td>Texture2DManager.ts:225–232</td><td>同上；不悄悄当成线性存</td></tr>
+        <tr><td>深度附件（depth16，存在 renderbuffer 里）不能被 shader 读</td><td>②</td><td>RenderTargetManager.ts:157–162</td><td>本项目 WebGL1 的深度附件是 renderbuffer，只给深度测试用；sampler 只能绑纹理。注意它和「depth16 不能当颜色格式」是两回事，后者在 ① 就被 RenderTarget 拦下</td></tr>
+        <tr><td>纹理单元够不够</td><td>③</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:134">WebGL1Uniforms.ts:134–143</a></td><td>要看这次 draw 的 program 有几个 sampler</td></tr>
+        <tr><td>不能采样正在写的附件</td><td>③</td><td>10 月 11 日还没有（当时 Material.ts 的 TODO）；现在由 SurfaceScope.assertCanSample 检查（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:299">WebGL1Backend.ts:299</a>；<a data-src="src/rendering/resources/materialParameters.ts:35">materialParameters.ts:35</a> 的注释也写明了）</td><td>只有 draw 时才知道这次画到哪个目标</td></tr>
+      </tbody>
+    </table></div>
+    <p>前三个时刻的效果，用真实代码跑一遍：</p>
+    <div id="lab-layers"></div>
+
+    <h3 id="s8-4">8.4 只有 draw 时才能查的：采样正在写的附件</h3>
+    <p>
+      阴影 pass 往 shadow 的颜色槽里画；如果这个 pass 的材质也采样 shadow 的颜色槽，就是「边写边读」。OpenGL ES 2.0 说结果未定义；WebGL 规范（Feedback Loops Between Textures and the Framebuffer 一节）改成：这种 draw 产生 INVALID_OPERATION，不执行。下面用原生 GL 看一次：
+    </p>
+    <div id="lab-feedback"></div>
+    <p>
+      WebGL 已经拒绝了，为什么引擎还要自己查？因为它只留下一个错误码：这次 draw 悄悄没画，除非有人马上问 getError。而 getError 不适合每次 draw 都问：在浏览器里它是一次同步调用，要等 GPU 那边把排在前面的命令处理完才能回答，MDN 的 <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices#avoid_blocking_api_calls_in_production">WebGL best practices</a> 把它列为生产环境里要避免的阻塞调用（第 16 课数过：没有 VAO 时，真实代码每次 draw 已经要问两次）。引擎在 CPU 上手里有答案：「这次 draw 的输出目标」和「这个地址指向的目标」是不是同一个对象。比一次对象身份几乎不花钱，还能报出「shadow/main 的 color 0 正在被写」这样能看懂的错误。这一条要在接 sampler2D 时一起做（resolveSampledColor 的注释 :151 也写了「调用者须先由 SurfaceScope 检查当前输出目标」）。
+    </p>
+
+    <h2 id="s9">9. 三个 Manager 共用什么（问题 6）</h2>
+    <h3 id="s9-1">9.1 一个函数模块，不是一个基类</h3>
+    <p>WebGL1TextureUploadSupport.ts 只有四样东西，三个 Manager 都在用：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>导出</th><th>做什么</th><th>2D</th><th>Cube</th><th>RT</th></tr></thead>
+      <tbody>
+        <tr><td><code>WebGL1TextureManagerHooks</code></td><td>invalidateState 回调的类型：Manager 直接动了 GL，通知 State 丢掉缓存</td><td>✓</td><td>✓</td><td>✓</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:21"><code>assertTextureOperation</code></a></td><td>问 isContextLost 和 getError，有错就抛；入口也调一次，清掉前人留下的错误码</td><td>✓</td><td>✓</td><td>✓</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:35"><code>requireTextureLimit</code></a></td><td>查设备上限，不是正整数就报错</td><td>✓</td><td>✓</td><td>✓</td></tr>
+        <tr><td><a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:62"><code>withTextureUploadState</code></a></td><td>上传作用域：记下当前单元的绑定和四个上传设置，设成固定值，结束后还回（第 17 课 3.5 节）</td><td>✓</td><td>✓</td><td>✓（还原颜色纹理那一格）</td></tr>
+      </tbody>
+    </table></div>
+    <p>看你的 Texture2DManager.get 怎样把它们组合起来。①～⑥ 和第 17 课的 cubemap get 是同一个骨架，只是上传一面而不是六面：</p>
+    <pre><code>// WebGL1Texture2DManager.ts:104–168（注释是课程加的；你正在写的工作区版本）
+get(texture: Texture2D): WebGL1Texture2DResource {
+  // ① 两道门：Manager 自己还能用吗（没关、没丢 context）；CPU 纹理还活着吗
+  this.assertReady()
+  texture.assertUsable()
+  // ② 按对象身份查缓存。同 label 的两个对象是两个 key
+  const cached = this.entries.get(texture)
+  if (cached !== undefined) return cached.resource
+
+  const gl = this.gl
+  let handle: WebGLTexture | null = null
+  try {
+    // ③ 先查完，再动手：清掉前人留下的错误码 → 读来源 → 设备能不能做
+    assertTextureOperation(gl, &#x27;begin texture2D upload&#x27;, texture.label)
+    const source = readSource(texture)
+    const format = this.validateStorage(texture, source)
+    const type = texture.storage.type === &#x27;float32&#x27; ? gl.FLOAT : gl.UNSIGNED_BYTE
+
+    // ④ 上传作用域：进来记下别人的绑定和四个上传设置，出去原样还回
+    withTextureUploadState(gl, gl.TEXTURE_2D, () =&gt; {
+      handle = requireNonNull(
+        gl.createTexture(),
+        () =&gt; new WebGLResourceCreationError(&#x27;texture2D&#x27;, texture.label)
+      )
+      gl.bindTexture(gl.TEXTURE_2D, handle)
+      // texImage2D 的两种重载：数组要自己给宽高；图片由浏览器给
+      if (source.kind === &#x27;data&#x27;) {
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          format,
+          source.width,
+          source.height,
+          0,
+          format,
+          type,
+          source.data
+        )
+      } else {
+        gl.texImage2D(gl.TEXTURE_2D, 0, format, format, type, source.image)
+      }
+      assertTextureOperation(gl, &#x27;upload texture2D pixels&#x27;, texture.label)
+      this.applySampler(texture)
+      if (texture.mipmapPolicy === &#x27;generate&#x27;) gl.generateMipmap(gl.TEXTURE_2D)
+      assertTextureOperation(gl, &#x27;configure texture2D&#x27;, texture.label)
+    })
+
+    // ⑤ 全部成功才发布：再确认一次 CPU 纹理没在上传期间被释放，
+    //    然后订阅它的 dispose、写进缓存。这是唯一的发布点
+    assertTextureOperation(gl, &#x27;restore texture2D upload state&#x27;, texture.label)
+    texture.assertUsable()
+    const resource = Object.freeze({
+      handle: requireNonNull&lt;WebGLTexture&gt;(
+        handle,
+        () =&gt; new WebGLResourceCreationError(&#x27;texture2D&#x27;, texture.label)
+      ),
+      target: gl.TEXTURE_2D
+    })
+    const unsubscribe = texture.onDispose(() =&gt; this.release(texture))
+    this.entries.set(texture, { resource, unsubscribe })
+    return resource
+  } catch (error: unknown) {
+    // ⑥ 失败：context 丢了就整代作废、不发命令；否则删掉这次建的半成品
+    if (this.lost || gl.isContextLost()) {
+      this.invalidateForContextLoss()
+      throw new WebGLContextLostError(&#x27;create texture2D&#x27;)
+    }
+    if (handle !== null) gl.deleteTexture(handle)
+    throw error
+  } finally {
+    // 上传 helper 恢复真实 GL 状态后，上层缓存也必须失效。
+    this.hooks.invalidateState()
+  }
+}</code></pre>
+    <p>注意这段里检查和动手的先后：③ 的三件事全部在 withTextureUploadState 之前，所以 8.3 节表里时刻 ② 的检查失败时，还没有任何 GPU 对象、任何状态被改过；⑤ 是唯一写缓存的地方，⑥ 只需要删掉这一次建的 handle。</p>
+    <p>为什么不写一个 <code>abstract class TextureManagerBase</code>，让三个 Manager 继承？因为三个 get 的骨架不一样：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th></th><th>Texture2DManager</th><th>CubeTextureManager</th><th>RenderTargetManager</th></tr></thead>
+      <tbody>
+        <tr><td>缓存命中条件</td><td>同一个对象</td><td>同一个对象</td><td>同一个对象且同一个 revision</td></tr>
+        <tr><td>上传前要查的尺寸</td><td>宽、高各一个</td><td>六面同尺寸，取一个边长</td><td>descriptor 的宽高，加上 MRT 数量</td></tr>
+        <tr><td>GPU 上建什么</td><td>1 个纹理，1 次 texImage2D</td><td>1 个纹理，6 次 texImage2D</td><td>1 个 FBO + n 个纹理（像素传 null）+ 可选 renderbuffer，再查 completeness</td></tr>
+        <tr><td>命中失败时还有旧的吗</td><td>没有</td><td>没有</td><td>可能有：先建新、再删旧</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      基类的做法通常是「模板方法」：基类写好 get 的骨架，子类填几个钩子。可 RenderTargetManager 的骨架（比 revision、正绑着不能重建、换新删旧）另外两个都没有，硬塞进一个骨架里，要么基类长出一堆只有它用的分支，要么它自己覆盖掉整个 get，基类就白写了。共同的部分其实只是几个「小动作」（查错、查上限、上传作用域），抽成函数，各自按自己的骨架组合，最简单。
+    </p>
+
+    <h3 id="s9-2">9.2 还没共用的：validateStorage</h3>
+    <p>Texture2DManager 和 CubeTextureManager 的 validateStorage 几乎一样。逐段对比（<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:178">Texture2DManager.ts:178–234</a> 对 <a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:203">CubeTextureManager.ts:203–262</a>）：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>段落</th><th>Texture2DManager</th><th>CubeTextureManager</th></tr></thead>
+      <tbody>
+        <tr><td>尺寸是正整数</td><td>在 validateStorage 开头（:183–194）</td><td>在外面，由 assertValidCubeFaceDimensions 查（:106–109）</td></tr>
+        <tr><td>设备上限</td><td>MAX_TEXTURE_SIZE，宽、高分别比</td><td>MAX_CUBE_MAP_TEXTURE_SIZE，比一个边长</td></tr>
+        <tr><td>NPOT</td><td>宽、高都要是 2 的幂</td><td>边长是 2 的幂</td></tr>
+        <tr><td>r/rg、float32 四条、sRGB 扩展</td><td colspan="2">逐字相同，只有报错用的名字不同</td></tr>
+        <tr><td>sRGB 不支持时的报错名</td><td><code>'texture2D ' + label</code>（经 unsupported）</td><td><code>'sRGB cubemap'</code>，没带 label（:253–256）</td></tr>
+        <tr><td>采样参数翻译成 GL 常量</td><td>单独的 applySampler 方法（:237–256）</td><td>写在 get 里面（:133–159）</td></tr>
+      </tbody>
+    </table></div>
+    <p>真正不同的只有「尺寸怎么来、和哪个上限比」。12.2 节的想一想会问：如果要抽出来，签名应该长什么样。</p>
+
+    <h3 id="s9-3">9.3 draw 时：从 Material 参数到纹理单元，sampler2D 还差什么</h3>
+    <aside class="note"><strong>10 月 12 日更新</strong>：这一节的节选和下面那张表是 10 月 11 日的状态。现在表里四个 ✗ 都已经在工作区里做了：ResourceManager 持有 Texture2DManager；Uniforms 通过第 4 个参数 resolve2D 解析 sampler2D；单元数把 SAMPLER_2D 一起数；反馈环由 SurfaceScope.assertCanSample 检查。接线代码见第 27 课 4.2 节。</aside>
+    <p>10 月 11 日时，draw 只接通了 cubemap。当时 Uniforms.prepare 里和纹理有关的部分：</p>
+    <pre><code>// WebGL1Uniforms.ts:116–125、:143–156（10 月 11 日的版本，即提交 5291a23；节选；注释是课程加的）
+// 先数一数这个 program 要几个纹理单元。现在只数 samplerCube
+const samplerCount = layout.filter((entry) =&gt; entry.type === this.gl.SAMPLER_CUBE).length
+
+if (samplerCount &gt; this.maxTextureUnits) {
+  throw new UnsupportedRenderFeatureError(
+    &#x27;texture units&#x27;,
+    &#x27;active cubemap uniforms exceed the fragment texture-unit limit&#x27;
+  )
+}
+
+let nextTextureUnit = 0
+// …（省略：逐个 active uniform 找到对应的 Material 参数，:127–141）
+
+if (parameter.type === &#x27;cubeTexture&#x27;) {
+  const unit = nextTextureUnit++ // 第 1 个纹理参数用单元 0，第 2 个用单元 1……
+  // resolveCube 是 Backend 交进来的 (texture) =&gt; resources.cubeTextures.get(texture)，
+  // 第一次 draw 时才真正上传（懒上传）
+  const resource = this.resolveCube(parameter.value)
+
+  // 这里只返回一条「待执行的命令」；prepare 全部成功后 upload 才执行
+  return () =&gt; {
+    this.gl.activeTexture(this.gl.TEXTURE0 + unit)
+    this.gl.bindTexture(this.gl.TEXTURE_CUBE_MAP, resource.handle)
+    this.gl.uniform1i(entry.location, unit)
+  }
+}
+
+// sampler2D 还没接：Texture2D、附件地址都走不到 GPU
+if (parameter.type === &#x27;texture2D&#x27;) {
+  throw new UnsupportedRenderFeatureError(
+    &#x27;sampler2D&#x27;,
+    &#x27;Task 15 has no Texture2D GPU manager&#x27;
+  )
+}</code></pre>
+    <p>
+      Backend 在建一代时把 <code>(texture) =&gt; resources.cubeTextures.get(texture)</code> 交给 Uniforms（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:292">WebGL1Backend.ts:292–295</a>）。也就是说，cubemap 第一次被画到的时候才上传，不是加载场景时。sampler2D 要接通，按「已有 / 还缺」列一下：
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>环节</th><th>cubemap</th><th>Texture2D</th><th>附件地址</th></tr></thead>
+      <tbody>
+        <tr><td>CPU 资源</td><td>✓ CubeTexture</td><td>✓ ImageTexture2D、DataTexture2D</td><td>✓ RenderTarget</td></tr>
+        <tr><td>Material 参数能写</td><td>✓</td><td>✓</td><td>✓（工作区）</td></tr>
+        <tr><td>GPU Manager 能解析</td><td>✓ get</td><td>✓ get（工作区）</td><td>✓ resolveSampledColor（工作区）</td></tr>
+        <tr><td>ResourceManager 持有、排进释放顺序</td><td>✓（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:108">ResourceManager.ts:108</a>、:112–119）</td><td>✗ 还没有这个 Manager</td><td>Manager 已在，采样路径未用</td></tr>
+        <tr><td>Uniforms 解析并绑定</td><td>✓ resolveCube</td><td>✗ 抛 UnsupportedRenderFeatureError（当时的 :154–156）</td><td>✗ 同左</td></tr>
+        <tr><td>单元数检查</td><td>✓ 但只数 SAMPLER_CUBE（当时的 :116）</td><td colspan="2">✗ 要和 SAMPLER_2D 一起数，共用一个上限</td></tr>
+        <tr><td>反馈环检查</td><td>不需要：cubemap 不会是输出目标</td><td>不需要</td><td>✗ 要做（8.4 节）</td></tr>
+      </tbody>
+    </table></div>
+    <p class="small">这张表只列事实，不是实现方案；怎样接，是你接下来要决定的事。</p>
+
+    <h2 id="s10">10. 和 Lifecycle 的关系</h2>
+    <p>第 13 课第 2 节说，context 丢了以后，Backend 要把旧的一代作废、再建新的一代。纹理一族在这两件事里做的事：</p>
+    <ul>
+      <li><strong>一代一份。</strong>ResourceManager 新建 CubeTextureManager、RenderTargetManager（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:108">WebGL1ResourceManager.ts:108–109</a>）；Texture2DManager 接进来以后也应该在这里。缓存跟着 Manager 走，也是一代一份。</li>
+      <li><strong>lost 事件到达：丢记录、退订，不 delete。</strong>三个 Manager 的 invalidateForContextLoss 都一样：记下 lost，退订所有 CPU 对象，清空表，通知 State（<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:280">Texture2DManager.ts:280–285</a>、<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:281">CubeTextureManager.ts:281–286</a>、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:380">RenderTargetManager.ts:380–385</a>）。GPU 对象已经随 context 失效，对死掉的 context 发 delete 没有意义。</li>
+      <li><strong>恢复以后：静态纹理重传，GPU 画的图重画。</strong>新一代的 Manager 表是空的。DataTexture2D 从自己的快照重传；ImageTexture2D、CubeTexture 从借用的图片重传，前提是创建者还没把图片关掉（5.1 节第三行）。RenderTarget 得到的是一块新的空存储：Manager 只能重建存储，不知道里面该画什么，要由拥有它的 pass 重画（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:152">RenderTargetManager.ts:152</a>：「新建存储不意味着旧内容已恢复，生产者需要重新绘制」）。</li>
+    </ul>
+    <div id="lab-lifecycle"></div>
+
+    <h2 id="s11">11. 架构视角：对照 three.js r177</h2>
+    <ul>
+      <li>
+        <strong>同样的拆分。</strong>three.js 的 Texture 是 CPU 描述加来源（source），不放 GPU 对象；新渲染器把每个纹理的 GPU 数据放在一张以纹理对象为 key 的 WeakMap 里（<a data-src="node_modules/three/src/renderers/common/DataMap.js:20">DataMap.js:20</a>，Textures 继承 DataMap，<a data-src="node_modules/three/src/renderers/common/Textures.js:15">Textures.js:15</a>）。和本项目的 <code>Map&lt;Texture2D, Entry&gt;</code> 是一回事；它用 WeakMap，本项目用 Map 加 onDispose 退订（第 4 课讲过两者的区别）。
+      </li>
+      <li>
+        <strong>附件的「地址」：three.js 用一个 Texture 对象。</strong>three.js 的 RenderTarget 构造时为每个颜色附件建一个 Texture，打上 <code>isRenderTargetTexture = true</code>，再记住它属于哪个目标（<a data-src="node_modules/three/src/core/RenderTarget.js:137">core/RenderTarget.js:137–145</a>）。材质直接写 <code>material.map = renderTarget.texture</code>。setSize 改掉这些纹理的尺寸并 dispose（<a data-src="node_modules/three/src/core/RenderTarget.js:284">:284–301</a>），下次用到时重建 GPU 存储；纹理对象本身没换，所以材质里那个引用一直有效。效果和本项目的地址一样：材质拿着一个「不会过期的东西」。区别在代价放在哪：three.js 让附件「看起来是一个 Texture」，于是所有处理 Texture 的代码都要认得这个标记，比如更新纹理时要跳过上传（<a data-src="node_modules/three/src/renderers/common/Textures.js:203">Textures.js:203–206</a>）；本项目让两种东西保持两种类型，在 Material 的参数类型里用联合写明，由 Backend 分别解析。
+      </li>
+      <li>
+        <strong>更新：版本号 vs 不可变。</strong>three.js 的纹理改了内容设 <code>needsUpdate = true</code>，version 加一（<a data-src="node_modules/three/src/textures/Texture.js:742">Texture.js:742–747</a>），Textures 比版本决定是否重传（<a data-src="node_modules/three/src/renderers/common/Textures.js:201">Textures.js:201</a>）。本项目的静态纹理不可变，要换图就新建一个 Texture；只有 RenderTarget 有 revision，而且只管尺寸。好处是 Manager 简单（缓存命中只看身份），代价是做视频纹理、动态贴图时要另设计一个 version/update 契约（<a data-src="src/rendering/resources/Texture2D.ts:14">Texture2D.ts:14–21</a> 的注释已经写明）。
+      </li>
+    </ul>
+
+    <h2 id="s12">12. 审查视角</h2>
+    <h3 id="s12-1">12.1 dispose 中途失败以后，能不能接着清理</h3>
+    <p>
+      ResourceManager.dispose 的注释说：某一步抛错就停在那一步，下次 dispose 从那一步重试；「当前步骤内部的部分清理和重试安全仍由该 Manager 保证」（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:189">WebGL1ResourceManager.ts:189–191</a>）。三个 Manager 对这句话的落实不一样：Texture2DManager 用 <code>closing</code> 表示「不再接新工作」，删除成功一个才从表里去掉一个，所以第二次 dispose 能接着删剩下的（<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:262">Texture2DManager.ts:262–304</a>，你的测试 :395 测的就是这个）；CubeTextureManager 和 RenderTargetManager 用 <code>disposed</code>，第二次 dispose 直接返回，而且第一次就先把表清空了（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:289">CubeTextureManager.ts:289–304</a>）。同一个故障注入在两个 Manager 上：
+    </p>
+    <div id="lab-dispose"></div>
+    <p class="small">deleteTexture 在正常 WebGL 里几乎不会抛错（传错类型才会），所以这更像契约一致性的问题，不是线上会频繁碰到的故障。要不要让三个 Manager 统一成 Texture2DManager 的写法，由你决定。</p>
+
+    <h3 id="s12-2">12.2 想一想</h3>
+    <ul>
+      <li>
+        <strong>validateStorage 要不要抽出来？</strong>9.2 节的表说明，两份只在「尺寸怎么来、和哪个上限比」上不同。如果抽成一个共用函数，参数应该是什么？sRGB 扩展那个「查过就记住」的缓存（<code>srgbExtension</code>）放在哪里：函数里、Manager 里，还是 Capabilities 里？各有什么后果？
+      </li>
+      <li>
+        <strong>上传时的那份副本能省吗？</strong>5.2 节算过，16 MiB 的 float 纹理上传时峰值 48 MiB，其中 16 MiB 只是为了「内部数组不外泄」。TypeScript 没有 friend。有没有办法让 Manager 读到内部快照、又不把它交给任意调用者？代价是什么（想想 Texture2D.ts 和 Manager 在不同目录）？
+      </li>
+      <li>
+        <strong>子类还是 kind？</strong>如果要加第三种二维来源（比如 HTMLVideoElement，每帧内容会变），按现在的子类分法要改哪些文件？如果二维也改成 CubeTexture 那样的 <code>source.kind</code>，又要改哪些？哪种改法出错时更早被发现？
+      </li>
+    </ul>
+
+    <h2 id="s13">13. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0029"></div>
+
+    <h2 id="s14">14. 延伸阅读</h2>
+    <ul>
+      <li><a href="https://registry.khronos.org/webgl/specs/latest/1.0/">WebGL 1.0 规范</a>：搜「Feedback Loops Between Textures and the Framebuffer」，一段话说明边写边读产生 INVALID_OPERATION。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/HTMLImageElement/complete">MDN：HTMLImageElement.complete</a>：图片加载失败时 complete 也是 true，要看 naturalWidth。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/ImageBitmap/close">MDN：ImageBitmap.close</a>：释放位图占用的资源，之后不能再用（5.1 节卡片实测：关闭后 width 读出来是 0）。</li>
+      <li><a href="https://threejs.org/docs/#api/en/core/RenderTarget">three.js 文档：RenderTarget</a>：<code>textures</code>、<code>setSize</code>。</li>
+      <li>本课程第 4 课（一份 CPU 资源，每个 context 一份 GPU 表示）、第 12 课（CPU 纹理类逐行）、第 17 课（CubeTextureManager 与上传作用域）。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：实验卡片和检查题各错了哪几题；12.2 节的三个想一想，直接在对话里回答。哪一步还接不上，把那几行贴给我。
+    </aside>
+
+    <div class="nav">
+      <a href="0017-cube-texture-manager.html">← 第 17 课：CubeTextureManager 与上传作用域</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0027-render-target-manager.html">第 27 课：RenderTargetManager 与 FBO →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 29 课 · 2026-10-11</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        const R = window.RTeachTexDesign
+
+        // 课程版（和页面上展示的代码出自同一份 TS，esbuild 去掉了类型）
+        var __defProp = Object.defineProperty;
+        var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+        var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+        class TextureV1 {
+          // 构造时就绑死一个 context（旧引擎 Texture.ts:13–15）
+          constructor(gl) {
+            this.gl = gl;
+            // GPU handle 直接放在 CPU 对象里（旧引擎 Texture.ts:11）
+            __publicField(this, "handle", null);
+          }
+          // 旧引擎是 createFromImage(image)；这里换成像素数组，卡片好造数据
+          createFromPixels(width, height, pixels) {
+            const gl = this.gl;
+            this.handle = gl.createTexture();
+            if (this.handle === null) throw new Error("createTexture failed");
+            gl.bindTexture(gl.TEXTURE_2D, this.handle);
+            gl.texImage2D(
+              gl.TEXTURE_2D,
+              0,
+              gl.RGBA,
+              width,
+              height,
+              0,
+              gl.RGBA,
+              gl.UNSIGNED_BYTE,
+              pixels
+            );
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+          }
+        }
+        var __defProp = Object.defineProperty;
+        var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+        var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+        class TextureV2 {
+          constructor(label, width, height, pixels) {
+            this.label = label;
+            this.width = width;
+            this.height = height;
+            this.pixels = pixels;
+          }
+        }
+        class TextureManagerV2 {
+          constructor(gl) {
+            this.gl = gl;
+            // key 是 CPU 对象本身；value 是这个 context 里的 handle
+            __publicField(this, "handles", /* @__PURE__ */ new Map());
+          }
+          get(texture) {
+            const cached = this.handles.get(texture);
+            if (cached !== void 0) return cached;
+            const gl = this.gl;
+            const handle = gl.createTexture();
+            if (handle === null) throw new Error("createTexture failed: " + texture.label);
+            gl.bindTexture(gl.TEXTURE_2D, handle);
+            gl.texImage2D(
+              gl.TEXTURE_2D,
+              0,
+              gl.RGBA,
+              texture.width,
+              texture.height,
+              0,
+              gl.RGBA,
+              gl.UNSIGNED_BYTE,
+              texture.pixels
+              // 像素从 CPU 对象里拿，随时能再拿一次
+            );
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+            this.handles.set(texture, handle);
+            return handle;
+          }
+        }
+
+        // ---------------- 真实 WebGL 的小工具（都是课程写的） ----------------
+        const HELPER_NOTE =
+          '课程写的部分：freshContext（建一个 2 × 2 的 canvas 和 WebGL context，用完释放）、read2D（把纹理挂到一个临时 framebuffer 上，用 readPixels 读回）、counted（给 gl 套一层代理，数某几种调用的次数，其余原样转发）、dataTexture（2 × 1 的 DataTexture2D，左红右蓝）。'
+        const LOSE_NOTE = ' 丢失、恢复用的是 WEBGL_lose_context 扩展；canvas 临时挂进页面（不挂的话，有的浏览器不发恢复事件），用完移除。'
+
+        /** 建一个小 canvas 和 WebGL context。inDom 为 true 时挂进页面（恢复 context 要用）。 */
+        function freshContext(inDom = false) {
+          const canvas = document.createElement('canvas')
+          canvas.width = 2
+          canvas.height = 2
+          if (inDom) {
+            canvas.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none'
+            document.body.appendChild(canvas)
+          }
+          canvas.addEventListener('webglcontextlost', (event) => event.preventDefault())
+          const gl = canvas.getContext('webgl')
+          if (!gl) throw new Error('这个浏览器拿不到 WebGL context')
+          const lose = gl.getExtension('WEBGL_lose_context')
+          return {
+            gl,
+            lose,
+            release: () => {
+              if (lose && !gl.isContextLost()) lose.loseContext()
+              canvas.remove()
+            }
+          }
+        }
+        async function withGL(body, inDom = false) {
+          const { gl, lose, release } = freshContext(inDom)
+          const lines = []
+          try {
+            await body(gl, lines, lose)
+          } catch (error) {
+            lines.push({ text: '实验里抛出了没有预料到的错误：' + err(error), kind: 'late' })
+          } finally {
+            release()
+          }
+          return { lines }
+        }
+        const err = (e) => (e && e.name ? e.name : 'Error') + '：' + (e && e.message ? e.message : String(e))
+        const attempt = (f) => {
+          try {
+            f()
+            return '成功'
+          } catch (error) {
+            return err(error)
+          }
+        }
+        const hooks = { invalidateState: () => undefined }
+        const caps = (gl) => R.detectWebGL1Capabilities(gl)
+
+        /** 让 context 丢一次再恢复；3 秒内没等到恢复事件就返回 'timeout'。 */
+        async function loseAndRestore(lose, canvasOf) {
+          lose.loseContext()
+          await new Promise((resolve) => setTimeout(resolve, 50))
+          const restored = new Promise((resolve) => canvasOf.addEventListener('webglcontextrestored', resolve, { once: true }))
+          lose.restoreContext()
+          return Promise.race([restored.then(() => 'restored'), new Promise((resolve) => setTimeout(() => resolve('timeout'), 3000))])
+        }
+
+        /** 读回一个二维纹理：挂到临时 framebuffer 上 readPixels，再还原原来的 framebuffer。 */
+        function read2D(gl, texture, width, height) {
+          const previous = gl.getParameter(gl.FRAMEBUFFER_BINDING)
+          const framebuffer = gl.createFramebuffer()
+          gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer)
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0)
+          const pixels = new Uint8Array(width * height * 4)
+          gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels)
+          gl.bindFramebuffer(gl.FRAMEBUFFER, previous)
+          gl.deleteFramebuffer(framebuffer)
+          return pixels
+        }
+        /** 把像素数组写成 (r, g, b, a) (r, g, b, a) …… */
+        function texels(pixels, count) {
+          const parts = []
+          for (let i = 0; i < count; i++) parts.push('(' + Array.from(pixels.slice(i * 4, i * 4 + 4)).join(', ') + ')')
+          return parts.join(' ')
+        }
+
+        /** 给 gl 套一层代理：names 里的方法每调用一次计一次数，其余原样转发。 */
+        function counted(gl, names, intercept = {}) {
+          const calls = {}
+          for (const name of names) calls[name] = 0
+          const proxy = new Proxy(gl, {
+            get(target, key) {
+              const value = target[key]
+              if (typeof value !== 'function') return value
+              if (key in calls || key in intercept) {
+                return (...args) => {
+                  if (key in calls) calls[key]++
+                  return intercept[key] ? intercept[key](target, args, value) : value.apply(target, args)
+                }
+              }
+              return value.bind(target)
+            }
+          })
+          return { gl: proxy, calls }
+        }
+
+        /** 2 × 1 的像素：左红右蓝。每次返回新数组。 */
+        const redBlue = () => new Uint8Array([255, 0, 0, 255, 0, 0, 255, 255])
+        const dataTexture = (label, pixels = redBlue(), extra = {}) =>
+          new R.DataTexture2D({
+            label,
+            storage: { format: 'rgba', type: 'uint8' },
+            colorSpace: 'data',
+            source: { width: 2, height: 1, data: pixels },
+            ...extra
+          })
+        function loadImage(url) {
+          return new Promise((resolve) => {
+            const image = new Image()
+            image.onload = () => resolve(['load', image])
+            image.onerror = () => resolve(['error', image])
+            image.src = url
+          })
+        }
+        const ONE_PIXEL_PNG =
+          'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=='
+
+        // ---------------- 3.2 第 1 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v1'),
+          storageKey: 'lesson-0029-v1',
+          cards: [
+            {
+              title: '第 1 版：context 丢了再恢复',
+              tags: ['真实 WebGL', '只跑第 1 版', '真的丢一次 context'],
+              desc: '用第 1 版建一张 2 × 1 的纹理（左红右蓝），读回确认。然后让 context 丢失、再恢复，看这个 TextureV1 对象。',
+              note: HELPER_NOTE + LOSE_NOTE,
+              question: '恢复以后，这个 TextureV1 还能用吗？能自己重建吗？',
+              choices: ['不能用（handle 已失效），也重建不了：对象里没有像素', '能用：恢复后 handle 自动复活', '不能用，但再调一次 createFromPixels() 就能重建，不需要别的东西'],
+              answer: 0,
+              explain: '恢复后的 context 是一个全新的 GPU 状态，旧 handle 一个都不认（isTexture 是 false）。TextureV1 手里只剩 gl 和这个死掉的 handle；像素在 createFromPixels 返回时就没了。要重建，只能让调用者再找一次像素：对图片来说就是重新加载。「再调一次 createFromPixels() 就能重建」的问题也在这：它要你把像素再交一次，而这个对象自己给不出来。',
+              run: () =>
+                withGL(async (gl, lines, lose) => {
+                  const texture = new TextureV1(gl)
+                  texture.createFromPixels(2, 1, redBlue())
+                  lines.push({ text: '第 1 代：createFromPixels(2, 1, 左红右蓝)，读回 → ' + texels(read2D(gl, texture.handle, 2, 1), 2), kind: 'server' })
+                  if (!lose) {
+                    lines.push({ text: '这个浏览器没有 WEBGL_lose_context', kind: 'late' })
+                    return
+                  }
+                  const outcome = await loseAndRestore(lose, gl.canvas)
+                  if (outcome !== 'restored') {
+                    lines.push({ text: '3 秒内没等到恢复事件，实验停在这里', kind: 'late' })
+                    return
+                  }
+                  lines.push({ text: '丢失、恢复完成；isContextLost → ' + gl.isContextLost(), kind: 'user' })
+                  lines.push({ text: 'texture.handle 还在对象里 → ' + (texture.handle !== null) + '；isTexture(handle) → ' + gl.isTexture(texture.handle), kind: 'server' })
+                  lines.push({ t: '结果', text: '对象里的字段：' + Object.keys(texture).join('、') + '。没有像素，拿不出东西重传', kind: 'result' })
+                }, true)
+            }
+          ]
+        })
+
+        // ---------------- 4.1 第 2 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v2'),
+          storageKey: 'lesson-0029-v2',
+          cards: [
+            {
+              title: '第 2 版：context 丢了再恢复',
+              tags: ['真实 WebGL', '只跑第 2 版', '真的丢一次 context'],
+              desc: '建一个 TextureV2（2 × 1，左红右蓝），第 1 代的 Manager get 一次并读回。丢失、恢复以后，新建第 2 代的 Manager，get 同一个 TextureV2。',
+              note: HELPER_NOTE + LOSE_NOTE,
+              question: '第 2 代的 Manager 读回什么？它从哪拿到像素？',
+              choices: ['左红右蓝；TextureV2 一直留着 pixels', '全是 0：新 context 里什么都没有', '左红右蓝；浏览器把旧纹理恢复了'],
+              answer: 0,
+              explain: '第 2 代的 Manager 表是空的，第一次 get 走「新建、上传」那条路，像素从 texture.pixels 拿。旧 handle 仍然是死的（isTexture false），但没人需要它了：CPU 对象就是重建的原料。',
+              run: () =>
+                withGL(async (gl, lines, lose) => {
+                  const texture = new TextureV2('albedo', 2, 1, redBlue())
+                  const first = new TextureManagerV2(gl)
+                  const oldHandle = first.get(texture)
+                  lines.push({ text: '第 1 代：get → 读回 ' + texels(read2D(gl, oldHandle, 2, 1), 2), kind: 'server' })
+                  if (!lose) {
+                    lines.push({ text: '这个浏览器没有 WEBGL_lose_context', kind: 'late' })
+                    return
+                  }
+                  const outcome = await loseAndRestore(lose, gl.canvas)
+                  if (outcome !== 'restored') {
+                    lines.push({ text: '3 秒内没等到恢复事件，实验停在这里', kind: 'late' })
+                    return
+                  }
+                  const second = new TextureManagerV2(gl)
+                  const newHandle = second.get(texture)
+                  lines.push({ text: '恢复后新建第 2 代 Manager，get 同一个 TextureV2 → 读回 ' + texels(read2D(gl, newHandle, 2, 1), 2), kind: 'server' })
+                  lines.push({ t: '结果', text: '新 handle → ' + (newHandle !== oldHandle) + '；isTexture(旧) → ' + gl.isTexture(oldHandle) + '，isTexture(新) → ' + gl.isTexture(newHandle), kind: 'result' })
+                }, true)
+            },
+            {
+              title: '第 2 版：两个 context 用同一张图',
+              tags: ['真实 WebGL', '只跑第 2 版'],
+              desc: '两个 canvas、两个 context，各一个 TextureManagerV2，get 同一个 TextureV2。然后试着把 context A 的 handle 绑到 context B 上。',
+              note: HELPER_NOTE,
+              question: '把 A 的 handle 绑到 B 上，B 的 getError 是多少？',
+              choices: ['1282（INVALID_OPERATION）：handle 只属于创建它的 context', '0：handle 在两个 context 里通用', '1281（INVALID_VALUE）'],
+              answer: 0,
+              explain: '两个 Manager 各建了一个 handle，各自读回都是左红右蓝；它们不是同一个对象。WebGL 规定，一个 context 建的对象拿到另一个 context 里用，产生 INVALID_OPERATION（第 4 课实测过）。所以「一张图」在两个 context 里必须是两个 GPU 对象，而记住「它们是同一张图」的，只能是那个 CPU 对象。',
+              run: async () => {
+                const a = freshContext()
+                const b = freshContext()
+                const lines = []
+                try {
+                  const texture = new TextureV2('albedo', 2, 1, redBlue())
+                  const handleA = new TextureManagerV2(a.gl).get(texture)
+                  const handleB = new TextureManagerV2(b.gl).get(texture)
+                  lines.push({ text: 'A 读回 ' + texels(read2D(a.gl, handleA, 2, 1), 2) + '；B 读回 ' + texels(read2D(b.gl, handleB, 2, 1), 2), kind: 'server' })
+                  lines.push({ text: 'A 的 handle 和 B 的是同一个吗 → ' + (handleA === handleB), kind: 'server' })
+                  b.gl.getError()
+                  b.gl.bindTexture(b.gl.TEXTURE_2D, handleA)
+                  lines.push({ t: '结果', text: '把 A 的 handle 绑到 B 上 → B 的 getError ' + b.gl.getError(), kind: 'result' })
+                } catch (error) {
+                  lines.push({ text: '实验里抛出了没有预料到的错误：' + err(error), kind: 'late' })
+                } finally {
+                  a.release()
+                  b.release()
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 4.2 对象身份 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-identity'),
+          storageKey: 'lesson-0029-identity',
+          cards: [
+            {
+              title: '真实 Texture2DManager：同名的两张图',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '建两个 DataTexture2D，label 都叫 floor/albedo，但像素不同：a 左红右蓝，b 左绿右白。get(a)、get(b)、再 get(a)，数 createTexture 和 texImage2D。',
+              note: HELPER_NOTE,
+              question: '三次 get 一共调用了几次 createTexture？',
+              choices: ['2 次：a、b 各一次，第三次命中 a 的缓存', '1 次：label 相同，b 用了 a 的', '3 次：每次 get 都上传'],
+              answer: 0,
+              explain: 'entries 的 key 是对象本身，a 和 b 是两个对象，所以是两个 key、两个 handle，读回的像素也各是各的。如果像旧引擎那样用字符串当 key，b 会拿到 a 的纹理，地板就贴错了图。第三次 get(a) 在第一行就查到缓存，交回同一个冻结对象，0 条 GL 命令。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const c = counted(gl, ['createTexture', 'texImage2D'])
+                  const manager = new R.WebGL1Texture2DManager(c.gl, caps(gl), hooks)
+                  const a = dataTexture('floor/albedo')
+                  const b = dataTexture('floor/albedo', new Uint8Array([0, 255, 0, 255, 255, 255, 255, 255]))
+                  const ra = manager.get(a)
+                  const rb = manager.get(b)
+                  const again = manager.get(a)
+                  lines.push({ text: 'a 读回 ' + texels(read2D(gl, ra.handle, 2, 1), 2) + '；b 读回 ' + texels(read2D(gl, rb.handle, 2, 1), 2), kind: 'server' })
+                  lines.push({ text: 'a、b 的 handle 不同 → ' + (ra.handle !== rb.handle) + '；第三次 get(a) 交回同一个对象 → ' + (again === ra), kind: 'server' })
+                  lines.push({ t: '结果', text: 'createTexture ' + c.calls.createTexture + ' 次，texImage2D ' + c.calls.texImage2D + ' 次', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 5.1 借用图片 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-image'),
+          storageKey: 'lesson-0029-image',
+          cards: [
+            {
+              title: '三种不能用的图：坏图、没加载完、已关闭',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '① 一张坏图：data: URL 里不是合法的 PNG，等 error 事件触发；② 一张正在加载的图：设了 src 马上就 get；③ 一个 ImageBitmap：建好纹理以后，创建者把它 close 了。三个都包成 ImageTexture2D（构造都成功），交给真实的 Texture2DManager，数 createTexture。',
+              note: HELPER_NOTE,
+              question: '坏图的 complete 是什么？Manager 在哪一步拦下它？',
+              choices: ['true；尺寸 0 × 0，被「宽高必须是正整数」拦下，没建纹理', 'false；被「还没加载完」拦下', 'true；texImage2D 报错之后才发现，建了又删'],
+              answer: 0,
+              explain: '加载失败也算「加载结束」，所以 complete 是 true；只有 naturalWidth、naturalHeight 是 0 能看出它坏了。readSource 把 0 × 0 交出去，validateStorage 第一条「宽高是正安全整数」拦下，这时还没调用 createTexture。② 才是 complete 为 false 的情况。③ 关闭后的 ImageBitmap 宽高读出来是 0，同样被第一条拦下：这就是 5.1 节说的「借用是一份约定」被打破的样子。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const c = counted(gl, ['createTexture'])
+                  const manager = new R.WebGL1Texture2DManager(c.gl, caps(gl), hooks)
+                  const image = (label, source) => new R.ImageTexture2D({ label, storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'srgb', source })
+
+                  const [event, broken] = await loadImage('data:image/png;base64,AAAA')
+                  lines.push({ text: '① 坏图：' + event + ' 事件；complete → ' + broken.complete + '；naturalWidth × naturalHeight → ' + broken.naturalWidth + ' × ' + broken.naturalHeight, kind: 'user' })
+                  lines.push({ text: '　get → ' + attempt(() => manager.get(image('broken', broken))), kind: 'server' })
+
+                  const pending = new Image()
+                  const pendingTexture = image('pending', pending)
+                  pending.src = ONE_PIXEL_PNG
+                  lines.push({ text: '② 刚设 src：complete → ' + pending.complete + '；get → ' + attempt(() => manager.get(pendingTexture)), kind: 'server' })
+
+                  if (typeof createImageBitmap === 'function') {
+                    const bitmap = await createImageBitmap(new ImageData(new Uint8ClampedArray([255, 0, 0, 255, 0, 0, 255, 255]), 2, 1))
+                    const bitmapTexture = image('bitmap', bitmap)
+                    bitmap.close()
+                    lines.push({ text: '③ ImageBitmap 被创建者 close：width → ' + bitmap.width + '；get → ' + attempt(() => manager.get(bitmapTexture)), kind: 'server' })
+                  }
+                  lines.push({ t: '结果', text: '三次都在上传之前被拒；createTexture 调用了 ' + c.calls.createTexture + ' 次', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 5.2 复制数组 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-copy'),
+          storageKey: 'lesson-0029-copy',
+          cards: [
+            {
+              title: '复制进来，复制出去',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '调用者用自己的数组 pixels（左红右蓝）建一个 DataTexture2D。建好以后，调用者把 pixels[0]、pixels[1] 改成 7；又从 copySource() 拿一份，把拿到的 data[0] 改成 9。最后交给真实的 Texture2DManager 上传，读回。',
+              note: HELPER_NOTE,
+              question: '上传后第 0 个纹素是什么？',
+              choices: ['(255, 0, 0, 255)：进来、出去都复制了，两处修改都碰不到内部快照', '(7, 7, 0, 255)：调用者的修改生效了', '(9, 7, 0, 255)：两处修改都生效了'],
+              answer: 0,
+              explain: '构造时 createTexturePixelSnapshot2D 用 new Uint8Array(data) 拷了一份，从此调用者的 pixels 和内部快照是两块内存；copySource 交出去的又是另一份。Manager 上传时自己再调用一次 copySource，拿到的仍是构造那一刻的值。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const pixels = redBlue()
+                  const texture = dataTexture('albedo', pixels)
+                  pixels[0] = 7
+                  pixels[1] = 7
+                  const copy = texture.copySource()
+                  copy.data[0] = 9
+                  lines.push({ text: '调用者的 pixels → ' + texels(pixels, 1) + '……；copySource 拿到的副本 → ' + texels(copy.data, 1) + '……', kind: 'user' })
+                  const manager = new R.WebGL1Texture2DManager(gl, caps(gl), hooks)
+                  const handle = manager.get(texture).handle
+                  lines.push({ t: '结果', text: '上传后读回 → ' + texels(read2D(gl, handle, 2, 1), 2), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 6.2 RenderTarget 与 revision ----------------
+        const shadowTarget = (size, withDepth = true) =>
+          new R.RenderTarget(
+            {
+              width: size,
+              height: size,
+              colors: [{ format: 'rgba8', sampler: { minFilter: 'nearest', magFilter: 'nearest' } }],
+              ...(withDepth ? { depth: { format: 'depth16' } } : {})
+            },
+            { label: 'shadow/main' }
+          )
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-rt'),
+          storageKey: 'lesson-0029-rt',
+          cards: [
+            {
+              title: 'resize 前拿到的地址，resize 后再解析',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '一个 4 × 4 的 shadow/main（一个颜色槽 + depth16）。先拿地址 ref = getColorAttachment(0)，用真实的 RenderTargetManager 解析两次；然后 resize(8, 8)，用同一个 ref 再解析；最后再 resize(8, 8) 一次。',
+              note: HELPER_NOTE,
+              question: 'resize(8, 8) 以后，用旧 ref 解析得到什么？旧纹理还在吗？',
+              choices: ['新的纹理；旧的已被 Manager 删掉（isTexture false）', '旧的纹理：ref 是 resize 之前拿的', '抛错：ref 已经过期'],
+              answer: 0,
+              explain: '前两次解析：revision 都是 0，第二次命中缓存（只建了 1 个纹理、1 个 FBO）。resize 让 revision 变成 1；ref 里只有 target、kind、index，没有 revision，所以同一个 ref 被 Manager 按当前 revision 解析，发现缓存过期，先建新的、再删旧的。第二次 resize(8, 8) 尺寸没变，revision 不动，也就不会白白重建。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const c = counted(gl, ['createTexture', 'createFramebuffer', 'deleteTexture'])
+                  const manager = new R.WebGL1RenderTargetManager(c.gl, caps(gl), hooks)
+                  const target = shadowTarget(4)
+                  const ref = target.getColorAttachment(0)
+                  const first = manager.resolveSampledColor(ref)
+                  const second = manager.resolveSampledColor(target.getColorAttachment(0))
+                  lines.push({ text: 'revision ' + target.revision + '：解析两次，同一个纹理 → ' + (first === second) + '；createTexture ' + c.calls.createTexture + '、createFramebuffer ' + c.calls.createFramebuffer, kind: 'server' })
+                  target.resize(8, 8)
+                  const third = manager.resolveSampledColor(ref)
+                  lines.push({ text: 'resize(8, 8) → revision ' + target.revision + '；用旧 ref 解析：新纹理 → ' + (third !== first) + '；isTexture(旧) → ' + gl.isTexture(first) + '，isTexture(新) → ' + gl.isTexture(third), kind: 'server' })
+                  target.resize(8, 8)
+                  lines.push({ t: '结果', text: '再 resize(8, 8)：revision → ' + target.revision + '；累计 createTexture ' + c.calls.createTexture + '、deleteTexture ' + c.calls.deleteTexture, kind: 'result' })
+                })
+            },
+            {
+              title: '正绑着的目标不能重建',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '先 get 一次 shadow/main，把它的 FBO 绑上（模拟「正在往它里面画」），然后 resize(16, 16) 再 get。',
+              note: HELPER_NOTE,
+              question: '这次 get 怎样？',
+              choices: ['抛 RenderTargetUnavailableError：要先离开它的 surface 作用域', '照常重建：先建新的再删旧的', '返回旧的 FBO，等解绑后再重建'],
+              answer: 0,
+              explain: '「先建新、再删旧」最后一步会删掉旧 FBO；如果它正绑着、画到一半，删掉它会让当前输出凭空消失。所以 get 在动手之前比一下 FRAMEBUFFER_BINDING（rtGet 那段的第一个检查），是旧 FBO 就拒绝。它也不会悄悄返回旧的：那样尺寸就和 descriptor 对不上了。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const manager = new R.WebGL1RenderTargetManager(gl, caps(gl), hooks)
+                  const target = shadowTarget(4)
+                  const resource = manager.get(target)
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, resource.framebuffer)
+                  target.resize(16, 16)
+                  lines.push({ text: '绑着旧 FBO，resize(16, 16)，revision → ' + target.revision, kind: 'user' })
+                  lines.push({ t: '结果', text: 'get → ' + attempt(() => manager.get(target)), kind: 'result' })
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+                })
+            }
+          ]
+        })
+
+        // ---------------- 7.2、7.3 采样来源 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-source'),
+          storageKey: 'lesson-0029-source',
+          cards: [
+            {
+              title: 'copyTexture2DSamplingSource：保留什么、复制什么',
+              tags: ['真实代码，不用 WebGL', '项目代码（工作区版本）'],
+              desc: '调用者写一个普通对象 input = { target: shadow, kind: \'color\', index: 0 }，交给 copyTexture2DSamplingSource；之后把 input.index 改成 5。再试几种不合法的输入，最后把 shadow dispose 掉再交一次。',
+              note: '这张卡片只用到 CPU 对象，不建 WebGL context。',
+              question: 'input.index 改成 5 以后，Material 里那份地址的 index 是多少？',
+              choices: ['0：Material 存的是一个新的冻结包装', '5：存的就是 input 本身', '抛错：input 被冻结了，不能改'],
+              answer: 0,
+              explain: '返回值是 Object.freeze({ target, kind, index }) 新建的对象，和 input 是两个对象，所以改 input 影响不到它；input 本身没被冻结（不冻结调用者的东西）。target 还是原来的 shadow，没有 revision 字段。不合法的输入在写进 Material 时就被拒：WebGLTexture 不是 RenderTarget，index 1 超出唯一的颜色槽，没配 depth 的目标没有 depth[0]，已释放的目标不能再被引用。',
+              run: () => {
+                const lines = []
+                const shadow = shadowTarget(4, false)
+                const input = { target: shadow, kind: 'color', index: 0 }
+                const stored = R.copyTexture2DSamplingSource(input, 'parameters.uShadowMap')
+                input.index = 5
+                lines.push({ text: '存下的和 input 是同一个对象 → ' + (stored === input) + '；存下的冻结了 → ' + Object.isFrozen(stored) + '；input 冻结了 → ' + Object.isFrozen(input), kind: 'server' })
+                lines.push({ text: 'input.index = 5 之后，存下的 index → ' + stored.index + '；target 还是 shadow → ' + (stored.target === shadow) + '；有 revision 字段 → ' + ('revision' in stored), kind: 'server' })
+                const albedo = dataTexture('albedo')
+                lines.push({ text: '交一个 DataTexture2D → 原样返回同一个对象 → ' + (R.copyTexture2DSamplingSource(albedo, 'parameters.uAlbedo') === albedo), kind: 'server' })
+                const scratch = document.createElement('canvas').getContext('webgl')
+                if (scratch) {
+                  lines.push({ text: '交一个 WebGLTexture → ' + attempt(() => R.copyTexture2DSamplingSource(scratch.createTexture(), 'parameters.uShadowMap')), kind: 'server' })
+                  const loseScratch = scratch.getExtension('WEBGL_lose_context')
+                  if (loseScratch) loseScratch.loseContext()
+                }
+                lines.push({ text: "{ shadow, 'color', 1 } → " + attempt(() => R.copyTexture2DSamplingSource({ target: shadow, kind: 'color', index: 1 }, 'parameters.uShadowMap')), kind: 'server' })
+                lines.push({ text: "{ shadow, 'depth', 0 }（没配 depth）→ " + attempt(() => R.copyTexture2DSamplingSource({ target: shadow, kind: 'depth', index: 0 }, 'parameters.uShadowMap')), kind: 'server' })
+                shadow.dispose()
+                lines.push({ t: '结果', text: 'shadow.dispose() 之后再交 → ' + attempt(() => R.copyTexture2DSamplingSource({ target: shadow, kind: 'color', index: 0 }, 'parameters.uShadowMap')), kind: 'result' })
+                return { lines }
+              }
+            },
+            {
+              title: 'depth 地址：Material 收，Backend 拒',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '这次 shadow/main 配了 depth16。把 getDepthAttachment() 的地址交给 copyTexture2DSamplingSource（Material 那一侧），再交给 RenderTargetManager.resolveSampledColor（Backend 那一侧），数 createFramebuffer。',
+              note: HELPER_NOTE,
+              question: '两侧分别怎样？Backend 拒绝之前建 FBO 了吗？',
+              choices: ['Material 收下；Backend 抛 UnsupportedRenderFeatureError，没建 FBO', 'Material 就拒绝：depth 不能采样', 'Backend 先建 FBO，发现是 renderbuffer 再删掉、抛错'],
+              answer: 0,
+              explain: 'Material 那一侧只证明「地址存在」：目标配了 depth，index 是 0，合法。能不能采样是设备的事：本项目 WebGL1 的 depth16 是 renderbuffer，不是纹理。resolveSampledColor 先查地址、再拒绝 depth、最后才 get，所以被拒的请求不会白建一个 FBO（createFramebuffer 0 次）。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const c = counted(gl, ['createFramebuffer'])
+                  const manager = new R.WebGL1RenderTargetManager(c.gl, caps(gl), hooks)
+                  const target = shadowTarget(4)
+                  const depthRef = target.getDepthAttachment()
+                  lines.push({ text: 'Material 侧：copyTexture2DSamplingSource(depth 地址) → ' + attempt(() => R.copyTexture2DSamplingSource(depthRef, 'parameters.uShadowMap')), kind: 'server' })
+                  lines.push({ text: 'Backend 侧：resolveSampledColor(depth 地址) → ' + attempt(() => manager.resolveSampledColor(depthRef)), kind: 'server' })
+                  lines.push({ t: '结果', text: 'createFramebuffer 调用了 ' + c.calls.createFramebuffer + ' 次', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 8.3 三个时刻 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-layers'),
+          storageKey: 'lesson-0029-layers',
+          cards: [
+            {
+              title: '同一类错误，在不同时刻被拦下',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '① 构造一个用 linear-mipmap-linear 过滤、却没写 mipmapPolicy 的 DataTexture2D（这一步还没有 gl）；② 构造一个 300 × 300、wrapS 为 repeat 的 DataTexture2D，再交给 WebGL1 的 Texture2DManager；③ 构造一个 format 为 rg 的，也交给 Manager。数 createTexture。',
+              note: HELPER_NOTE,
+              question: '300 × 300 + repeat 那张，构造成功了吗？上传呢？',
+              choices: ['构造成功；第一次 get 抛 UnsupportedRenderFeatureError，没建纹理', '构造就失败：NPOT 不能 repeat', '构造成功，上传也成功，采样时才发现是黑的'],
+              answer: 0,
+              explain: '「没有 mipmap 却用 mipmap 过滤」在任何 API 里都错，所以 Texture 构造时就拒绝（InvalidTextureSourceError，时刻 ①）。「NPOT 不能 repeat」只是 WebGL1 的限制，WebGL2 没有，所以 CPU 资源放行，WebGL1 的 Manager 在 createTexture 之前拒绝（时刻 ②）。rg 也是：WebGL1 没有两通道格式。「上传成功、采样时才发现是黑的」正是第 2 版会出的事。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  lines.push({ text: '① 构造（无 gl）：mipmap 过滤 + 默认 mipmapPolicy → ' + attempt(() => dataTexture('lut', redBlue(), { sampler: { minFilter: 'linear-mipmap-linear' } })), kind: 'user' })
+                  const npot = new R.DataTexture2D({
+                    label: 'npot',
+                    storage: { format: 'rgba', type: 'uint8' },
+                    colorSpace: 'data',
+                    sampler: { wrapS: 'repeat' },
+                    source: { width: 300, height: 300, data: new Uint8Array(300 * 300 * 4) }
+                  })
+                  lines.push({ text: '② 构造 300 × 300 + repeat → 成功（width ' + npot.width + '）', kind: 'user' })
+                  const c = counted(gl, ['createTexture'])
+                  const manager = new R.WebGL1Texture2DManager(c.gl, caps(gl), hooks)
+                  lines.push({ text: '　WebGL1 Manager get → ' + attempt(() => manager.get(npot)), kind: 'server' })
+                  const rg = new R.DataTexture2D({ label: 'rg', storage: { format: 'rg', type: 'uint8' }, colorSpace: 'data', source: { width: 2, height: 2, data: new Uint8Array(8) } })
+                  lines.push({ text: '③ 构造 rg → 成功；get → ' + attempt(() => manager.get(rg)), kind: 'server' })
+                  lines.push({ t: '结果', text: 'createTexture 调用了 ' + c.calls.createTexture + ' 次', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 8.4 反馈环 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-feedback'),
+          storageKey: 'lesson-0029-feedback',
+          cards: [
+            {
+              title: '采样正在写的那张纹理',
+              tags: ['真实 WebGL', '原生 GL'],
+              desc: '建一个 2 × 2 的纹理 T，挂到一个 FBO 的颜色槽上并绑定这个 FBO（这一刻 T 是输出目标）。shader 采样一个 sampler2D，纹理单元 0 里放的也是 T。drawArrays 一次，问 getError；再解绑 FBO（画到 canvas 上），同样 draw 一次。',
+              note: '课程写的部分：整段都是原生 GL，没有用项目代码；program 用 bindAttribLocation 把 position 定在 location 0。',
+              question: '画进 FBO 的那次 draw，getError 是多少？',
+              choices: ['1282（INVALID_OPERATION），这次 draw 没执行', '0：照常画，结果未定义', '1286（INVALID_FRAMEBUFFER_OPERATION）'],
+              answer: 0,
+              explain: 'T 同时是这次 draw 的输出和输入，WebGL 规范规定这种 draw 产生 INVALID_OPERATION、不执行。换成画到 canvas 上，T 不再是输出，同样的采样就没问题（0）。引擎每次 draw 不问 getError，所以光靠 WebGL 的这个错误码，只会看到「这次没画出来」，看不到原因。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const texture = gl.createTexture()
+                  gl.bindTexture(gl.TEXTURE_2D, texture)
+                  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+                  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+                  const framebuffer = gl.createFramebuffer()
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer)
+                  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0)
+                  const program = gl.createProgram()
+                  const sources = [
+                    [gl.VERTEX_SHADER, 'attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }'],
+                    [gl.FRAGMENT_SHADER, 'precision mediump float; uniform sampler2D u; void main() { gl_FragColor = texture2D(u, vec2(0.5)); }']
+                  ]
+                  for (const [type, source] of sources) {
+                    const shader = gl.createShader(type)
+                    gl.shaderSource(shader, source)
+                    gl.compileShader(shader)
+                    gl.attachShader(program, shader)
+                  }
+                  gl.bindAttribLocation(program, 0, 'p')
+                  gl.linkProgram(program)
+                  gl.useProgram(program)
+                  const buffer = gl.createBuffer()
+                  gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+                  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW)
+                  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+                  gl.enableVertexAttribArray(0)
+                  gl.activeTexture(gl.TEXTURE0)
+                  gl.bindTexture(gl.TEXTURE_2D, texture)
+                  gl.uniform1i(gl.getUniformLocation(program, 'u'), 0)
+                  lines.push({ text: 'FBO 状态 → ' + (gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE ? 'COMPLETE' : '不完整'), kind: 'user' })
+                  gl.getError()
+                  gl.drawArrays(gl.TRIANGLES, 0, 3)
+                  lines.push({ text: '输出是 T、单元 0 也是 T：drawArrays 之后 getError → ' + gl.getError(), kind: 'server' })
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+                  gl.drawArrays(gl.TRIANGLES, 0, 3)
+                  lines.push({ t: '结果', text: '解绑 FBO、画到 canvas 上：getError → ' + gl.getError(), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 10 Lifecycle ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-lifecycle'),
+          storageKey: 'lesson-0029-lifecycle',
+          cards: [
+            {
+              title: '一张静态纹理和一张阴影贴图，丢失、恢复',
+              tags: ['真实 WebGL', '项目代码（工作区版本）', '真的丢一次 context'],
+              desc: '第 1 代：Texture2DManager 上传 albedo（2 × 1，左红右蓝）；RenderTargetManager 建 2 × 2 的 shadow/main，用 clear 把它涂成绿色（假装阴影 pass 画过）。丢失后马上 get 一次；恢复后新建第 2 代的两个 Manager，get 同样两个 CPU 对象，读回。',
+              note: HELPER_NOTE + LOSE_NOTE + ' 这里手动装配两个 Manager（Texture2DManager 还没接进 ResourceManager）。',
+              question: '恢复以后，shadow/main 的颜色槽里是什么？',
+              choices: ['(0, 0, 0, 0)：新存储是空的，要由阴影 pass 重画', '(0, 255, 0, 255)：Manager 把绿色恢复了', '读不出来：RenderTarget 恢复后不能再用'],
+              answer: 0,
+              explain: 'albedo 从 DataTexture2D 的快照重传，和第 1 代一模一样。shadow/main 的 CPU 描述（尺寸、格式）还在，所以第 2 代能建出一样大的 FBO；但绿色是 GPU 画出来的，CPU 上从来没有，Manager 不知道该填什么，只能给一块新的空存储。谁画的谁重画：这件事属于拥有它的 pass，不属于 Manager。',
+              run: () =>
+                withGL(async (gl, lines, lose) => {
+                  const make = () => ({ textures: new R.WebGL1Texture2DManager(gl, caps(gl), hooks), targets: new R.WebGL1RenderTargetManager(gl, caps(gl), hooks) })
+                  const albedo = dataTexture('albedo')
+                  const shadow = new R.RenderTarget({ width: 2, height: 2, colors: [{ format: 'rgba8' }] }, { label: 'shadow/main' })
+                  const first = make()
+                  const oldTexture = first.textures.get(albedo).handle
+                  const oldTarget = first.targets.get(shadow)
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, oldTarget.framebuffer)
+                  gl.clearColor(0, 1, 0, 1)
+                  gl.clear(gl.COLOR_BUFFER_BIT)
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+                  lines.push({ text: '第 1 代：albedo → ' + texels(read2D(gl, oldTexture, 2, 1), 2) + '；shadow 第 0 个像素 → ' + texels(read2D(gl, oldTarget.colorTextures[0], 2, 2), 1), kind: 'server' })
+                  if (!lose) {
+                    lines.push({ text: '这个浏览器没有 WEBGL_lose_context', kind: 'late' })
+                    return
+                  }
+                  lose.loseContext()
+                  lines.push({ text: '丢失后马上 get albedo → ' + attempt(() => first.textures.get(albedo)), kind: 'server' })
+                  await new Promise((resolve) => setTimeout(resolve, 50))
+                  const restored = new Promise((resolve) => gl.canvas.addEventListener('webglcontextrestored', resolve, { once: true }))
+                  lose.restoreContext()
+                  const outcome = await Promise.race([restored.then(() => 'restored'), new Promise((resolve) => setTimeout(() => resolve('timeout'), 3000))])
+                  if (outcome !== 'restored') {
+                    lines.push({ text: '3 秒内没等到恢复事件，实验停在这里', kind: 'late' })
+                    return
+                  }
+                  lines.push({ text: '恢复事件到达；旧 Manager 再 get → ' + attempt(() => first.textures.get(albedo)), kind: 'user' })
+                  const second = make()
+                  const newTexture = second.textures.get(albedo).handle
+                  const newTarget = second.targets.get(shadow)
+                  lines.push({ text: '第 2 代：albedo → ' + texels(read2D(gl, newTexture, 2, 1), 2) + '；isTexture(旧 albedo) → ' + gl.isTexture(oldTexture), kind: 'server' })
+                  lines.push({ t: '结果', text: '第 2 代：shadow 第 0 个像素 → ' + texels(read2D(gl, newTarget.colorTextures[0], 2, 2), 1) + '（尺寸 ' + newTarget.width + ' × ' + newTarget.height + '）', kind: 'result' })
+                }, true)
+            }
+          ]
+        })
+
+        // ---------------- 12.1 dispose 重试 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-dispose'),
+          storageKey: 'lesson-0029-dispose',
+          cards: [
+            {
+              title: '第二个 deleteTexture 抛错，然后再 dispose 一次',
+              tags: ['真实 WebGL', '项目代码（工作区版本）', '审查'],
+              desc: '同一个故障分别注入两个 Manager：各上传两张纹理 a、b，然后 dispose；代理让第 2 次 deleteTexture 抛一个 Error（只抛这一次）。接着再调用一次 dispose，看 a、b 的纹理还活着没有。',
+              note: HELPER_NOTE + ' cubemap 用 1 × 1 的六面数组。',
+              question: '第二次 dispose 之后，CubeTextureManager 的 b 还活着吗？',
+              choices: ['活着：第二次 dispose 直接返回，b 再也没人删', '已删除：第二次 dispose 补删了 b', '两次 dispose 都抛错'],
+              answer: 0,
+              explain: 'Texture2DManager：第一次 dispose 删掉 a，删 b 时抛错，b 留在表里；第二次 dispose 接着删 b，一共 3 次 deleteTexture，两张都没了。CubeTextureManager：第一次就把 disposed 设成 true、把表清空，删 b 抛错以后，第二次 dispose 在第一行就返回了，b 的纹理再没人能删（表里已经没有它）。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  for (const kind of ['Texture2DManager', 'CubeTextureManager']) {
+                    let deletes = 0
+                    let armed = true
+                    const c = counted(gl, [], {
+                      deleteTexture: (target, args, original) => {
+                        deletes++
+                        if (deletes === 2 && armed) {
+                          armed = false
+                          throw new Error('delete failed')
+                        }
+                        return original.apply(target, args)
+                      }
+                    })
+                    let manager
+                    let a
+                    let b
+                    if (kind === 'Texture2DManager') {
+                      manager = new R.WebGL1Texture2DManager(c.gl, caps(gl), hooks)
+                      a = dataTexture('a')
+                      b = dataTexture('b')
+                    } else {
+                      manager = new R.WebGL1CubeTextureManager(c.gl, caps(gl), hooks)
+                      const face = () => ({ width: 1, height: 1, data: new Uint8Array(4) })
+                      const cube = (label) => new R.CubeTexture({ label, storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'data', source: { kind: 'data', faces: [face(), face(), face(), face(), face(), face()] } })
+                      a = cube('a')
+                      b = cube('b')
+                    }
+                    const handleA = manager.get(a).handle
+                    const handleB = manager.get(b).handle
+                    const once = attempt(() => manager.dispose())
+                    const twice = attempt(() => manager.dispose())
+                    lines.push({ text: kind + '：第一次 dispose → ' + once + '；第二次 → ' + twice, kind: 'server' })
+                    lines.push({ t: kind === 'CubeTextureManager' ? '结果' : undefined, text: '　a 活着 → ' + gl.isTexture(handleA) + '，b 活着 → ' + gl.isTexture(handleB) + '；deleteTexture 一共调用 ' + deletes + ' 次', kind: kind === 'CubeTextureManager' ? 'result' : 'server' })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0029"]'), [
+          {
+            q: '为什么 CPU 的 Texture 不保存 WebGLTexture？',
+            opts: ['handle 只属于一个 context，丢失后就死了；CPU 对象要留着原料，让每个 context、每一代各建各的', 'WebGLTexture 太大，放不进 JS 对象', '为了让 Texture 可以被 JSON 序列化'],
+            answer: 0,
+            why: '第 3、4 节：第 1 版把 handle 放进对象，丢一次 context 就重建不了；两个 context 也不能共用一个 handle（1282）。'
+          },
+          {
+            q: '两个 DataTexture2D 的 label 都是 floor/albedo，Texture2DManager 怎样处理？',
+            opts: ['当成两张图，各建一个纹理：key 是对象身份', '当成一张图，第二个直接用第一个的纹理', '抛错：label 必须唯一'],
+            answer: 0,
+            why: 'label 只用于诊断（Texture.ts:73–79）。按字符串缓存会把两张不同的图合并（4.2 节卡片）。'
+          },
+          {
+            q: '一张加载失败（onerror 已触发）的 HTMLImageElement，complete 和 naturalWidth 是多少？',
+            opts: ['complete 为 true，naturalWidth 为 0', 'complete 为 false，naturalWidth 为 0', 'complete 为 true，naturalWidth 还是图片原本的宽度'],
+            answer: 0,
+            why: '失败也算加载结束。Texture2DManager 靠「宽高必须是正整数」在上传前拦下它（5.1 节卡片）。'
+          },
+          {
+            q: 'DataTexture2D 构造以后，调用者改了自己数组里的值，上传的是哪个值？',
+            opts: ['构造那一刻的值：构造时复制了一份', '改过的值', '看改的是哪个位置'],
+            answer: 0,
+            why: 'readonly 和 Object.freeze 都挡不住改 TypedArray 的元素，只能复制（5.2 节）。代价是内存：16 MiB 的纹理上传时 CPU 上可能同时有三份。'
+          },
+          {
+            q: 'resize 之前拿到的附件地址 { shadow, \'color\', 0 }，resize 之后再解析，得到什么？',
+            opts: ['resize 之后新建的纹理：地址不记 revision，按目标当前的 revision 解析', 'resize 之前的旧纹理', '抛错：地址过期了，要重新取'],
+            answer: 0,
+            why: '地址是「去哪里找」，不是「某一刻的结果」（图 3、6.2 节卡片）。'
+          },
+          {
+            q: 'Material 收下了 depth[0] 的地址，为什么 Backend 还会拒绝采样它？',
+            opts: ['Material 只证明地址存在；本项目 WebGL1 的 depth16 是 renderbuffer，不能被 shader 采样', 'Material 没检查 depth', 'depth 地址的 index 必须是 1'],
+            answer: 0,
+            why: '「地址存在」是和后端无关的规则，「能不能采样」是设备和实现的事，两件事分在两层查（7.3 节）。'
+          },
+          {
+            q: '300 × 300、wrapS 为 repeat 的 DataTexture2D，在 WebGL1 上会怎样？',
+            opts: ['构造成功；第一次 get 抛 UnsupportedRenderFeatureError，没有建纹理', '构造就失败', '上传成功，采样出黑色'],
+            answer: 0,
+            why: 'NPOT 限制只属于 WebGL1，所以放在 WebGL1 Manager 里、createTexture 之前查（第 8 节）。'
+          },
+          {
+            q: '一次 draw 的输出是 shadow 的颜色槽，shader 又采样同一个颜色槽，会怎样？',
+            opts: ['WebGL 产生 INVALID_OPERATION，这次 draw 不执行；引擎应该在 CPU 上先查出来', '照常画，只是结果未定义', 'WebGL 会自动复制一份再采样'],
+            answer: 0,
+            why: 'WebGL 规范的 Feedback Loops 一节。错误码要有人问 getError 才看得到，所以引擎要在 draw 时比一下对象身份（8.4 节）。'
+          },
+          {
+            q: 'context 恢复以后，阴影贴图里是什么？',
+            opts: ['一块新的空存储，要由阴影 pass 重画', 'Manager 从 CPU 数据重新上传的内容', '丢失之前的内容，浏览器保存了'],
+            answer: 0,
+            why: 'RenderTarget 只有描述没有像素；Manager 能重建存储，不知道该画什么（第 10 节卡片）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

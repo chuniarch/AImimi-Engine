@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 7 课 · core 精读</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/gl-sandbox.js"></script>
+    <script src="../assets/predict.js"></script>
+    <script src="../assets/rendering-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 详细设计篇 1/12 · 约 30 分钟</p>
+    <h1>core：Resource、错误体系与 requireNonNull</h1>
+    <p class="lede">
+      从这一课起逐个模块精读。第一站是 core：所有包都依赖它，它自己不依赖 rendering 里的任何包。里面只有几样东西——一份生命周期协议（Resource）、一套描述失败的词汇（错误类）、一个收窄 null 的小工具（requireNonNull），以及上周搬进来的纯数学类型。这一课逐行读前三样，重点看一条还没定下来的规则：释放时 listener 抛错怎么办。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— Task 15 的 Backend 抛出的每个错误都来自这里的类，Renderer 要按类别决定怎么办；Resource 的通知是 Backend 删除 GPU 副本的唯一入口。你正在重写的 ResourceManager 里，beforeDelete 故意用抛错做屏障——这个错误会一路冒到本课第 4 节的那个循环里。
+    </div>
+
+    <h2>0. 热身：前几课还记得吗</h2>
+    <div class="quiz" data-quiz="lesson-0007-warmup"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0007-warmup"]'), [
+        {
+          q: 'Scene 已经 dispose 过了，这时再调用 scene.release(geometry) 会怎样？',
+          opts: ['返回 false，什么也不做', '抛出 ResourceDisposedError', '照常交还一份引用'],
+          answer: 0,
+          why: 'dispose 开始后 release 一律返回 false（<a data-src="src/rendering/scene/Scene.ts:103">Scene.ts:103</a>），防止 listener 在同一轮里取消别的引用——第 5 课 Scene 账本的第三处顺序。本课第 4 节会看到这条规则的另一面。'
+        },
+        {
+          q: 'GeometryManager 在什么时候订阅 Geometry 的 onDispose？',
+          opts: ['第一次 get、buffer 全部建好之后', 'Geometry 构造的时候', 'Scene.retain 的时候'],
+          answer: 0,
+          why: '所有 buffer 创建、上传成功后，才订阅并发布 entry（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:185">GeometryManager.ts:185</a>）——第 4 课的「entry 与订阅同生共死」。Geometry 自己不知道有哪些 Manager。'
+        },
+        {
+          q: '按「上层该做什么」分类，WebGLContextLostError 属于哪一类？',
+          opts: ['设备暂时不可用：等恢复，不要重试这一次调用', '调用者用错了：去修代码', '功能不支持：换一条实现路径'],
+          answer: 0,
+          why: '第 6 课第 4 节的分类。context 丢失是一个状态：Renderer 看 ready，恢复后从 CPU 资源懒上传。'
+        }
+      ])
+    </script>
+
+    <h2>1. 设计问题：core 里该放什么？</h2>
+    <p>
+      core 在依赖图的最底部：scene、resources、frame、backend 都 import 它，它不 import 其中任何一个。所以放进 core 的东西要同时满足三条：<strong>被好几个包需要</strong>；<strong>不知道 GL、也不知道 Scene</strong>；<strong>是协议或词汇，而不是某种具体资源</strong>。现在的 core 正好是这几样：
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 26%">文件</th><th style="width: 30%">它是什么</th><th>谁在用</th></tr>
+        <tr><td><a data-src="src/rendering/core/Resource.ts:27">Resource.ts</a></td><td>CPU 资源的生命周期协议：计数、释放、通知</td><td>Geometry、Material、ShaderModule、纹理、RenderTarget 继承它；四个 Manager 订阅它</td></tr>
+        <tr><td><a data-src="src/rendering/core/errors/index.ts:1">errors/</a></td><td>描述失败的词汇：RenderingError 和它的 26 个子类</td><td>所有包</td></tr>
+        <tr><td><a data-src="src/rendering/core/requireNonNull.ts:15">requireNonNull.ts</a></td><td>把 <code>T | null</code> 收窄成 <code>T</code></td><td>各个 Manager 创建 GL 对象时</td></tr>
+        <tr><td><a data-src="src/rendering/core/validation.ts:16">validation.ts</a>（10 月 10 日新增，6.1 节）</td><td>「是不是对象、boolean、有限数」的共用规则，报什么错由调用方给</td><td>Material、Texture2DSamplingSource、PerspectiveCamera</td></tr>
+        <tr><td><a data-src="src/rendering/core/math/tuples.ts:12">math/tuples.ts</a></td><td>跨包传值的纯类型</td><td>Transform、Material、ViewState、RenderItem</td></tr>
+      </table>
+    </div>
+    <p>
+      <strong>想一想（先不用回答）：</strong><code>WebGLContextLostError</code>、<code>WebGLOperationError</code> 也住在 core/errors 里，名字里却带着 WebGL。它们没有 import 任何 GL 类型，但「WebGL」这个知识已经进了 core 的名字。将来加 WebGL2 后端时它们还适用吗？加一个独立的 WebGPU 模块呢？这个问题留到本课最后。
+    </p>
+
+    <h2>2. 精读 ①：Resource 的状态与两个抽象成员</h2>
+    <pre><code>export abstract class Resource {
+  private disposedValue: boolean = false        // :29  单向：只能从 false 变成 true
+  private sceneReferenceCountValue = 0          // :38  持有它的 Scene 数，不是 JS 引用数
+  private readonly disposeListeners = new Set&lt;DisposeListener&gt;()  // :43  按注册顺序
+
+  protected abstract readonly resourceType: string   // :50  稳定的诊断名，不用 constructor.name
+  protected abstract disposeCPUData(): void          // :59  子类释放自己的 CPU 数据</code></pre>
+    <ul>
+      <li><strong>三个字段都是 private。</strong>子类（比如 Geometry）碰不到 <code>disposedValue</code>，也就没法把一个已经释放的对象改回可用（<a data-src="src/rendering/core/Resource.ts:24">Resource.ts:24–25</a>）。要用这个状态，只能读公开的 <code>disposed</code>，或者调用 <code>assertUsable()</code>（<a data-src="src/rendering/core/Resource.ts:77">:77–81</a>）。</li>
+      <li><strong><code>readonly</code> 管的是「能不能换掉这个 Set」，不是「能不能往里加」。</strong>注释写得很直白（<a data-src="src/rendering/core/Resource.ts:41">:41</a>）：禁止替换 Set，但允许增删其中的 listener。</li>
+      <li><strong><code>resourceType</code> 为什么要子类自己写一个字符串？</strong>因为生产构建会压缩类名，<code>constructor.name</code> 靠不住（<a data-src="src/rendering/core/Resource.ts:47">:47–50</a>）。错误消息里的「Geometry has been disposed」用的就是它，还有专门的测试钉住（<a data-src="tests/unit/rendering/core/Resource.test.ts:338">Resource.test.ts:338</a>）。记住这一条——第 9.2 节会看到，错误类自己没有做到同样的事。</li>
+    </ul>
+    <aside class="note">
+      <strong>10 月 10 日更新（提交 2c8291a）</strong>：<code>assertUsable()</code> 从 protected 改成了 public（<a data-src="src/rendering/core/Resource.ts:63">Resource.ts:63–81</a>），注释换成「供子类与外部借用者在使用本资源前统一验证生命周期」。改它是为了借用方：Mesh 构造时要确认 Geometry、Material 还活着，以前只能自己写 <code>if (geometry.disposed) throw new ResourceDisposedError('Geometry')</code>，资源名要再手写一遍；现在写 <code>geometry.assertUsable()</code>，错误里的名字由资源自己的 resourceType 给出，和 onDispose 用的是同一条检查（3.1 节）。src/rendering 里现在有 40 多处这样的调用：Mesh、Material、Texture2DSamplingSource、各个资源自己的 getter，还有 RenderTargetManager 和 Texture2DManager。新注释也写明了它保证不了什么：成功只说明「这一刻 CPU 资源还活着」，不保证 GPU 上传成功或 context 可用；跨过 await 以后要在用的地方重新检查。同一个提交还给 core 加了一个模块 validation.ts，见 6.1 节。
+    </aside>
+
+    <h2>3. 精读 ②：订阅与通知</h2>
+    <h3>3.1 onDispose：已经释放就拒绝，返回一个取消函数</h3>
+    <pre><code>onDispose(listener: DisposeListener): () =&gt; void {
+  this.assertUsable()      // :105  已经释放就抛 ResourceDisposedError
+                           //       「避免创建永远不会触发的订阅」（:102）
+  this.disposeListeners.add(listener)
+  return () =&gt; {
+    this.disposeListeners.delete(listener)               // :110  Set.delete 天然幂等
+  }
+}
+// 10 月 10 日以前，第一行写的是
+// if (this.disposedValue) { throw new ResourceDisposedError(…) }，行为一样</code></pre>
+    <ul>
+      <li><strong>为什么拒绝，而不是悄悄返回一个什么也不做的取消函数？</strong>悄悄接受的话，调用方会以为自己将来能收到通知，它的 GPU 副本就永远等不到删除（<a data-src="src/rendering/core/Resource.ts:102">:102</a>）。大声拒绝，错误就出现在订阅的那一行。</li>
+      <li><strong>为什么返回一个函数，而不是提供 <code>removeListener(listener)</code>？</strong>调用方只要保存这一个闭包，不必再留着 listener 的引用；Manager 的 entry 里存的正是它（第 4 课的 <code>{ resource, unsubscribe }</code>）。three.js 用的是另一种写法：<code>removeEventListener(type, listener)</code>，调用方必须拿着同一个函数对象。</li>
+    </ul>
+
+    <h3>3.2 finalizeDisposal：唯一真正的清理路径</h3>
+    <pre><code>private finalizeDisposal(): void {
+  if (this.disposedValue) return          // :205  重入时直接返回
+  this.disposedValue = true               // :207  ① 先标记
+  for (const listener of this.disposeListeners) {
+    listener()                            // :210  ② 按注册顺序通知
+  }
+  this.disposeListeners.clear()           // :213  ③ 清空
+  this.disposeCPUData()                   // :215  ④ 最后释放 CPU 数据
+}</code></pre>
+    <p>第 5 课讲过，只有两个入口能到达这里：没有 Scene 引用时的 <code>dispose()</code> / <code>tryDispose()</code>，以及引用数从 1 减到 0 的那一次 <code>releaseSceneReference()</code>（<a data-src="src/rendering/core/Resource.ts:192">:192–203</a>）。这一课看顺序本身：</p>
+    <ul>
+      <li><strong>先标记。</strong>listener 里如果又调了 <code>dispose()</code>，:205 直接返回，不会重复通知；想再订阅，:105 拒绝；想读数据，公开 getter 会因 <code>assertUsable</code> 抛错。所以 Manager 的 listener 只按<strong>对象身份</strong>查自己的表，不再读 CPU 数据——OES 顶点输入管理器的注释写明了这一点（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:160">WebGL1OESVertexInputManager.ts:160</a>）。</li>
+      <li><strong>先通知，后释放 CPU 数据。</strong>Manager 删 GPU 副本时要用 CPU 对象当 key；CPU 数据最后才清，保证通知期间对象身份和它的记录都还在（项目文档「监听者为何先于 CPU 清理」一节专门讲这个）。</li>
+      <li><strong>在遍历中退订自己，安全吗？</strong>GeometryManager 的 listener 会调用 <code>release</code>，而 release 里要执行 <code>entry.unsubscribe()</code>（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:232">GeometryManager.ts:232</a>）——也就是在 for-of 遍历这个 Set 的途中，把当前这一项删掉。JavaScript 的 Set 按插入顺序遍历，删除当前项或已访问过的项不影响后面的项；只有删掉还没访问到的项，它才会被跳过。卡片 A 会验证。three.js 的做法不同：派发前先复制一份监听器数组（<a data-src="node_modules/three/src/core/EventDispatcher.js:113">EventDispatcher.js:113–114</a>），因为从数组里删元素会让后面的下标前移。</li>
+    </ul>
+
+    <h2>4. 一条还没定下来的规则：listener 抛错怎么办</h2>
+    <p>
+      上面那个循环没有 try/catch。第一个 listener 一抛错，后面三步都不再执行：<strong>disposed 已经是 true，但后面的 listener 收不到通知，Set 没清空，CPU 数据也没释放</strong>。这是项目有意留下、写进待决清单的一条（<a data-src="src/rendering/TODOList.md:5">TODOList.md:5–36</a>）。它的后果分三层：
+    </p>
+    <ol>
+      <li><strong>这个资源自己：</strong>处在「已标记释放、却没清理完」的半截状态。再调一次 dispose 也救不回来：:183 看到 disposed 为 true 就直接返回（卡片 B）。</li>
+      <li><strong>其他 context：</strong>后面没收到通知的 listener，往往是另一个 context 的 Manager。它的 GPU 副本和订阅会一直留到那个 Backend 关闭（第 4 课审查视角提过）。</li>
+      <li><strong>往上一层的 Scene：</strong><code>Scene.dispose()</code> 先把自己标记为 disposed，再逐个交还引用（<a data-src="src/rendering/scene/Scene.ts:134">Scene.ts:134–140</a>）。其中一个资源的 listener 抛错，循环就断了；此后 <code>release</code> 返回 false，再 <code>dispose</code> 直接返回。<strong>剩下的资源再也释放不掉</strong>（卡片 C）。一个 listener 的错误，变成了另一个资源的泄漏。</li>
+    </ol>
+    <p>
+      会抛错的 listener 从哪里来？最现实的来源就是 GeometryManager 和 ProgramManager 的 release：它们先调用 <code>beforeDelete</code>，这个钩子一抛错，release 就停在删除之前，把 entry 留下来等重试（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:209">GeometryManager.ts:209</a>）。在 Manager 内部，这是故意的屏障；但它是在 Resource 的通知循环里被调用的，所以这个错误会一路冒到这里。
+    </p>
+    <p>待决清单列出了要回答的几个问题。三种典型做法：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 20%">做法</th><th style="width: 30%">怎么做</th><th style="width: 25%">好处</th><th>代价</th></tr>
+        <tr><td>① 遇错即停（现状）</td><td>第一个错误直接冒出去</td><td>简单；错误不会被吞掉</td><td>上面三层后果全部存在</td></tr>
+        <tr><td>② 继续通知，最后汇总</td><td>每个 listener 各自 try/catch；全部通知完、清空 Set、释放 CPU 数据之后，把收集到的错误用 <code>AggregateError</code> 一次抛出</td><td>一个 Manager 出错不连累别的；资源一定能完整释放</td><td>Scene.dispose 也得照样改，否则它仍会中途停下；还要想清楚 disposeCPUData 自己抛错怎么办</td></tr>
+        <tr><td>③ 规定 listener 不许抛错</td><td>把「不抛错」写进 onDispose 的契约；Manager 在自己的 listener 里 catch 并记录</td><td>Resource 保持简单</td><td>契约靠自觉遵守；要和 Manager「beforeDelete 抛错即屏障」的设计协调</td></tr>
+      </table>
+    </div>
+    <aside class="note">
+      <strong>一处小小的文档漂移：</strong>待决清单写的是「<code>Resource.dispose()</code> currently: 1. marks the resource as disposed…」。那是引入引用计数之前的写法；现在这个循环在 <code>finalizeDisposal()</code> 里，<code>dispose</code>、<code>tryDispose</code>、<code>releaseSceneReference</code> 三个入口都会走到它，所以同一个问题的影响面比清单里写的更大。
+    </aside>
+
+    <h2>5. 精读 ③：错误体系</h2>
+    <h3>5.1 基类 EngineError：旧引擎留下的通用结构</h3>
+    <p>
+      RenderingError 继承的是项目原有的 <a data-src="src/errors/EngineError/BaseError.ts:39">EngineError</a>，它给所有错误提供同一套字段：<code>code</code>（稳定的错误码）、<code>context</code>（诊断上下文）、<code>recoverable</code>、<code>cause</code>（原始错误）、<code>timestamp</code>，以及给日志用的 <code>toJSON()</code>（<a data-src="src/errors/EngineError/BaseError.ts:92">:92–102</a>）。构造函数里有三行值得认识：
+    </p>
+    <ul>
+      <li><code>Object.setPrototypeOf(this, new.target.prototype)</code>（<a data-src="src/errors/EngineError/BaseError.ts:67">:67</a>）：编译到 ES5 时，继承内置的 Error 会丢原型链，<code>instanceof</code> 失灵，这一行把它接回来。编译目标是 ES2015 以上时不需要，但也无害。</li>
+      <li><code>this.name = this.constructor.name</code>（<a data-src="src/errors/EngineError/BaseError.ts:69">:69</a>）：错误的名字取自类名。<strong>第 9.2 节的发现就从这一行开始。</strong></li>
+      <li><code>Error.captureStackTrace(this, new.target)</code>（<a data-src="src/errors/EngineError/BaseError.ts:81">:81–83</a>）：V8 引擎的扩展，让调用栈从「创建错误的那一行」开始，不包含构造函数自己。</li>
+    </ul>
+
+    <h3>5.2 RenderingError：冻结诊断现场</h3>
+    <pre><code>constructor(message: string, code: string, details: RenderingErrorDetails = {}) {
+  const frozenDetails = Object.freeze({ ...details })    // :34  复制一层，再冻结最外层
+  super(message, code, { context: frozenDetails, recoverable: false })   // :38–41
+  this.details = frozenDetails                            // :43  details 与 context 是同一个对象
+}</code></pre>
+    <ul>
+      <li><strong>为什么复制再冻结？</strong>错误创建之后，调用方可能继续修改自己手里那个对象。复制一层，错误里记下的就是「出错那一刻」的现场（<a data-src="src/rendering/core/errors/RenderingError.ts:19">RenderingError.ts:19–23</a>）。</li>
+      <li><strong>只冻结最外层。</strong>details 里嵌套的对象还是调用方原来那个，改它就能从错误里看到（卡片 D）。所以 details 里最好只放字符串、数字这样的值。</li>
+      <li><strong><code>recoverable: false</code> 是写死的</strong>——这是第 6 课 8.2 节的审查发现，这里不再展开。</li>
+    </ul>
+
+    <h3>5.3 26 个子类：每个类固定一个错误码和它最窄的上下文</h3>
+    <p>
+      子类的写法都一样：构造参数只收它能解释的上下文，错误码写死。例如 <a data-src="src/rendering/core/errors/RenderingError.ts:48">ResourceDisposedError</a> 只收一个 <code>resourceName</code>，码是 <code>RESOURCE_DISPOSED</code>；<a data-src="src/rendering/core/errors/RenderingError.ts:67">ResourceHasSceneReferencesError</a> 多收一个当前引用数。其中 19 个写在 RenderingError.ts 里（Task 1 一次落全），后来的任务又加了 7 个单独的文件，比如 <a data-src="src/rendering/core/errors/InvalidMeshError.ts:9">InvalidMeshError.ts</a>。
+    </p>
+    <p>于是，一个错误有三种「身份」，各有用处：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 22%">身份</th><th style="width: 38%">是什么</th><th>适合用来</th></tr>
+        <tr><td><code>instanceof</code></td><td>类本身</td><td>程序分支：「是 context 丢失吗」。压缩改不了它</td></tr>
+        <tr><td><code>code</code></td><td>写死在子类里的字符串</td><td>日志聚合、统计、国际化映射</td></tr>
+        <tr><td><code>name</code></td><td>来自 <code>constructor.name</code>，除非子类自己赋值</td><td>给人看的调试输出——但见第 9.2 节</td></tr>
+      </table>
+    </div>
+
+    <h2>6. 精读 ④：requireNonNull</h2>
+    <pre><code>export function requireNonNull&lt;T&gt;(value: T | null, errorFactory: () =&gt; Error): T {
+  if (value === null) {       // :16  只认 null，不认 falsy
+    throw errorFactory()      // :17  惰性：只有失败时才创建错误
+  }
+  return value                // :20  原样返回，对象身份不变
+}</code></pre>
+    <ul>
+      <li><strong><code>=== null</code>，不是 <code>!value</code>。</strong>0、false、空字符串都可能是合法结果，比如 attribute location 0（<a data-src="src/rendering/core/requireNonNull.ts:11">requireNonNull.ts:11–12</a>）。</li>
+      <li><strong>传工厂，不传错误对象。</strong>成功路径上不创建错误、不拼诊断字符串；参数类型是 <code>() =&gt; Error</code>，传一个普通字符串会编译不过（测试里用 <code>@ts-expect-error</code> 钉住）。</li>
+      <li><strong>只管「null 表示创建失败」。</strong><code>getUniformLocation</code> 返回 null 是正常结果：这个 uniform 没有被使用。那种地方用 requireNonNull 就错了。</li>
+    </ul>
+    <p>
+      <strong>一个实测出来的事实：</strong>现行 WebGL 1.0 的接口定义里，<code>createBuffer</code>、<code>createProgram</code> 等都已经不返回 null，只有 <code>createShader</code> 还是可空的；TypeScript 5.8 的类型与此一致（<a data-src="node_modules/typescript/lib/lib.dom.d.ts:26023">lib.dom.d.ts:26023</a> 的 <code>createBuffer(): WebGLBuffer</code>，<a data-src="node_modules/typescript/lib/lib.dom.d.ts:26031">:26031</a> 的 <code>createShader(…): WebGLShader | null</code>）。Chromium 在 context 丢失后，create 返回的是一个作废的对象（<code>isBuffer</code> 为 false），而不是 null（见 <a href="../reference/webgl1-api.html#measured">API 速查的实测清单</a>）。
+    </p>
+    <p>
+      所以今天真正起作用的，是紧跟在 create 后面的那一次 context 检查。ProgramManager 是这样写的：<code>gl.createProgram()</code> 之后立刻 <code>assertAvailable('create program')</code>，然后才 requireNonNull（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:108">ProgramManager.ts:108–114</a>）。OES 顶点输入管理器的注释也说得很老实：requireNonNull「保留对历史实现或异常测试替身的 null 防御」（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:87">WebGL1OESVertexInputManager.ts:87–101</a>）。对 createShader，它仍然是真正的类型收窄。
+    </p>
+
+    <h3 id="s6-1">6.1 10 月 10 日新增：validation.ts，规则共用、报什么错由调用方定</h3>
+    <p>
+      <strong>需求。</strong>Material 要查「float 参数是有限数」「depthTest 是 boolean」「options 是对象」；PerspectiveCamera 要查「fovY 是有限数」「options 是对象」。规则一模一样，要抛的错误却不一样：Material 抛 InvalidMaterialError，字段路径写成 <code>parameters.uRoughness</code>；相机抛 InvalidPerspectiveCameraError，字段是 <code>fovY</code>，还要把收到的原值放进 details。
+    </p>
+    <pre><code>// 第 1 版：10 月 10 日以前的写法。两个文件各有一份，错误类型写死在函数里
+// Material.ts（提交 77c6e7e）
+function requireFiniteNumber(value: unknown, fieldName: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value))
+    throw new InvalidMaterialError(fieldName, 'must be a finite number')
+  return value
+}
+// PerspectiveCamera.ts（提交 86036aa）：同名、同规则，只是 throw 的换成
+//   new InvalidPerspectiveCameraError(fieldName, 'must be a finite number', { received: value })
+// requireBoolean、「是不是非数组对象」也各写了一份</code></pre>
+    <p>
+      第 1 版的问题：规则有两份，改一份忘了另一份，两边就不一致；想把规则搬进 core 共用，又不能让 core 替调用方决定抛哪个错误、字段路径怎么写。第 2 版就是现在的 <a data-src="src/rendering/core/validation.ts:63">validation.ts</a>：函数只管规则，错误由调用方用工厂交进来，写法和上面的 requireNonNull 一样。
+    </p>
+    <pre><code>// src/rendering/core/validation.ts:63–69（注释是课程加的）
+export function requireFiniteNumber(value: unknown, errorFactory: () =&gt; Error): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {   // '1'、NaN、±Infinity 都不过
+    throw errorFactory()     // 失败时才调用工厂；抛的就是工厂交回的那个错误对象
+  }
+  return value               // 原样返回：-0 还是 -0，1e100 还是 1e100
+}
+
+// 调用方一：PerspectiveCamera.ts:45–50
+const fovYInput = options.fovY          // 只读一次：options 上的 fovY 可能是 getter，每次读的值都可能不同
+const fovY = requireFiniteNumber(
+  fovYInput,
+  () =&gt;
+    new InvalidPerspectiveCameraError('fovY', 'must be a finite number', { received: fovYInput })
+)
+
+// 调用方二：materialParameters.ts:159–161（copyParameter 的 float 分支）
+requireFiniteNumber(parameter.value, () =&gt;
+  createError(fieldName, 'must be a finite number')  // 这个工厂也是调用方交的
+)</code></pre>
+    <div class="table-scroll"><table>
+      <thead><tr><th>函数</th><th>放行</th><th>拒绝</th><th>不管的事</th></tr></thead>
+      <tbody>
+        <tr><td><a data-src="src/rendering/core/validation.ts:16">assertNonArrayObject</a></td><td>任何非 null、非数组的对象，包括 Date、Map、TypedArray</td><td>null、数组、数字、字符串</td><td>字段在不在、字段名对不对、字段值合不合法</td></tr>
+        <tr><td><a data-src="src/rendering/core/validation.ts:39">requireBoolean</a></td><td>true、false</td><td>1、'true'、null</td><td>不做 Boolean(value) 转换，不补默认值</td></tr>
+        <tr><td><a data-src="src/rendering/core/validation.ts:63">requireFiniteNumber</a></td><td>任何有限的 number，包括 -0、1e100</td><td>'1'、NaN、±Infinity</td><td>正数、整数、Float32 能不能装下：<code>Math.fround(1e100)</code> 是 Infinity，要由相机的投影检查、Uniforms 的 Float32 检查各自再拦</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      注释给这条设计起的名字是「规则与错误分离」（validation-rule-error-separation）。三个函数都不复制、不冻结输入，成功时也不创建错误对象。现在用它的是 Material、ParameterBlock、Texture2DSamplingSource 和 PerspectiveCamera；第 9 课、第 11 课的节选已经换成了新写法。
+    </p>
+    <aside class="note"><strong>10 月 19 日更新</strong>：「调用方二」原来在 Material.ts 里，直接写 <code>new InvalidMaterialError(…)</code>。新的参数块 ParameterBlock 也要用同一套复制规则，可它出错时该报 InvalidParameterBlockError，所以 copyParameter 搬进了 <a data-src="src/rendering/resources/materialParameters.ts:141">materialParameters.ts</a>，又多收一个错误工厂 <code>createError</code>：Material 交进来的造 InvalidMaterialError（<a data-src="src/rendering/resources/Material.ts:21">Material.ts:21–22</a>），ParameterBlock 交进来的造 InvalidParameterBlockError（<a data-src="src/rendering/resources/ParameterBlock.ts:53">ParameterBlock.ts:53–54</a>）。这是本节的思路往上走了一层：validation.ts 不替调用方决定报什么错，materialParameters.ts 也不替 Material 和 ParameterBlock 决定。</aside>
+
+    <h2>7. 先预测、再运行：跑真实的项目代码</h2>
+    <p>卡片 B 用到一个课程写的最小子类 <code>Probe</code>（在下面的准备代码里），只用来观察 Resource 基类的行为；项目源码里没有它。其余卡片只用项目里的真实类。</p>
+    <details>
+      <summary>每张卡片之前都会先运行的准备代码</summary>
+      <pre><code id="prelude-view"></code></pre>
+    </details>
+    <div id="predict-0007"></div>
+    <script>
+      ;(function () {
+        // 只为课程演示：SceneNode 用 crypto.randomUUID 生成 UUID，它要求安全上下文。
+        // 个别浏览器在 file:// 下没有这个函数，这里用 getRandomValues 补一个同格式的实现。
+        if (window.crypto && typeof window.crypto.randomUUID !== 'function') {
+          Object.defineProperty(window.crypto, 'randomUUID', {
+            configurable: true,
+            value: function randomUUID() {
+              const bytes = window.crypto.getRandomValues(new Uint8Array(16))
+              bytes[6] = (bytes[6] & 0x0f) | 0x40
+              bytes[8] = (bytes[8] & 0x3f) | 0x80
+              const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+              return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20)
+            }
+          })
+        }
+
+        const prelude = [
+          'const R = window.RTeachRendering                      // 打包进来的真实项目代码',
+          'const hooks = { invalidateState: () => undefined }',
+          'const geometries = new R.WebGL1GeometryManager(gl, { elementIndexUint: null }, hooks)',
+          'const makeGeometry = () => new R.Geometry({ attributes: { position: new R.VertexAttribute({ data: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), itemSize: 3 }) } })',
+          'class Probe extends R.Resource {                     // 课程写的最小子类：只用来观察基类',
+          "  resourceType = 'Probe'",
+          '  cpuReleased = false',
+          '  disposeCPUData() { this.cpuReleased = true }',
+          '}'
+        ].join('\n')
+        document.getElementById('prelude-view').textContent = prelude
+
+        if (!window.RTeachRendering) {
+          document.getElementById('predict-0007').textContent =
+            '没有加载到 assets/rendering-bundle.js，卡片无法运行。按 MAINTENANCE.md「真实代码打包」重新构建一次。'
+          return
+        }
+
+        RTeach.predict({
+          mount: document.getElementById('predict-0007'),
+          storageKey: 'lesson-0007',
+          canvas: false,
+          prelude,
+          items: [
+            {
+              title: 'A · GeometryManager 在自己的 listener 里退订自己：排在它后面的 listener 还会被调用吗？',
+              code: [
+                'const geometry = makeGeometry()',
+                'geometries.get(geometry)                 // 第 1 个 listener：GeometryManager 的（GeometryManager.ts:185）',
+                "geometry.onDispose(() => log('第 2 个 listener 被调用了'))",
+                'geometry.dispose()                       // release 里会执行 entry.unsubscribe()，把第 1 个从 Set 里删掉',
+                "log('disposed =', geometry.disposed)"
+              ].join('\n'),
+              choices: ['会：删掉正在执行的那一项，不影响后面的', '不会：遍历途中删了元素，后面的被跳过', '抛错：Set 不允许在遍历时被修改'],
+              answer: 0,
+              explain: 'Set 按插入顺序遍历；删除当前项或已访问过的项是安全的，后面的照常访问。只有删掉还没访问到的项，它才会被跳过。GeometryManager 的 release 在 listener 里退订的正是它自己（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:232">GeometryManager.ts:232</a>），属于前一种。调用日志里能看到它发出的 deleteBuffer。three.js 为了同样的安全，派发前先复制一份数组（<a data-src="node_modules/three/src/core/EventDispatcher.js:113">EventDispatcher.js:113–114</a>）。'
+            },
+            {
+              title: 'B · 第一个 listener 抛错：disposed、第二个 listener、CPU 清理分别怎样？',
+              note: 'Probe 是准备代码里课程写的最小 Resource 子类，项目源码里没有它；它继承的 R.Resource 是真实代码。',
+              code: [
+                'const probe = new Probe()',
+                "probe.onDispose(() => { throw new Error('beforeDelete 失败') })",
+                "probe.onDispose(() => log('第二个 listener 被调用了'))",
+                "try { probe.dispose() } catch (error) { log('dispose 抛出：', error.message) }",
+                "log('disposed =', probe.disposed, '；CPU 数据释放了吗？', probe.cpuReleased)",
+                "probe.dispose()",
+                "log('再 dispose 一次之后，CPU 数据释放了吗？', probe.cpuReleased)"
+              ].join('\n'),
+              choices: ['disposed 已是 true，但第二个 listener 和 CPU 清理都没执行', 'disposed 仍是 false：一切保持原样，可以重试', '所有步骤都执行完，最后才把错误抛出来'],
+              answer: 0,
+              explain: 'finalizeDisposal 先把 disposed 设成 true（<a data-src="src/rendering/core/Resource.ts:207">Resource.ts:207</a>），第一个 listener 一抛错，后面的通知、清空 Set（:213）和 disposeCPUData（:215）都没执行。再 dispose 一次也救不回来：disposed 已经是 true，:183 直接返回。这就是待决清单里那一条（<a data-src="src/rendering/TODOList.md:5">TODOList.md:5</a>）。'
+            },
+            {
+              title: 'C · Scene.dispose 途中有 listener 抛错：另一个资源还能释放吗？',
+              code: [
+                'const scene = new R.Scene()',
+                'const first = scene.retain(makeGeometry())',
+                'const second = scene.retain(makeGeometry())',
+                "first.onDispose(() => { throw new Error('beforeDelete 失败') })",
+                "try { scene.dispose() } catch (error) { log('scene.dispose 抛出：', error.message) }",
+                "log('second：引用数 =', second.sceneReferenceCount, '，disposed =', second.disposed)",
+                "log('scene.release(second) →', scene.release(second))",
+                'scene.dispose()',
+                "log('再 dispose 一次之后：引用数 =', second.sceneReferenceCount, '；tryDispose →', second.tryDispose())"
+              ].join('\n'),
+              choices: ['不能：Scene 已标记释放，release 和 dispose 都不再处理它', '能：再调一次 scene.dispose() 就会接着释放', '能：Scene 标记释放时，它的引用已经归零'],
+              answer: 0,
+              explain: 'Scene.dispose 先把自己标记为 disposed（<a data-src="src/rendering/scene/Scene.ts:134">Scene.ts:134</a>），再逐个交还引用（:138–140）。first 的 listener 抛错，循环中断，second 的引用还在。之后 release 返回 false（:103），再 dispose 直接返回（:132）；second 自己的 tryDispose 返回 false，dispose 则会抛 ResourceHasSceneReferencesError。它再也进不了 disposed 状态，它在各个 context 里的 GPU 副本只能等 Backend 关闭时才删除。一个 listener 的错误，变成了另一个资源的泄漏。'
+            },
+            {
+              title: 'D · 创建错误之后再改 details：error.details 里看到的是哪个值？',
+              code: [
+                "const details = { resourceName: 'Geometry', extra: { count: 1 } }",
+                "const error = new R.RenderingError('演示', 'DEMO', details)",
+                "details.resourceName = '改过了'",
+                'details.extra.count = 2',
+                "log('resourceName =', error.details.resourceName, '；extra.count =', error.details.extra.count)",
+                "log('最外层冻结了吗？', Object.isFrozen(error.details), '；extra 冻结了吗？', Object.isFrozen(error.details.extra))",
+                "log('context 与 details 是同一个对象吗？', error.context === error.details, '；recoverable =', error.recoverable)"
+              ].join('\n'),
+              choices: ['resourceName 没变，extra.count 变成了 2', '两个都没变：details 被整个深拷贝了', '两个都变了：错误直接保存了原对象'],
+              answer: 0,
+              explain: 'RenderingError 先展开复制一层，再 Object.freeze（<a data-src="src/rendering/core/errors/RenderingError.ts:34">RenderingError.ts:34–36</a>）。最外层是新对象而且冻结了，改原对象的 resourceName 不影响它；extra 还是原来那个对象，改它就能看到。context 和 details 指向同一个对象（:38–43），recoverable 固定为 false（:40）。'
+            },
+            {
+              title: 'E · requireNonNull 依次收到 0、空字符串、null：错误工厂一共被调用了几次？',
+              code: [
+                'let calls = 0',
+                "const factory = () => { calls += 1; return new R.WebGLResourceCreationError('buffer', '演示') }",
+                "log('0 →', R.requireNonNull(0, factory))",
+                "log('空字符串 →', JSON.stringify(R.requireNonNull('', factory)))",
+                "try { R.requireNonNull(null, factory) } catch (error) { log('null →', error.name, error.code) }",
+                "log('工厂一共被调用了', calls, '次')"
+              ].join('\n'),
+              choices: ['1 次：只有 null 才调用工厂', '3 次：每次都先把错误准备好', '2 次：0 和 null 都被当成失败'],
+              answer: 0,
+              explain: '只有 value === null 才调用工厂（<a data-src="src/rendering/core/requireNonNull.ts:16">requireNonNull.ts:16</a>），0 和空字符串原样返回。工厂是惰性的：成功路径上不创建错误对象。这里 error.name 能显示出类名，是因为课程打包时保留了类名；生产构建里它是什么，见第 9.2 节。'
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <h2>8. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0007"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0007"]'), [
+        {
+          q: 'finalizeDisposal 为什么先把 disposed 设成 true，再通知 listener？',
+          opts: ['listener 里重入 dispose、再订阅或读数据时，都能看出资源已在释放', '为了让 listener 能读到最新的 CPU 数据', '因为 Set 只能在 disposed 为 true 时遍历'],
+          answer: 0,
+          why: '重入的 dispose 在 :205 直接返回，onDispose 在 :105 拒绝，公开 getter 因 assertUsable 抛错。所以 Manager 的 listener 只按对象身份查自己的表（<a data-src="src/rendering/core/Resource.ts:201">Resource.ts:201–202</a>）。'
+        },
+        {
+          q: 'onDispose 在资源已经释放时为什么直接抛错，而不是悄悄返回一个空的取消函数？',
+          opts: ['那样的订阅永远不会触发，调用方却以为自己会收到通知', '为了省下 Set 里的一个位置', 'Set 在对象释放之后不能再添加元素'],
+          answer: 0,
+          why: '「避免创建永远不会触发的订阅」（<a data-src="src/rendering/core/Resource.ts:102">Resource.ts:102</a>）。悄悄接受，调用方的 GPU 副本就永远等不到删除通知；大声拒绝，错误出现在订阅的那一行。'
+        },
+        {
+          q: 'RenderingError 构造时对 details 做了什么？',
+          opts: ['复制一层并冻结最外层，嵌套的对象仍是原来那个', '深拷贝，并递归冻结整个对象', '直接保存调用方传进来的对象'],
+          answer: 0,
+          why: 'RenderingError.ts:34–36，卡片 D 验证过。所以 details 里最好只放字符串、数字这类值；要放对象，就先自己复制一份。'
+        },
+        {
+          q: '上层代码要判断「这是不是 context 丢失」，最可靠的写法是哪个？',
+          opts: ['error instanceof WebGLContextLostError', "error.name === 'WebGLContextLostError'", "error.message.includes('lost')"],
+          answer: 0,
+          why: 'instanceof 比较的是类本身，压缩改不了；code 是稳定字符串，适合日志；name 来自 constructor.name，第 9.2 节实测它在生产构建里是空字符串；message 是给人看的，随时可能改写。'
+        },
+        {
+          q: 'requireNonNull 为什么写 value === null，而不是 !value？',
+          opts: ['0、false、空字符串都是合法结果，不能当成失败', '=== 比 ! 运行得更快', 'TypeScript 不允许对泛型值用 !'],
+          answer: 0,
+          why: '<a data-src="src/rendering/core/requireNonNull.ts:11">requireNonNull.ts:11–12</a>。attribute location 0 就是合法值，一个 falsy 判断会把它当成失败（卡片 E）。'
+        },
+        {
+          q: '下面哪个调用返回的 null，不该交给 requireNonNull 处理？',
+          opts: ['getUniformLocation：null 表示这个 uniform 没有被使用', 'createShader：null 表示没能创建', 'createProgram：旧版接口定义里 null 表示没能创建'],
+          answer: 0,
+          why: 'requireNonNull 只处理「null 表示创建失败」。getUniformLocation 返回 null 是正常结果：uniform 被编译器优化掉了，或者根本不存在。调用方应该跳过它，而不是报错。'
+        }
+      ])
+    </script>
+
+    <h2>9. 架构视角</h2>
+    <h3>9.1 对照 three.js</h3>
+    <ul>
+      <li><strong>通知机制相同，生命周期不同。</strong>three.js 的 BufferGeometry、Material、Texture 都继承 EventDispatcher，<code>dispose()</code> 派发一个 dispose 事件，渲染器内部的模块监听它、删除 GPU 数据——和 Resource 加 Manager 是同一种观察者模式。不同在于：three.js 的 dispose 不是终点，对象之后还能再用、再上传（第 5 课）；这里的 disposed 是单向的。</li>
+      <li><strong>创建 GL 对象不检查 null。</strong>three.js 创建 buffer 就是一行 <code>gl.createBuffer()</code>，紧接着 bind、上传（<a data-src="node_modules/three/src/renderers/webgl/WebGLAttributes.js:11">WebGLAttributes.js:11–14</a>）。context 丢失交给渲染器统一处理，而不是在每个创建点防御。</li>
+      <li><strong>没有错误类体系。</strong>出错时在控制台打印、调用 onShaderError 钩子，然后继续运行（第 6 课 8.1）。</li>
+    </ul>
+    <p>
+      取舍：three.js 代码少，对「用完再用」很宽容；本项目多写了一层协议和一套词汇，换来的是「释放只有一次、失败有名字」。代价也看到了：协议越严格，像第 4 节那样没定下来的角落就越显眼。
+    </p>
+
+    <h3>9.2 审查视角：生产构建里，错误的 name 是空字符串</h3>
+    <p>
+      第 2 节说过，Resource 特意不用 <code>constructor.name</code>，因为生产构建会压缩类名。可错误类的 name 恰恰来自 <code>this.name = this.constructor.name</code>（<a data-src="src/errors/EngineError/BaseError.ts:69">BaseError.ts:69</a>）。项目的生产构建用 terser 压缩（<a data-src="vite.config.ts:133">vite.config.ts:133</a>），Vite 6.3.5 对 ES 模块产物会打开 terser 的 <code>module</code> 选项，顶层的名字都可以改。我用同样的设置压缩了一段只 new 错误的代码，实测结果：
+    </p>
+    <pre><code>未压缩：   ResourceDisposedError   WebGLContextLostError   InvalidMeshError
+压缩之后："" （空字符串）          ""                       InvalidMeshError</code></pre>
+    <p>
+      <code>code</code> 和 <code>instanceof</code> 都不受影响。InvalidMeshError 能保住名字，是因为它在构造函数里自己写了 <code>this.name = 'InvalidMeshError'</code>（<a data-src="src/rendering/core/errors/InvalidMeshError.ts:15">InvalidMeshError.ts:15</a>）；单独成文件的 7 个错误类里有 4 个这样做了，写在 RenderingError.ts 里的 19 个都没有。测试也挡不住：<a data-src="tests/unit/rendering/core/RenderingError.test.ts:198">RenderingError.test.ts:198</a> 断言的是 <code>error.name === error.constructor.name</code>，压缩之后两边都是空字符串，照样通过——它检查的是「前后一致」，不是「名字稳定」。影响在于日志：<code>toJSON()</code> 输出的 name（<a data-src="src/errors/EngineError/BaseError.ts:94">BaseError.ts:94</a>）会是空的。
+    </p>
+    <p>
+      <strong>想一想（不用写代码）：</strong>你会在哪一层修？每个子类像 InvalidMeshError 那样自己赋值；在 RenderingError 或 EngineError 里想办法；还是在构建配置里让 terser 保留类名？各自的代价是什么？再想一个测试：不跑生产构建，也能挡住这个问题。
+    </p>
+
+    <h3>9.3 找茬：实施计划和实现对不上的两处</h3>
+    <p>
+      对照实施计划 Task 1 里 RenderingError 的写法（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-28-hw2-complete-webgl1-architecture-implementation-plan.md:253">接口列表</a>、<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-28-hw2-complete-webgl1-architecture-implementation-plan.md:259">代码草图</a>）和实现（<a data-src="src/rendering/core/errors/RenderingError.ts:24">RenderingError.ts:24–44</a>），找出两处不一致。找到之后告诉我：该改计划，还是该改实现？
+    </p>
+
+    <h2>10. 延伸阅读</h2>
+    <p>
+      <strong>首选（一手来源，约 10 分钟）：</strong>项目自己的 <a data-src="src/rendering/core/docs/resource-lifecycle-and-errors.zh-CN.md:35">Resource 生命周期与错误设计</a> 后三节：「监听者为何先于 CPU 清理」「errors：让失败原因可分类」「requireNonNull：只做一种验证」。读的时候留意它关于 create 返回 null 的说法，和第 6 节的实测比一比。
+    </p>
+    <p>
+      补充：待决清单的 <a data-src="src/rendering/TODOList.md:5">listener 失败语义</a> 一节（第 4 节的原文）；MDN 的 <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/AggregateError">AggregateError</a>（第 4 节做法 ② 会用到）；esbuild 文档里 <a href="https://esbuild.github.io/api/#keep-names">keep-names</a> 一节，解释了压缩器为什么会改掉函数和类的名字。
+    </p>
+
+    <aside class="ask">
+      做完告诉我：热身题和检查题各错了哪几题、五张卡片猜对了几张。还有四个开放问题可以直接在对话里回答：第 1 节 WebGL 命名的错误该不该留在 core；第 4 节三种做法你选哪种；第 9.2 节在哪一层修；第 9.3 节的两处不一致。下一课先上第 19 课（Task 15，提前），之后回到第 8 课读 scene 的 Transform 和 SceneNode。
+    </aside>
+
+    <div class="nav">
+      <a href="0006-boundaries-and-failure.html">← 第 6 课：边界与失败</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0019-task15-backend-orchestration.html">第 19 课（提前）：Task 15 编排 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 7 课 · 2026-09-26</footer>
+  </body>
+</html>

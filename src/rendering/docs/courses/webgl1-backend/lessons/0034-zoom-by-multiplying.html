@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 34 课 · 滚轮缩放</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/camera-bundle.js"></script>
+    <script src="../assets/orbit-lab.js"></script>
+    <script src="../assets/view-lab.js"></script>
+  </head>
+  <body>
+    <p class="kicker">零基础重写 · 相机数学 3/4 · 约 20 分钟</p>
+    <h1>滚轮缩放：为什么是「距离乘一个数」</h1>
+    <p class="lede">
+      滚一格滚轮，相机朝目标点靠近或远离。最直接的写法是「每格走 5 个单位」，可项目写的是 <code>Math.exp(deltaY × 0.001)</code>：每格把距离乘一个数。这一课从两个手感要求出发，推出只能这样写。
+    </p>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：第 32 课的 ★ 和「同样长的东西，占的像素和深度成反比」（第 32 课第 8 节）。指数只用到「q 的 n 次方」这个意思。<br />
+      <strong>这一课讲的</strong>：屏幕大小和距离的关系；要求一「每格放大同样的比例」推出乘法；要求二「分几次滚和一次滚完结果一样」推出指数；项目的 onWheel 逐行读（含 WheelEvent 的全部字段）；两种写法并排滚一滚。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">要回答的问题</a></li>
+        <li><a href="#s2">屏幕上的大小和距离成反比</a></li>
+        <li><a href="#s3">要求一：每格放大的比例一样 → 乘法</a></li>
+        <li><a href="#s4">要求二：分几次滚和一次滚完一样 → 指数</a></li>
+        <li><a href="#s5">两种写法并排滚一滚</a></li>
+        <li><a href="#s6">项目代码：onWheel 逐行读</a></li>
+        <li><a href="#s7">检查题</a></li>
+        <li><a href="#s8">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 要回答的问题</h2>
+    <p>相机离目标点的距离记作 r。HW2 一开始 r = 50.99。你向上滚一格，画面放大一点。问题是：这一格之后，r 应该变成多少？</p>
+    <p>滚轮缩放只改 r，不改相机看的方向，相机始终沿着「相机—目标」这条线前后移动。所以目标点一直在画面正中，它的深度就是 r。</p>
+
+    <h2 id="s2">2. 屏幕上的大小和距离成反比</h2>
+    <p>在目标点那里竖一根长 L 的棒（垂直于视线）。由第 32 课的 ★，它在屏幕上占的像素是：</p>
+<pre>像素长度 = L × H / h(r) = L × H / (2 × r × tan(fovY/2))</pre>
+    <p>L、H、fovY 都不变，变的只有 r。所以<strong>像素长度和 r 成反比</strong>：r 减半，棒在屏幕上的长度翻倍。HW2 里一根 2 个单位长的棒：</p>
+<pre>r = 50.99：2 × 600 ÷ (2 × 50.99 × 0.41421) = 28.41 px
+r = 25.50：56.82 px（r 减半，长度翻倍）</pre>
+    <p>（下面实验台的画布只有 240 px 高，读数会小得多；而且 HW2 的相机低着头，竖直的棒和视线不完全垂直，读数还会再小 2% 左右。这两件事都不影响比例：r 减半，长度照样翻倍。）</p>
+
+    <h2 id="s3">3. 要求一：每格放大的比例一样 → 乘法</h2>
+    <p>第一个手感要求：<strong>不管现在离多远，滚一格，画面都放大同样的比例</strong>。比如每格都放大 10%。离得远时滚一格只动一点点，离得近时滚一格就猛冲过去，都是不好的手感。</p>
+    <p>写成式子。设滚一格前距离 r，滚一格后 r'，放大比例是 k（比如 1.1）。由第 2 节，大小和距离成反比：</p>
+<pre>新大小 ÷ 旧大小 = (1/r') ÷ (1/r) = r ÷ r' = k
+⟹ r' = r ÷ k</pre>
+    <p>不管 r 是多少，每格都是「除以同一个 k」，也就是乘同一个数 1/k。这就是乘法。</p>
+    <p>对照「每格走 5 个单位」（r' = r − 5），它放大的比例是 r ÷ (r − 5)，随 r 变：</p>
+<pre>r = 50.99 → 45.99：放大 50.99 ÷ 45.99 = 1.109 倍（约 11%）
+r = 10    → 5    ：放大 10 ÷ 5        = 2 倍    （一格就翻倍）
+r = 4     → −1   ：距离变成负数，相机穿过了目标点</pre>
+    <p>乘法没有这个问题：一个正数乘一个正数，结果永远是正数，相机永远到不了目标点上，更不会穿过去。</p>
+
+    <h2 id="s4">4. 要求二：分几次滚和一次滚完一样 → 指数</h2>
+    <p>浏览器交来的不是「格」，而是一个数 <code>deltaY</code>（第 38 课细讲）。鼠标滚一格常见的是 100 左右（不同系统、不同鼠标不一样，第 38 课的实验台会显示你的鼠标给多少）；触控板一滑，会发很多个 wheel 事件，每个只有几到十几。</p>
+    <p>第二个手感要求：<strong>同样的滚动量，分几次来和一次来，结果要一样</strong>。触控板滑 10 个 deltaY = 10，和鼠标滚一格 deltaY = 100，应该缩放得一样多。</p>
+    <p>设「收到 deltaY = Δ 以后，r 乘上 g(Δ)」。先收到 a、再收到 b，r 乘了 g(a) × g(b)；一次收到 a + b，r 乘了 g(a + b)。要求两者相等：</p>
+<pre>g(a + b) = g(a) × g(b)          对任意 a、b 都成立</pre>
+    <p>只用这一条，就能一步步推出 g 长什么样：</p>
+    <ol>
+      <li><strong>Δ = 0 时不缩放</strong>：取 a = b = 0，g(0) = g(0) × g(0)，所以 g(0) = 1。</li>
+      <li><strong>整数</strong>：取 a = b = 1，g(2) = g(1)²；再加一个 1，g(3) = g(1)³……记 q = g(1)，就有 g(n) = qⁿ。</li>
+      <li><strong>分数</strong>：把 1 拆成 m 份，1/m + 1/m + … + 1/m（m 个）= 1，所以 g(1/m)ᵐ = g(1) = q，g(1/m) = q^(1/m)。再用第 2 步，g(n/m) = q^(n/m)。</li>
+      <li><strong>负数</strong>：g(Δ) × g(−Δ) = g(0) = 1，所以 g(−Δ) = 1 / g(Δ) = q^(−Δ)。向上滚一格和向下滚一格正好抵消。</li>
+    </ol>
+    <p>所以 g(Δ) = q^Δ：滚动量出现在<strong>指数</strong>上（再加上「g 连续变化」这个自然的要求，无理数也一样）。数学里习惯把 q 写成 e 的某次方：q = e^c，于是</p>
+<pre>g(Δ) = e^(c × Δ)        c 是一个常数，决定滚一下缩放多快</pre>
+    <p>e ≈ 2.71828。e^(c × Δ) 和 q^Δ 是同一个东西换了写法：选好 c，q 就定了。项目取 c = zoomSpeed = 0.001：</p>
+<pre>deltaY = +100（向下滚一格）：r × e^0.1  = r × 1.10517   相机后退约 10.5%
+deltaY = −100（向上滚一格）：r × e^−0.1 = r × 0.90484   相机前进
+                              画面放大 1 ÷ 0.90484 = 1.10517 倍
+10 次 deltaY = 10：r × (e^0.01)^10 = r × e^0.1，和一次 100 完全一样</pre>
+
+    <h2 id="s5">5. 两种写法并排滚一滚</h2>
+    <p>左边是项目真实的 mountOrbitCameraInput（乘以 e^(0.001 × deltaY)），右边是课程写的「每格走 5 个单位」。在画布上滚轮，或者点按钮。读数显示上一格前后的距离 r，以及目标点处一根 2 个单位长的竖棒在屏幕上的长度。试试：</p>
+    <ul>
+      <li>速查：<a href="../reference/camera-controls-math.html">相机控制的数学</a>（第 32–35 课的公式和数字都在这一页）。</li>
+      <li>两边都连续向上滚：左边每格放大的比例一直是 1.105 倍；右边越滚越猛，最后穿过目标点，目标点从画面上消失。</li>
+      <li>左边向上滚一格、再向下滚一格：r 回到原来的数。</li>
+    </ul>
+<pre id="subtract-code"></pre>
+    <div class="vl-pair">
+      <div><p class="vl-caption">项目代码：r × e^(0.001 × deltaY)</p><div id="zoom-real"></div></div>
+      <div><p class="vl-caption">课程写的：每格走 5 个单位</p><div id="zoom-sub"></div></div>
+    </div>
+
+    <h2 id="s6">6. 项目代码：onWheel 逐行读</h2>
+    <p>滚轮事件交给这个函数（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:296">mountOrbitCameraInput.ts:296–306</a>），注释是课程加的。函数前面那段注释列出 WheelEvent 的全部字段，依据是 <a href="https://developer.mozilla.org/en-US/docs/Web/API/WheelEvent">MDN：WheelEvent</a> 和 <a href="https://w3c.github.io/pointerevents/#interface-wheelevent">W3C Pointer Events 规范</a>（WheelEvent 的定义已经从 UI Events 规范移到了这份规范）。函数里每一行的注释写着这一行用到哪个字段、哪条数学。</p>
+    <aside class="note">10 月 19 日补充：按你的建议，注释里加上了 WheelEvent 的字段和每一行用到的数学，applyOrbit 的节选也扩成了整段。项目代码本身没有变。</aside>
+<pre>// ── WheelEvent 有哪些字段（MDN；W3C Pointer Events 规范）──
+// 用到它的事件只有一种：wheel。滚轮、触控板滑动、触控板捏合都发它；
+//   旧的 mousewheel、DOMMouseScroll 不是标准事件，已经废弃
+// 自己的 4 个，都只读：
+//   deltaX     横向滚动量，往右为正
+//   deltaY     纵向滚动量，往下为正：deltaY &gt; 0，页面会往下滚
+//   deltaZ     z 方向的滚动量，远离用户为正
+//   deltaMode  上面三个数的单位：0 像素、1 行、2 页
+// 从 MouseEvent 继承：clientX、clientY（指针在哪里）、
+//   ctrlKey、shiftKey、altKey、metaKey（按着哪个修饰键）、
+//   buttons（按着哪些鼠标键）等
+// 从 Event 继承：cancelable（能不能取消）、preventDefault()
+// 已经废弃，不要用：wheelDelta、wheelDeltaX、wheelDeltaY
+//
+// 这个函数只读 deltaY、deltaMode，只调用 preventDefault()。
+// 不读的几个，为什么不读：
+//   deltaX     横着滑不缩放。只横着滑的事件 deltaY = 0，第一行就返回
+//   clientX/Y  总是朝目标点缩放，不朝指针所在的点
+//              （three.js OrbitControls 的 zoomToCursor 选项做后者）
+//   ctrlKey    按着 Ctrl 滚、触控板捏合缩放时为 true（第 38 课）。
+//              这里不区分：捏合也走同一个公式
+function onWheel(event: WheelEvent): void {
+  // 已经卸载、deltaY 不是有限数、或者是 0：什么都不做。
+  // 这里检查 deltaY 是有限数，之后放心：指数和 zoom 都是有限数。
+  //   不检查的话 NaN 会一路传下去：e^NaN = NaN，r × NaN = NaN
+  // deltaY = 0 时 e^0 = 1，r 不变，所以直接返回。返回得早，
+  //   也就不调用 preventDefault：浏览器照常做自己的事（比如横向滚动）
+  if (closed || !Number.isFinite(event.deltaY) || event.deltaY === 0) return
+  const camera = getCamera()
+  // 没有相机：不缩放，也不拦，页面照常滚
+  if (camera === null) return
+  // 拖动途中换了相机：先结束那次拖动（第 37 课）
+  if (drag !== null &amp;&amp; camera !== drag.camera) endDrag()
+  // 把 deltaY 换成 CSS 像素：Δ = deltaY × unit
+  //   deltaMode 0 像素：unit = 1
+  //   deltaMode 1 行：  unit = 16（项目定的：1 行按 16 像素）
+  //   deltaMode 2 页：  unit = 画布高度；画布看不见时高度是 0，至少取 1
+  //   例：deltaY = 3（行）→ Δ = 48 像素 → zoom = e^0.048 = 1.0492
+  // MDN：不要假设是像素；有的浏览器还会看你有没有读过 deltaMode，
+  //   再决定给哪种单位。所以两个字段要从同一个事件里一起读
+  // 乘一个正数只是换单位，第 4 节的 g(a + b) = g(a) × g(b) 照样成立
+  const unit =
+    event.deltaMode === 1
+      ? 16
+      : event.deltaMode === 2
+        ? Math.max(1, canvas.clientHeight)
+        : 1
+  // 第 4 节的 g(Δ) = e^(c × Δ)，c = zoomSpeed = 0.001（每像素）：
+  //   deltaY = +100 → e^0.1  = 1.10517：r 变大，相机后退
+  //   deltaY = −100 → e^−0.1 = 0.90484：r 变小，相机前进
+  //   触控板 10 个 +10：e^0.01 连乘 10 次 = e^0.1，和一次 +100 一样
+  //   （指数相加：e^a × e^b = e^(a + b)）
+  // clamp(v, 下限, 上限)：比下限小取下限，比上限大取上限（:40）。
+  // 这里把指数限制在 ±50，之后放心：zoom 是有限的正数。
+  //   Math.exp(x)：x &gt; 709.78 得 Infinity，x &lt; −745 左右得 0
+  //   e^50 ≈ 5.18 × 10²¹，e^−50 ≈ 1.93 × 10⁻²²
+  // ±50 不会让缩放变少：HW2 的 r 在 [1, 300] 里，两端只差
+  //   300 = e^5.70 倍，一个事件的指数超过 ±5.70 就已经撞到边界
+  const zoom = Math.exp(clamp(event.deltaY * unit * zoomSpeed, -50, 50))
+  // 只缩放、不旋转：方位角、仰角的变化都是 0
+  applyOrbit(camera, 0, 0, zoom)
+  // 取消默认动作：页面不跟着滚；捏合时浏览器也不缩放整页（MDN）。
+  //   要配合 passive: false 登记（:314，第 38 课），而且只对
+  //   cancelable 为 true 的事件有效
+  // 放在最后：上面提前返回的那几种情况，页面照常滚
+  event.preventDefault()
+}</pre>
+    <p>applyOrbit 接着把 zoom 用到相机上（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:138">:138–163</a>）。数字用 HW2 一开始的相机：位置 (0, 20, 50)，目标点 (0, 10, 0)。</p>
+<pre>// applyOrbit 节选；滚轮调用它时 azimuthDelta = elevationDelta = 0
+const target = targets.get(camera) ?? initialTarget
+const position = camera.transform.position
+// 从目标点指向相机的向量 (x, y, z)：
+//   (0, 20, 50) − (0, 10, 0) = (0, 10, 50)
+const x = position[0] - target[0]
+const y = position[1] - target[1]
+const z = position[2] - target[2]
+// 勾股定理：水平面上的长度 √(x² + z²) = 50
+const horizontal = Math.hypot(x, z)
+// 再用一次：r = √(horizontal² + y²) = √(x² + y² + z²) = 50.99
+const distance = Math.hypot(horizontal, y)
+// 这里检查 r 是有限数，之后放心：下面的乘法、三角函数都得有限数
+if (!Number.isFinite(distance)) return
+
+// r' = r × zoom，再限制在 [minDistance, maxDistance]（HW2 是 1 到 300）。
+// distance || minDistance：r = 0（相机正好在目标点上）时改用
+//   minDistance。0 乘任何数都是 0，不换的话怎么滚都离不开目标点
+// 限制会让「上下各一格正好抵消」在边界附近不成立：
+//   r = 290，往下一格：290 × 1.10517 = 320.50 → 限制成 300
+//   再往上一格：300 × 0.90484 = 271.45，回不到 290
+const radius = clamp((distance || minDistance) * zoom, minDistance, maxDistance)
+// 从 (x, y, z) 反算两个角（第 35 课细讲），再加上变化量 0：
+//   方位角 = atan2(x, z)：水平面上偏离 +z 轴多少，HW2 是 0°
+//   仰角   = atan2(y, horizontal)：相机在目标点上方多少度，HW2 是 11.31°
+const azimuth = (Math.atan2(x, z) + azimuthDelta) % TWO_PI
+const elevation = clamp(
+  Math.atan2(y, horizontal) + elevationDelta,
+  // 仰角限制在 ±(90° − 0.057°)：正上方时方位角没有定义
+  -MAX_ELEVATION,
+  MAX_ELEVATION
+)
+// 球坐标 → 直角坐标：相机 = 目标 + radius × 单位方向，
+//   单位方向 = (cos 仰角 × sin 方位角, sin 仰角, cos 仰角 × cos 方位角)
+// 两个角没变，单位方向就是原来的 (x, y, z) ÷ r，所以
+//   相机 = 目标 + (radius ÷ r) × (x, y, z)：只把那个向量拉长或缩短
+//   HW2 往上滚一格：(0, 10, 0) + 0.90484 × (0, 10, 50)
+//                 = (0, 19.05, 45.24)
+const ringRadius = radius * Math.cos(elevation) // 水平面上的那一段
+const next: Vec3Tuple = [
+  target[0] + ringRadius * Math.sin(azimuth),
+  target[1] + radius * Math.sin(elevation),
+  target[2] + ringRadius * Math.cos(azimuth)
+]
+// Transform 保存 Float32，不能把溢出的输入写成 Infinity 而破坏下一帧矩阵。
+//   ↑ 这一行是项目原有的注释。Float32 最大约 3.4 × 10³⁸，比 double 小
+//   得多：这里检查转成 Float32 后仍是有限数，之后放心：矩阵里没有 Infinity
+if (!next.every((value) =&gt; Number.isFinite(Math.fround(value)))) return
+camera.transform.setPosition(next)
+// 朝向也按这两个角设，相机继续看着目标点（第 35 课）
+camera.transform.setRotation([-elevation, azimuth, 0])</pre>
+    <p>合起来：滚轮缩放只把「目标点 → 相机」这个向量乘上 zoom（碰到距离限制时乘得少一些），相机沿着这条线前后移动，目标点一直在画面正中。</p>
+
+    <h2 id="s7">7. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0034"></div>
+
+    <h2 id="s8">8. 延伸阅读</h2>
+    <ul>
+      <li>首选：<a href="https://developer.mozilla.org/en-US/docs/Web/API/Element/wheel_event">MDN：Element: wheel event</a>。它的例子用滚轮缩放一个方块，还说明了用触控板做缩放手势时，浏览器也会发 wheel 事件，并把 ctrlKey 设成 true（第 38 课会实测）。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/WheelEvent/deltaMode">MDN：WheelEvent.deltaMode</a>：0 像素、1 行、2 页，读 deltaY 之前要先看它。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/WheelEvent">MDN：WheelEvent</a>：第 6 节注释里的字段表，以及 wheel 和 scroll 两种事件的区别（滚轮不一定让页面滚动，页面滚动也不一定来自滚轮）。</li>
+      <li><a href="https://w3c.github.io/pointerevents/#interface-wheelevent">W3C Pointer Events 规范：WheelEvent</a>：deltaX、deltaY、deltaZ 的正方向（往右、往下、远离用户）和 deltaMode 三个常量的正式定义。</li>
+      <li>three.js r177 的 OrbitControls 也是第 4 节的形式：<code>_getZoomScale</code> 返回 <code>Math.pow(0.95, zoomSpeed × |deltaY × 0.01|)</code>，就是 q^Δ，q = 0.95；向哪边缩放由 <code>_dollyIn</code>、<code>_dollyOut</code> 决定（本地 OrbitControls.js:846–851、:1064–1078）。</li>
+    </ul>
+
+    <aside class="note">
+      第 4 节的推导如果哪一步跳得太快，直接在对话里问我。做完告诉我检查题错了哪几题。
+    </aside>
+
+    <div class="nav">
+      <a href="0033-pan-from-the-formula.html">← 第 33 课：平移</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0035-roll-orbit-vs-arcball.html">第 35 课：歪头 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 34 课 · 2026-10-15</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+        const V = RTeach.viewLab
+        const num = V.num
+
+        // ---------------- 课程写的错误版本：每格走 5 个单位 ----------------
+        function attachSubtract5(canvas, api) {
+          function onWheel(event) {
+            event.preventDefault() // 不让页面跟着滚
+            const p = api.camera.transform.position
+            // 从相机指向目标点的方向，长度变成 1
+            const t = V.TARGET // 目标点 [0, 10, 0]
+            const toTarget = [t[0] - p[0], t[1] - p[1], t[2] - p[2]]
+            const length = Math.hypot(toTarget[0], toTarget[1], toTarget[2])
+            // 向上滚（deltaY < 0）朝目标走 5，向下滚后退 5
+            // 不管 deltaY 多大，每个事件都是 5
+            const step = event.deltaY < 0 ? 5 : -5
+            api.camera.transform.setPosition([
+              p[0] + (toTarget[0] / length) * step,
+              p[1] + (toTarget[1] / length) * step,
+              p[2] + (toTarget[2] / length) * step
+            ])
+            // 不改相机朝向：它还沿着原来的方向看
+          }
+          canvas.addEventListener('wheel', onWheel, { passive: false })
+          return () => canvas.removeEventListener('wheel', onWheel)
+        }
+        document.getElementById('subtract-code').textContent =
+          '// 课程写的「每格走 5 个单位」\n// 右边画布用的就是这段代码；api.camera 是右边那台相机\n' + V.sourceOf(attachSubtract5)
+
+        const markers = [
+          { name: '+1', point: [0, 11, 0], color: '#1f5f8b' },
+          { name: '−1', point: [0, 9, 0], color: '#1f5f8b' }
+        ]
+        function readout(api, marks) {
+          const p = api.camera.transform.position
+          const r = V.distance(p)
+          const len = (m) => (m[0].at && m[1].at ? Math.hypot(m[0].at.x - m[1].at.x, m[0].at.y - m[1].at.y) : NaN)
+          const lines = ['现在：r = ' + num(r, 4) + '，竖棒 ' + (Number.isFinite(len(marks)) && marks[0].at.depth > 0 ? num(len(marks), 2) + ' px' : '看不到（目标点不在相机前方）')]
+          if (api.snapshot) {
+            const before = api.snapshot
+            const r0 = api.snapshotR
+            if (r0 !== undefined) lines.push('上一格：r 从 ' + num(r0, 4) + ' 变成 ' + num(r, 4) + '（× ' + num(r / r0, 5) + '）')
+            const l0 = len(before)
+            const l1 = len(marks)
+            if (Number.isFinite(l0) && Number.isFinite(l1) && marks[0].at.depth > 0) lines.push('竖棒：' + num(l0, 2) + ' px → ' + num(l1, 2) + ' px（× ' + num(l1 / l0, 5) + '）')
+          }
+          return lines.join('\n')
+        }
+        const buttons = [
+          { label: '合成：向上滚一格（deltaY = −100）', run: (api) => api.wheel(-100) },
+          { label: '向下滚一格（+100）', run: (api) => api.wheel(100) },
+          {
+            label: '复位',
+            run: (api) => {
+              api.reset()
+              api.snapshotR = undefined
+            }
+          }
+        ]
+        for (const [id, extra] of [
+          ['zoom-real', { orbit: {} }],
+          ['zoom-sub', { attach: attachSubtract5 }]
+        ]) {
+          const api = V.scene(document.getElementById(id), { ...extra, markers, buttons, readout })
+          // 滚轮事件先到这里（scene 先登记的「记下位置」之后、控制之前）：记下这一格之前的距离
+          api.canvas.addEventListener('wheel', () => {
+            api.snapshotR = V.distance(api.camera.transform.position)
+          }, { capture: true })
+        }
+
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0034"]'), [
+          {
+            q: '相机离目标的距离从 40 变成 20，目标处的物体在屏幕上会怎样？',
+            opts: ['变成原来的两倍大', '变成原来的一半大', '大小保持不变'],
+            answer: 0,
+            why: '第 2 节：像素长度和 r 成反比，r 减半，长度翻倍。'
+          },
+          {
+            q: '「每格走 5 个单位」违反了哪个要求？',
+            opts: ['每格放大的比例应该一样', '分几次滚应该和一次一样', '向上向下滚应该能抵消'],
+            answer: 0,
+            why: '第 3 节：放大比例是 r ÷ (r − 5)，r = 50.99 时约 1.11 倍，r = 10 时 2 倍。它向上向下一格能抵消，按「格」算也满足第二个要求，只是比例不一样。'
+          },
+          {
+            q: 'g(a + b) = g(a) × g(b)，已知 g(1) = 1.2。g(3) 是多少？',
+            opts: ['1.2³ = 1.728', '1.2 × 3 = 3.6', '1.2 + 3 = 4.2'],
+            answer: 0,
+            why: '第 4 节第 2 步：g(3) = g(1 + 1 + 1) = g(1)³。'
+          },
+          {
+            q: '项目里 deltaY = −100 时，距离 r 乘以多少？',
+            opts: ['e^(−0.1) ≈ 0.905', 'e^(0.1) ≈ 1.105', '−100 × 0.001 = −0.1'],
+            answer: 0,
+            why: 'zoom = exp(deltaY × zoomSpeed) = exp(−0.1) ≈ 0.90484：向上滚，相机靠近。'
+          },
+          {
+            q: '为什么用乘法的缩放，相机永远不会穿过目标点？',
+            opts: ['正数乘正数，结果还是正数', '项目把距离限制在 1 到 300 之间', '浏览器不会发太大的 deltaY'],
+            answer: 0,
+            why: '第 3 节：e 的任何次方都是正数，r × 正数永远是正数。项目另外还把 r 限制在 [1, 300]，那是为了不靠得太近、不离得太远。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

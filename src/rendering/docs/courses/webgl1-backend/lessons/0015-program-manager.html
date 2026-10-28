@@ -1,0 +1,1506 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 15 课 · ProgramManager</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/program-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 详细篇 9 · backend ③ · 约 40 分钟</p>
+    <h1>backend ③：把 shader 源码变成可以 draw 的 program</h1>
+    <p class="lede">
+      ShaderModule 里只有两段 GLSL 文本。要用它 draw，得先编译、链接成 GPU 上的 program，再查出每个顶点输入和 uniform 的位置。教程里这只是十来行代码；可一旦源码写错、重试很多次、多个材质共用一份源码，或者 program 正在被使用时要删掉它，十来行就不够了。这一课从教程写法出发，一版一版补上缺的东西，最后对照项目的 WebGL1ProgramManager。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 每次 draw，Backend 的第一件事就是向 ProgramManager 要 program（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:208">WebGL1Backend.ts:208</a>）；它交回的反射结果，一份给顶点输入按名字找 location，一份给 Uniforms 上传参数（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:213">WebGL1Uniforms.ts:213–250</a>）。HW2 的 Mary 只有一份 PRT shader，可它被 Scene 持有、被 Material 借用，什么时候编译、什么时候删除，都由这个类决定。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：createShader、compileShader、linkProgram 这一串调用（第 1 课）；GL 出错时不抛异常，只留下错误标志，要用 getError 去取（第 2 课）；Resource 的 onDispose 订阅（第 4、5 课）；ShaderModule 的字段（第 11 课）；第 14 课 2.2 节「正在用的 program 删不掉」的实验。<br />
+      <strong>这一课从零讲的</strong>：编译和链接失败时浏览器交回什么；为什么失败也要删干净、怎样做到；为什么要先 detach 再 delete；反射拿到的是什么，location 0 和数组名字的坑；缓存的 key 为什么是对象本身；删除之前怎样通知还在用它的顶点输入（beforeDelete 钩子），为什么要在删除之前；删除 program 的顺序。<br />
+      <strong>页面会用到你的显卡</strong>：除了一张说明了的，所有卡片都在你的浏览器里创建真实的 WebGL context，真的编译、链接、删除，用完释放。第 5 节有一个编译计时实验。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">需求</a>：<a href="#s1-1">谁要什么</a> <a href="#s1-2">要应付的情况</a></li>
+        <li><a href="#s2">一版一版写</a>：<a href="#s2-1">第 1 版</a> <a href="#s2-2">第 2 版</a> <a href="#s2-3">第 3 版</a> <a href="#s2-4">第 4 版</a> <a href="#s2-5">真实代码</a> <a href="#s2-6">删除之前：谁还在用它</a> <a href="#s2-7">删除的顺序</a> <a href="#s2-8">和 Lifecycle 的关系</a></li>
+        <li><a href="#s3">反射结果交给谁</a></li>
+        <li><a href="#s4">架构视角：对照 three.js</a></li>
+        <li><a href="#s5">审查视角</a></li>
+        <li><a href="#s6">检查题</a></li>
+        <li><a href="#s7">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 需求</h2>
+
+    <h3 id="s1-1">1.1 先看原始输入：一段 shader 和三个使用者</h3>
+    <p>这是 HW2 的 PRT vertex shader 的接口部分（<a data-src="src/shaders/prt/sphericalHarmonics/order2/vertex.vert:12">order2/vertex.vert:12–28</a>，原文的注释换成了课程的注释）：</p>
+    <pre><code>attribute vec3 position;        // 顶点位置
+attribute vec3 aTransportSH0;   // 每个顶点的 9 个传输系数，分三组
+attribute vec3 aTransportSH1;
+attribute vec3 aTransportSH2;
+
+uniform mat4 uModelMatrix;      // 三个矩阵：Engine 每次 draw 自动填（builtInUniforms）
+uniform mat4 uViewMatrix;
+uniform mat4 uProjectionMatrix;
+uniform mat3 uLightSH_R;        // 环境光的 9 个系数，R、G、B 各一份：来自 Material 参数
+uniform mat3 uLightSH_G;
+uniform mat3 uLightSH_B;
+
+varying vec3 vColor;            // 交给 fragment shader 的颜色</code></pre>
+    <p>这段源码装在 ShaderModule 里（<a data-src="src/scenes/games202/hw2/createHW2Scene.ts:295">createHW2Scene.ts:295–303</a>）。拿到它以后，有三方要用编译的结果：</p>
+    <ul>
+      <li><strong>Backend 的 draw</strong>：要一个 <code>WebGLProgram</code>，交给 useProgram。</li>
+      <li><strong>顶点输入</strong>：要知道「position 在第几号 location」，才能把 buffer 接到正确的位置上（第 16 课）。location 是链接时由 GPU 驱动分配的数字，源码里看不出来。</li>
+      <li><strong>Uniforms</strong>：要每个 uniform 的 location，才能 uniformMatrix4fv 上传（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:239">WebGL1Uniforms.ts:239</a> 从这张表里取 location，这一课不展开）。</li>
+    </ul>
+    <p>所以 ProgramManager 的输入是一个 ShaderModule，输出是 <code>{ program, attributes: 名字 → location, uniforms: 名字 → location }</code>（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:22">WebGL1ProgramManager.ts:22–26</a>）。</p>
+
+    <h3 id="s1-2">1.2 需求：要应付哪些情况</h3>
+    <ol class="steps">
+      <li><strong>写错了要说清楚。</strong>GLSL 少一个分号，要报出「哪个模块、哪一段、驱动日志原文」，而不是让画面悄悄变黑。</li>
+      <li><strong>两段都对、合起来错，也要说清楚。</strong>vertex 输出的 varying 是 vec3，fragment 却当成 vec4 来读：各自都能编译，链接时才出错。</li>
+      <li><strong>失败不留垃圾。</strong>编译到一半失败，已经建好的 shader、program 都要删掉。用户改一次源码重试一次，重试多少次都不能越积越多。</li>
+      <li><strong>成功后只留 program。</strong>链接完成以后，两段 shader 就用不着了，要真正释放。</li>
+      <li><strong>交出反射结果。</strong>location 0 是有效位置；数组、没用到的变量，要按 GL 的规矩处理。</li>
+      <li><strong>同一份源码只编译一次。</strong>多个 Material 共用一个 ShaderModule 时，只建一个 program。同名不等于同一份源码。</li>
+      <li><strong>半成品不进缓存。</strong>只要有一步失败，缓存里就不能出现这个 ShaderModule。</li>
+      <li><strong>源码释放了，program 也要删。</strong>先让依赖它的顶点输入收拾，正在用的先换下来，再删。</li>
+      <li><strong>别人的错误不算到自己头上；context 丢了不乱发命令。</strong></li>
+    </ol>
+
+    <h2 id="s2">2. 一版一版写</h2>
+
+    <h3 id="s2-1">2.1 第 1 版：照教程写</h3>
+    <pre><code>// 第 1 版：照教程写。编译两段，链接，交回 program
+function createProgramV1(
+  gl: WebGLRenderingContext,
+  vertexSource: string,
+  fragmentSource: string
+): WebGLProgram {
+  const vertex = gl.createShader(gl.VERTEX_SHADER)! // 新建一个空的 shader 对象
+  gl.shaderSource(vertex, vertexSource) // 交给它源码
+  gl.compileShader(vertex) // 编译
+  const fragment = gl.createShader(gl.FRAGMENT_SHADER)!
+  gl.shaderSource(fragment, fragmentSource)
+  gl.compileShader(fragment)
+
+  const program = gl.createProgram() // 新建 program，把两段装进去
+  gl.attachShader(program, vertex)
+  gl.attachShader(program, fragment)
+  gl.linkProgram(program) // 链接：检查两段的接口对不对得上（varying 的名字和类型）
+  return program
+}</code></pre>
+    <div id="lab-v1"></div>
+
+    <h3 id="s2-2">2.2 第 2 版：编译、链接之后都问一次</h3>
+    <p>GL 不会因为源码写错就抛异常，结果记在 COMPILE_STATUS、LINK_STATUS 里，日志要用 getShaderInfoLog、getProgramInfoLog 去取。第 2 版把这两步补上：</p>
+    <pre><code>// 第 2 版：编译、链接之后都问一次结果，失败就带着驱动的日志抛错
+function compileV2(
+  gl: WebGLRenderingContext,
+  type: number,
+  source: string,
+  stage: &#x27;vertex&#x27; | &#x27;fragment&#x27;
+): WebGLShader {
+  const shader = gl.createShader(type)!
+  gl.shaderSource(shader, source)
+  gl.compileShader(shader)
+  // GL 不抛异常，失败只记在 COMPILE_STATUS 里，要自己问
+  if (gl.getShaderParameter(shader, gl.COMPILE_STATUS) !== true) {
+    // 日志是驱动写的原文，比如「ERROR: 0:3: &#x27;}&#x27; : syntax error」
+    throw new Error(`${stage} shader 编译失败：${gl.getShaderInfoLog(shader) ?? &#x27;&#x27;}`)
+  }
+  return shader
+}
+
+function createProgramV2(
+  gl: WebGLRenderingContext,
+  vertexSource: string,
+  fragmentSource: string
+): WebGLProgram {
+  const vertex = compileV2(gl, gl.VERTEX_SHADER, vertexSource, &#x27;vertex&#x27;)
+  const fragment = compileV2(gl, gl.FRAGMENT_SHADER, fragmentSource, &#x27;fragment&#x27;)
+  const program = gl.createProgram()
+  gl.attachShader(program, vertex)
+  gl.attachShader(program, fragment)
+  gl.linkProgram(program)
+  // 两段各自编译成功，链接仍可能失败：比如同一个 varying 两边的类型不一样
+  if (gl.getProgramParameter(program, gl.LINK_STATUS) !== true) {
+    throw new Error(`链接失败：${gl.getProgramInfoLog(program) ?? &#x27;&#x27;}`)
+  }
+  return program
+}</code></pre>
+    <div id="lab-v2"></div>
+
+    <h3 id="s2-3">2.3 第 3 版：失败也要收拾，成功后只留 program</h3>
+    <p>
+      第 2 版每失败一次，就在 GPU 上留下一两个 shader，链接失败时还多一个 program。这些对象没有任何 JS 变量指着它们，再也删不掉了。第 3 版用一张清单记下这次新建的 shader，<code>finally</code> 里统一删除；失败时连 program 一起删。
+    </p>
+    <pre><code>// 第 3 版：失败也要收拾。这次新建的东西记在清单上，最后统一删
+function compileV3(
+  gl: WebGLRenderingContext,
+  type: number,
+  source: string,
+  stage: &#x27;vertex&#x27; | &#x27;fragment&#x27;,
+  owned: WebGLShader[]
+): WebGLShader {
+  const shader = gl.createShader(type)!
+  owned.push(shader) // 先登记，再编译：编译失败时 finally 也找得到它
+  gl.shaderSource(shader, source)
+  gl.compileShader(shader)
+  if (gl.getShaderParameter(shader, gl.COMPILE_STATUS) !== true) {
+    throw new Error(`${stage} shader 编译失败：${gl.getShaderInfoLog(shader) ?? &#x27;&#x27;}`)
+  }
+  return shader
+}
+
+function createProgramV3(
+  gl: WebGLRenderingContext,
+  vertexSource: string,
+  fragmentSource: string
+): WebGLProgram {
+  const owned: WebGLShader[] = [] // 本次新建的 shader，不管成败都要删
+  let program: WebGLProgram | null = null
+  try {
+    const vertex = compileV3(gl, gl.VERTEX_SHADER, vertexSource, &#x27;vertex&#x27;, owned)
+    const fragment = compileV3(
+      gl,
+      gl.FRAGMENT_SHADER,
+      fragmentSource,
+      &#x27;fragment&#x27;,
+      owned
+    )
+    program = gl.createProgram()
+    gl.attachShader(program, vertex)
+    gl.attachShader(program, fragment)
+    gl.linkProgram(program)
+    if (gl.getProgramParameter(program, gl.LINK_STATUS) !== true) {
+      throw new Error(`链接失败：${gl.getProgramInfoLog(program) ?? &#x27;&#x27;}`)
+    }
+    // 链接好的 program 自己保存了编译结果，用不着这两段了。
+    // 先拆开：还装在 program 上的 shader，deleteShader 只会给它做个记号，并不真的释放
+    gl.detachShader(program, vertex)
+    gl.detachShader(program, fragment)
+    return program
+  } catch (error) {
+    if (program !== null) gl.deleteProgram(program) // 失败：半成品 program 也删掉
+    throw error
+  } finally {
+    for (const shader of owned) gl.deleteShader(shader) // 成功、失败都删 shader
+  }
+}</code></pre>
+    <div id="lab-v3"></div>
+    <p>
+      这里还有第二个细节：成功的时候为什么要先 <code>detachShader</code>？OpenGL ES 2.0 规定，还装在 program 上的 shader 被 delete 时只会被标记为「待删除」，等它从所有 program 上拆下来才真正释放。所以只 delete 不 detach，两段 shader 会一直活到 program 被删除为止。上面第二张卡片就是在你的浏览器里看这件事。three.js 选择了不 detach，原因见第 4 节。
+    </p>
+
+    <h3 id="s2-4">2.4 第 4 版：反射，以及缓存</h3>
+    <p>
+      反射 (reflection) 指链接之后问 GL「这个 program 实际用到了哪些输入，各在哪个位置」。只有 <strong>active</strong> 的才会被列出：链接器发现某个 uniform 声明了却没被用到，会把它优化掉，它就不在列表里。缓存的 key 用 ShaderModule 对象本身，第 6 条需求说过，同名不等于同一份源码。
+    </p>
+    <pre><code>// 第 4 版：再加两件事。查出每个输入的位置（反射），同一份源码只建一次（缓存）
+interface ShaderSource {
+  readonly name: string
+  readonly vertexSource: string
+  readonly fragmentSource: string
+}
+
+interface ProgramInfo {
+  readonly program: WebGLProgram
+  // 顶点输入名 → location，给顶点输入用
+  readonly attributes: ReadonlyMap&lt;string, number&gt;
+  // uniform 名 → location，给 uniform 上传用
+  readonly uniforms: ReadonlyMap&lt;string, WebGLUniformLocation&gt;
+}
+
+class ProgramCacheV4 {
+  // key 是源码对象本身：两个对象哪怕 name 相同，也是两份不同的东西
+  private readonly entries = new Map&lt;ShaderSource, ProgramInfo&gt;()
+
+  constructor(private readonly gl: WebGLRenderingContext) {}
+
+  get(source: ShaderSource): ProgramInfo {
+    const cached = this.entries.get(source)
+    if (cached !== undefined) return cached // 第二次起直接交回，不再编译
+
+    const gl = this.gl
+    const program = createProgramV3(gl, source.vertexSource, source.fragmentSource)
+    try {
+      const info: ProgramInfo = {
+        program,
+        attributes: reflectAttributes(gl, program),
+        uniforms: reflectUniforms(gl, program)
+      }
+      this.entries.set(source, info) // 全部成功才登记，缓存里不会出现半成品
+      return info
+    } catch (error) {
+      gl.deleteProgram(program) // 反射失败：program 也不要了
+      throw error
+    }
+  }
+}
+
+function reflectAttributes(
+  gl: WebGLRenderingContext,
+  program: WebGLProgram
+): Map&lt;string, number&gt; {
+  const result = new Map&lt;string, number&gt;()
+  // ACTIVE：链接器认为 shader 真正用到的那些；声明了却没用的，不在里面
+  const count = gl.getProgramParameter(program, gl.ACTIVE_ATTRIBUTES) as number
+  for (let index = 0; index &lt; count; index++) {
+    const info = gl.getActiveAttrib(program, index)!
+    const location = gl.getAttribLocation(program, info.name)
+    // 0 是有效位置，不能写 if (!location)；只有 -1 表示「没有」
+    if (location &lt; 0) throw new Error(`attribute ${info.name} 没有位置`)
+    result.set(info.name, location)
+  }
+  return result
+}
+
+function reflectUniforms(
+  gl: WebGLRenderingContext,
+  program: WebGLProgram
+): Map&lt;string, WebGLUniformLocation&gt; {
+  const result = new Map&lt;string, WebGLUniformLocation&gt;()
+  const count = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS) as number
+  for (let index = 0; index &lt; count; index++) {
+    // 数组只占一项，名字带 [0]，比如 uTint[0]
+    const info = gl.getActiveUniform(program, index)!
+    const location = gl.getUniformLocation(program, info.name)
+    if (location !== null) result.set(info.name, location)
+  }
+  return result
+}</code></pre>
+    <div id="lab-v4"></div>
+
+    <h3 id="s2-5">2.5 真实代码：比第 4 版多了什么</h3>
+    <p>
+      第 4 版已经满足前七条需求的大意。真实的 <code>get</code> 多做了几件事：错误换成专用的类（ShaderCompilationError 带上 stage，ProgramLinkError 带上日志）；只接受 GLSL ES 1.00；进门先清点已有的 GL 错误；每次查询以后检查 context 是否丢失；把订阅 ShaderModule 的释放放在登记缓存之前的最后一步。
+    </p>
+    <pre><code>// 项目里的真实代码（WebGL1ProgramManager.ts:80–198，节选，注释是课程加的）
+get(shader: ShaderModule): WebGL1ProgramResource {
+  this.assertAvailable(&#x27;get program&#x27;) // Manager 已关闭或 context 已丢：不再服务
+  // 已释放的源码不能再编译
+  if (shader.disposed) throw new ResourceDisposedError(&#x27;ShaderModule&#x27;)
+  if (this.releasing.has(shader)) {
+    // 正在删它的 program（beforeDelete 回调里又来要）：不能一边删一边建
+    throw new WebGLOperationError(&#x27;get program&#x27;, shader.name, &#x27;release is in progress&#x27;)
+  }
+
+  const cached = this.entries.get(shader) // 和第 4 版一样：按对象身份缓存
+  if (cached !== undefined) return cached.resource
+
+  // WebGL1 只认 GLSL ES 1.00；3.00 的源码在动用 GPU 之前就拒绝
+  if (shader.language !== &#x27;glsl-es-100&#x27;) {
+    throw new UnsupportedShaderLanguageError(shader.name, shader.language, &#x27;webgl1&#x27;)
+  }
+
+  const gl = this.gl
+  // 进门先清点：别人留下的 GL 错误，不能算成这次编译的
+  this.checkError(&#x27;preflight&#x27;, shader.name)
+
+  const shaders: WebGLShader[] = [] // 第 3 版的清单
+  let program: WebGLProgram | null = null
+  try {
+    const vertex = this.compile(shader, &#x27;vertex&#x27;, gl.VERTEX_SHADER, shaders)
+    const fragment = this.compile(shader, &#x27;fragment&#x27;, gl.FRAGMENT_SHADER, shaders)
+    // createProgram 可能交回 null（比如正好丢了 context），所以先问一次再用
+    const candidate = gl.createProgram()
+    this.assertAvailable(&#x27;create program&#x27;)
+    program = requireNonNull(
+      candidate,
+      () =&gt; new WebGLResourceCreationError(&#x27;program&#x27;, shader.name)
+    )
+
+    gl.attachShader(program, vertex)
+    gl.attachShader(program, fragment)
+    gl.linkProgram(program)
+    const linked: unknown = gl.getProgramParameter(program, gl.LINK_STATUS)
+    this.assertAvailable(&#x27;link program&#x27;) // 丢失期间查询会交回 null，先排除「丢了」
+    if (linked !== true) {
+      // 专用错误类，带日志
+      throw new ProgramLinkError(shader.name, gl.getProgramInfoLog(program) ?? &#x27;&#x27;)
+    }
+
+    gl.detachShader(program, vertex) // 第 3 版的 detach
+    gl.detachShader(program, fragment)
+    this.checkError(&#x27;link program&#x27;, shader.name)
+
+    // ……反射 attributes 和 uniforms，和第 4 版相同，多了计数校验和丢失检查（:141–172）……
+
+    const resource: WebGL1ProgramResource = Object.freeze({
+      program,
+      attributes,
+      uniforms
+    })
+    // 订阅：ShaderModule 被释放时，自动删掉这个 program
+    const unsubscribe = shader.onDispose(() =&gt; this.release(shader))
+    this.entries.set(shader, { resource, unsubscribe }) // 最后一步才登记
+    return resource
+  } catch (error) {
+    if (gl.isContextLost() || this.lostValue) {
+      // 丢了：旧句柄全部失效，不去 delete，整个 Manager 作废
+      this.invalidateForContextLoss()
+      throw new WebGLContextLostError(&#x27;create program&#x27;)
+    }
+    if (program !== null) gl.deleteProgram(program)
+    throw error
+  } finally {
+    if (!gl.isContextLost() &amp;&amp; !this.lostValue) {
+      for (const compiled of shaders) gl.deleteShader(compiled)
+    }
+  }
+}</code></pre>
+    <aside class="note"><strong>10 月 12 日更新</strong>：上面调用的 <code>checkError</code>（进门 preflight、每个 shader 编译后、链接后各一次）以前每次只读一个错误码。你在工作区把它改成了有界循环（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:354">WebGL1ProgramManager.ts:354–382</a>）：一直读到 NO_ERROR 为止，最多读 32 次，读到的码一次报出，信息是「GL errors: 1280, 1281」；32 次还没见到 NO_ERROR，就报「收集未完成」。每读一次，前后都 assertAvailable，丢失时照旧按丢失处理。下面「别人留下的 GL 错误」这张卡片已经换成新代码跑。GeometryManager 的同名方法做了同样的修改（第 16 课）；顶点输入和纹理上传的检查（<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:168">WebGL1VertexInputSupport.ts:168</a>、<a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:27">WebGL1TextureUploadSupport.ts:27</a>）还是只读一次。</aside>
+    <div id="lab-final"></div>
+
+    <h3 id="s2-6">2.6 删除之前：还有谁在用这个 program</h3>
+    <p>
+      先看一个具体场景。Mary 的 Geometry 一直留着，材质却换了 shader：比如调试时把 PRT shader 换成一个只画法线的 shader，或者改了 GLSL 重新加载。旧的 ShaderModule 被释放，ProgramManager 就要删掉它的 program。问题是：除了 ProgramManager，还有谁记着这个 program？
+    </p>
+    <p>
+      答案是<strong>顶点输入</strong>（第 16 课细讲）。它要告诉 GPU：「第 0 号 attribute 从 Mary 的 position buffer 读，每个顶点 3 个 float；第 1 号从 aTransportSH0 的 buffer 读……」。这里的 0、1 号是 2.4 节反射出来的 location，<strong>由 program 决定</strong>：PRT program 里 position 在 0 号，另一个 shader 链接出来 position 可能在 2 号。所以这份「谁接到哪个 location」的配置只对一个 program 有效。有 VAO 扩展时，顶点输入把这份配置录进一个 VAO，按「Geometry、program」两层缓存起来（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:30">WebGL1OESVertexInputManager.ts:30</a>）：
+    </p>
+    <pre><code>// 顶点输入的缓存：Map&lt;Geometry, Map&lt;WebGLProgram, { vao, … }&gt;&gt;
+// 换了三次 shader 以后，如果从来没人通知它：
+//   Mary ─┬─ program#1（已经删了） → VAO#1   ← 再也不会有人拿 program#1 来查
+//         ├─ program#2（已经删了） → VAO#2   ← 同上
+//         └─ program#3（正在用）   → VAO#3
+// VAO 是 GPU 对象，不调用 deleteVertexArrayOES 就一直占着。</code></pre>
+    <p style="color: var(--muted)">这张图出现在讲 VAO 之前，不好懂。第 16 课 4.4 节讲完 VAO 以后，用一张五步表、一张图和两张跑真实代码的卡片把它重讲了一遍（<a href="0016-geometry-and-vertex-input.html#s4-4">第 16 课 4.4 节</a>）。</p>
+    <p>
+      所以删 program 之前，要先让顶点输入把「按这个 program 建的 VAO」删掉。ProgramManager 自己不认识顶点输入（它不 import 顶点输入的任何代码），于是用一个<strong>钩子</strong> (hook)：构造 ProgramManager 时，从外面递进来一个函数；ProgramManager 在固定的时刻调用它，并不关心函数里做什么。
+    </p>
+    <pre><code>// ① 声明：ProgramManager 说「删除之前，我会调用这个函数，
+//    参数是要删的 program」
+//    WebGL1ProgramManager.ts:34–44（节选，去掉了原注释）
+export interface WebGL1ProgramManagerHooks {
+  readonly invalidateState: () =&gt; undefined // 删完后让 State 忘掉缓存（第 14 课）
+  readonly beforeDelete?: (program: WebGLProgram) =&gt; undefined // 删之前调用
+}
+
+// ② 接线：负责把各个 Manager 组装起来的 ResourceManager，递进去的函数是
+//    「请顶点输入放掉这个 program 的 VAO」    WebGL1ResourceManager.ts:100–105
+this.programsValue = new WebGL1ProgramManager(gl, {
+  invalidateState: hooks.invalidateState,
+  beforeDelete: (program) =&gt; {
+    this.vertexInputsValue.releaseProgram(program) // 删掉 Map 里这个 program 对应的 VAO
+  }
+})
+
+// ③ 调用：release 删除之前先调它（下一节的真实代码 ①）
+this.hooks.beforeDelete?.(entry.resource.program)</code></pre>
+    <p>为什么不让顶点输入自己订阅 ShaderModule 的 onDispose？有三个原因：</p>
+    <ul>
+      <li>顶点输入手里只有 WebGLProgram，不知道它来自哪个 ShaderModule。</li>
+      <li>就算知道，订阅的通知按注册顺序执行：ProgramManager 在 get 时就订阅了（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:180">WebGL1ProgramManager.ts:180</a>），比顶点输入早，program 会先被删掉，顺序正好反了。</li>
+      <li>整个 Backend 关闭时，ShaderModule 并没有被释放，不会有 onDispose；ProgramManager.dispose 是自己逐个 release 的（:260–273）。</li>
+    </ul>
+    <p>
+      为什么一定在删除<strong>之前</strong>，而不是之后？因为收拾可能失败（比如顶点输入那边抛错）。在之前调用：失败了就停下，program 没删，缓存记录还在，以后可以再 release 一次。如果先删 program、把记录从缓存里拿掉，再去通知，通知失败时就再也没有人记得「还有 VAO 没删」，只能一直漏下去。下面两张卡片在你的浏览器里用真实代码演示这两件事。
+    </p>
+    <div id="lab-before-delete"></div>
+
+    <h3 id="s2-7">2.7 删除的顺序：真实的 release</h3>
+    <p>
+      ShaderModule 被释放时，订阅触发 <code>release</code>。删除 program 之前要处理两类依赖它的东西：上一节的 VAO（beforeDelete），以及「它正是当前 program」这件事（第 14 课 2.2 节：正在用的 program，delete 只会被推迟）。
+    </p>
+    <pre><code>// 项目里的真实代码（WebGL1ProgramManager.ts:209–241，注释是课程加的）
+release(shader: ShaderModule): void {
+  const entry = this.entries.get(shader)
+  // 没建过，或者正在删（回调里又调了 release）：什么也不做
+  if (entry === undefined || this.releasing.has(shader)) return
+
+  if (this.gl.isContextLost() || this.lostValue) {
+    this.invalidateForContextLoss() // 丢了：不发 delete，只丢记录
+    return
+  }
+
+  this.releasing.add(shader) // 标记「正在删」，挡住重入
+  try {
+    // ① 先让依赖它的一方收拾：顶点输入里按这个 program 建的 VAO（2.6 节）
+    //    抛错就停在这里：entry 还在，program 也没删，以后可以重试
+    this.hooks.beforeDelete?.(entry.resource.program)
+
+    if (this.gl.isContextLost() || this.lostValue) {
+      this.invalidateForContextLoss() // 回调期间丢了
+      return
+    }
+
+    // ② 退订、移出缓存
+    entry.unsubscribe()
+    this.entries.delete(shader)
+
+    // ③ 正在用的 program，先换下来再删；否则删除会被推迟（第 14 课 2.2 节的实验）
+    if (this.gl.getParameter(this.gl.CURRENT_PROGRAM) === entry.resource.program) {
+      this.gl.useProgram(null)
+    }
+
+    // ④ 删除，并让 State 忘掉缓存的 program
+    this.gl.deleteProgram(entry.resource.program)
+    this.hooks.invalidateState()
+  } finally {
+    this.releasing.delete(shader)
+  }
+}</code></pre>
+    <div id="lab-release"></div>
+    <p>
+      顺序上的每一步都有测试守着：<a data-src="tests/unit/rendering/backend/webgl1/WebGL1ProgramManager.test.ts:175">CPU dispose 先触发依赖清理，再解绑当前 program 并删除</a>、<a data-src="tests/unit/rendering/backend/webgl1/WebGL1ProgramManager.test.ts:235">依赖清理失败不删除 program，dispose 可以重试</a>、<a data-src="tests/unit/rendering/backend/webgl1/WebGL1ProgramManager.test.ts:255">lost 丢弃记录并取消订阅</a>。
+    </p>
+
+    <h3 id="s2-8">2.8 和 Lifecycle 的关系</h3>
+    <p>第 13 课第 2 节说，context 丢了以后 Backend 要把旧的一代作废、再建新的一代。ProgramManager 在这两件事里做的事：</p>
+    <ol>
+      <li><strong>一代一个 ProgramManager。</strong>createGeneration 新建 ResourceManager（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:263">WebGL1Backend.ts:263–267</a>），它再新建 ProgramManager（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:100">WebGL1ResourceManager.ts:100–105</a>）。缓存跟着 Manager 走，所以缓存也是一代一份。</li>
+      <li>
+        <strong>lost 事件到达：丢记录、退订，不 delete。</strong>onLost → invalidateGeneration → <code>resources.invalidateForContextLoss()</code>，它依次通知每个 Manager（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:171">WebGL1ResourceManager.ts:171–179</a>）。ProgramManager 这一步（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:244">WebGL1ProgramManager.ts:244–251</a>）记下 lostValue，退订所有 ShaderModule，清空缓存，再通知 State 作废。它不调用 deleteProgram：program 的 handle 已经随 context 一起失效了。<br />
+        为什么要退订：订阅的回调引用着这个旧 Manager，而 ShaderModule 还活在 Scene 里。不退订的话，旧的一整代 Manager 连同缓存会一直被引用着，回收不掉，每丢一次就多留下一代；以后 ShaderModule 被释放时，还会去叫醒这个早就不用的 Manager。
+      </li>
+      <li><strong>事件还在排队、context 已经丢了：先发现，不乱删。</strong>get 开头的 assertAvailable 会先发现（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:385">:385–392</a>），作废并抛 WebGLContextLostError。编译到一半丢了，get 的 catch 和 finally 也先问 isContextLost，不去 delete 已经失效的 shader 和 program（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:184">:184–197</a>）；release 同理（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:214">:214–217</a>）。</li>
+      <li><strong>恢复以后：新 Manager，空缓存，重新编译。</strong>第 2 代的 ProgramManager 什么都没有。同一个 ShaderModule 第一次 draw 时，get 重新编译、链接、反射，得到一个新的 program。ShaderModule 本身没有变，它就是重建的原料（第 4 课）。</li>
+    </ol>
+    <p>下面的卡片在你的浏览器里真的丢一次 context：</p>
+    <div id="lab-lifecycle"></div>
+
+    <h2 id="s3">3. 反射结果交给谁</h2>
+    <ul>
+      <li><strong>attributes</strong>：顶点输入按 Geometry 的属性名（position、aTransportSH0……）去这张表里找 location，再调用 vertexAttribPointer。找不到的属性不接；shader 要的属性 Geometry 没有，就报错（第 16 课）。</li>
+      <li>
+        <strong>uniforms</strong>：Uniforms 拿名字去配 Material 参数和内建矩阵。但它没有只用这张表，而是自己又反射了一遍，为的是拿到每个 uniform 的类型和 size（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:205">WebGL1Uniforms.ts:205–250</a>）：类型用来核对「Material 给的是 mat3，shader 要的也是 mat3」；size 用来拒绝数组，因为 Material 还没有数组参数。ProgramManager 交出的表里只有 location，没有类型，注释说这是为了不改动 Task 11 已经定下的接口。第 5 节回到这一点。
+      </li>
+    </ul>
+
+    <h2 id="s4">4. 架构视角：对照 three.js r177</h2>
+    <ul>
+      <li>
+        <strong>缓存的 key：按内容，不按对象。</strong>three.js 把材质类型、宏定义、灯光数量等拼成一个字符串 cacheKey（<a data-src="node_modules/three/src/renderers/webgl/WebGLPrograms.js:377">WebGLPrograms.js:377</a>），key 相同就复用同一个 program，并用 <code>usedTimes</code> 计数；计数归零才 destroy（<a data-src="node_modules/three/src/renderers/webgl/WebGLPrograms.js:591">:591–631</a>）。它的 shader 是由引擎根据材质生成的，内容相同就一定可以共用。本项目的 ShaderModule 是用户手写的源码，引擎没法判断「两份内容一样」；按对象身份缓存，加上 Resource 的引用计数（第 5 课）决定什么时候删。
+      </li>
+      <li>
+        <strong>错误检查：推迟到第一次使用。</strong>three.js 在构造时就 compileShader、linkProgram（<a data-src="node_modules/three/src/renderers/webgl/WebGLProgram.js:895">WebGLProgram.js:895–913</a>），但不立刻查结果，等第一次用到这个 program 时才查 LINK_STATUS 和日志（<a data-src="node_modules/three/src/renderers/webgl/WebGLProgram.js:916">:916</a>）。中间的时间里，浏览器可以在后台并行编译。它还支持 KHR_parallel_shader_compile，用不阻塞的 COMPLETION_STATUS_KHR 查询「编完了没有」（<a data-src="node_modules/three/src/renderers/webgl/WebGLProgram.js:1046">:1046–1056</a>）。本项目每编译一段就立刻查结果，第 5 节讨论这个取舍。
+      </li>
+      <li>
+        <strong>detach：three.js 故意不做。</strong>它在链接后直接 deleteShader，detachShader 那两行被注释掉了，注释说 iOS 9、iOS 10 上会崩溃（<a data-src="node_modules/three/src/renderers/webgl/WebGLProgram.js:995">:995–1000</a>，issue #18402）。代价就是 2.3 节卡片看到的：两段 shader 活到 program 被删除为止。本项目选择 detach，换来及时释放；如果将来要支持很老的 iOS，这里要重新评估。
+      </li>
+      <li>
+        <strong>反射：three.js 一次拿全。</strong>它的 fetchAttributeLocations 同时记下类型、location，以及矩阵属性占几个 location（<a data-src="node_modules/three/src/renderers/webgl/WebGLProgram.js:194">:194–222</a>）；uniform 由 WebGLUniforms 一次性解析成可以直接上传的结构，数组和 struct 都支持。本项目把 location 和类型分在了两个类里反射。
+      </li>
+    </ul>
+
+    <h2 id="s5">5. 审查视角</h2>
+    <ol>
+      <li>
+        <strong>每编译一段就查 COMPILE_STATUS。</strong>真实代码在 compileShader 之后立刻查结果（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:310">WebGL1ProgramManager.ts:310</a>）。MDN 的 WebGL 最佳实践建议：除非链接失败，否则不要查编译状态，因为这个查询是同步的，会打断流水线；先把所有 shader 都编译、所有 program 都链接，最后再查（<a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices#dont_check_shader_compile_status_unless_linking_fails">MDN · Don't check shader compile status unless linking fails</a>）。HW2 只有两三个 program，影响很小；FFT 有十几个。下面的实验在你的浏览器里比较两种顺序。我在无界面 Chrome（软件渲染，没有 KHR_parallel_shader_compile）里跑了两次，两种顺序互有快慢，看不出稳定的差别；在有后台编译能力的真实显卡上可能不一样，所以请你自己跑：
+        <div id="lab-timing"></div>
+        <strong>想一想：</strong>如果改成「先链接，链接失败了再分别查两段」，ShaderCompilationError 还能报出是哪一段吗？需要改动 get 里的哪几行？（提示：链接失败的时候，两段 shader 还没有被 finally 删掉。）
+      </li>
+      <li>
+        <strong>uniform 反射了两次，而且对数组的态度不一致。</strong>ProgramManager 收下了数组（表里的名字是 uTint[0]），Uniforms 却拒绝数组（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:235">WebGL1Uniforms.ts:235–237</a>）。<strong>想一想：</strong>把类型和 size 也放进 WebGL1ProgramResource，Uniforms 就不用再反射一遍。这样改，Uniforms 的测试和 ProgramManager 的测试各要改什么？数组该在哪一层拒绝？
+      </li>
+      <li>
+        <strong>找茬题：</strong><a data-src="src/rendering/backend/webgl1/docs/program-and-geometry-managers.zh-CN.md:96">program-and-geometry-managers.zh-CN.md</a> 第 96 行以后，有一段话和现在的代码对不上。找出来，并用 2.3 节的卡片说明现在的代码实际怎样。
+      </li>
+    </ol>
+
+    <h2 id="s6">6. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0015"></div>
+
+    <h2 id="s7">7. 延伸阅读</h2>
+    <p>
+      <strong>首选（约 8 分钟）：</strong><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices#compile_shaders_and_link_programs_in_parallel">MDN · WebGL best practices</a> 里相邻的三节：并行编译和链接、链接失败前不查编译状态、优先用 KHR_parallel_shader_compile。正好对应第 5 节第 1 条。
+    </p>
+    <p>
+      补充：项目文档 <a data-src="src/rendering/backend/webgl1/docs/program-and-geometry-managers.zh-CN.md:1">program-and-geometry-managers.zh-CN.md</a> 的前半部分（读的时候留意找茬题）；three.js 的 <a data-src="node_modules/three/src/renderers/webgl/WebGLProgram.js:895">WebGLProgram.js</a> 从链接到 isReady 的一段。
+    </p>
+
+    <aside class="ask">
+      做完告诉我：实验卡片和检查题各错了哪几题；审查视角的两个「想一想」和找茬题，直接在对话里回答。第 5 节的计时实验，把你浏览器里的数字贴给我。
+    </aside>
+
+    <div class="nav">
+      <a href="0014-webgl1-state.html">← 第 14 课：WebGL1State</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0025-camera-and-orbit-controls.html">第 25 课（插课）：相机与轨道控制 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 15 课 · 2026-10-07</footer>
+
+    <script>
+      ;(function () {
+        const R = window.RTeachProgram
+
+        // 四个版本（和上面代码块是同一份源文件，去掉了类型标注）
+        const createProgramV1 = (function () {
+function createProgramV1(gl, vertexSource, fragmentSource) {
+  const vertex = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vertex, vertexSource);
+  gl.compileShader(vertex);
+  const fragment = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fragment, fragmentSource);
+  gl.compileShader(fragment);
+  const program = gl.createProgram();
+  gl.attachShader(program, vertex);
+  gl.attachShader(program, fragment);
+  gl.linkProgram(program);
+  return program;
+}
+          return createProgramV1
+        })()
+        const createProgramV2 = (function () {
+function compileV2(gl, type, source, stage) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (gl.getShaderParameter(shader, gl.COMPILE_STATUS) !== true) {
+    throw new Error(`${stage} shader \u7F16\u8BD1\u5931\u8D25\uFF1A${gl.getShaderInfoLog(shader) ?? ""}`);
+  }
+  return shader;
+}
+function createProgramV2(gl, vertexSource, fragmentSource) {
+  const vertex = compileV2(gl, gl.VERTEX_SHADER, vertexSource, "vertex");
+  const fragment = compileV2(gl, gl.FRAGMENT_SHADER, fragmentSource, "fragment");
+  const program = gl.createProgram();
+  gl.attachShader(program, vertex);
+  gl.attachShader(program, fragment);
+  gl.linkProgram(program);
+  if (gl.getProgramParameter(program, gl.LINK_STATUS) !== true) {
+    throw new Error(`\u94FE\u63A5\u5931\u8D25\uFF1A${gl.getProgramInfoLog(program) ?? ""}`);
+  }
+  return program;
+}
+          return createProgramV2
+        })()
+        const V3 = (function () {
+function compileV3(gl, type, source, stage, owned) {
+  const shader = gl.createShader(type);
+  owned.push(shader);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (gl.getShaderParameter(shader, gl.COMPILE_STATUS) !== true) {
+    throw new Error(`${stage} shader \u7F16\u8BD1\u5931\u8D25\uFF1A${gl.getShaderInfoLog(shader) ?? ""}`);
+  }
+  return shader;
+}
+function createProgramV3(gl, vertexSource, fragmentSource) {
+  const owned = [];
+  let program = null;
+  try {
+    const vertex = compileV3(gl, gl.VERTEX_SHADER, vertexSource, "vertex", owned);
+    const fragment = compileV3(
+      gl,
+      gl.FRAGMENT_SHADER,
+      fragmentSource,
+      "fragment",
+      owned
+    );
+    program = gl.createProgram();
+    gl.attachShader(program, vertex);
+    gl.attachShader(program, fragment);
+    gl.linkProgram(program);
+    if (gl.getProgramParameter(program, gl.LINK_STATUS) !== true) {
+      throw new Error(`\u94FE\u63A5\u5931\u8D25\uFF1A${gl.getProgramInfoLog(program) ?? ""}`);
+    }
+    gl.detachShader(program, vertex);
+    gl.detachShader(program, fragment);
+    return program;
+  } catch (error) {
+    if (program !== null) gl.deleteProgram(program);
+    throw error;
+  } finally {
+    for (const shader of owned) gl.deleteShader(shader);
+  }
+}
+          return { createProgramV3, compileV3 }
+        })()
+        const createProgramV3 = V3.createProgramV3
+        const V4 = (function () {
+var __defProp = Object.defineProperty;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+class ProgramCacheV4 {
+  constructor(gl) {
+    this.gl = gl;
+    // key 是源码对象本身：两个对象哪怕 name 相同，也是两份不同的东西
+    __publicField(this, "entries", /* @__PURE__ */ new Map());
+  }
+  get(source) {
+    const cached = this.entries.get(source);
+    if (cached !== void 0) return cached;
+    const gl = this.gl;
+    const program = createProgramV3(gl, source.vertexSource, source.fragmentSource);
+    try {
+      const info = {
+        program,
+        attributes: reflectAttributes(gl, program),
+        uniforms: reflectUniforms(gl, program)
+      };
+      this.entries.set(source, info);
+      return info;
+    } catch (error) {
+      gl.deleteProgram(program);
+      throw error;
+    }
+  }
+}
+function reflectAttributes(gl, program) {
+  const result = /* @__PURE__ */ new Map();
+  const count = gl.getProgramParameter(program, gl.ACTIVE_ATTRIBUTES);
+  for (let index = 0; index < count; index++) {
+    const info = gl.getActiveAttrib(program, index);
+    const location = gl.getAttribLocation(program, info.name);
+    if (location < 0) throw new Error(`attribute ${info.name} \u6CA1\u6709\u4F4D\u7F6E`);
+    result.set(info.name, location);
+  }
+  return result;
+}
+function reflectUniforms(gl, program) {
+  const result = /* @__PURE__ */ new Map();
+  const count = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+  for (let index = 0; index < count; index++) {
+    const info = gl.getActiveUniform(program, index);
+    const location = gl.getUniformLocation(program, info.name);
+    if (location !== null) result.set(info.name, location);
+  }
+  return result;
+}
+          return { ProgramCacheV4, reflectAttributes, reflectUniforms }
+        })()
+
+        // ---------------- 源码 ----------------
+        // HW2 的 PRT shader（order2/vertex.vert、fragment.frag，去掉了注释）
+        const PRT_VS = [
+          'precision highp float;',
+          'attribute vec3 position;',
+          'uniform mat4 uModelMatrix;',
+          'uniform mat4 uViewMatrix;',
+          'uniform mat4 uProjectionMatrix;',
+          'attribute vec3 aTransportSH0;',
+          'attribute vec3 aTransportSH1;',
+          'attribute vec3 aTransportSH2;',
+          'uniform mat3 uLightSH_R;',
+          'uniform mat3 uLightSH_G;',
+          'uniform mat3 uLightSH_B;',
+          'varying vec3 vColor;',
+          'void main() {',
+          '  float r = dot(uLightSH_R[0], aTransportSH0) + dot(uLightSH_R[1], aTransportSH1) + dot(uLightSH_R[2], aTransportSH2);',
+          '  float g = dot(uLightSH_G[0], aTransportSH0) + dot(uLightSH_G[1], aTransportSH1) + dot(uLightSH_G[2], aTransportSH2);',
+          '  float b = dot(uLightSH_B[0], aTransportSH0) + dot(uLightSH_B[1], aTransportSH1) + dot(uLightSH_B[2], aTransportSH2);',
+          '  vColor = max(vec3(r, g, b), vec3(0.0));',
+          '  gl_Position = uProjectionMatrix * uViewMatrix * uModelMatrix * vec4(position, 1.0);',
+          '}'
+        ].join('\n')
+        const PRT_FS = [
+          'precision highp float;',
+          'varying vec3 vColor;',
+          'void main() {',
+          '  vec3 color = pow(vColor, vec3(1.0 / 2.2));',
+          '  gl_FragColor = vec4(color, 1.0);',
+          '}'
+        ].join('\n')
+        // 少了一个分号（第 5 行末尾）
+        const FS_TYPO = PRT_FS.replace('gl_FragColor = vec4(color, 1.0);', 'gl_FragColor = vec4(color, 1.0)')
+        // vertex 输出 vec3 的 vColor，这里当成 vec4 来读
+        const FS_MISMATCH = ['precision highp float;', 'varying vec4 vColor;', 'void main() {', '  gl_FragColor = vColor;', '}'].join('\n')
+        // 反射实验用：一个用到的 uniform、一个没用到的、一个数组
+        const FS_REFLECT = [
+          'precision highp float;',
+          'varying vec3 vColor;',
+          'uniform float uExposure;   // 用到了',
+          'uniform float uUnused;     // 声明了，没用到',
+          'uniform vec3 uTint[4];     // 数组',
+          'void main() {',
+          '  gl_FragColor = vec4(pow(vColor * uExposure + uTint[1], vec3(1.0 / 2.2)), 1.0);',
+          '}'
+        ].join('\n')
+
+        // ---------------- 真实 WebGL 的小工具 ----------------
+        function freshContext() {
+          const canvas = document.createElement('canvas')
+          canvas.width = 4
+          canvas.height = 4
+          const gl = canvas.getContext('webgl')
+          if (!gl) throw new Error('这个浏览器拿不到 WebGL context')
+          const lose = gl.getExtension('WEBGL_lose_context')
+          return { gl, release: () => { if (lose && !gl.isContextLost()) lose.loseContext() } }
+        }
+
+        /**
+         * 给 gl 套一层代理：记下新建了哪些 shader 和 program，以及几种调用的顺序。
+         * 返回的 gl 和原来的用法完全一样，只是多了记账。
+         */
+        function watch(gl) {
+          const shaders = []
+          const programs = []
+          const calls = []
+          const names = new Map()
+          const label = (value) => (value === null ? 'null' : names.get(value) || (typeof value === 'object' ? '对象' : String(value)))
+          const logged = new Set(['createShader', 'compileShader', 'createProgram', 'attachShader', 'linkProgram', 'detachShader', 'deleteShader', 'deleteProgram', 'useProgram'])
+          const proxy = new Proxy(gl, {
+            get(target, prop) {
+              const value = target[prop]
+              if (typeof value !== 'function') return value
+              return function () {
+                const args = Array.from(arguments)
+                const result = value.apply(target, args)
+                if (prop === 'createShader' && result) {
+                  shaders.push(result)
+                  names.set(result, (args[0] === target.VERTEX_SHADER ? 'vertex' : 'fragment') + '#' + shaders.length)
+                }
+                if (prop === 'createProgram' && result) {
+                  programs.push(result)
+                  names.set(result, 'program#' + programs.length)
+                }
+                if (prop === 'getParameter' && args[0] === target.CURRENT_PROGRAM) calls.push('gl.getParameter(CURRENT_PROGRAM) → ' + label(result))
+                if (logged.has(prop)) {
+                  const shown = args.filter((a) => typeof a === 'object' || a === null).map(label)
+                  calls.push('gl.' + String(prop) + '(' + shown.join(', ') + ')' + (prop.startsWith('create') ? ' → ' + label(result) : ''))
+                }
+                return result
+              }
+            }
+          })
+          return {
+            gl: proxy,
+            calls,
+            label,
+            name: (value, text) => names.set(value, text),
+            live: () => ({
+              shaders: shaders.filter((s) => gl.isShader(s)).length,
+              programs: programs.filter((p) => gl.isProgram(p)).length,
+              createdShaders: shaders.length,
+              createdPrograms: programs.length
+            })
+          }
+        }
+
+        const liveLine = (w) => {
+          const live = w.live()
+          return '新建过 ' + live.createdShaders + ' 个 shader、' + live.createdPrograms + ' 个 program；现在还活着（isShader / isProgram 为 true）：' + live.shaders + ' 个 shader、' + live.programs + ' 个 program'
+        }
+        const errorLine = (error) => (error && error.name ? error.name : 'Error') + '：' + (error && error.message ? error.message : String(error))
+        const shaderModule = (name, fragmentSource) =>
+          new R.ShaderModule({ name, language: 'glsl-es-100', vertexSource: PRT_VS, fragmentSource })
+
+        /** 跑一个实验：建 context、套代理，跑完释放；异常也会变成一行记录。 */
+        async function withGL(body) {
+          const { gl, release } = freshContext()
+          const lines = []
+          try {
+            await body(gl, lines)
+          } catch (error) {
+            lines.push({ text: '实验里抛出了没有预料到的错误：' + errorLine(error), kind: 'late' })
+          } finally {
+            release()
+          }
+          return { lines }
+        }
+
+        // ---------------- 2.1 第 1 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v1'),
+          storageKey: 'lesson-0015-v1',
+          cards: [
+            {
+              title: '第 1 版：fragment shader 少一个分号',
+              tags: ['真实 WebGL', '第 1 版'],
+              desc: 'PRT 的 fragment shader，第 5 行末尾少了一个分号。用第 1 版建 program，然后 useProgram、draw，每一步之后问一次 getError。',
+              question: 'createProgramV1 会怎样？',
+              choices: ['照常交回 program，问题留到 draw 才冒出来', '当场抛出异常，指出第 5 行的语法错误', '交回 null，表示这个 program 创建失败'],
+              answer: 0,
+              explain: 'compileShader、linkProgram 都不抛异常，失败只记在 COMPILE_STATUS、LINK_STATUS 里。第 1 版没去问，照常把 program 交了出去。等到 useProgram，GL 记下 INVALID_OPERATION（1282），当前 program 根本没换过去；draw 同样只得到 1282，画面上什么也没有。整个过程没有一个 JS 异常：如果不主动 getError，你只会看到一块黑屏。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const program = createProgramV1(gl, PRT_VS, FS_TYPO)
+                  lines.push({ text: 'createProgramV1 正常返回了：' + (program ? '一个 program 对象' : 'null'), kind: 'server' })
+                  lines.push({ text: 'LINK_STATUS → ' + gl.getProgramParameter(program, gl.LINK_STATUS), kind: 'muted' })
+                  gl.useProgram(program)
+                  lines.push({ text: 'useProgram(它) 之后 getError → ' + gl.getError() + '；CURRENT_PROGRAM 是它吗 → ' + (gl.getParameter(gl.CURRENT_PROGRAM) === program), kind: 'late' })
+                  gl.drawArrays(gl.POINTS, 0, 1)
+                  lines.push({ text: 'drawArrays 之后 getError → ' + gl.getError(), kind: 'late' })
+                  lines.push({ t: '结果', text: '没有任何 JS 异常', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.2 第 2 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v2'),
+          storageKey: 'lesson-0015-v2',
+          cards: [
+            {
+              title: '第 2 版：同样少一个分号',
+              tags: ['真实 WebGL', '第 2 版'],
+              question: '第 2 版抛出的错误里有什么？',
+              choices: ['fragment 段编译失败，附驱动日志原文', '只说「链接失败」，没有更多的信息', '不报错，和第 1 版一样交回 program'],
+              answer: 0,
+              explain: '编译 fragment 段之后问 COMPILE_STATUS，得到 false，于是取出日志抛错。日志是驱动写的，格式因浏览器而异：Chrome（ANGLE）的写法是「ERROR: 0:行号: 出错的记号 : 原因」，这里的 0 是源码串编号，行号从 1 开始数。分号漏在第 5 行末尾，日志却指向第 6 行的 }：编译器读到 } 才发现上一句还没结束。',
+              run: () =>
+                withGL((gl, lines) => {
+                  try {
+                    createProgramV2(gl, PRT_VS, FS_TYPO)
+                    lines.push({ text: '没有报错', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: '抛出：' + error.message, kind: 'result' })
+                  }
+                })
+            },
+            {
+              title: '第 2 版：varying 的类型对不上',
+              tags: ['真实 WebGL', '第 2 版'],
+              desc: 'vertex shader 输出 varying vec3 vColor；fragment shader 却声明 varying vec4 vColor。两段单独看都没有错。',
+              question: '第 2 版会在哪一步报错？',
+              choices: ['链接：两边 vColor 的类型不同', '编译 vertex 段的时候就报错', '编译 fragment 段的时候报错'],
+              answer: 0,
+              explain: '编译只看一段源码本身，两段各自都合法。varying 是两段之间的接口，只有链接时才把两边放在一起核对，所以错误出现在 LINK_STATUS 和 getProgramInfoLog 里。这就是要分别检查编译和链接的原因。',
+              run: () =>
+                withGL((gl, lines) => {
+                  try {
+                    createProgramV2(gl, PRT_VS, FS_MISMATCH)
+                    lines.push({ text: '没有报错', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: '抛出：' + error.message, kind: 'result' })
+                  }
+                })
+            },
+            {
+              title: '第 2 版：失败 5 次以后',
+              tags: ['真实 WebGL', '第 2 版'],
+              desc: '用户改了 5 次源码，每次都是 varying 对不上，每次都用第 2 版重建一次。',
+              question: '5 次之后，GPU 上还活着多少对象？',
+              choices: ['10 个 shader、5 个 program', '0 个：失败的对象会自动回收', '2 个 shader、1 个 program'],
+              answer: 0,
+              explain: '每次失败，两段 shader 和一个 program 都已经建好了，第 2 版直接抛错，谁也没删它们。JS 里也没有变量再指着它们，以后想删都找不到。重试越多，留下的越多，一直到页面关闭。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const w = watch(gl)
+                  for (let i = 1; i <= 5; i++) {
+                    try {
+                      createProgramV2(w.gl, PRT_VS, FS_MISMATCH)
+                    } catch {
+                      lines.push({ text: '第 ' + i + ' 次：链接失败', kind: 'muted' })
+                    }
+                  }
+                  lines.push({ t: '结果', text: liveLine(w), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.3 第 3 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v3'),
+          storageKey: 'lesson-0015-v3',
+          cards: [
+            {
+              title: '第 3 版：同样失败 5 次',
+              tags: ['真实 WebGL', '第 3 版'],
+              question: '5 次之后，GPU 上还活着多少对象？',
+              choices: ['0 个：每次都删干净了', '10 个 shader、5 个 program', '5 个 program，shader 都删了'],
+              answer: 0,
+              explain: '链接失败抛错，先经过 catch：删掉半成品 program；再经过 finally：删掉清单上的两段 shader。记录里能看到每一次的完整调用顺序。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const w = watch(gl)
+                  for (let i = 1; i <= 5; i++) {
+                    const start = w.calls.length
+                    try {
+                      createProgramV3(w.gl, PRT_VS, FS_MISMATCH)
+                    } catch {
+                      if (i === 1) for (const call of w.calls.slice(start)) lines.push({ text: '　' + call, kind: 'server' })
+                      lines.push({ text: '第 ' + i + ' 次：链接失败' + (i === 1 ? '（上面是这一次的调用）' : ''), kind: 'muted' })
+                    }
+                  }
+                  lines.push({ t: '结果', text: liveLine(w), kind: 'result' })
+                })
+            },
+            {
+              title: '成功以后：只 delete，和先 detach 再 delete',
+              tags: ['真实 WebGL', '第 3 版对照'],
+              desc: '同一对正确的 PRT shader 建两次 program：一次照第 3 版先 detach 再 delete；一次去掉那两行 detach，只 delete。然后看两段 shader 还在不在，program 还能不能用。',
+              question: '只 delete、不 detach，之后 gl.isShader(vertex) 是？',
+              choices: ['true：还装在 program 上，只是做了记号', 'false：shader 已经被浏览器删掉了', '抛错：不能删装在 program 上的 shader'],
+              answer: 0,
+              explain: '还装在 program 上的 shader，delete 只是标记「待删除」，ATTACHED_SHADERS 仍是 2，两段 shader 活到 program 被删除为止。先 detach 再 delete，shader 立刻释放，ATTACHED_SHADERS 变成 0。两种情况下 program 都已经链接好，照样能用：链接结果存在 program 里，不依赖 shader 对象。',
+              run: () =>
+                withGL((gl, lines) => {
+                  for (const detach of [false, true]) {
+                    const vertex = gl.createShader(gl.VERTEX_SHADER)
+                    gl.shaderSource(vertex, PRT_VS)
+                    gl.compileShader(vertex)
+                    const fragment = gl.createShader(gl.FRAGMENT_SHADER)
+                    gl.shaderSource(fragment, PRT_FS)
+                    gl.compileShader(fragment)
+                    const program = gl.createProgram()
+                    gl.attachShader(program, vertex)
+                    gl.attachShader(program, fragment)
+                    gl.linkProgram(program)
+                    if (detach) {
+                      gl.detachShader(program, vertex)
+                      gl.detachShader(program, fragment)
+                    }
+                    gl.deleteShader(vertex)
+                    gl.deleteShader(fragment)
+                    const title = detach ? '先 detach 再 delete' : '只 delete、不 detach'
+                    lines.push({ text: title + '：isShader(vertex) → ' + gl.isShader(vertex) + '，isShader(fragment) → ' + gl.isShader(fragment) + '，ATTACHED_SHADERS → ' + gl.getProgramParameter(program, gl.ATTACHED_SHADERS), kind: detach ? 'result' : 'late' })
+                    gl.useProgram(program)
+                    gl.drawArrays(gl.POINTS, 0, 1)
+                    lines.push({ text: '　用这个 program draw 一次，getError → ' + gl.getError(), kind: 'muted' })
+                    gl.useProgram(null)
+                    gl.deleteProgram(program)
+                    lines.push({ text: '　deleteProgram 之后，isShader(vertex) → ' + gl.isShader(vertex), kind: 'muted' })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.4 第 4 版 ----------------
+        const showMap = (map) => '{ ' + [...map.keys()].map((key) => (typeof map.get(key) === 'number' ? key + ': ' + map.get(key) : key)).join(', ') + ' }'
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v4'),
+          storageKey: 'lesson-0015-v4',
+          cards: [
+            {
+              title: 'HW2 的 PRT shader 的反射结果',
+              tags: ['真实 WebGL', '第 4 版'],
+              question: 'uniforms 表里会有几个名字？',
+              choices: ['6 个：3 个矩阵，3 个光照系数', '9 个：每个光照系数单独一个', '3 个：只有三个变换矩阵'],
+              answer: 0,
+              explain: '六个 uniform 都在 main 里用到了，所以都是 active。mat3 是一个 uniform，不会拆成 9 个。attributes 里有 4 个，location 是驱动在链接时分配的，不同显卡可能不同，所以代码只能按名字去查，不能写死「position 是 0」。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const info = new V4.ProgramCacheV4(gl).get({ name: 'HW2/PRT', vertexSource: PRT_VS, fragmentSource: PRT_FS })
+                  lines.push({ text: 'attributes：' + showMap(info.attributes), kind: 'server' })
+                  lines.push({ text: 'uniforms：' + showMap(info.uniforms) + '（值是不透明的 WebGLUniformLocation 对象，这里只列名字）', kind: 'server' })
+                  lines.push({ t: '结果', text: 'attributes ' + info.attributes.size + ' 个，uniforms ' + info.uniforms.size + ' 个', kind: 'result' })
+                })
+            },
+            {
+              title: '没用到的 uniform，和数组',
+              tags: ['真实 WebGL', '第 4 版'],
+              desc: 'fragment shader 换成：uExposure 用到了；uUnused 声明了，没用到；uTint 是 vec3 的数组，长度 4。',
+              question: 'uUnused 会出现在 uniforms 里吗？数组叫什么？',
+              choices: ['不出现；数组叫 uTint[0]', '出现，location 是 null；数组叫 uTint', '不出现；数组的名字叫 uTint'],
+              answer: 0,
+              explain: '没用到的 uniform 被链接器优化掉，不是 active，不在列表里；直接 getUniformLocation(\'uUnused\') 得到 null。数组只占列表里的一项，名字带 [0]，size 是 4；getUniformLocation(\'uTint[3]\') 能拿到第 4 个元素的位置。所以 Material 参数名写「uTint」，在这张表里是找不到的。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const info = new V4.ProgramCacheV4(gl).get({ name: 'reflect', vertexSource: PRT_VS, fragmentSource: FS_REFLECT })
+                  lines.push({ text: 'uniforms：' + showMap(info.uniforms), kind: 'server' })
+                  const count = gl.getProgramParameter(info.program, gl.ACTIVE_UNIFORMS)
+                  for (let i = 0; i < count; i++) {
+                    const u = gl.getActiveUniform(info.program, i)
+                    if (u.name.startsWith('uTint')) lines.push({ text: 'getActiveUniform：name = ' + u.name + '，size = ' + u.size, kind: 'muted' })
+                  }
+                  lines.push({ text: "getUniformLocation('uUnused') → " + gl.getUniformLocation(info.program, 'uUnused'), kind: 'muted' })
+                  lines.push({ text: "getUniformLocation('uTint[3]') 拿到位置了吗 → " + (gl.getUniformLocation(info.program, 'uTint[3]') !== null), kind: 'muted' })
+                })
+            },
+            {
+              title: '用 if (!location) 判断「没有位置」',
+              tags: ['真实 WebGL', '课程自写的错误写法'],
+              desc: '把第 4 版 reflectAttributes 里的 if (location < 0) 换成 if (!location)，其余不变，反射 PRT shader。',
+              question: '结果会怎样？',
+              choices: ['把位置为 0 的那个属性当成没有，报错', '没有影响，0 和 -1 都会被拦下来', '只会拦下 -1，0 照样正常通过'],
+              answer: 0,
+              explain: '!0 是 true，于是分到位置 0 的属性被当成「没有位置」。getAttribLocation 用 -1 表示找不到，0 是完全合法的位置，而且通常第一个就分到它。真实代码写的是 location &lt; 0（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:156">WebGL1ProgramManager.ts:156</a>），测试也专门守着「location 0 保留」（<a data-src="tests/unit/rendering/backend/webgl1/WebGL1ProgramManager.test.ts:49">WebGL1ProgramManager.test.ts:49</a>）。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const program = createProgramV3(gl, PRT_VS, PRT_FS)
+                  const count = gl.getProgramParameter(program, gl.ACTIVE_ATTRIBUTES)
+                  try {
+                    for (let index = 0; index < count; index++) {
+                      const info = gl.getActiveAttrib(program, index)
+                      const location = gl.getAttribLocation(program, info.name)
+                      lines.push({ text: info.name + ' → location ' + location, kind: 'muted' })
+                      if (!location) throw new Error('attribute ' + info.name + ' 没有位置')
+                    }
+                    lines.push({ t: '结果', text: '没有报错', kind: 'result' })
+                  } catch (error) {
+                    lines.push({ t: '结果', text: '抛出：' + error.message, kind: 'late' })
+                  }
+                })
+            },
+            {
+              title: '按 name 缓存',
+              tags: ['真实 WebGL', '课程自写的错误写法'],
+              desc: '两个源码对象，name 都是「HW2/PRT」：一个的 fragment 做了 gamma 校正，一个没做（比如调试时复制了一份）。对照两种缓存：第 4 版按对象本身；课程自写的变体只把 Map 的 key 换成 source.name。',
+              question: '按 name 缓存时，第二个对象拿到的是？',
+              choices: ['第一个对象的 program，画错了', '自己的 program，两者互不影响', '一个重名错误，第二次 get 失败'],
+              answer: 0,
+              explain: 'name 只是给人看的诊断名，ShaderModule 的注释也写明它「不充当 GPU cache key」（<a data-src="src/rendering/resources/ShaderModule.ts:16">ShaderModule.ts:16–21</a>）。按 name 缓存时，第二次 get 命中了第一个的记录，没有 gamma 的那份源码根本没被编译，画出来的颜色和预期不同，也没有任何报错。按对象缓存，两份各编译一次。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const withGamma = { name: 'HW2/PRT', vertexSource: PRT_VS, fragmentSource: PRT_FS }
+                  const raw = { name: 'HW2/PRT', vertexSource: PRT_VS, fragmentSource: PRT_FS.replace('pow(vColor, vec3(1.0 / 2.2))', 'vColor') }
+                  for (const byName of [true, false]) {
+                    const w = watch(gl)
+                    const cache = new V4.ProgramCacheV4(w.gl)
+                    if (byName) {
+                      const map = new Map()
+                      cache.entries = { get: (source) => map.get(source.name), set: (source, info) => map.set(source.name, info) }
+                    }
+                    const a = cache.get(withGamma)
+                    const b = cache.get(raw)
+                    lines.push({ text: (byName ? '按 name 缓存' : '按对象缓存（第 4 版）') + '：两次拿到的是同一个 program 吗 → ' + (a.program === b.program) + '；一共 linkProgram ' + w.calls.filter((c) => c.startsWith('gl.linkProgram')).length + ' 次', kind: byName ? 'late' : 'result' })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.5 真实代码 ----------------
+        const managerHooks = (lines) => ({
+          invalidateState: () => {
+            lines.push({ text: '　hooks.invalidateState()', kind: 'abort' })
+            return undefined
+          },
+          beforeDelete: (program) => {
+            lines.push({ text: '　hooks.beforeDelete(program)：顶点输入清掉按它建的 VAO', kind: 'abort' })
+            return undefined
+          }
+        })
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-final'),
+          storageKey: 'lesson-0015-final',
+          cards: [
+            {
+              title: '真实代码：同一个 ShaderModule 要两次',
+              tags: ['真实 WebGL', '项目代码'],
+              question: '第二次 get 会再编译一次吗？',
+              choices: ['不会：交回同一个对象', '会：每次 get 都重新编译', '会：但交回的是同一个 program'],
+              answer: 0,
+              explain: '第一次 get 走完整个冷路径：两次 createShader、一次 createProgram、链接、detach、反射，最后 deleteShader。第二次直接命中缓存，一条 GL 命令也不发，交回的就是第一次那个冻结的对象。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const w = watch(gl)
+                  const manager = new R.WebGL1ProgramManager(w.gl, managerHooks([]))
+                  const shader = shaderModule('HW2/PRT', PRT_FS)
+                  const first = manager.get(shader)
+                  lines.push({ text: '第一次 get：', kind: 'user' })
+                  for (const call of w.calls) lines.push({ text: '　' + call, kind: 'server' })
+                  const before = w.calls.length
+                  const second = manager.get(shader)
+                  lines.push({ text: '第二次 get：发出 ' + (w.calls.length - before) + ' 条上面这类命令', kind: 'user' })
+                  lines.push({ t: '结果', text: '两次交回的是同一个对象吗 → ' + (first === second) + '；它被冻结了吗 → ' + Object.isFrozen(first), kind: 'result' })
+                })
+            },
+            {
+              title: '真实代码：少一个分号',
+              tags: ['真实 WebGL', '项目代码'],
+              question: '抛出什么错误，GPU 上还剩什么？',
+              choices: ['ShaderCompilationError，什么也不剩', 'ProgramLinkError，剩下两个 shader', '普通的 Error，剩下一个 program'],
+              answer: 0,
+              explain: 'fragment 段编译失败，抛出专用的 ShaderCompilationError，details 里有 stage 和日志。vertex 段已经编译好了，它在清单上，finally 把它删掉；program 还没来得及建。缓存里也没有登记，下次 get 会重新尝试。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const w = watch(gl)
+                  const manager = new R.WebGL1ProgramManager(w.gl, managerHooks([]))
+                  try {
+                    manager.get(shaderModule('HW2/PRT', FS_TYPO))
+                  } catch (error) {
+                    for (const call of w.calls) lines.push({ text: '　' + call, kind: 'server' })
+                    lines.push({ text: '抛出 ' + errorLine(error), kind: 'result' })
+                    if (error.details) lines.push({ text: 'details.stage = ' + error.details.stage, kind: 'muted' })
+                  }
+                  lines.push({ t: '结果', text: liveLine(w), kind: 'result' })
+                })
+            },
+            {
+              title: '真实代码：别人留下的 GL 错误',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '有段代码调用了 gl.enable(0x1234)（一个不存在的开关），留下了 INVALID_ENUM，没人去取。接着用一份完全正确的 PRT shader 调用 get。',
+              question: '这时调用 get 会怎样？',
+              choices: ['抛 WebGLOperationError（preflight），不编译', '正常编译，旧的错误被悄悄清掉', '抛 ShaderCompilationError，算成这次的'],
+              answer: 0,
+              explain: '进门的 checkError(\'preflight\') 取到了 1280（INVALID_ENUM），于是在动用 GPU 之前就停下，并且明确说是「preflight」：错误早就存在，不是这次编译造成的。如果没有这一步，后面编译完的 checkError 会取到这个旧错误，把一份正确的源码报成「编译出错」。GL 的错误不是栈，而是一组标志：同一种错误码最多记一个，getError 每次交出其中一个并把它清掉，交出的顺序没有规定。这里只留了一种错误，preflight 取走它以后就没了，所以重试会成功。记录最后是对照：留下两种不同的错误。10 月 12 日起（工作区版本），checkError 一直取到 NO_ERROR 为止（最多 32 次），所以第 1 次 get 就一次报出两个码「GL errors: 1280, 1281」（两个码谁先谁后没有保证），第 2 次成功，第 3 次命中缓存。改之前它每次只取一个：第 1 次报 1280，第 2 次报 1281，第 3 次才成功。两种写法都在 preflight 就停下、不编译，旧错误不会被算到编译头上；新写法省掉了「一个错误重试一次」。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const w = watch(gl)
+                  const manager = new R.WebGL1ProgramManager(w.gl, managerHooks([]))
+                  gl.enable(0x1234)
+                  lines.push({ text: 'gl.enable(0x1234)：留下一个错误，没人去取', kind: 'user' })
+                  try {
+                    manager.get(shaderModule('HW2/PRT', PRT_FS))
+                    lines.push({ text: '没有报错', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: '抛出 ' + errorLine(error), kind: 'result' })
+                  }
+                  lines.push({ text: '这期间 createShader 了几次 → ' + w.live().createdShaders, kind: 'muted' })
+                  const again = manager.get(shaderModule('HW2/PRT', PRT_FS))
+                  lines.push({ text: '再试一次：' + (again ? '成功拿到 program' : '失败'), kind: 'server' })
+                  // 对照：留下两种不同的错误。用一个新的 ShaderModule，免得直接命中缓存、跳过 preflight
+                  gl.enable(0x1234)
+                  gl.viewport(0, 0, -1, -1)
+                  lines.push({ text: '对照：再留两种不同的错误，enable(0x1234) 和 viewport(0, 0, -1, -1)', kind: 'user' })
+                  const other = shaderModule('HW2/PRT', PRT_FS)
+                  const attempts = []
+                  for (let i = 1; i <= 3; i++) {
+                    try {
+                      manager.get(other)
+                      attempts.push('第 ' + i + ' 次成功')
+                    } catch (error) {
+                      attempts.push('第 ' + i + ' 次 ' + (String(error.message).match(/GL errors?:? [\d, ]*\d/) || [error.name])[0])
+                    }
+                  }
+                  lines.push({ t: '结果', text: attempts.join('，'), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.6 beforeDelete ----------------
+        // 只用 position 的小 shader：每个版本的源码多一行注释，好让 ShaderModule 各是各的
+        const SIMPLE_VS = ['attribute vec3 position;', 'void main() {', '  gl_Position = vec4(position, 1.0);', '}'].join('\n')
+        const SIMPLE_FS = ['precision mediump float;', 'void main() {', '  gl_FragColor = vec4(1.0);', '}'].join('\n')
+
+        /**
+         * 按 ResourceManager 的接法装一套真实的 ProgramManager + GeometryManager + 顶点输入，
+         * 让同一个 Geometry 依次换 5 个 shader（新的 bind 以后，旧的 ShaderModule 释放）。
+         * withHook 为 false 时，ProgramManager 不接 beforeDelete，看 VAO 会怎样。
+         */
+        function switchShaders(gl, lines, withHook) {
+          const caps = R.detectWebGL1Capabilities(gl)
+          const ext = caps.vertexArrayObject
+          if (ext === null) {
+            lines.push({ text: '这个浏览器没有 OES_vertex_array_object，顶点输入改走手动接线，没有 VAO 可数。', kind: 'late' })
+            return
+          }
+          // 记下新建的每个 VAO，好用 isVertexArrayOES 数「还活着的」
+          const vaos = []
+          const create = ext.createVertexArrayOES.bind(ext)
+          ext.createVertexArrayOES = () => {
+            const vao = create()
+            vaos.push(vao)
+            return vao
+          }
+          const invalidateState = () => undefined
+          const vertexInputs = R.createWebGL1VertexInputManager(gl, caps, { invalidateState })
+          const geometries = new R.WebGL1GeometryManager(gl, caps, { invalidateState })
+          const programs = new R.WebGL1ProgramManager(
+            gl,
+            withHook
+              ? {
+                  invalidateState,
+                  beforeDelete: (program) => {
+                    vertexInputs.releaseProgram(program) // 和 WebGL1ResourceManager.ts:102–104 一样
+                    return undefined
+                  }
+                }
+              : { invalidateState }
+          )
+          const geometry = new R.Geometry({
+            attributes: { position: new R.VertexAttribute({ data: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), itemSize: 3 }) }
+          })
+          const gpuGeometry = geometries.get(geometry)
+          const made = []
+          let previous = null
+          for (let i = 1; i <= 5; i++) {
+            const shader = new R.ShaderModule({ name: 'shader v' + i, language: 'glsl-es-100', vertexSource: SIMPLE_VS + '\n// v' + i, fragmentSource: SIMPLE_FS })
+            const resource = programs.get(shader)
+            made.push(resource.program)
+            vertexInputs.bind(geometry, gpuGeometry, resource) // 新 program 建一个 VAO
+            if (previous !== null) previous.dispose() // 换掉旧 shader：ProgramManager 删旧 program
+            previous = shader
+            const liveVAO = vaos.filter((vao) => ext.isVertexArrayOES(vao)).length
+            const livePrograms = made.filter((program) => gl.isProgram(program)).length
+            lines.push({ text: '换到第 ' + i + ' 个 shader：活着的 program ' + livePrograms + ' 个，活着的 VAO ' + liveVAO + ' 个', kind: 'server' })
+          }
+          lines.push({ t: '结果', text: (withHook ? '接了 beforeDelete：' : '没接 beforeDelete：') + '新建过 ' + vaos.length + ' 个 VAO，还活着 ' + vaos.filter((vao) => ext.isVertexArrayOES(vao)).length + ' 个', kind: 'result' })
+        }
+
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-before-delete'),
+          storageKey: 'lesson-0015-before-delete',
+          cards: [
+            {
+              title: '同一个 Geometry 换 5 次 shader',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '按 ResourceManager 的方式装好 ProgramManager、GeometryManager 和顶点输入。三角形的 Geometry 一直留着，shader 换 5 次：每次新 shader 先 bind（建一个 VAO），再释放旧的 ShaderModule。先不接 beforeDelete 跑一遍，再接上跑一遍。',
+              question: '没接 beforeDelete 时，换完 5 次，还活着几个 VAO？',
+              choices: ['5 个：旧 program 删了，它们的 VAO 一个都没删', '1 个：旧 program 删掉时，VAO 跟着自动删了', '0 个：program 一删，所有 VAO 都失效'],
+              answer: 0,
+              explain:
+                '两种接法下，活着的 program 都只有 1 个，ProgramManager 自己没漏。漏的是顶点输入：没人通知它，旧 program 的 VAO 就一直留在它的 Map 里，GPU 上也一直占着。接上 beforeDelete 以后，每次删 program 之前先 releaseProgram，VAO 只剩当前那 1 个。GL 不会因为 program 被删就删 VAO：VAO 里记的是 buffer 和格式，不知道是为哪个 program 录的。',
+              run: () =>
+                withGL((gl, lines) => {
+                  lines.push({ text: '不接 beforeDelete：', kind: 'user' })
+                  switchShaders(gl, lines, false)
+                  lines.push({ text: '接上 beforeDelete：', kind: 'user' })
+                  const second = freshContext()
+                  try {
+                    switchShaders(second.gl, lines, true)
+                  } finally {
+                    second.release()
+                  }
+                })
+            },
+            {
+              title: 'beforeDelete 第一次抛错，再 release 一次',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '让 beforeDelete 第一次调用时抛错（假装顶点输入那边收拾失败），第二次正常。直接调用 manager.release(shader) 两次。',
+              question: '第一次 release 抛错以后，program 和缓存是什么状态？',
+              choices: ['program 还活着，缓存里还是它；第二次 release 才删掉', 'program 已经删了，只是 VAO 没清', 'program 删了，缓存也空了，第二次 release 什么也不做'],
+              answer: 0,
+              explain:
+                'beforeDelete 在 release 的最前面（WebGL1ProgramManager.ts:222），它一抛错，后面的退订、移出缓存、deleteProgram 都没执行。所以 get 还能拿回同一个 program，第二次 release 从头再来，这次成功了。要是反过来先删再通知，第一次失败时记录已经没了，VAO 就再也没人删。',
+              run: () =>
+                withGL((gl, lines) => {
+                  let failOnce = true
+                  const manager = new R.WebGL1ProgramManager(gl, {
+                    invalidateState: () => undefined,
+                    beforeDelete: () => {
+                      if (failOnce) {
+                        failOnce = false
+                        throw new Error('顶点输入那边收拾失败（演示）')
+                      }
+                      return undefined
+                    }
+                  })
+                  const shader = shaderModule('HW2/PRT', PRT_FS)
+                  const resource = manager.get(shader)
+                  try {
+                    manager.release(shader)
+                    lines.push({ text: '第一次 release：没有抛错（意外）', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: '第一次 release：抛出「' + error.message + '」', kind: 'abort' })
+                  }
+                  lines.push({ text: '　isProgram → ' + gl.isProgram(resource.program) + '；manager.get(shader) 还是同一个 program → ' + (manager.get(shader) === resource), kind: 'server' })
+                  manager.release(shader)
+                  lines.push({ text: '第二次 release：正常返回', kind: 'user' })
+                  lines.push({ t: '结果', text: 'isProgram → ' + gl.isProgram(resource.program), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-release'),
+          storageKey: 'lesson-0015-release',
+          cards: [
+            {
+              title: '真实代码：ShaderModule 被释放时',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '先 get 到 program，并把它设为当前 program（正在用）。然后 shader.dispose()。钩子 beforeDelete 和 invalidateState 被调用时，记录里会写出来。',
+              question: '下面哪个顺序和记录一致？',
+              choices: ['先清 VAO，再换下当前 program，最后删除', '先删除 program，再清依赖它的 VAO', '先换下当前 program，删除后再清 VAO'],
+              answer: 0,
+              explain: 'dispose 触发订阅，进入 release：先调用 beforeDelete，让顶点输入清掉按这个 program 建的 VAO（2.6 节）；然后查 CURRENT_PROGRAM，发现正是它，先 useProgram(null)；接着 deleteProgram；最后通知 State 忘掉缓存的 program（第 14 课）。删完以后 isProgram 是 false，说明真的删掉了，没有被推迟。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const w = watch(gl)
+                  const manager = new R.WebGL1ProgramManager(w.gl, {
+                    invalidateState: () => {
+                      w.calls.push('hooks.invalidateState()')
+                      return undefined
+                    },
+                    beforeDelete: () => {
+                      w.calls.push('hooks.beforeDelete(program)：顶点输入清掉按它建的 VAO')
+                      return undefined
+                    }
+                  })
+                  const shader = shaderModule('HW2/PRT', PRT_FS)
+                  const resource = manager.get(shader)
+                  gl.useProgram(resource.program)
+                  lines.push({ text: 'get 到 program，并 useProgram(它)', kind: 'user' })
+                  const start = w.calls.length
+                  shader.dispose()
+                  lines.push({ text: 'shader.dispose() 之后发生了：', kind: 'user' })
+                  for (const call of w.calls.slice(start)) lines.push({ text: '　' + call, kind: call.startsWith('hooks') ? 'abort' : 'server' })
+                  lines.push({ t: '结果', text: 'isProgram → ' + gl.isProgram(resource.program) + '；CURRENT_PROGRAM → ' + (gl.getParameter(gl.CURRENT_PROGRAM) === null ? 'null' : '还是别的'), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.8 和 Lifecycle 的关系 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-lifecycle'),
+          storageKey: 'lesson-0015-lifecycle',
+          cards: [
+            {
+              title: 'context 丢了又恢复：两代 ProgramManager',
+              tags: ['真实 WebGL', '项目代码', '要等浏览器恢复，可能要几秒'],
+              desc: '第 1 代 ProgramManager 先 get 到 PRT 的 program。然后用 WEBGL_lose_context 让 context 丢失，像 Backend 的 onLost 那样调用 invalidateForContextLoss，再试一次 get。恢复以后建第 2 代 ProgramManager，用同一个 ShaderModule 再 get 一次。最后释放这个 ShaderModule。',
+              question: '丢失以后，第 1 代对它缓存的 program 调用了几次 deleteProgram？恢复以后，同一个 ShaderModule 怎样拿到 program？',
+              choices: ['0 次；第 2 代重新编译出一个新的 program', '1 次；第 2 代直接复用丢失前的 program', '0 次；第 1 代在恢复后自己把 program 补回来'],
+              answer: 0,
+              explain:
+                '丢失时 handle 已经失效，invalidateForContextLoss 只丢记录、退订、通知 State（hooks.invalidateState 被调用了 1 次），不发 delete；之后第 1 代的 get 直接抛 WebGLContextLostError。恢复以后，旧 program 的 isProgram 是 false，第 2 代重新编译得到 program#2。最后释放 ShaderModule 时，只有第 2 代的订阅还在，所以只删了 program#2；第 1 代已经退订，不会被叫醒。',
+              run: async () => {
+                const canvas = document.createElement('canvas')
+                canvas.width = 4
+                canvas.height = 4
+                const gl = canvas.getContext('webgl')
+                const lose = gl && gl.getExtension('WEBGL_lose_context')
+                if (!lose) return { lines: [{ text: '这个浏览器没有 WEBGL_lose_context，做不了这个实验', kind: 'late' }] }
+                let lostEvent = false
+                canvas.addEventListener('webglcontextlost', (event) => {
+                  event.preventDefault() // 不调用的话，restoreContext() 不会生效
+                  lostEvent = true
+                })
+                let restored = false
+                canvas.addEventListener('webglcontextrestored', () => (restored = true))
+                const w = watch(gl)
+                let invalidations = 0
+                const hooks = { invalidateState: () => { invalidations += 1; return undefined } }
+                const lines = []
+                try {
+                  const first = new R.WebGL1ProgramManager(w.gl, hooks)
+                  const shader = shaderModule('HW2/PRT', PRT_FS)
+                  const p1 = first.get(shader).program
+                  lines.push({ text: '第 1 代 get(PRT) → ' + w.label(p1), kind: 'server' })
+                  lose.loseContext()
+                  lines.push({ text: 'loseContext()：isContextLost → ' + gl.isContextLost() + '，lost 事件在排队', kind: 'user' })
+                  for (let waited = 0; waited < 2000 && !lostEvent; waited += 50) await new Promise((resolve) => setTimeout(resolve, 50))
+                  if (!lostEvent) return { lines: [...lines, { text: '2 秒内没有收到 lost 事件，实验做不下去', kind: 'late' }] }
+                  lines.push({ text: '收到 webglcontextlost，像 Backend 的 onLost 那样通知第 1 代', kind: 'server' })
+                  const before = w.calls.length
+                  const hooksBefore = invalidations
+                  first.invalidateForContextLoss()
+                  const deletes = w.calls.slice(before).filter((call) => call.startsWith('gl.delete'))
+                  lines.push({ text: '第 1 代 invalidateForContextLoss()：delete 调用 ' + deletes.length + ' 次；hooks.invalidateState 调用 ' + (invalidations - hooksBefore) + ' 次', kind: 'result' })
+                  try {
+                    first.get(shader)
+                    lines.push({ text: '第 1 代再 get：居然成功了（意外）', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: '第 1 代再 get → ' + errorLine(error), kind: 'abort' })
+                  }
+                  lose.restoreContext()
+                  lines.push({ text: 'restoreContext()，等浏览器派发 restored……', kind: 'user' })
+                  for (let waited = 0; waited < 10000 && !restored; waited += 50) await new Promise((resolve) => setTimeout(resolve, 50))
+                  if (!restored) return { lines: [...lines, { text: '10 秒内没有恢复，实验做不下去', kind: 'late' }] }
+                  lines.push({ text: '收到 webglcontextrestored；旧 program：isProgram → ' + gl.isProgram(p1), kind: 'server' })
+                  const second = new R.WebGL1ProgramManager(w.gl, hooks)
+                  const p2 = second.get(shader).program
+                  lines.push({ text: '第 2 代 get(同一个 ShaderModule) → ' + w.label(p2) + '；和第 1 代的是同一个吗 → ' + (p1 === p2) + '；isProgram → ' + gl.isProgram(p2), kind: 'result' })
+                  const start = w.calls.length
+                  shader.dispose()
+                  const after = w.calls.slice(start).filter((call) => call.startsWith('gl.deleteProgram'))
+                  lines.push({ text: 'shader.dispose() 之后：' + (after.length ? after.join('；') : '没有 deleteProgram'), kind: 'result' })
+                } finally {
+                  if (!gl.isContextLost()) lose.loseContext()
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 5 计时 ----------------
+        RTeach.traceLab.playground({
+          mount: document.getElementById('lab-timing'),
+          title: '在你的浏览器里计时：编译 N 个 program（真实 WebGL）',
+          selects: [{ id: 'n', options: [['10', '10 个 program'], ['30', '30 个 program']] }],
+          describe: () => '每次运行都给源码加一个随机注释，避免命中浏览器的 shader 缓存。「逐个查」：编译一段查一次 COMPILE_STATUS，链接后马上查 LINK_STATUS（和项目一样）。「最后查」：先全部编译、全部链接，最后统一查 LINK_STATUS（MDN 的建议）。两种顺序交替跑 3 轮。',
+          run: async (values) => {
+            const n = Number(values.n)
+            const { gl, release } = freshContext()
+            try {
+              const parallel = !!gl.getExtension('KHR_parallel_shader_compile')
+              const fragment = (i, salt) => PRT_FS.replace('void main() {', 'uniform float uK;\nvoid main() {\n  float k = uK;\n  for (int j = 0; j < 16; j++) { k = sin(k * ' + (i + 2) + '.0 + float(j)); }') .replace('gl_FragColor = vec4(color, 1.0);', 'gl_FragColor = vec4(color + k * 0.0001, 1.0);') + '\n// ' + salt + '-' + i
+              const shader = (type, source) => {
+                const s = gl.createShader(type)
+                gl.shaderSource(s, source)
+                gl.compileShader(s)
+                return s
+              }
+              const serial = (salt) => {
+                const t = performance.now()
+                for (let i = 0; i < n; i++) {
+                  const v = shader(gl.VERTEX_SHADER, PRT_VS + '\n// ' + salt + '-' + i)
+                  if (!gl.getShaderParameter(v, gl.COMPILE_STATUS)) throw new Error('vertex 编译失败')
+                  const f = shader(gl.FRAGMENT_SHADER, fragment(i, salt))
+                  if (!gl.getShaderParameter(f, gl.COMPILE_STATUS)) throw new Error('fragment 编译失败')
+                  const p = gl.createProgram()
+                  gl.attachShader(p, v)
+                  gl.attachShader(p, f)
+                  gl.linkProgram(p)
+                  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('链接失败')
+                }
+                return performance.now() - t
+              }
+              const batched = (salt) => {
+                const t = performance.now()
+                const programs = []
+                for (let i = 0; i < n; i++) {
+                  const p = gl.createProgram()
+                  gl.attachShader(p, shader(gl.VERTEX_SHADER, PRT_VS + '\n// ' + salt + '-' + i))
+                  gl.attachShader(p, shader(gl.FRAGMENT_SHADER, fragment(i, salt)))
+                  programs.push(p)
+                }
+                for (const p of programs) gl.linkProgram(p)
+                for (const p of programs) if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('链接失败')
+                return performance.now() - t
+              }
+              const lines = [{ text: 'KHR_parallel_shader_compile：' + (parallel ? '有' : '没有'), kind: 'muted' }]
+              const base = Date.now() + '-' + Math.random().toString(36).slice(2)
+              for (let round = 1; round <= 3; round++) {
+                const a = serial(base + 's' + round)
+                const b = batched(base + 'b' + round)
+                lines.push({ text: '第 ' + round + ' 轮：逐个查 ' + a.toFixed(1) + ' ms，最后查 ' + b.toFixed(1) + ' ms', kind: 'server' })
+              }
+              lines.push({ text: '第 1 轮常常偏慢（预热）。差别取决于浏览器能不能在后台编译；同一台机器上多跑几次再下结论。', kind: 'muted' })
+              return { lines }
+            } finally {
+              release()
+            }
+          }
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0015"]'), [
+          {
+            q: 'GLSL 少一个分号，又没有检查 COMPILE_STATUS，会出现什么情况？',
+            opts: ['useProgram、draw 都悄悄失败，错误码 1282', 'compileShader 当场抛出一个 JS 异常', 'createProgram 交回 null 表示失败'],
+            answer: 0,
+            why: 'GL 不抛异常。链接失败的 program 不能被 useProgram，draw 也只留下 INVALID_OPERATION（2.1 节）。'
+          },
+          {
+            q: '两段 shader 各自编译成功，为什么还要检查链接结果？',
+            opts: ['varying 等接口要放在一起才能核对', '编译成功的结果会在链接时被清空', '浏览器规定编译后必须先检查链接'],
+            answer: 0,
+            why: '比如 vertex 输出 vec3 的 vColor、fragment 读 vec4 的 vColor，只有链接时才会发现（2.2 节）。'
+          },
+          {
+            q: 'owned 清单为什么在 compileShader 之前就登记？',
+            opts: ['编译失败时，finally 也能找到它删掉', '先登记，浏览器的编译速度会更快', '登记以后，浏览器会自动替你回收'],
+            answer: 0,
+            why: '编译失败会直接抛错。先登记，finally 才知道这次新建过哪些 shader（2.3 节）。'
+          },
+          {
+            q: '链接成功后，为什么要先 detachShader 再 deleteShader？',
+            opts: ['装在 program 上的 shader，delete 只做记号', '不 detach 的话，program 就无法使用', 'detach 之后 program 才能链接成功'],
+            answer: 0,
+            why: '还装着的 shader 只被标记为待删除，要等它从 program 上拆下来才真正释放（2.3 节第二张卡片）。'
+          },
+          {
+            q: '缓存为什么用 ShaderModule 对象本身做 key，而不是 name？',
+            opts: ['同名不等于同一份源码，会拿错 program', '用对象做 key，查找起来要更快一些', 'ShaderModule 的 name 允许是空字符串'],
+            answer: 0,
+            why: 'name 只是诊断名。按 name 缓存，另一份同名源码会拿到别人的 program（2.4 节最后一张卡片）。'
+          },
+          {
+            q: '删除 program 时，为什么要在 deleteProgram 之前先 useProgram(null)？',
+            opts: ['正在用的 program，删除会被推迟', '不先解绑，deleteProgram 会抛异常', 'useProgram(null) 会顺便清掉 VAO'],
+            answer: 0,
+            why: '当前 program 被删除只会被标记，仍然可用，直到不再是当前 program（第 14 课 2.2 节、2.6 节）。'
+          },
+          {
+            q: 'context 丢失后，第 1 代 ProgramManager 会对缓存里的 program 调用 deleteProgram 吗？',
+            opts: ['不会：handle 已失效，只丢记录、退订', '会：先删干净，再把工作交给第 2 代', '会：等到恢复以后，再补删一次'],
+            answer: 0,
+            why: 'invalidateForContextLoss 不向失效的 context 发 delete；它退订 ShaderModule，免得旧的一代一直被引用（2.8 节的卡片）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

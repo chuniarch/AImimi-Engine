@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 3 课 · src/rendering 全景</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 架构篇 1/4 · 约 20 分钟</p>
+    <h1>src/rendering 全景：为什么要这样分层</h1>
+    <p class="lede">
+      这一课回答三个问题：旧引擎哪里疼、新架构用什么判据来切分、切完以后每一层放了什么。读完你应该能在一张纸上画出 <code>src/rendering</code> 的四层、两条继承体系和一次 draw 的路径，并说出每一处切分换来了什么、付出了什么。
+    </p>
+
+    <aside class="note">
+      <strong>课程改版：</strong>从这一课起改为<strong>精读</strong>，不需要手敲代码。每课的结构是：设计问题 → 逐行注释的源码 → 为什么这样写 → 检查题 → 架构视角（对照 three.js）。第 1、2 课保留为选修的动手课，不看也不影响后面的内容。
+    </aside>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 你要学的是这套代码的架构设计思想、详细设计思想和代码细节。这一课是地图：后面每一课精读一个模块时，你都应该能在这张图上指出它的位置、它依赖谁、谁依赖它。
+    </div>
+
+    <h2>1. 先看旧引擎哪里疼</h2>
+    <p>
+      阅读指南给每个设计定下的第一个问题是：「没有它时，哪段具体代码会重复、混乱或出错？」所以先看旧代码。下面三处都在你的仓库里，链接会在 VS Code 里打开对应的行。
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 16%">旧代码</th><th style="width: 38%">它同时做了什么</th><th>具体的疼</th></tr>
+        <tr>
+          <td><a data-src="src/objects/Mesh.ts:19">objects/Mesh.ts</a></td>
+          <td>持有 <code>gl</code>（<a data-src="src/objects/Mesh.ts:23">:23</a>）、VBO 和 IBO（<a data-src="src/objects/Mesh.ts:33">:33–34</a>）、按 program 分的 VAO（<a data-src="src/objects/Mesh.ts:42">:42</a>）、location 缓存（<a data-src="src/objects/Mesh.ts:45">:45</a>），还有 transform（<a data-src="src/objects/Mesh.ts:30">:30</a>）</td>
+          <td>CPU 数据、GPU 资源、场景变换三件事搅在一个类里。它自己的注释写着：location 缓存「隐含假设一个 Mesh 只被一个 program 绘制」，而 ShadowPass 和 FFT 计算 pass 都违反了这个假设（<a data-src="src/objects/Mesh.ts:36">:36–38</a>）。按 program 分的 VAO 表，就是为了这个问题打的补丁。</td>
+        </tr>
+        <tr>
+          <td><a data-src="src/materials/Material.ts:6">materials/Material.ts</a></td>
+          <td>持有 <code>WebGLFramebuffer</code>（<a data-src="src/materials/Material.ts:12">:12</a>）和 <code>WebGLUniformLocation</code> 缓存（<a data-src="src/materials/Material.ts:14">:14</a>）；<code>applyUniforms(gl, shader, textureUnitStart)</code> 直接发 GL 调用，还自己分配纹理单元（<a data-src="src/materials/Material.ts:45">:45</a>）</td>
+          <td>uniform location 只对查询它的那个 program 有效，材质一旦配上第二个 program，缓存就是错的。材质本该只描述「长什么样」，却被迫知道当前在画哪个 framebuffer、纹理单元从几号开始。</td>
+        </tr>
+        <tr>
+          <td><a data-src="src/renderers/BaseRenderer.ts:73">renderers/BaseRenderer.ts</a></td>
+          <td>构造时就 <code>mesh.createVBOs(gl)</code>、缓存 location（<a data-src="src/renderers/BaseRenderer.ts:73">:73–75</a>）；每次 draw 直接 <code>uniformMatrix4fv</code>（<a data-src="src/renderers/BaseRenderer.ts:196">:196</a>）</td>
+          <td>「资源什么时候上传到 GPU」和「对象什么时候被创建」绑死了。context 丢失以后，没有一个地方知道有哪些 GPU 对象需要重建。</td>
+        </tr>
+      </table>
+    </div>
+    <p>
+      用数字看（重构方案 <a data-main="claude-workspace/threejs-refactor/PLAN.md:48">PLAN.md §1.2</a> 实测）：删掉死代码以后，活代码里还有 <strong>456 个 <code>gl.*</code> 调用点</strong>，散落在 Shader、Mesh、Material、BaseRenderer、textures、framebuffers、passes 等十几个文件里。<strong>没有一个地方独占 GL</strong>。由此带来三个后果：
+    </p>
+    <ol class="steps">
+      <li><strong>换 WebGL2 要改遍整个仓库。</strong>任何一个文件都可能直接依赖 WebGL1 的扩展写法（例如旧 Mesh 专门有一个取 OES VAO 扩展的 getter）。</li>
+      <li><strong>context 丢失无法统一处理。</strong>GPU 句柄 (handle) 散在各个对象里，丢失时没法「整批作废、整批重建」。</li>
+      <li><strong>共享一加入，就得给对象加维度。</strong>同一个 Mesh 被第二个 program 画，就得把缓存从「按名字」改成「按 program × 名字」。每一种新的共享方式，都要回头改数据对象。</li>
+    </ol>
+
+    <h2>2. 切分的判据：只有一句话</h2>
+    <p>重构方案给出的核心判据（<a data-main="claude-workspace/threejs-refactor/PLAN.md:320">PLAN.md §5.1</a>）：</p>
+    <aside class="note" style="font-size: 1.05rem; color: var(--ink)">
+      <strong>一个类型属于哪一层，看它知不知道 <code>gl</code> 的存在。</strong>
+    </aside>
+    <p>
+      阅读指南换了个说法：<strong>CPU 对象描述「是什么」；Backend 决定「在这个 context 上怎样实现」。</strong>于是 <code>texParameteri</code> 从一条散落在各处的<em>命令</em>，变成了 Texture 上的一个<em>数据字段</em>（sampler 描述），由 Backend 在创建 GPU 对象时统一读取。整个架构都是从这一句推出来的。
+    </p>
+
+    <h2>3. 四层，以及两种「方向」</h2>
+    <p>来源：HW2 架构设计 §4（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:135">架构设计文档</a>）。标注的「已实现 / 未实现」是 2026-09-23 的源码状态。</p>
+    <aside class="note"><strong>10 月 12 日更新</strong>：下面标「未实现」「还没写」的几样，现在都写好了。第二层的 <code>frame/</code> 多了 RenderList、RenderListBuilder、RenderView、FrameSnapshot、copyMat4Snapshot；<code>passes/</code> 下有 RenderPass、RenderPassContext、RenderPipeline、ForwardPass；最上面是 <a data-src="src/rendering/Renderer.ts:16">Renderer</a>。frame/、passes/ 和 Renderer.ts 现在一共约 670 行。第三层的 WebGL1Backend（Task 15）也已完成。这张图和第 5 节的记录保留 9 月 23 日的样子，方便对照设计文档。这几个类由<a href="0030-frame-orchestration.html">第 30 课</a>专门讲（10 月 13 日发，排在第 18 课之前）。</aside>
+    <div class="layers">
+      <div class="layer">
+        <div class="name">第一层 · 场景与逻辑资源（CPU）· 已实现</div>
+        <code>scene/</code>：SceneNode、Transform、Group、Scene、Mesh、Camera、PerspectiveCamera<br />
+        <code>resources/</code>：VertexAttribute、Geometry、ShaderModule、Material、Texture 家族、RenderTarget<br />
+        横切的基础：<code>core/</code> 里的 Resource（生命周期）、errors（错误类型）、requireNonNull
+      </div>
+      <div class="arrow-down">↓ 数据：第二层读取第一层，复制成一帧的「值」</div>
+      <div class="layer">
+        <div class="name">第二层 · 帧提取与编排 · 只有两个类型</div>
+        <code>frame/</code>：<a data-src="src/rendering/frame/RenderItem.ts:15">RenderItem</a>、<a data-src="src/rendering/frame/ViewState.ts:13">ViewState</a>。RenderList、RenderListBuilder、Pass、Pipeline、Renderer 都还没写（Task 16–18）
+      </div>
+      <div class="arrow-down">↓ 调用：只通过 RenderBackend 接口</div>
+      <div class="layer here">
+        <div class="name">第三层 · 设备后端 · 零件已实现，编排类未实现</div>
+        <code>backend/</code>：<a data-src="src/rendering/backend/RenderBackend.ts:18">RenderBackend</a>（接口）、RenderSurface；<code>webgl1/</code> 下 13 个文件；<code>WebGL1Backend</code>（Task 15）
+      </div>
+      <div class="arrow-down">↓ 调用：唯一持有 gl 的一层</div>
+      <div class="layer">
+        <div class="name">第四层 · 平台</div>
+        HTMLCanvasElement · WebGLRenderingContext · 驱动 · GPU
+      </div>
+    </div>
+    <aside class="note">
+      <strong>更正（2026-09-24）：</strong>这一节原来的标题是「四层，依赖只能向下」。这句话不能照字面读：图上第一层在最上面，而第三层的后端明明 import 了第一层的 Geometry、Material——照图看是「向上」依赖，却完全合法；「Material 不知道 Backend」禁止的反倒是「向下」依赖。问题出在图里其实混着两种不同的方向。
+    </aside>
+    <p>图中各层的顺序，是<strong>一帧数据流动的顺序</strong>：场景数据被提取成一帧的值，交给后端，后端驱动设备。「依赖」则要分成两种方向来看：</p>
+    <ol class="steps">
+      <li><strong>调用方向</strong>（谁调用谁、谁持有谁）：只能沿着 Engine → Renderer → Pipeline → Pass → Backend → GL 往下走。设计文档里「依赖只能向下」这句话下面列出的，全是这条调用链上的边（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:160">§4</a>）。这个方向上的「反向」，是被调用的一方反过来知道调用它的一方：Pass 不保存 Renderer，Backend 不知道 ForwardPass。</li>
+      <li><strong>知识方向</strong>（谁 import 谁的类型）：处理数据的机器可以读数据——第一层的 Geometry、Material，第二层的 RenderItem、ViewState——但数据本身不知道任何读它的机器。这个方向上的「反向」，是数据知道了消费它的机器：Material 不知道 Frame、Backend；Resource 不知道具体的 Manager；Mesh 不知道 GL；Scene 不调度 Pass。</li>
+    </ol>
+    <p>两条合起来是同一条原则：<strong>被依赖的一方要更稳定、更通用，不能反过来知道依赖它的、更具体、更易变的一方。</strong>设计文档还有一条「Material 不知道 Camera」：它们同在第一层，这条管的不是层次，而是职责——同一个 Material 被许多 Mesh 共用，同一帧还可能从不同视角去画，相机数据如果存进 Material，这些视角就会互相覆盖。所以相机数据每次随 ViewState 传进后端（Task 15 改动前的 RenderBackend.ts 注释写着「item 的模型矩阵和 view 的相机快照不会塞入共享 Material」；现在由 WebGL1Uniforms 在每次 draw 时从 DrawSubmission 读取内建值来保证，见 <a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:272">WebGL1Uniforms.ts:272</a>）。</p>
+    <p>当前源码实际的 import 方向：core 被所有包依赖；resources → core；scene → core、resources（Mesh 借用 Geometry、Material）；frame → resources、scene；backend → core、resources、frame（只用 RenderItem、ViewState 这些值类型）。另外还有一条不该有的 resources → scene，见 7.2 节。</p>
+    <p>
+      这不只是文档上的约定——我用 grep 核对过当前源码：<code>scene/</code>、<code>resources/</code>、<code>core/</code>、<code>frame/</code> 下<strong>没有一个文件</strong> import <code>backend/</code>；整个 <code>src/rendering</code> 也没有 import 任何旧引擎模块（只借用了 <code>@/errors</code> 里的两个通用工具）。你可以自己跑一下（输出为空就说明没有违规）：
+    </p>
+    <pre><code>grep -rln "rendering/backend" src/rendering/scene src/rendering/resources src/rendering/core src/rendering/frame</code></pre>
+
+    <h2>4. 两条继承体系，外加「借用」</h2>
+    <p>阅读指南特意强调：「架构关系不是一条继承链」（<a data-src="src/rendering/docs/design-reading-guide.zh-CN.md:32">design-reading-guide.zh-CN.md:32</a>）。实际上有两条互不相干的继承体系，它们之间靠<strong>借用</strong>连起来：</p>
+    <pre><code>Resource（core/Resource.ts：一次性释放、Scene 引用计数、onDispose 通知）
+├── Geometry            由若干 VertexAttribute 组成（VertexAttribute 本身不是 Resource）
+├── ShaderModule
+├── Material ───────────── 借用 → ShaderModule、Texture2D / CubeTexture
+├── Texture（抽象）
+│   ├── Texture2D（抽象）
+│   │   ├── ImageTexture2D
+│   │   └── DataTexture2D
+│   └── CubeTexture
+└── RenderTarget
+
+SceneNode（scene/SceneNode.ts：UUID、父子关系、遍历、world matrix 缓存；内含一个 Transform）
+├── Group
+│   └── Scene ───────────── retain → 任意 Resource（同一个 Scene 对同一资源只记一次）
+├── Mesh ───────────────── 借用 → Geometry、Material
+└── Camera（抽象）
+    └── PerspectiveCamera
+
+不在任何一条链上：backend/ 里的 Manager、State、Lifecycle。
+其中四个 Manager 通过 onDispose 注册监听器（订阅资源的释放事件），
+各自维护「CPU 对象 → 这一代 GPU 表示」的表。State、Lifecycle 不订阅资源。</code></pre>
+    <p>两条体系回答的是两个不同的问题：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th></th><th>Resource</th><th>SceneNode</th></tr>
+        <tr><td>代表什么</td><td>可以被多处共享、需要显式释放、会被 Manager 映射成 GPU 对象的<strong>数据</strong></td><td>在树里有位置、有变换的<strong>东西</strong></td></tr>
+        <tr><td>生命周期</td><td>一次性：disposed 之后不能复活；最后一个 Scene 引用释放时自动清理</td><td>没有 dispose；从树上摘下来还能再挂回去</td></tr>
+        <tr><td>和 GPU 的关系</td><td>每个 context 的 Manager 以它的<strong>对象身份</strong>为 key 建 GPU 表示</td><td>没有直接关系；Mesh 的 world matrix 在提取时被复制进 RenderItem</td></tr>
+      </table>
+    </div>
+    <p>
+      所以 <a data-src="src/rendering/scene/Mesh.ts:22">Mesh</a> 继承的是 SceneNode 而不是 Resource：它只是把「在这里、用这个材质、画这个几何体」组合起来，借用 Geometry 和 Material，自己没有要交给 GPU 的数据，也没有 <code>dispose()</code>（<a data-src="src/rendering/scene/Mesh.ts:10">Mesh.ts:10–14</a>）。这是 has-a（对象组合 object composition，即「组合优于继承」里的组合，不是 UML 里那个管寿命的「组合」关系）与 is-a（继承）的分工：Mesh <em>是</em>一个节点，<em>有</em>一个几何体。
+    </p>
+
+    <h2>5. 一次 draw 穿过各层（目标路径）</h2>
+    <p>两个 Mesh 共用同一个 Geometry 和 Material，分别放在 x = 0 和 x = 10。它们的一次绘制要这样穿过四层：</p>
+    <pre><code>第一层  Scene ─ Mesh（借用 geometry、material；自己的 transform）          已实现
+          │ RenderListBuilder 遍历可见节点，复制出这一帧的值              未实现（Task 16）
+第二层  RenderItem { geometry, material, worldMatrix ← 复制 }             类型已定义
+        ViewState  { viewMatrix, projectionMatrix, cameraWorldPosition ← 复制 }
+          │ ForwardPass 调用 backend.draw({ item, view })                 未实现（Task 17–18）
+第三层  RenderBackend 接口 → WebGL1Backend.draw                          接口已定义；实现是 Task 15
+          │ programs.get → geometries.get → state.useProgram → 上传矩阵
+          │ → vertexInputs.bind → drawElements                           这些零件都已实现
+第四层  WebGLRenderingContext → 驱动 → GPU</code></pre>
+    <p>注意第二层做的事：它把可变的场景<strong>复制成值</strong>。<a data-src="src/rendering/frame/RenderItem.ts:5">RenderItem</a> 带的是 worldMatrix 的副本，<a data-src="src/rendering/frame/ViewState.ts:3">ViewState</a> 带的是相机矩阵的副本。于是 Backend 永远看不到 Mesh、SceneNode、Camera，同一批 draw 里看到的也都是冻结下来的值。这种「值快照当边界」的做法，是层与层解耦的关键。</p>
+
+    <h2>6. 这些切分换来了什么，付出了什么</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th>换来</th><th>付出</th></tr>
+        <tr>
+          <td>
+            <ul>
+              <li>GL 只存在于一层：可以换后端，也可以让 WebGL1、WebGL2 两个后端并存，逐像素对比（<a data-main="claude-workspace/threejs-refactor/PLAN.md:169">PLAN.md §3.1</a> 选这条路的决定性理由）</li>
+              <li>context 丢失时整代丢弃、重建，CPU 数据原封不动</li>
+              <li>第一层可以脱离 GL 测试：<code>tests/unit/rendering/scene</code> 和 <code>resources</code> 下的测试全都不需要 GL</li>
+              <li>共享是天然的：多个 Mesh、多个 Scene 共用一个 Geometry，只上传一次</li>
+            </ul>
+          </td>
+          <td>
+            <ul>
+              <li>多了间接层：每次 draw 都要查几次 Map（按对象身份找 GPU 表示）</li>
+              <li>生命周期必须显式管理：retain/release、onDispose 订阅、Manager 的 unsubscribe、固定的释放顺序——概念和代码都变多了</li>
+              <li>边界上有复制成本：值快照、<code>copyData()</code>、冻结的 descriptor</li>
+              <li>编排层没写完之前，整条链路没法端到端验证（这是现状）</li>
+            </ul>
+          </td>
+        </tr>
+      </table>
+    </div>
+
+    <h2>7. 架构视角</h2>
+    <h3>7.1 对照 three.js</h3>
+    <ul>
+      <li><strong>数据对象不碰 GL，这一点和 three.js 一致。</strong>three.js 的 Object3D、BufferGeometry、Material 本来就不持有 GL 句柄，GPU 数据放在渲染器内部、按对象保存的 WeakMap 里（旧渲染器是 <a data-src="node_modules/three/src/renderers/webgl/WebGLProperties.js:3">WebGLProperties</a>）。反倒是本仓库的旧引擎是例外：Mesh 和 Material 自己拿着 gl。</li>
+      <li><strong>后端抽象更接近 three.js 的新渲染器。</strong>旧的 WebGLRenderer 把编排和 GL 细节写在一个 3505 行的闭包里，再配约 30 个 WebGL* 模块；新渲染器（<code>src/renderers/common/</code>）让 <a data-src="node_modules/three/src/renderers/common/Renderer.js:3001">Renderer</a> 只跟抽象的 <a data-src="node_modules/three/src/renderers/common/Backend.js:43">Backend</a> 说话，下面有 WebGPUBackend 和 WebGLBackend 两个实现。本项目的 RenderBackend 加 WebGL1Backend（将来加 WebGL2Backend）是同一个形状。</li>
+      <li><strong>本项目多了一样 three.js 没有的东西：第一层的显式生命周期。</strong>three.js 靠用户手动 <code>geometry.dispose()</code>；本项目有 Scene 级的引用计数，最后一个引用释放时自动清理。这是第 5 课的主题。</li>
+    </ul>
+    <h3>7.2 一个小小的审查发现</h3>
+    <p>
+      核对依赖时我发现：<code>resources/Material.ts</code> 和 <code>frame/ViewState.ts</code> 当时都为了一个 <code>Vec3Tuple</code> 类型，去 import <code>scene/Transform.ts</code>（2026-09-25 已修复，见本节末尾）。两处都只是 <code>import type</code>，运行时没有依赖；但它们在不同的层，问题也不一样（2026-09-24 更正：原文把两处当成了同一种问题）：
+    </p>
+    <ul>
+      <li><strong>Material.ts → scene（第一层内部，两个兄弟包）：</strong><a data-src="src/rendering/scene/Mesh.ts:2">Mesh.ts:2–3</a> 本来就让 scene 依赖 resources（Mesh 借用 Geometry、Material），再加上这一条，就成了 <strong>scene ⇄ resources 的包循环依赖</strong>。两个包从此只能一起理解、一起测试、一起复用，违反无环依赖原则 (Acyclic Dependencies Principle)。</li>
+      <li><strong>ViewState.ts → scene（第二层读第一层）：</strong>方向本身允许，将来的 RenderListBuilder 本来就要读场景。问题在于 ViewState 是交给后端的值类型，<a data-src="src/rendering/backend/RenderBackend.ts:2">RenderBackend.ts:2</a> import 了它，于是后端的类型依赖顺着它一路连到了 scene/Transform，「Backend 不知道 Scene」在类型层面被打破了。</li>
+    </ul>
+    <p>
+      修法：把 <code>Vec3Tuple</code>，连同 <code>frame/ViewState.ts</code> 里同类的 <code>Mat4Tuple</code>，搬进一个不依赖任何包的纯类型模块，例如 <code>core/math/</code>（这是你在答疑里提出的位置，我认为合适：core 本来就被所有包依赖，搬进去不会新增任何依赖方向）。这是一个很好的练习方向：<strong>审查架构时，不只看层与层之间，也看同一层内部有没有包循环，以及值类型会把哪些依赖「带」过边界。</strong>
+    </p>
+    <aside class="note">
+      <strong>2026-09-25 已修复：</strong>按上面的修法，两个类型搬进了 <a data-src="src/rendering/core/math/tuples.ts:12">core/math/tuples.ts</a>（只放纯类型，不引入 gl-matrix）。<a data-src="src/rendering/resources/materialParameters.ts:2">materialParameters.ts:2</a>（10 月 19 日以前在 Material.ts，参数类型搬家时跟着走了）、<a data-src="src/rendering/frame/ViewState.ts:1">ViewState.ts:1</a>、<a data-src="src/rendering/frame/RenderItem.ts:1">RenderItem.ts:1</a>、<a data-src="src/rendering/scene/Transform.ts:3">Transform.ts:3</a> 都改从这里导入。现在 resources 不再 import scene，RenderBackend 的类型依赖里也不再有 scene 的文件。
+    </aside>
+
+    <h2>8. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0003"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0003"]'), [
+        {
+          q: '按本项目的分层判据，「把 Float32Array 上传成 WebGLBuffer」归哪一层？',
+          opts: ['第三层：设备后端（GeometryManager）', '第一层：逻辑资源（Geometry 自己）', '第二层：帧提取（RenderItem）'],
+          answer: 0,
+          why: '判据是「知不知道 gl」。Geometry 只保存 CPU 快照，从不碰 gl；上传是 <a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:104">GeometryManager.get</a> 的事。旧引擎把它放在 <code>mesh.createVBOs(gl)</code> 里，这正是要拆掉的耦合。'
+        },
+        {
+          q: '为什么 Mesh 继承 SceneNode，而不是继承 Resource？',
+          opts: ['它在树里有位置和变换，但不拥有要释放的数据', '它需要引用计数，SceneNode 里恰好有这个功能', 'TypeScript 不允许一个类同时继承两个父类'],
+          answer: 0,
+          why: 'Resource 管的是「能被共享、要显式释放、会被 Manager 映射成 GPU 对象」的数据。Mesh 只是对象组合：借用 Geometry 和 Material，没有自己的 GPU 数据，也没有 dispose()。「不允许同时继承两个父类」是事实（单继承），但不是原因：就算能多继承，Mesh 也不该是 Resource。'
+        },
+        {
+          q: '下面哪一个 import 会破坏依赖方向？',
+          opts: ['resources/Material.ts 导入 WebGL1ProgramManager', 'backend 的 ProgramManager 导入 ShaderModule', 'scene/Mesh.ts 导入 resources/Geometry'],
+          answer: 0,
+          why: '数据不能知道消费它的机器：第三层可以 import 第一层的类型（ProgramManager 拿 ShaderModule 当缓存 key），第一层绝不能 import 第三层。Mesh 导入 Geometry 是第一层里的借用，也是允许的方向。当前源码里 scene/、resources/、core/、frame/ 没有一个文件导入 backend/。'
+        },
+        {
+          q: '旧 Material 缓存了 WebGLUniformLocation，问题出在哪？',
+          opts: ['location 属于某一个 program，换了就失效', 'location 太占内存，应该每次都重新查询', 'location 只能在 useProgram 之前查询到'],
+          answer: 0,
+          why: 'WebGLUniformLocation 只对查询它的那个 program 有效。材质一旦配了第二个 program（比如阴影 pass），缓存就是错的——旧 Mesh 的 location 缓存有同样的问题，它的注释里点名了 ShadowPass 和 FFT 计算 pass。新架构里 location 放在 ProgramManager 返回的 <a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:22">WebGL1ProgramResource</a> 里，天然按 program 分开。'
+        },
+        {
+          q: 'RenderItem 为什么带一份 worldMatrix 的副本，而不是直接引用 Mesh？',
+          opts: ['让 Backend 只看到这一帧固定下来的值', '因为 Mesh 的 world matrix 是私有字段', '为了让 Material 能够读到这个矩阵'],
+          answer: 0,
+          why: '值快照是层与层之间的边界：提取阶段读一次可变的场景，之后 Backend 在同一批 draw 里看到的都是冻结的值，它也不必知道 Mesh、SceneNode 的存在。'
+        },
+        {
+          q: '这套分层付出的最大代价是什么？',
+          opts: ['生命周期必须显式管理，概念和代码都变多', '每次 draw 都要把 shader 重新编译一遍', '不能再让两个 Mesh 共用同一个 Geometry'],
+          answer: 0,
+          why: '「每次 draw 都重新编译」和「不能共用 Geometry」恰恰是这套架构解决掉的问题（编译结果有缓存；共享是天然的）。真正的代价是：谁拥有、谁借用、什么时候释放，都得写成显式的协议——retain/release、onDispose 订阅、Manager 的 unsubscribe、固定的释放顺序。'
+        }
+      ])
+    </script>
+
+    <h2>9. 延伸阅读</h2>
+    <p>
+      <strong>首选（一手来源）：</strong>HW2 架构设计文档的 §3–§6：从屏幕结果反推一帧数据流（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:94">§3</a>）、四层架构与单向依赖（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:135">§4</a>）、模块目录（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:181">§5</a>）、所有权矩阵（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:245">§6</a>）。大约 15 分钟，比这一课多了 HW2 的具体场景。
+    </p>
+    <p>
+      想知道「为什么先划边界、再换 GL」和「为什么要双后端并存」，读重构方案的 <a data-main="claude-workspace/threejs-refactor/PLAN.md:155">§3.0–§3.1</a>；后端接口的三条硬规则（方法名用意图而不用 GL 术语、能力差异用 hasFeature、签名里不许出现 GL 类型）在 <a data-main="claude-workspace/threejs-refactor/PLAN.md:517">§5.8</a>。想一眼看全所有文件，见本课程的 <a href="../reference/architecture-map.html">架构地图</a>。
+    </p>
+
+    <aside class="ask">
+      有任何没讲清楚的地方，直接在对话里问我。做完告诉我检查题错了哪几题——第 4 课讲第一条架构决策：<strong>CPU 逻辑资源和每个 context 的 GPU 表示是怎样协作的</strong>（Resource.onDispose 与 Manager 的缓存表）。
+    </aside>
+
+    <div class="nav">
+      <a href="../index.html">← 课程首页</a>
+      <a href="../reference/architecture-map.html">架构地图</a>
+      <span style="color: var(--muted)">第 4 课（待发）→</span>
+    </div>
+    <footer>src/rendering 精读课 · 第 3 课 · 2026-09-23</footer>
+  </body>
+</html>

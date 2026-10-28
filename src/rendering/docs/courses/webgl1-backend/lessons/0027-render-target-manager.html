@@ -1,0 +1,1813 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 27 课 · 离屏画布</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/render-target-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 详细篇 11 续 · backend ⑤ 续 · 约 80 分钟</p>
+    <h1>backend ⑤ 续：给 GPU 一块离屏画布——RenderTargetManager 与 FBO</h1>
+    <p class="lede">
+      HW1 的阴影要画两遍：第一遍从光源看场景，把「离光源多远」画进一张看不见的图（阴影贴图）；第二遍正常画，每个像素去那张图里查自己是不是被挡住了。第一遍画到的那块「看不见的画布」，在 CPU 上是一个 RenderTarget，在 GPU 上是一个 framebuffer 对象（FBO）加上挂在它上面的纹理和 renderbuffer。这一课先把阴影贴图里存的数和 FBO 的 GL 调用看明白，再从旧引擎的 FBO 类出发一版一版写，最后读真实的 RenderTargetManager，以及使用它的 SurfaceScope。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW1 阴影、HW3 的 GBuffer、将来的后处理和环境烘焙，都要「先画进一块离屏画布，再拿它当纹理用」。你 10 月 12 日刚接上的 sampler2D 采样附件（Backend 里的 <code>scope.assertCanSample</code> → <code>resolveSampledColor</code>），读的就是这一课讲的 Manager 建出来的东西。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 第 29 课第 6、7 节：RenderTarget 为什么不是 Texture、resize 让 revision 加一、Material 记的是附件地址 <code>{ target, kind, index }</code>（1.2 节会把字段再列一遍）；② 第 17 课 3.5 节的上传作用域 withTextureUploadState（记下并还回当前单元的纹理格子和四个上传设置）；③ 第 16 课第 3 节「先记下、再还回绑定；失败删掉这次建的」；④ 第 13 课第 2 节「一代」。如果其中哪一条其实没懂，告诉我，我先补那一块。<br />
+      <strong>这一课从零讲的</strong>：阴影贴图里一个像素存的是什么（打包公式和具体数）；FBO 是什么、颜色附件和深度附件各管什么；完整性检查和它的状态码；MRT 的 drawBuffers 记在哪里；旧引擎 FBO 的两个问题；validate、create、release；SurfaceScope 怎样用 Manager 建出来的 FBO；采样附件时的反馈环检查；和 Lifecycle 的关系。<br />
+      <strong>工作区版本</strong>：RenderTarget.ts、WebGL1RenderTargetManager.ts、WebGL1SurfaceScope.ts、WebGL1Backend.ts 都有未提交的改动，本课按 2026-10-12 工作区里的版本讲，行号以后可能会变。<br />
+      <strong>页面会用到你的显卡</strong>：卡片都在你的浏览器里创建真实的 WebGL context，用完释放。2.5 节的卡片会打印你这台机器的上限。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">原始输入与需求</a>：<a href="#s1-1">阴影贴图里存的是什么</a> <a href="#s1-2">CPU 上的描述</a> <a href="#s1-3">谁来要</a> <a href="#s1-4">需求</a></li>
+        <li><a href="#s2">先把 GL 调用看明白</a>：<a href="#s2-1">FBO</a> <a href="#s2-2">深度附件</a> <a href="#s2-3">完整性</a> <a href="#s2-4">drawBuffers</a> <a href="#s2-5">上限</a></li>
+        <li><a href="#s3">一版一版写</a>：<a href="#s3-1">旧引擎</a> <a href="#s3-2">第 2 版</a> <a href="#s3-3">validate</a> <a href="#s3-4">create</a> <a href="#s3-5">get 与替换</a> <a href="#s3-6">释放</a></li>
+        <li><a href="#s4">谁在用它：SurfaceScope</a>：<a href="#s4-1">run</a> <a href="#s4-2">反馈环检查</a> <a href="#s4-3">scope 里不能改目标</a></li>
+        <li><a href="#s5">和 Lifecycle 的关系</a></li>
+        <li><a href="#s6">架构视角：对照 three.js r177</a></li>
+        <li><a href="#s7">审查视角</a></li>
+        <li><a href="#s8">检查题</a></li>
+        <li><a href="#s9">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 原始输入与需求</h2>
+    <h3 id="s1-1">1.1 阴影贴图里存的是什么</h3>
+    <p>
+      阴影 pass 画每个片元时，并不输出颜色，而是输出「这个点离光源多远」：深度 d，0 是近平面，1 是远平面。可颜色附件每个通道只有 8 位，存 0～255 的整数，一个通道只能把 d 分成 256 档，太粗。HW1 的做法是把 d 拆成四个 8 位数，分别放进 R、G、B、A，像写一个四位的 256 进制小数：
+    </p>
+    <pre><code>d ≈ r + g / 256 + b / 256² + a / 256³     // r、g、b、a 各在 [0, 1)，存成 0～255 的整数
+// 类比十进制：0.3141 = 0.3 + 0.01 + 0.004 + 0.0001，每一位只管自己那一档</code></pre>
+    <p>这一步写在阴影 pass 的片元 shader 里：</p>
+    <pre><code>// 旧引擎 src/shaders/lighting/shadow/directional/rgbaPack.frag
+// :5–12、:21–24（注释是课程加的）
+// 阴影 pass 的片元 shader：把这个片元离光源多远（深度 d，0～1）写成一个 RGBA 颜色
+vec4 pack(float depth) {
+  // 把 d 拆成 4 位「256 进制小数」：d ≈ r + g/256 + b/256² + a/256³
+  const vec4 bitShift = vec4(1.0, 256.0, 256.0 * 256.0, 256.0 * 256.0 * 256.0);
+  const vec4 bitMask = vec4(1.0 / 256.0, 1.0 / 256.0, 1.0 / 256.0, 0.0);
+  // fract(d × 256^k)：第 k 位以及它后面的所有位
+  vec4 rgbaDepth = fract(depth * bitShift);
+  // 每一位减掉「下一位已经表示了的那部分」，只留自己这一位
+  rgbaDepth -= rgbaDepth.gbaa * bitMask;
+  return rgbaDepth;
+}
+
+void main() {
+  // gl_FragCoord.z：深度测试用的那个深度值，0 = 近平面，1 = 远平面
+  gl_FragColor = pack(gl_FragCoord.z);
+}</code></pre>
+    <p>
+      把 d = 0.3 和 d = 0.7 代进去（Node 按 shader 的公式逐步算，存储按 8 位通道取整到 k / 255，解码用接收阴影的 shader 里的 unpack，<a data-src="src/shaders/lighting/directLight/fragment.frag:55">directLight/fragment.frag:55–58</a>）：
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>d</th><th>pack 输出 (r, g, b, a)</th><th>存进纹理的 4 个字节</th><th>读回再解码</th></tr></thead>
+      <tbody>
+        <tr><td>0.3</td><td>(0.296875, 0.796875, 0.796875, 0.8)</td><td>76, 203, 203, 204</td><td>0.30116</td></tr>
+        <tr><td>0.7</td><td>(0.699219, 0.199219, 0.199219, 0.2)</td><td>178, 51, 51, 51</td><td>0.69882</td></tr>
+      </tbody>
+    </table></div>
+    <aside class="note">
+      <strong>顺带一个数值细节</strong>：解码只差 0.001 左右，不是正好 0.3。原因是 pack 按 256 进位，而 8 位通道存的是 k / 255，两者对不上。同一个文件里被注释掉的 EncodeFloatRGBA（rgbaPack.frag:14–19）按 255 进位，Node 实算 0.3、0.5、0.7 都能精确还原（它的第四个常数写成了 160581375，255³ 应该是 16,581,375）。这是旧引擎 shader 的事，不在 src/rendering 里；将来新架构写阴影 shader 时值得记得。
+    </aside>
+    <p>
+      <strong>为什么阴影贴图要用 nearest 过滤？</strong>解码是一个加权求和（线性的），所以线性过滤两个纹素，解出来正好是两个深度的加权平均（Node 实算：0.3、0.7 两组字节各取一半，解出 0.49999）。问题在于这个平均值是编出来的。看一个阴影边缘：左边纹素是挡光物体，存 0.3；右边是地板，存 0.7。地板上一个点 P 离光源 0.70，采样位置在两个纹素之间、偏右 75%：
+    </p>
+    <ul>
+      <li>nearest：取右边那个纹素，0.7。P 的 0.70 不比它远，判为被照亮（对）。</li>
+      <li>linear：0.25 × 0.3 + 0.75 × 0.7 = 0.6。P 的 0.70 比 0.6 远，判为在阴影里（错）。没有任何表面离光源 0.6，这个深度是插值编出来的。</li>
+    </ul>
+    <p>
+      所以 RenderTarget 允许为颜色附件选过滤方式，而且注释里专门写了「RGBA 打包深度用于硬阴影时应显式选择 nearest」（<a data-src="src/rendering/resources/RenderTarget.ts:30">RenderTarget.ts:30–39</a>）；默认是 linear，因为普通的离屏颜色（后处理、缩放）要平滑。
+    </p>
+    <p>
+      阴影 pass 还需要第二样东西：一个深度缓冲。光源看过去，同一个像素上可能有好几个物体，要留下最近的那个。这个深度缓冲只在阴影 pass 里做深度测试，主 pass 不读它。两样东西的大小（HW1 默认 2048 × 2048，<a data-src="src/lights/directionalLight/DirectionalLight-refactor.ts:143">DirectionalLight-refactor.ts:143</a>）：
+    </p>
+    <pre><code>颜色（存打包后的深度）：2048 × 2048 × 4 字节 = 16,777,216 字节 = 16 MiB
+深度缓冲（depth16）  ：2048 × 2048 × 2 字节 =  8,388,608 字节 =  8 MiB
+// 两样都在显存里；CPU 上一个字节都没有，内容全靠阴影 pass 每帧画</code></pre>
+
+    <h3 id="s1-2">1.2 CPU 上的描述</h3>
+    <p>新架构里，这块画布先在 CPU 上写成一个 RenderTarget（第 29 课第 6 节）。项目里还没有代码建它，下面是课程按 HW1 写的：</p>
+    <pre><code>// 课程写的：HW1 的阴影贴图，用新架构的 RenderTarget 描述（项目里还没有代码建它）
+const shadow = new RenderTarget(
+  {
+    width: 2048, // 像素，不是 CSS 尺寸；DirectionalLight 默认的阴影分辨率
+    height: 2048,
+    colors: [
+      {
+        format: &#x27;rgba8&#x27;, // 存 pack 后的深度：每像素 4 字节，2048² × 4 = 16 MiB
+        // 1.1 节：线性过滤会在边缘编出不存在的深度，所以用 nearest
+        sampler: { minFilter: &#x27;nearest&#x27;, magFilter: &#x27;nearest&#x27; }
+      }
+    ],
+    depth: { format: &#x27;depth16&#x27; } // 阴影 pass 自己做深度测试用：2048² × 2 = 8 MiB
+  },
+  { label: &#x27;shadow/main&#x27; } // 只用于报错时认出是哪块画布
+)
+// 这一行之后：CPU 上只有一份冻结的描述，revision 是 0；GPU 上什么都还没有</code></pre>
+    <p>描述里的每一项，在 GPU 上变成什么：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>描述</th><th>GPU 上</th><th>本课</th></tr></thead>
+      <tbody>
+        <tr><td><code>width</code>、<code>height</code></td><td>颜色纹理和 renderbuffer 的尺寸；画进去时的 viewport</td><td>3.4、4.1 节</td></tr>
+        <tr><td><code>colors[i].format: 'rgba8'</code></td><td>一张 RGBA、UNSIGNED_BYTE 的空纹理，挂到第 i 个颜色槽</td><td>2.1、3.4 节</td></tr>
+        <tr><td><code>colors[i].sampler</code></td><td>这张纹理的 MIN_FILTER、MAG_FILTER；wrap 固定 clamp-to-edge，没有 mipmap</td><td>3.4 节</td></tr>
+        <tr><td><code>colors.length &gt; 1</code></td><td>MRT：要 WEBGL_draw_buffers，还要设 drawBuffers</td><td>2.4、3.3 节</td></tr>
+        <tr><td><code>depth: { format: 'depth16' }</code></td><td>一个 DEPTH_COMPONENT16 的 renderbuffer，挂到深度槽；不能被 shader 采样</td><td>2.2 节</td></tr>
+        <tr><td><code>label</code></td><td>不上 GPU，只出现在报错里</td><td>—</td></tr>
+        <tr><td><code>revision</code>（resize 时加一）</td><td>不上 GPU；Manager 用它判断旧 FBO 是否过期</td><td>3.5 节</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3 id="s1-3">1.3 谁来要：一条写的路，一条读的路</h3>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 292" role="img" aria-label="阴影 pass 通过 SurfaceScope.run 写进 shadow：resolveTarget 调用 RenderTargetManager.get，拿到 framebuffer 和宽高，绑上 FBO、把 viewport 设成 2048。主 pass 在 draw 时读 shadow：Uniforms 先让 scope 检查不是边写边读，再调用 resolveSampledColor，它内部同样调用 get，拿到颜色纹理绑进纹理单元。两条路共用 Manager 里同一张表。">
+          <defs>
+            <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+            <marker id="f1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <rect x="20" y="24" width="220" height="56" class="box" />
+          <text x="130" y="47" text-anchor="middle">阴影 pass：写进 shadow</text>
+          <text x="130" y="66" text-anchor="middle" class="small">SurfaceScope.run（4.1 节）</text>
+          <rect x="20" y="212" width="220" height="56" class="box" />
+          <text x="130" y="235" text-anchor="middle">主 pass：读 shadow</text>
+          <text x="130" y="254" text-anchor="middle" class="small">Uniforms，每次 draw（4.2 节）</text>
+
+          <rect x="290" y="92" width="200" height="110" class="box hl" />
+          <text x="390" y="115" text-anchor="middle">RenderTargetManager</text>
+          <text x="390" y="135" text-anchor="middle" class="small">Map&lt;RenderTarget, entry&gt;</text>
+          <text x="390" y="153" text-anchor="middle" class="small">同对象、同 revision 才命中</text>
+          <text x="390" y="171" text-anchor="middle" class="small">否则 validate → create → 删旧</text>
+          <text x="390" y="189" text-anchor="middle" class="small">一个 context 一代</text>
+
+          <rect x="540" y="24" width="200" height="56" class="box" />
+          <text x="640" y="47" text-anchor="middle">绑上 FBO</text>
+          <text x="640" y="66" text-anchor="middle" class="small">viewport(0, 0, 2048, 2048)</text>
+          <rect x="540" y="212" width="200" height="56" class="box" />
+          <text x="640" y="235" text-anchor="middle">颜色纹理放进单元 n</text>
+          <text x="640" y="254" text-anchor="middle" class="small">activeTexture、uniform1i</text>
+
+          <path d="M240 52 L330 52 L330 90" class="line" marker-end="url(#f1a)" />
+          <text x="248" y="44" class="small">resolveTarget → get</text>
+          <path d="M240 240 L330 240 L330 204" class="line accent" marker-end="url(#f1b)" />
+          <text x="248" y="286" class="small accent">先 assertCanSample，再 resolveSampledColor → get</text>
+          <path d="M450 90 L450 52 L538 52" class="line" marker-end="url(#f1a)" />
+          <text x="458" y="44" class="small">FBO、宽高</text>
+          <path d="M450 204 L450 240 L538 240" class="line accent" marker-end="url(#f1b)" />
+          <text x="442" y="226" text-anchor="end" class="small accent">colorTextures[0]</text>
+        </svg>
+      </div>
+      <figcaption>图 1　同一块画布，一条写的路、一条读的路，都经过 RenderTargetManager.get。写的路由 Backend 接线：<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:279">WebGL1Backend.ts:279</a>；读的路是 10 月 12 日新接的闭包：<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:292">:292–302</a>。第一次用到时，不管从哪条路来，都由 get 建 FBO（懒创建）。</figcaption>
+    </figure>
+
+    <h3 id="s1-4">1.4 需求</h3>
+    <ol>
+      <li><strong>按需建，一代一份。</strong>描述在 CPU 上，GPU 对象第一次用到才建，context 丢了整代重建（和纹理一样）。</li>
+      <li><strong>设备做不到就早报错。</strong>尺寸超过上限、多颜色附件没有扩展，要在建任何东西之前拒绝。</li>
+      <li><strong>建出来的必须能用。</strong>「完整性」检查不过，宁可报错，也不交出一个 draw 不进去的 FBO。</li>
+      <li><strong>不弄乱别人。</strong>建 FBO 时要临时绑这绑那；建完，进来时绑着的 framebuffer、renderbuffer、纹理都要原样还回。</li>
+      <li><strong>失败不留半成品。</strong>建到一半失败，这次建的全删。</li>
+      <li><strong>会换尺寸。</strong>revision 变了要换新的，而且失败时旧的还能用（第 29 课 6.2 节）。</li>
+      <li><strong>不能边写边读。</strong>正往里画的那块画布，这次 draw 不能采样它。</li>
+    </ol>
+
+    <h2 id="s2">2. 先把 GL 调用看明白</h2>
+    <h3 id="s2-1">2.1 FBO：一块插座板</h3>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 196" role="img" aria-label="FBO 自己没有像素，只有几个插槽：COLOR_ATTACHMENT0 插一张颜色纹理，COLOR_ATTACHMENT1 到 7 用于 MRT，DEPTH_ATTACHMENT 插一个 depth16 renderbuffer。bindFramebuffer 绑上这个 FBO 后，draw 写进插着的东西；绑 null 则写进 canvas 自带的缓冲。">
+          <defs>
+            <marker id="f2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+          </defs>
+          <rect x="20" y="40" width="190" height="44" class="box" />
+          <text x="115" y="59" text-anchor="middle">颜色纹理</text>
+          <text x="115" y="76" text-anchor="middle" class="small">2048² RGBA，texImage2D(null)</text>
+          <rect x="20" y="118" width="190" height="44" class="box" />
+          <text x="115" y="137" text-anchor="middle">renderbuffer</text>
+          <text x="115" y="154" text-anchor="middle" class="small">DEPTH_COMPONENT16</text>
+
+          <rect x="270" y="14" width="250" height="172" class="box hl" />
+          <text x="395" y="34" text-anchor="middle">FBO（自己没有像素）</text>
+          <rect x="285" y="46" width="220" height="30" class="box" />
+          <text x="395" y="66" text-anchor="middle" class="small">COLOR_ATTACHMENT0</text>
+          <rect x="285" y="84" width="220" height="30" class="box" />
+          <text x="395" y="104" text-anchor="middle" class="small">COLOR_ATTACHMENT1…7（MRT）</text>
+          <rect x="285" y="122" width="220" height="30" class="box" />
+          <text x="395" y="142" text-anchor="middle" class="small">DEPTH_ATTACHMENT</text>
+          <text x="395" y="174" text-anchor="middle" class="small">STENCIL_ATTACHMENT（本项目不用）</text>
+
+          <path d="M210 62 L283 62" class="line" marker-end="url(#f2a)" />
+          <text x="246" y="54" text-anchor="middle" class="small">挂上</text>
+          <path d="M210 140 L283 140" class="line" marker-end="url(#f2a)" />
+          <text x="246" y="132" text-anchor="middle" class="small">挂上</text>
+
+          <rect x="570" y="40" width="170" height="122" class="box" />
+          <text x="655" y="62" text-anchor="middle">draw 写到哪</text>
+          <text x="582" y="90" class="small">绑这个 FBO：</text>
+          <text x="582" y="107" class="small">　写进插着的东西</text>
+          <text x="582" y="132" class="small">绑 null：</text>
+          <text x="582" y="149" class="small">　写进 canvas</text>
+        </svg>
+      </div>
+      <figcaption>图 2　FBO 是一块插座板。像素在插上去的纹理和 renderbuffer 里；FBO 只记「哪个槽插了谁」，以及 2.4 节的 drawBuffers 设置。挂纹理用 framebufferTexture2D，挂 renderbuffer 用 framebufferRenderbuffer，两者都作用于当前绑着的 FBO。</figcaption>
+    </figure>
+    <p>
+      <code>bindFramebuffer(gl.FRAMEBUFFER, null)</code> 的 null 不是「没有」，而是「canvas 自带的那套缓冲」，WebGL 叫它默认 framebuffer。颜色纹理用 <code>texImage2D(…, null)</code> 分配：只要显存，不传像素，WebGL 规定这块新存储全是 0。下面的卡片画一次看看：
+    </p>
+    <div id="lab-fbo"></div>
+
+    <h3 id="s2-2">2.2 深度附件：没有它，深度测试等于没开</h3>
+    <p>
+      深度测试比较的是「深度缓冲里已有的值」。一个 FBO 如果没有挂深度附件，就没有深度缓冲可比：开了 DEPTH_TEST 也不起作用，后画的永远盖住先画的。阴影 pass 要留下离光源最近的物体，所以必须挂深度附件。
+    </p>
+    <p>
+      为什么用 renderbuffer 而不是纹理？renderbuffer 是「只给 GPU 自己画的时候用」的存储，shader 不能采样它；深度纹理要 WEBGL_depth_texture 扩展（旧引擎有这条路，<a data-src="src/framebuffers/ShadowMapFBO.ts:30">ShadowMapFBO.ts:30–51</a>）。本项目现在只描述 depth16，就是 renderbuffer，所以第 29 课里采样 depth 地址会被拒绝。
+    </p>
+    <div id="lab-depth"></div>
+
+    <h3 id="s2-3">2.3 完整性：checkFramebufferStatus</h3>
+    <p>
+      插座板插得不对，FBO 就「不完整」，往里 draw 或 clear 都会失败。<code>checkFramebufferStatus</code> 返回一个状态码告诉你哪里不对。本机实测（SwiftShader）：
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>插法</th><th>状态码</th><th>名字</th></tr></thead>
+      <tbody>
+        <tr><td>RGBA 纹理 4 × 4 + depth16 4 × 4</td><td>36053</td><td>FRAMEBUFFER_COMPLETE</td></tr>
+        <tr><td>什么都没插</td><td>36055</td><td>INCOMPLETE_MISSING_ATTACHMENT</td></tr>
+        <tr><td>RGBA 纹理 4 × 4 + depth16 8 × 8</td><td>36057</td><td>INCOMPLETE_DIMENSIONS（WebGL1 要求所有附件同尺寸）</td></tr>
+        <tr><td>LUMINANCE 纹理</td><td>36054</td><td>INCOMPLETE_ATTACHMENT（这种格式不能当画布）</td></tr>
+        <tr><td>只插 depth16</td><td>36053</td><td>COMPLETE（只做深度也可以）</td></tr>
+      </tbody>
+    </table></div>
+    <p>往不完整的 FBO 上 clear，getError 得到 1286（INVALID_FRAMEBUFFER_OPERATION），什么都没写。WebGL 不会因为 FBO 不完整而抛异常，只留一个错误码，所以建完必须自己问一次状态。</p>
+    <div id="lab-complete"></div>
+
+    <h3 id="s2-4">2.4 MRT：drawBuffers 记在 FBO 里</h3>
+    <p>
+      GBuffer 一次 draw 要同时写几张图：shader 写 <code>gl_FragData[0]</code>、<code>gl_FragData[1]</code>……，FBO 挂 COLOR_ATTACHMENT0、1……。中间还要一张对照表：「第 i 个输出写进哪个槽」，这就是 WEBGL_draw_buffers 的 <code>drawBuffersWEBGL([...])</code>。关键是这张表存在哪：
+    </p>
+    <div id="lab-drawbuffers"></div>
+    <p>
+      实测说明，这张表是每个 FBO 自己的：在 A 上设了 [C0, C1]，B 的第 1 项仍是 NONE；默认 framebuffer 的第 0 项是 BACK。所以只要在建 FBO 时（它正绑着的时候）设一次就够了，以后每次 bind 都自动生效，也不会影响别的 FBO。旧引擎每次 <code>bind()</code> 都重设一遍（<a data-src="src/framebuffers/FBO.ts:257">FBO.ts:257–271</a>），是多余的。
+    </p>
+
+    <h3 id="s2-5">2.5 设备上限</h3>
+    <p>能建多大、能挂几个颜色槽，每台设备不同。本机 SwiftShader 的值和这张卡片在你浏览器里打印的值，多半不一样：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>上限</th><th>管什么</th><th>本机 SwiftShader</th></tr></thead>
+      <tbody>
+        <tr><td>MAX_TEXTURE_SIZE</td><td>颜色纹理的边长</td><td>8192</td></tr>
+        <tr><td>MAX_RENDERBUFFER_SIZE</td><td>深度 renderbuffer 的边长</td><td>8192</td></tr>
+        <tr><td>MAX_COLOR_ATTACHMENTS_WEBGL</td><td>能挂几个颜色槽（要扩展）</td><td>8</td></tr>
+        <tr><td>MAX_DRAW_BUFFERS_WEBGL</td><td>一次 draw 能同时写几个（要扩展）</td><td>8</td></tr>
+      </tbody>
+    </table></div>
+    <div id="lab-limits"></div>
+
+    <h2 id="s3">3. 一版一版写</h2>
+    <h3 id="s3-1">3.1 第 1 版：旧引擎的 FBO</h3>
+    <p>旧引擎的 FBO 类在构造函数里就建好全部 GPU 对象，最后调用 initFrameBuffer 收尾：</p>
+    <pre><code>// 旧引擎 src/framebuffers/FBO.ts:77–126（节选；注释是课程加的）
+// 构造函数 new FBO(gl, options) 最后调用它：一 new 就在这个 gl 上建好全部 GPU 对象
+private initFrameBuffer(colorAttachmentCount: number) {
+  const gl = this.gl
+
+  this.framebuffer = gl.createFramebuffer()
+  if (!this.framebuffer) {
+    console.error(&#x27;无法创建帧缓冲区对象&#x27;)
+    throw new FramebufferCreationError(this.width, this.height)
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer)
+
+  // …（省略：建颜色纹理并挂上去，MRT 时设 drawBuffersWEBGL，:88–107）
+
+  if (this.depthMode === &#x27;texture&#x27;) {
+    this.createDepthTexture()
+  } else {
+    this.createDepthRenderbuffer()
+  }
+
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER)
+  if (status !== gl.FRAMEBUFFER_COMPLETE) {
+    // ② 抛错，但上面已经建好的 framebuffer、纹理、renderbuffer 一个都没删
+    throw new FramebufferIncompleteError(
+      status,
+      this.width,
+      this.height,
+      colorAttachmentCount
+    )
+  }
+
+  // ① 一律清成 null：不管调用者进来时绑的是哪个 FBO、哪张纹理、哪个 renderbuffer
+  this.gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+  this.gl.bindTexture(gl.TEXTURE_2D, null)
+  this.gl.bindRenderbuffer(gl.RENDERBUFFER, null)
+}</code></pre>
+    <p>阴影贴图包了一层 ShadowMapFBO，画之前 bind、画完 unbind：</p>
+    <pre><code>// 旧引擎 src/framebuffers/ShadowMapFBO.ts:56–71（节选；注释是课程加的）
+bind(): void {
+  const gl = this.gl
+  this.fbo.bind()
+  gl.viewport(0, 0, this.resolution, this.resolution)
+}
+
+// ⑤ 「画完」= 回到屏幕：unbind 一律绑 null，viewport 要调用者传 canvas 尺寸进来。
+//    如果进来之前绑的是另一个 FBO（比如 GBuffer），它不知道，也还不回去
+unbind(fullWidth: number, fullHeight: number): void {
+  this.fbo.unbind()
+  this.gl.viewport(0, 0, fullWidth, fullHeight)
+}</code></pre>
+    <p>对照 1.4 节的需求，问题有五处：</p>
+    <ul>
+      <li><strong>① 收尾一律绑 null</strong>（需求 4）。如果调用者正在画 GBuffer，中途第一次用到阴影贴图、触发创建，创建完 GBuffer 的 FBO 就被换成了 canvas，之后的 draw 全画到屏幕上；纹理单元里原来的纹理、原来的 renderbuffer 也被清掉。</li>
+      <li><strong>② 完整性失败不收拾</strong>（需求 5）。抛错前建的 framebuffer、纹理、renderbuffer 没人删，也没人记得它们。</li>
+      <li><strong>③ new 的时候就建、绑死 gl</strong>（需求 1、6）。没有 resize，换分辨率只能 new 一个新的；context 丢了以后对象里的 handle 全死，也没人知道该重建。</li>
+      <li><strong>④ 悄悄降级</strong>（需求 2）。过滤方式不被支持时，checkTexureConfig 打一行 warn 就改成别的（<a data-src="src/framebuffers/FBO.ts:403">FBO.ts:403–457</a>），调用者拿到的和描述的不一样。</li>
+      <li><strong>⑤ 退出只会回屏幕</strong>（需求 4）。unbind 绑 null，viewport 要调用者传 canvas 尺寸；嵌套在别的离屏画布里时还不回去。</li>
+    </ul>
+    <p>把 ① ② 改写成一个可以在卡片里跑的最小函数：</p>
+    <pre><code>// 建好的三样 GPU 对象（第 1、2 版共用这个返回类型）
+interface TargetHandles {
+  readonly framebuffer: WebGLFramebuffer
+  readonly color: WebGLTexture
+  readonly depth: WebGLRenderbuffer
+}
+
+// 第 1 版：照旧引擎 FBO.ts 的 initFrameBuffer 改写（课程写的；一个颜色槽 + 深度）
+// 旧引擎每个 create 之后都查 null 并抛错，这里用 ! 省略
+function createTargetV1(gl: WebGLRenderingContext, size: number): TargetHandles {
+  const framebuffer = gl.createFramebuffer()!
+  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer)
+
+  // 颜色槽：一张 size × size 的空纹理（像素传 null），挂到 COLOR_ATTACHMENT0
+  const color = gl.createTexture()!
+  gl.bindTexture(gl.TEXTURE_2D, color)
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color, 0)
+
+  // 深度槽：一个同样大的 renderbuffer，挂到 DEPTH_ATTACHMENT
+  const depth = gl.createRenderbuffer()!
+  gl.bindRenderbuffer(gl.RENDERBUFFER, depth)
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, size, size)
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth)
+
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER)
+  if (status !== gl.FRAMEBUFFER_COMPLETE) {
+    // 和旧引擎一样：抛错，上面建的三样都没删
+    throw new Error(&#x27;framebuffer incomplete: &#x27; + status)
+  }
+
+  // 和旧引擎 FBO.ts:123–125 一样：一律清成 null
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+  gl.bindTexture(gl.TEXTURE_2D, null)
+  gl.bindRenderbuffer(gl.RENDERBUFFER, null)
+  return { framebuffer, color, depth }
+}</code></pre>
+    <div id="lab-v1"></div>
+
+    <h3 id="s3-2">3.2 第 2 版：记下、还回；登记、失败删</h3>
+    <p>第 16 课 GeometryManager 上传 buffer 时用过的两个办法，搬到 FBO 上：</p>
+    <pre><code>// 第 2 版（课程写的）：进来先记下三个绑定；建一样登记一样；
+// 失败时删掉登记过的；无论成败，最后把绑定原样还回去
+function createTargetV2(gl: WebGLRenderingContext, size: number): TargetHandles {
+  // ① 记下别人的（例：外层正在画 GBuffer，绑着它的 FBO；纹理单元里有它的纹理）
+  const previousFramebuffer: WebGLFramebuffer | null =
+    gl.getParameter(gl.FRAMEBUFFER_BINDING)
+  const previousRenderbuffer: WebGLRenderbuffer | null =
+    gl.getParameter(gl.RENDERBUFFER_BINDING)
+  const previousTexture: WebGLTexture | null = gl.getParameter(gl.TEXTURE_BINDING_2D)
+
+  // ② 账本：null = 还没建
+  let framebuffer: WebGLFramebuffer | null = null
+  let color: WebGLTexture | null = null
+  let depth: WebGLRenderbuffer | null = null
+
+  try {
+    framebuffer = gl.createFramebuffer()!
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer)
+
+    color = gl.createTexture()!
+    gl.bindTexture(gl.TEXTURE_2D, color)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color, 0)
+
+    depth = gl.createRenderbuffer()!
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depth)
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, size, size)
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth)
+
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER)
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      throw new Error(&#x27;framebuffer incomplete: &#x27; + status)
+    }
+    return { framebuffer, color, depth }
+  } catch (error) {
+    // ③ 只在失败时做：账本里有什么删什么，不留半成品
+    if (framebuffer !== null) gl.deleteFramebuffer(framebuffer)
+    if (color !== null) gl.deleteTexture(color)
+    if (depth !== null) gl.deleteRenderbuffer(depth)
+    throw error
+  } finally {
+    // ④ 无论成败都做：还回进来时的三个绑定，而不是一律 null
+    gl.bindFramebuffer(gl.FRAMEBUFFER, previousFramebuffer)
+    gl.bindRenderbuffer(gl.RENDERBUFFER, previousRenderbuffer)
+    gl.bindTexture(gl.TEXTURE_2D, previousTexture)
+  }
+}</code></pre>
+    <p>同样两个场景：</p>
+    <div id="lab-v2"></div>
+    <p>
+      第 2 版解决了 ① ②，剩下的 ③ ④ ⑤ 不是一个函数能解决的：③ 要一个「按描述、按需建、能换代」的 Manager；④ 要在动手之前就查清楚设备能不能做；⑤ 要一个能嵌套、能自动还原的作用域（第 4 节）。真实代码把这些分到三处：get 管缓存和换新，validate 管事前检查，create 管第 2 版做的事。
+    </p>
+
+    <h3 id="s3-3">3.3 真实代码：validate，动手之前先查</h3>
+    <pre><code>// WebGL1RenderTargetManager.ts:191–230（注释是课程加的；工作区版本）
+// 只查询、不创建：任何一条不满足，都在第一次 createFramebuffer 之前抛错
+private validate(descriptor: RenderTargetDescriptorSnapshot): void {
+  const gl = this.gl
+  // 颜色附件是纹理，受 MAX_TEXTURE_SIZE 限制（本机 SwiftShader：8192）
+  const maximum = requireTextureLimit(gl, gl.MAX_TEXTURE_SIZE, &#x27;MAX_TEXTURE_SIZE&#x27;)
+  // 有深度附件时，它是 renderbuffer，还受 MAX_RENDERBUFFER_SIZE 限制；没有就不问
+  const maximumDepth =
+    descriptor.depth === undefined
+      ? maximum
+      : requireTextureLimit(gl, gl.MAX_RENDERBUFFER_SIZE, &#x27;MAX_RENDERBUFFER_SIZE&#x27;)
+
+  // 所有附件同尺寸（2.3 节：不同尺寸是 36057），所以宽高要同时满足两个上限
+  if (
+    descriptor.width &gt; Math.min(maximum, maximumDepth) ||
+    descriptor.height &gt; Math.min(maximum, maximumDepth)
+  ) {
+    throw new UnsupportedRenderFeatureError(&#x27;render target size&#x27;, &#x27;exceeds device limits&#x27;)
+  }
+
+  // 一个颜色槽不需要扩展；两个以上（GBuffer）要 WEBGL_draw_buffers
+  if (descriptor.colors.length &gt; 1) {
+    const extension = this.capabilities.drawBuffers
+    if (extension === null) {
+      throw new UnsupportedRenderFeatureError(&#x27;MRT&#x27;, &#x27;WEBGL_draw_buffers is required&#x27;)
+    }
+
+    // 两个上限都要满足：能挂几个槽、一次 draw 能同时写几个槽（本机都是 8）
+    const colors = requireTextureLimit(
+      gl,
+      extension.MAX_COLOR_ATTACHMENTS_WEBGL,
+      &#x27;MAX_COLOR_ATTACHMENTS_WEBGL&#x27;
+    )
+    const draws = requireTextureLimit(
+      gl,
+      extension.MAX_DRAW_BUFFERS_WEBGL,
+      &#x27;MAX_DRAW_BUFFERS_WEBGL&#x27;
+    )
+
+    if (descriptor.colors.length &gt; Math.min(colors, draws)) {
+      throw new UnsupportedRenderFeatureError(
+        &#x27;MRT&#x27;,
+        &#x27;color attachment count exceeds device limits&#x27;
+      )
+    }
+  }
+}</code></pre>
+    <p>注意它只查询、不创建：被拒的请求连一个 framebuffer 都不会建。在你的浏览器里试三种设备做不到的描述：</p>
+    <div id="lab-validate"></div>
+
+    <h3 id="s3-4">3.4 真实代码：create</h3>
+    <p>create 是第 2 版的完整版。上半段建 FBO 和颜色纹理：</p>
+    <pre><code>// WebGL1RenderTargetManager.ts:240–308（上半段；注释是课程加的；工作区版本）
+private create(
+  descriptor: RenderTargetDescriptorSnapshot,
+  revision: number,
+  label: string // 例：&#x27;shadow/main (RenderTarget revision 0)&#x27;
+): WebGL1RenderTargetResource {
+  const gl = this.gl
+  // ① 记下别人的 framebuffer、renderbuffer 绑定（纹理那一格交给下面的上传作用域）
+  const previousFramebuffer = gl.getParameter(
+    gl.FRAMEBUFFER_BINDING
+  ) as WebGLFramebuffer | null
+  const previousRenderbuffer = gl.getParameter(
+    gl.RENDERBUFFER_BINDING
+  ) as WebGLRenderbuffer | null
+
+  // ② 账本：null / 空数组 = 还没建
+  let framebuffer: WebGLFramebuffer | null = null
+  let depth: WebGLRenderbuffer | null = null
+  const colors: WebGLTexture[] = []
+  const { width, height } = descriptor
+
+  try {
+    // 第 17 课的上传作用域：记下并还回当前单元的 TEXTURE_2D 格子和四个上传设置
+    return withTextureUploadState(gl, gl.TEXTURE_2D, () =&gt; {
+      framebuffer = requireNonNull(
+        gl.createFramebuffer(),
+        () =&gt; new WebGLResourceCreationError(&#x27;framebuffer&#x27;, label)
+      )
+      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer)
+
+      for (let index = 0; index &lt; descriptor.colors.length; index++) {
+        const texture = requireNonNull(
+          gl.createTexture(),
+          () =&gt; new WebGLResourceCreationError(&#x27;color-texture&#x27;, label + &#x27; color &#x27; + index)
+        )
+        colors.push(texture) // 先登记，再做可能失败的事
+        gl.bindTexture(gl.TEXTURE_2D, texture)
+
+        // 只分配存储、不传像素（null）；WebGL 保证新存储全是 0
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          width,
+          height,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          null
+        )
+
+        // CPU Snapshot 已补齐 sampler；硬阴影的打包深度可显式选择 nearest。
+        const sampler = descriptor.colors[index]!.sampler
+        gl.texParameteri(
+          gl.TEXTURE_2D,
+          gl.TEXTURE_MIN_FILTER,
+          sampler.minFilter === &#x27;nearest&#x27; ? gl.NEAREST : gl.LINEAR
+        )
+        gl.texParameteri(
+          gl.TEXTURE_2D,
+          gl.TEXTURE_MAG_FILTER,
+          sampler.magFilter === &#x27;nearest&#x27; ? gl.NEAREST : gl.LINEAR
+        )
+        // 固定 clamp、没有 mipmap：任何尺寸（包括 NPOT）都能用，也不用每帧重建 mipmap
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+
+        // 第 index 个颜色槽 ← 这张纹理（GBuffer：0、1、2……）
+        gl.framebufferTexture2D(
+          gl.FRAMEBUFFER,
+          gl.COLOR_ATTACHMENT0 + index,
+          gl.TEXTURE_2D,
+          texture,
+          0
+        )
+
+        // 显存不够时 texImage2D 只留一个错误码；每个槽建完问一次
+        assertTextureOperation(gl, &#x27;allocate color attachment &#x27; + index, label)
+      }</code></pre>
+    <p>下半段挂深度、设 drawBuffers、查完整性，以及失败时的收拾：</p>
+    <pre><code>// WebGL1RenderTargetManager.ts:310–354（下半段，接上一段；注释是课程加的）
+      if (descriptor.depth !== undefined) {
+        depth = requireNonNull(
+          gl.createRenderbuffer(),
+          () =&gt; new WebGLResourceCreationError(&#x27;depth-renderbuffer&#x27;, label)
+        )
+        gl.bindRenderbuffer(gl.RENDERBUFFER, depth)
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, width, height)
+        gl.framebufferRenderbuffer(
+          gl.FRAMEBUFFER,
+          gl.DEPTH_ATTACHMENT,
+          gl.RENDERBUFFER,
+          depth
+        )
+      }
+
+      // drawBuffers 记在「当前绑着的 FBO」里（2.4 节）：此刻绑的是新 FBO，
+      // 所以只设它自己，不碰外层 FBO 的设置，以后 bind 时也不用再设
+      if (this.capabilities.drawBuffers !== null) {
+        this.capabilities.drawBuffers.drawBuffersWEBGL(
+          colors.map((_texture, index) =&gt; gl.COLOR_ATTACHMENT0 + index)
+        )
+      }
+
+      // 两种失败分开报：先问错误码（显存不够、参数错），再问完整性
+      assertTextureOperation(gl, &#x27;configure framebuffer attachments&#x27;, label)
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER)
+      assertTextureOperation(gl, &#x27;check framebuffer completeness&#x27;, label)
+
+      if (status !== gl.FRAMEBUFFER_COMPLETE)
+        throw new IncompleteFramebufferError(status, label)
+
+      // 全部成功才交出去：冻结，并记下这是哪个 revision 的
+      return Object.freeze({
+        framebuffer,
+        colorTextures: Object.freeze(colors),
+        depthAttachment: depth,
+        width,
+        height,
+        revision
+      })
+    })
+  } catch (error: unknown) {
+    // ③ 只在失败时：删账本里的。context 丢了就不删（对死掉的 context 发命令没用）
+    if (!gl.isContextLost()) {
+      if (framebuffer !== null) gl.deleteFramebuffer(framebuffer)
+      for (const texture of colors) gl.deleteTexture(texture)
+      if (depth !== null) gl.deleteRenderbuffer(depth)
+    }
+    throw error
+  } finally {
+    // ④ 无论成败：还回 framebuffer、renderbuffer；viewport 从头到尾没动过
+    if (!gl.isContextLost()) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, previousFramebuffer)
+      gl.bindRenderbuffer(gl.RENDERBUFFER, previousRenderbuffer)
+    }
+  }
+}</code></pre>
+    <p>和第 2 版相比多做的四件事：</p>
+    <ol>
+      <li><strong>纹理那一格交给上传作用域。</strong>withTextureUploadState 记下并还回当前单元的 TEXTURE_2D 格子（还有四个上传设置，这里用不到但无害），和第 17 课的纹理 Manager 共用同一个函数。framebuffer、renderbuffer 两个绑定由 create 自己记、自己还。</li>
+      <li><strong>每个颜色槽建完问一次错误码。</strong>显存不够时 texImage2D 不抛异常，只留 OUT_OF_MEMORY；问一次才知道是哪个槽。</li>
+      <li><strong>两种失败分开报。</strong>先 assertTextureOperation（GL 错误码，抛 WebGLOperationError），再 checkFramebufferStatus（不完整，抛 IncompleteFramebufferError）。你的测试「上传的 GL 错误不是 framebuffer incomplete」（<a data-src="tests/unit/rendering/backend/webgl1/WebGL1RenderTargetManager.test.ts:264">WebGL1RenderTargetManager.test.ts:264</a>）测的就是这条：两种错误处理方式不同，报错不能混。</li>
+      <li><strong>交出去的结果带 revision，并且冻结。</strong>get 拿它和 CPU 的 revision 比（3.5 节）。</li>
+    </ol>
+    <p>卡片在「外层 FBO 正绑着、单元 3 里有别人的纹理」的 context 里，让真实 Manager 建一次失败的、再建一次成功的：</p>
+    <div id="lab-create"></div>
+
+    <h3 id="s3-5">3.5 get：revision 与替换</h3>
+    <p>
+      get 的骨架第 29 课 6.2 节逐行读过（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:72">WebGL1RenderTargetManager.ts:72–124</a>）：缓存要「同一个对象」而且「同一个 revision」才命中；不命中时 validate → create → 发布新的 → 最后删旧的；旧 FBO 正绑着时拒绝重建。这里只补一个第 29 课没跑过的情况：换新失败。
+    </p>
+    <div id="lab-replace"></div>
+
+    <h3 id="s3-6">3.6 释放</h3>
+    <pre><code>// WebGL1RenderTargetManager.ts:357–403（节选；注释是课程加的）
+// 一个目标 = 1 个 FBO + n 张颜色纹理 + 0 或 1 个 renderbuffer，三样都要删
+private deleteResource(resource: WebGL1RenderTargetResource): void {
+  this.gl.deleteFramebuffer(resource.framebuffer)
+  for (const texture of resource.colorTextures) this.gl.deleteTexture(texture)
+  if (resource.depthAttachment !== null)
+    this.gl.deleteRenderbuffer(resource.depthAttachment)
+}
+
+// CPU 的 RenderTarget.dispose() 经 onDispose 调到这里（订阅在 get 里建）。
+// 这时 descriptor 已经读不了了，所以只用缓存里记下的 GPU 对象
+release(target: RenderTarget): void {
+  if (this.lost || this.gl.isContextLost()) {
+    this.invalidateForContextLoss()
+    return
+  }
+
+  const entry = this.entries.get(target)
+  if (entry === undefined) return
+
+  this.entries.delete(target)
+  entry.unsubscribe()
+  this.deleteResource(entry.resource)
+  this.hooks.invalidateState()
+}
+
+// …（省略 invalidateForContextLoss，:380–385，和第 17、29 课的纹理 Manager 一样）
+
+// Backend 结束时：先退订，再删自己建的 GPU 对象；不 dispose CPU 的 RenderTarget
+dispose(): void {
+  if (this.disposed) return
+  this.disposed = true
+
+  const entries = [...this.entries.values()]
+  this.entries.clear()
+  for (const entry of entries) entry.unsubscribe()
+
+  if (this.lost || this.gl.isContextLost()) {
+    this.invalidateForContextLoss()
+    return
+  }
+
+  for (const entry of entries) this.deleteResource(entry.resource)
+  this.hooks.invalidateState()
+}</code></pre>
+    <p>
+      订阅只建一次：第一次 get 时 <code>target.onDispose(() =&gt; this.release(target))</code>；换新时沿用旧条目的 unsubscribe（:108），所以一个目标不管 resize 多少次，都只有一个订阅。
+    </p>
+    <div id="lab-release"></div>
+
+    <h2 id="s4">4. 谁在用它：SurfaceScope</h2>
+    <h3 id="s4-1">4.1 run：进去、画、原样出来</h3>
+    <p>
+      旧引擎的 bind / unbind 有 ⑤ 的问题：退出只会回屏幕。新架构把「画到哪」写成一个作用域：<code>backend.withRenderSurface({ surface, clear }, () =&gt; { …draw… })</code>，Backend 转给 SurfaceScope.run（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:180">WebGL1Backend.ts:180–182</a>）。作用域可以嵌套，每一层退出都还原到进入前的样子：
+    </p>
+    <pre><code>// WebGL1SurfaceScope.ts:191–244（注释是课程加的；工作区版本）
+run(descriptor: RenderSurfaceScopeDescriptor, callback: () =&gt; undefined): void {
+  this.assertAvailable()
+  this.assertUnchanged()
+
+  // 先验证、复制调用者的输入（surface、clear），这时还没发任何 GL 命令
+  const next = snapshot(descriptor)
+
+  if (typeof callback !== &#x27;function&#x27;)
+    invalid(&#x27;callback&#x27;, &#x27;must return undefined synchronously&#x27;)
+
+  const target = next.surface.kind === &#x27;render-target&#x27; ? next.surface.target : null
+
+  // 这一层的「身份证」：画到哪个目标、进来时它的 revision、canvas 多大。
+  // assertUnchanged 之后拿它比对，发现中途被 resize、dispose 就报错
+  const frame: ActiveScope = {
+    target,
+    revision: target === null ? 0 : target.revision,
+    drawingWidth: this.gl.drawingBufferWidth,
+    drawingHeight: this.gl.drawingBufferHeight
+  }
+
+  // ① 先记下进来时的真实绑定和 viewport（例：外层 GBuffer 的 FBO，0,0,1920,1080）
+  const previous = this.state.captureSurfaceState()
+  let failed = false
+  let failure: unknown
+
+  this.stack.push(frame)
+
+  try {
+    // ② 第一次用到这个目标时，这一行让 RenderTargetManager 建 FBO（懒创建）
+    const resource = target === null ? null : this.hooks.resolveTarget(target)
+
+    this.assertDrawable()
+    // ③ 绑上这个目标的 FBO，viewport 设成它的宽高（默认输出则是 null 和 canvas 尺寸）
+    this.state.bindSurface(resource)
+    // ④ 入口清除：每次进入只清一次
+    this.clearAttachments(next.clear)
+    this.assertDrawable()
+
+    // ⑤ 调用者在这里 draw（必须同步，不能 await）
+    const result: unknown = callback()
+
+    if (result !== undefined) invalid(&#x27;callback&#x27;, &#x27;must return undefined synchronously&#x27;)
+
+    this.assertDrawable()
+  } catch (error: unknown) {
+    failed = true
+    failure = error
+  } finally {
+    // ⑥ 无论成败：出栈，还回 ① 记下的绑定和 viewport
+    this.stack.pop()
+
+    try {
+      this.restoreEntry(previous)
+    } catch (restoreError: unknown) {
+      // 操作失败、还原也失败：两个错误都留下，装进一个 AggregateError
+      failure = failed
+        ? new AggregateError(
+            [failure, restoreError],
+            &#x27;Surface operation and restoration failed&#x27;
+          )
+        : restoreError
+      failed = true
+    }
+  }
+
+  if (failed) throw failure
+}</code></pre>
+    <p>
+      ② 那一行就是 Manager 被调用的地方。注意 ① 在 ② 之前：先记下真实绑定，再去可能建 FBO 的 resolveTarget。Manager 的 create 自己会还原绑定，但 scope 不依赖这一点（第 7 节想一想）。③ 的 bindSurface 只做两件事：绑 FBO、把 viewport 设成目标的宽高（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:207">WebGL1State.ts:207–217</a>）。
+    </p>
+    <p>用课程装配的 State、Manager、Scope 嵌套三层，每一层打印绑定和 viewport：</p>
+    <div id="lab-scope"></div>
+
+    <h3 id="s4-2">4.2 反馈环检查：assertCanSample</h3>
+    <p>
+      第 29 课 8.4 节实测过：采样正在写的那张纹理，WebGL 产生 INVALID_OPERATION，这次 draw 不执行，而引擎每次 draw 不问 getError，只会看到「没画出来」。你 10 月 12 日把这条检查接上了。Backend 里的接线：
+    </p>
+    <pre><code>// WebGL1Backend.ts:292–302（注释是课程加的；工作区版本，10 月 12 日新接的）
+// Uniforms 遇到 sampler2D 时调用第 4 个参数，问「这个来源现在是哪张 WebGLTexture」
+const uniforms = new WebGL1Uniforms(
+  this.gl,
+  capabilities.maxTextureUnits,
+  (texture) =&gt; resources.cubeTextures.get(texture),
+  (source, uniformName) =&gt; {
+    // CPU 纹理：交给 Texture2DManager 上传或取缓存
+    if (source instanceof Texture2D) return resources.textures2D.get(source).handle
+
+    // 附件地址：先问 scope「这次 draw 是不是正往它里面画」，再解析。
+    // 顺序不能反：resolveSampledColor 里的 get 可能建 FBO、甚至替换旧 FBO
+    scope.assertCanSample(source.target, uniformName)
+    return resources.renderTargets.resolveSampledColor(source)
+  }
+)</code></pre>
+    <p>SurfaceScope 里的检查，以及它先调用的 assertUnchanged：</p>
+    <pre><code>// WebGL1SurfaceScope.ts:276–288、:319–335（节选；注释是课程加的；工作区版本）
+assertCanSample(target: RenderTarget, uniformName: string): void {
+  // 先确认：有活动 scope，而且每一层的目标都没被 dispose、没换尺寸（见下面）
+  this.assertDrawable()
+
+  // 只看栈顶：GL 只往「当前绑着的那一个」FBO 里写。
+  // 外层暂停中的目标（例：在 shadow 里画时的 gbuffer）可以读
+  const current = this.stack[this.stack.length - 1]!
+
+  if (current.target === target) {
+    throw new RenderTargetUnavailableError(
+      target.label,
+      &#x27;uniform &#x27; + uniformName + &#x27; cannot sample the current render target&#x27;
+    )
+  }
+}
+
+// …（省略 restoreEntry、assertAvailable，:290–316）
+
+// assertDrawable 里调用的检查：逐层比对 run 进来时记下的「身份证」
+private assertUnchanged(): void {
+  for (const frame of this.stack) {
+    // canvas 尺寸变了（drawing buffer 被 resize）
+    if (
+      this.gl.drawingBufferWidth !== frame.drawingWidth ||
+      this.gl.drawingBufferHeight !== frame.drawingHeight
+    ) {
+      throw new RenderTargetUnavailableError(
+        &#x27;drawing buffer&#x27;,
+        &#x27;resized inside an active scope&#x27;
+      )
+    }
+
+    // 某一层的目标被 dispose 或 resize 了：它的 FBO 已经或即将被换掉
+    if (
+      frame.target !== null &amp;&amp;
+      (frame.target.disposed || frame.target.revision !== frame.revision)
+    ) {
+      throw new RenderTargetUnavailableError(
+        &#x27;active scope&#x27;,
+        &#x27;target was disposed or resized&#x27;
+      )
+    }
+  }
+}</code></pre>
+    <p>
+      为什么只比栈顶？GL 只往当前绑着的那一个 FBO 里写。在 gbuffer 里嵌套画 shadow 时，gbuffer 暂停了，这时读 gbuffer 没有冲突；回到 gbuffer 以后，读 gbuffer 才是边写边读。为什么能用 RenderTarget 的身份比，而不比 WebGLFramebuffer？因为本阶段每个 RenderTarget 独占自己的存储，「同一个目标」就等于「同一组纹理」（:269 的注释）。
+    </p>
+    <div id="lab-feedback"></div>
+
+    <h3 id="s4-3">4.3 scope 里不能改目标</h3>
+    <p>
+      run 进来时给每一层记了一张「身份证」：目标、它的 revision、canvas 尺寸。assertUnchanged 逐层比对。为什么要逐层、而不只是栈顶？设想外层在画 gbuffer，内层在画 shadow，这时有人把 gbuffer resize 了：下一次 draw 采样 gbuffer，resolveSampledColor 会让 Manager 按新 revision 重建 gbuffer、删掉旧 FBO，而外层 scope 记下的「退出时还回去」的正是那个旧 FBO。Manager 自己的检查（「正绑着的 FBO 不能重建」）只看当前绑定，看不到暂停中的外层（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:48">RenderTargetManager.ts:48–50</a> 的注释就写了这个限制），所以要 scope 来补。
+    </p>
+    <div id="lab-unchanged"></div>
+    <p>
+      结果是「宁可整串报错，也不画到错的地方」：内层 run 的操作失败、还原也失败（assertUnchanged 在 restoreEntry 里又查了一次），两个错误装进一个 AggregateError；外层 run 把它原样抛出，但外层自己的还原成功了，所以最后绑定和 viewport 回到了 canvas。scope 只能发现违规，不能阻止调用者去 resize（:251–252 的注释）。
+    </p>
+
+    <h2 id="s5">5. 和 Lifecycle 的关系</h2>
+    <p>第 13 课第 2 节说，context 丢了以后，Backend 要把旧的一代作废、再建新的一代。RenderTargetManager 在这两件事里做的事：</p>
+    <ul>
+      <li><strong>一代一个。</strong>ResourceManager 新建它（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:109">WebGL1ResourceManager.ts:109</a>），SurfaceScope 的 resolveTarget 和 Uniforms 的附件解析用的都是这一代的（Backend.ts:279、:292–302）。释放顺序里它排在两个纹理 Manager 前面（:112–119）：它是借用方之后最先结束的所有者。</li>
+      <li><strong>lost 事件到达：丢记录、退订，不 delete。</strong>invalidateForContextLoss（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:380">:380–385</a>）和纹理 Manager 一样；create 的 catch、finally 遇到 lost 也不删、不还原绑定（3.4 节）。SurfaceScope 的还原遇到 lost 只让 State 忘掉缓存（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:294">SurfaceScope.ts:294–298</a>）。注意 lost 标记只有两个来源：有人调用 invalidateForContextLoss，或者丢失期间有人调用 get、自己看到 isContextLost。下面的卡片里，一个没人通知、丢失期间也没被调用的 Manager，恢复后会把旧 FBO 当缓存交出去：这就是 lost 事件必须通知到每个 Manager 的原因。</li>
+      <li><strong>恢复以后：新的 FBO，空的内容。</strong>RenderTarget 的描述和 revision 都还在 CPU 上，新一代的 Manager 第一次 get 就能建出一样大小的 FBO。但里面的像素是 GPU 画的，CPU 上从来没有，所以新存储是全 0：要由拥有它的 pass 重画（RenderTarget.ts:407；Backend.ts 的 attachment-content-rebuild 注释）。这和纹理不同：纹理从 CPU 原料重传，画布只能重画。</li>
+    </ul>
+    <div id="lab-lifecycle"></div>
+
+    <h2 id="s6">6. 架构视角：对照 three.js r177</h2>
+    <ul>
+      <li>
+        <strong>同样懒创建。</strong>three.js 的 <code>setRenderTarget(rt)</code> 发现这个目标还没有 FBO，就当场建（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:2683">WebGLRenderer.js:2683</a>、<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:2704">:2704–2706</a>），和本项目「第一次 get 才建」一样。
+      </li>
+      <li>
+        <strong>不查完整性。</strong>r177 的源码里一次都没有调用 checkFramebufferStatus（全目录搜索为 0）：它相信自己的格式表配出来的组合一定完整。本项目在 WebGL1 上要处理扩展有无、设备差异，所以每次建完都问，并把状态码变成 IncompleteFramebufferError。
+      </li>
+      <li>
+        <strong>建完绑回 null，切换靠调用者手动保存。</strong>three.js 挂附件后直接 <code>bindFramebuffer(null)</code>（<a data-src="node_modules/three/src/renderers/webgl/WebGLTextures.js:1552">WebGLTextures.js:1552–1564</a>），和旧引擎一样。它能这样做，是因为它独占 context，每次 setRenderTarget 都重新绑定。嵌套使用时，由调用者自己记住旧目标再设回去，比如 PMREMGenerator 先 <code>getRenderTarget()</code> 存下（<a data-src="node_modules/three/src/extras/PMREMGenerator.js:127">PMREMGenerator.js:127</a>），用完 <code>setRenderTarget(旧的)</code>（<a data-src="node_modules/three/src/extras/PMREMGenerator.js:253">:253</a>）。本项目把这件事做进了 SurfaceScope 的栈，调用者忘不了。
+      </li>
+      <li>
+        <strong>深度。</strong>three.js 的 RenderTarget 默认带深度缓冲，WebGL2 下也可以用深度纹理直接采样；本项目 WebGL1 只描述 depth16 renderbuffer，阴影走 RGBA 打包（1.1 节）。
+      </li>
+    </ul>
+
+    <h2 id="s7">7. 审查视角</h2>
+    <ul>
+      <li>
+        <strong>想一想：capture 为什么要在 resolveTarget 之前？</strong>run 的注释说「首次创建 FBO 可能改变实际绑定」，可 3.4 节的 create 明明会还原 framebuffer 和 renderbuffer。既然 Manager 已经还原了，scope 先 capture 还有什么用？如果把 ① 挪到 ② 之后，在什么情况下会出错？（提示：resolveTarget 是一个 hook，scope 不知道它背后是谁；再想想 create 中途 context 丢失时 finally 做了什么。）
+      </li>
+      <li>
+        <strong>想一想：要采样深度该怎么改？</strong>Capabilities 里已经探测了 WEBGL_depth_texture（WebGL1Capabilities.ts:46）。如果要让阴影贴图直接用深度纹理（省掉 1.1 节的打包），RenderTarget 的描述、validate、create、resolveSampledColor、SurfaceScope 的 depth clear 检查，各要改什么？哪些检查放在 CPU 资源里，哪些放在 Manager 里（第 29 课 8.1 节的三个问题）？
+      </li>
+      <li>
+        <strong>想一想：半分辨率的附件怎么描述？</strong>2.3 节实测，WebGL1 要求一个 FBO 的附件同尺寸（36057）。如果 GBuffer 想要一张一半分辨率的环境光遮蔽图，在现在的 RenderTarget 描述里该怎么表达？要不要给颜色槽加一个「各自的尺寸」字段？
+      </li>
+      <li>
+        <strong>和第 29 课 12.1 节同一个问题。</strong>RenderTargetManager 的 release 先从表里删掉条目、再删 GPU 对象；dispose 用 <code>disposed</code> 早退、先清空表（3.6 节节选）。某一次 delete 抛错的话，剩下的对象再没人删。Texture2DManager 的写法（closing + 删成功才移出表）可以重试。
+      </li>
+    </ul>
+
+    <h2 id="s8">8. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0027"></div>
+
+    <h2 id="s9">9. 延伸阅读</h2>
+    <ul>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/checkFramebufferStatus">MDN：checkFramebufferStatus</a>：各个状态码的含义。</li>
+      <li><a href="https://registry.khronos.org/webgl/extensions/WEBGL_draw_buffers/">WEBGL_draw_buffers 扩展</a>：drawBuffersWEBGL、两个上限、gl_FragData。</li>
+      <li><a href="https://learnopengl-cn.github.io/04%20Advanced%20OpenGL/05%20Framebuffers/">LearnOpenGL CN：帧缓冲</a>：附件、渲染缓冲对象、完整性（旧引擎 FBO.ts 的注释里也引了它）。</li>
+      <li><a href="https://learnopengl-cn.github.io/05%20Advanced%20Lighting/03%20Shadows/01%20Shadow%20Mapping/">LearnOpenGL CN：阴影映射</a>：两遍渲染、深度比较、bias 与阴影失真。</li>
+      <li><a href="https://threejs.org/docs/#api/en/renderers/WebGLRenderTarget">three.js 文档：WebGLRenderTarget</a>：depthBuffer、depthTexture、setSize。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：实验卡片和检查题各错了哪几题；第 7 节的三个想一想，直接在对话里回答。哪一步还接不上，把那几行贴给我。
+    </aside>
+
+    <div class="nav">
+      <a href="0029-texture-family-design.html">← 第 29 课：纹理一族的设计思路</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0030-frame-orchestration.html">第 30 课：帧编排——从 Scene 到一次次 draw →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 27 课 · 2026-10-12</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        const R = window.RTeachRT
+
+        // 课程版（和页面上展示的代码出自同一份 TS，esbuild 去掉了类型）
+        function createTargetV1(gl, size) {
+          const framebuffer = gl.createFramebuffer();
+          gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+          const color = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, color);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color, 0);
+          const depth = gl.createRenderbuffer();
+          gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+          gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, size, size);
+          gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+          const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+          if (status !== gl.FRAMEBUFFER_COMPLETE) {
+            throw new Error("framebuffer incomplete: " + status);
+          }
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.bindTexture(gl.TEXTURE_2D, null);
+          gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+          return { framebuffer, color, depth };
+        }
+        function createTargetV2(gl, size) {
+          const previousFramebuffer = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+          const previousRenderbuffer = gl.getParameter(gl.RENDERBUFFER_BINDING);
+          const previousTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
+          let framebuffer = null;
+          let color = null;
+          let depth = null;
+          try {
+            framebuffer = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+            color = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, color);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color, 0);
+            depth = gl.createRenderbuffer();
+            gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+            gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, size, size);
+            gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+            const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+            if (status !== gl.FRAMEBUFFER_COMPLETE) {
+              throw new Error("framebuffer incomplete: " + status);
+            }
+            return { framebuffer, color, depth };
+          } catch (error) {
+            if (framebuffer !== null) gl.deleteFramebuffer(framebuffer);
+            if (color !== null) gl.deleteTexture(color);
+            if (depth !== null) gl.deleteRenderbuffer(depth);
+            throw error;
+          } finally {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, previousFramebuffer);
+            gl.bindRenderbuffer(gl.RENDERBUFFER, previousRenderbuffer);
+            gl.bindTexture(gl.TEXTURE_2D, previousTexture);
+          }
+        }
+
+        // ---------------- 真实 WebGL 的小工具（都是课程写的） ----------------
+        const HELPER_NOTE =
+          '课程写的部分：freshContext（建一个小 canvas 和 WebGL context，用完释放）、read2D（把一张纹理挂到临时 framebuffer 上 readPixels 读回，再还原绑定）、tracked（给 gl 套一层代理：记下 create 出来的 framebuffer、纹理、renderbuffer，可以让 checkFramebufferStatus 假装返回「不完整」，其余原样转发）。'
+        const SCOPE_NOTE =
+          ' makeScope 也是课程写的：照 WebGL1Backend.ts:259–281 的接线装配 WebGL1State、RenderTargetManager、WebGL1SurfaceScope，其中 assertReady、isCurrent 简化成「总是可用」。'
+        const LOSE_NOTE = ' 丢失、恢复用的是 WEBGL_lose_context 扩展；canvas 临时挂进页面（不挂的话，有的浏览器不发恢复事件），用完移除。'
+
+        function freshContext(size = 2, inDom = false) {
+          const canvas = document.createElement('canvas')
+          canvas.width = size
+          canvas.height = size
+          if (inDom) {
+            canvas.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none'
+            document.body.appendChild(canvas)
+          }
+          canvas.addEventListener('webglcontextlost', (event) => event.preventDefault())
+          const gl = canvas.getContext('webgl')
+          if (!gl) throw new Error('这个浏览器拿不到 WebGL context')
+          const lose = gl.getExtension('WEBGL_lose_context')
+          return {
+            gl,
+            lose,
+            release: () => {
+              if (lose && !gl.isContextLost()) lose.loseContext()
+              canvas.remove()
+            }
+          }
+        }
+        async function withGL(body, size = 2, inDom = false) {
+          const { gl, lose, release } = freshContext(size, inDom)
+          const lines = []
+          try {
+            await body(gl, lines, lose)
+          } catch (error) {
+            lines.push({ text: '实验里抛出了没有预料到的错误：' + err(error), kind: 'late' })
+          } finally {
+            release()
+          }
+          return { lines }
+        }
+        const err = (e) => (e && e.name ? e.name : 'Error') + '：' + (e && e.message ? e.message : String(e))
+        const attempt = (f) => {
+          try {
+            f()
+            return '成功'
+          } catch (error) {
+            return err(error)
+          }
+        }
+        const caps = (gl) => R.detectWebGL1Capabilities(gl)
+        const hooks = { invalidateState: () => undefined }
+
+        /** 读回一张二维纹理：挂到临时 framebuffer 上 readPixels，再还原原来的 framebuffer。 */
+        function read2D(gl, texture, width = 1, height = 1) {
+          const previous = gl.getParameter(gl.FRAMEBUFFER_BINDING)
+          const framebuffer = gl.createFramebuffer()
+          gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer)
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0)
+          const pixels = new Uint8Array(width * height * 4)
+          gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels)
+          gl.bindFramebuffer(gl.FRAMEBUFFER, previous)
+          gl.deleteFramebuffer(framebuffer)
+          return '(' + Array.from(pixels.slice(0, 4)).join(', ') + ')'
+        }
+        /** 读当前绑着的 framebuffer 左下角那个像素。 */
+        function readBound(gl) {
+          const pixel = new Uint8Array(4)
+          gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel)
+          return '(' + Array.from(pixel).join(', ') + ')'
+        }
+        /** 一个外层 FBO（2 × 2 的颜色纹理），模拟「调用者正在画 GBuffer」。 */
+        function outerTarget(gl) {
+          const texture = gl.createTexture()
+          gl.bindTexture(gl.TEXTURE_2D, texture)
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+          const framebuffer = gl.createFramebuffer()
+          gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer)
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0)
+          return { framebuffer, texture }
+        }
+        /** 给 gl 套一层代理：记下建出来的对象；failStatus() 为 true 时 checkFramebufferStatus 假装返回 36054。 */
+        function tracked(gl, failStatus = () => false) {
+          const made = []
+          const remember = (kind) => (target, args, original) => {
+            const object = original.apply(target, args)
+            made.push([kind, object])
+            return object
+          }
+          const intercept = {
+            createFramebuffer: remember('framebuffer'),
+            createTexture: remember('texture'),
+            createRenderbuffer: remember('renderbuffer'),
+            checkFramebufferStatus: (target, args, original) => (failStatus() ? gl.FRAMEBUFFER_INCOMPLETE_ATTACHMENT : original.apply(target, args))
+          }
+          const proxy = new Proxy(gl, {
+            get(target, key) {
+              const value = target[key]
+              if (typeof value !== 'function') return value
+              if (key in intercept) return (...args) => intercept[key](target, args, value)
+              return value.bind(target)
+            }
+          })
+          const alive = () =>
+            made.filter(([kind, object]) => (kind === 'framebuffer' ? gl.isFramebuffer(object) : kind === 'texture' ? gl.isTexture(object) : gl.isRenderbuffer(object))).length
+          return { gl: proxy, made, alive }
+        }
+        /** 照 WebGL1Backend 的接线装配 State、RenderTargetManager、SurfaceScope（课程简化版）。 */
+        function makeScope(gl, managerGL = gl) {
+          const state = new R.WebGL1State(gl)
+          const manager = new R.WebGL1RenderTargetManager(managerGL, caps(gl), {
+            invalidateState: () => {
+              state.invalidate()
+            }
+          })
+          const scope = new R.WebGL1SurfaceScope(gl, state, {
+            assertReady: () => undefined,
+            isCurrent: () => true,
+            resolveTarget: (target) => manager.get(target)
+          })
+          return { state, manager, scope }
+        }
+        const target = (label, size, extra = {}) =>
+          new R.RenderTarget({ width: size, height: size, colors: [{ format: 'rgba8' }], ...extra }, { label })
+        const DEPTH = { depth: { format: 'depth16' } }
+
+        // ---------------- 2.1 FBO ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-fbo'),
+          storageKey: 'lesson-0027-fbo',
+          cards: [
+            {
+              title: '画进 FBO，canvas 有没有变',
+              tags: ['真实 WebGL', '原生 GL'],
+              desc: '先把 canvas 清成蓝色。建一张 2 × 2 的空纹理（texImage2D 传 null），挂到一个 FBO 的 COLOR_ATTACHMENT0，读一次；把这个 FBO 清成红色，读一次；最后绑 null，读 canvas。',
+              note: '课程写的部分：整段都是原生 GL，没有用项目代码。',
+              question: '清成红色以后，canvas 是什么颜色？',
+              choices: ['还是蓝色：clear 写进的是绑着的 FBO 上插的纹理', '红色：FBO 和 canvas 共用一块缓冲', '黑色：绑 FBO 时 canvas 被清空了'],
+              answer: 0,
+              explain: '新纹理读出来是 (0, 0, 0, 0)：texImage2D 传 null 只分配显存，WebGL 规定新存储全是 0。绑着 FBO 时，clear 和 draw 都写进插在它上面的纹理；canvas 自带的缓冲（bindFramebuffer(null) 那个）没被碰过，还是蓝色。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  gl.clearColor(0, 0, 1, 1)
+                  gl.clear(gl.COLOR_BUFFER_BIT)
+                  const { framebuffer } = outerTarget(gl)
+                  lines.push({ text: '状态 → ' + gl.checkFramebufferStatus(gl.FRAMEBUFFER) + '（36053 = COMPLETE）；新纹理读出 → ' + readBound(gl), kind: 'user' })
+                  gl.clearColor(1, 0, 0, 1)
+                  gl.clear(gl.COLOR_BUFFER_BIT)
+                  lines.push({ text: '绑着 FBO，清成红色，读出 → ' + readBound(gl), kind: 'server' })
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+                  lines.push({ t: '结果', text: 'bindFramebuffer(null) 后读 canvas → ' + readBound(gl) + '；FRAMEBUFFER_BINDING 是 null → ' + (gl.getParameter(gl.FRAMEBUFFER_BINDING) === null) + '；那个 FBO 对象还在 → ' + gl.isFramebuffer(framebuffer), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.2 深度附件 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-depth'),
+          storageKey: 'lesson-0027-depth',
+          cards: [
+            {
+              title: '先画近的红，再画远的蓝',
+              tags: ['真实 WebGL', '原生 GL'],
+              desc: '两个 FBO，都挂一张 2 × 2 的颜色纹理；第二个另挂一个 depth16 renderbuffer。两边都开 DEPTH_TEST、depthFunc(LESS)，先画一个盖满画面、z = −0.5 的红三角形（近），再画 z = 0.5 的蓝三角形（远），读中心像素。',
+              note: '课程写的部分：整段都是原生 GL；两个只输出纯色的 shader，position 用 bindAttribLocation 定在 location 0。',
+              question: '没有深度附件的那个 FBO，最后是什么颜色？',
+              choices: ['蓝：没有深度缓冲，深度测试不起作用，后画的盖住先画的', '红：深度测试照样把远的蓝挡掉', '黑：没有深度附件，什么都画不进去'],
+              answer: 0,
+              explain: '深度测试是拿新片元的深度和深度缓冲里的值比。FBO 没挂深度附件，DEPTH_BITS 是 0，没有东西可比，测试相当于没开，后画的蓝色覆盖了红色。挂了 depth16 以后，红色先写下深度，蓝色更远，被挡掉。阴影 pass 要留下离光源最近的物体，靠的就是这个附件。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const program = (r, g, b) => {
+                    const p = gl.createProgram()
+                    const sources = [
+                      [gl.VERTEX_SHADER, 'attribute vec3 p; void main() { gl_Position = vec4(p, 1.0); }'],
+                      [gl.FRAGMENT_SHADER, 'precision mediump float; void main() { gl_FragColor = vec4(' + r + ', ' + g + ', ' + b + ', 1.0); }']
+                    ]
+                    for (const [type, source] of sources) {
+                      const shader = gl.createShader(type)
+                      gl.shaderSource(shader, source)
+                      gl.compileShader(shader)
+                      gl.attachShader(p, shader)
+                    }
+                    gl.bindAttribLocation(p, 0, 'p')
+                    gl.linkProgram(p)
+                    return p
+                  }
+                  const triangle = (z) => {
+                    const buffer = gl.createBuffer()
+                    gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+                    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, z, 3, -1, z, -1, 3, z]), gl.STATIC_DRAW)
+                    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0)
+                    gl.enableVertexAttribArray(0)
+                  }
+                  const red = program(1, 0, 0)
+                  const blue = program(0, 0, 1)
+                  for (const withDepth of [false, true]) {
+                    outerTarget(gl)
+                    if (withDepth) {
+                      const depth = gl.createRenderbuffer()
+                      gl.bindRenderbuffer(gl.RENDERBUFFER, depth)
+                      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, 2, 2)
+                      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth)
+                    }
+                    gl.viewport(0, 0, 2, 2)
+                    gl.enable(gl.DEPTH_TEST)
+                    gl.depthFunc(gl.LESS)
+                    gl.clearColor(0, 0, 0, 1)
+                    gl.clearDepth(1)
+                    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+                    gl.useProgram(red)
+                    triangle(-0.5)
+                    gl.drawArrays(gl.TRIANGLES, 0, 3)
+                    gl.useProgram(blue)
+                    triangle(0.5)
+                    gl.drawArrays(gl.TRIANGLES, 0, 3)
+                    lines.push({ t: withDepth ? '结果' : undefined, text: (withDepth ? '挂了 depth16' : '没挂深度附件') + '：DEPTH_BITS → ' + gl.getParameter(gl.DEPTH_BITS) + '；中心像素 → ' + readBound(gl), kind: withDepth ? 'result' : 'server' })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.3 完整性 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-complete'),
+          storageKey: 'lesson-0027-complete',
+          cards: [
+            {
+              title: '四种插法，问 checkFramebufferStatus',
+              tags: ['真实 WebGL', '原生 GL'],
+              desc: '① 什么都不插，问状态，再 clear 一次问 getError；② 4 × 4 的 RGBA 纹理 + 8 × 8 的 depth16；③ 一张 LUMINANCE 纹理；④ 4 × 4 的 RGBA 纹理 + 4 × 4 的 depth16。',
+              note: '课程写的部分：整段都是原生 GL。',
+              question: '颜色 4 × 4、深度 8 × 8，状态码是多少？',
+              choices: ['36057（INCOMPLETE_DIMENSIONS）：WebGL1 要求附件同尺寸', '36053（COMPLETE）：取两者重叠的 4 × 4', '36054（INCOMPLETE_ATTACHMENT）'],
+              answer: 0,
+              explain: '不完整有好几种原因，状态码各不相同：没插东西 36055，尺寸不一致 36057，格式不能当画布 36054。往不完整的 FBO 上 clear 不抛异常，只留下 1286（INVALID_FRAMEBUFFER_OPERATION），什么都没写。所以建完一定要自己问一次状态：这正是 validate 要求所有附件用同一个 width、height 的原因（3.3 节），也是 create 最后一步做的事（3.4 节）。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const status = () => gl.checkFramebufferStatus(gl.FRAMEBUFFER)
+                  const color = (size, format = gl.RGBA) => {
+                    const texture = gl.createTexture()
+                    gl.bindTexture(gl.TEXTURE_2D, texture)
+                    gl.texImage2D(gl.TEXTURE_2D, 0, format, size, size, 0, format, gl.UNSIGNED_BYTE, null)
+                    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0)
+                  }
+                  const depth = (size) => {
+                    const renderbuffer = gl.createRenderbuffer()
+                    gl.bindRenderbuffer(gl.RENDERBUFFER, renderbuffer)
+                    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, size, size)
+                    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, renderbuffer)
+                  }
+                  const fresh = () => gl.bindFramebuffer(gl.FRAMEBUFFER, gl.createFramebuffer())
+                  fresh()
+                  const empty = status()
+                  gl.getError()
+                  gl.clear(gl.COLOR_BUFFER_BIT)
+                  lines.push({ text: '① 什么都不插 → ' + empty + '；clear 之后 getError → ' + gl.getError(), kind: 'server' })
+                  fresh()
+                  color(4)
+                  depth(8)
+                  lines.push({ text: '② 颜色 4 × 4 + 深度 8 × 8 → ' + status(), kind: 'server' })
+                  fresh()
+                  color(4, gl.LUMINANCE)
+                  lines.push({ text: '③ LUMINANCE 纹理 → ' + status(), kind: 'server' })
+                  fresh()
+                  color(4)
+                  depth(4)
+                  lines.push({ t: '结果', text: '④ 颜色 4 × 4 + 深度 4 × 4 → ' + status() + '（COMPLETE = ' + gl.FRAMEBUFFER_COMPLETE + '）', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.4 drawBuffers ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-drawbuffers'),
+          storageKey: 'lesson-0027-drawbuffers',
+          cards: [
+            {
+              title: 'drawBuffers 记在谁身上',
+              tags: ['真实 WebGL', '原生 GL', '要 WEBGL_draw_buffers'],
+              desc: '两个 FBO：A、B 都挂两个颜色槽。只在 A 绑着的时候调用 drawBuffersWEBGL([C0, C1])。然后绑 B 问「第 1 项写到哪」（DRAW_BUFFER1_WEBGL），再绑回 A 问，最后绑 null 问默认 framebuffer 的第 0 项。',
+              note: '课程写的部分：整段都是原生 GL。没有 WEBGL_draw_buffers 的浏览器只打印一行说明。',
+              question: '绑着 B 时，DRAW_BUFFER1_WEBGL 是什么？',
+              choices: ['NONE（0）：A 的设置不会带到 B', 'COLOR_ATTACHMENT1：drawBuffers 是整个 context 一份', 'BACK：B 没设过，用默认值'],
+              answer: 0,
+              explain: 'drawBuffers 的表是每个 framebuffer 自己的：A 记着 [C0, C1]，B 没设过，第 1 项是默认的 NONE；默认 framebuffer 的第 0 项是 BACK（画到 canvas）。所以 create 在新 FBO 绑着时设一次就够，以后每次 bind 自动生效，不会影响外层 FBO；旧引擎每次 bind 都重设，是多余的。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const extension = gl.getExtension('WEBGL_draw_buffers')
+                  if (!extension) {
+                    lines.push({ t: '结果', text: '这个浏览器没有 WEBGL_draw_buffers，单颜色槽以外的目标会被 validate 拒绝', kind: 'late' })
+                    return
+                  }
+                  const make = () => {
+                    const framebuffer = gl.createFramebuffer()
+                    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer)
+                    for (let i = 0; i < 2; i++) {
+                      const texture = gl.createTexture()
+                      gl.bindTexture(gl.TEXTURE_2D, texture)
+                      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+                      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, texture, 0)
+                    }
+                    return framebuffer
+                  }
+                  const hex = (value) => '0x' + value.toString(16)
+                  const A = make()
+                  extension.drawBuffersWEBGL([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT0 + 1])
+                  make()
+                  lines.push({ text: '绑着 B：DRAW_BUFFER1 → ' + hex(gl.getParameter(extension.DRAW_BUFFER1_WEBGL)) + '（NONE = 0）', kind: 'server' })
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, A)
+                  lines.push({ text: '绑回 A：DRAW_BUFFER1 → ' + hex(gl.getParameter(extension.DRAW_BUFFER1_WEBGL)) + '（COLOR_ATTACHMENT1 = ' + hex(gl.COLOR_ATTACHMENT0 + 1) + '）', kind: 'server' })
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+                  lines.push({ t: '结果', text: '绑 null：DRAW_BUFFER0 → ' + hex(gl.getParameter(extension.DRAW_BUFFER0_WEBGL)) + '（BACK = ' + hex(gl.BACK) + '）', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.5 上限 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-limits'),
+          storageKey: 'lesson-0027-limits',
+          cards: [
+            {
+              title: '你这台机器的上限',
+              tags: ['真实 WebGL', '原生 GL'],
+              desc: '打印 MAX_TEXTURE_SIZE、MAX_RENDERBUFFER_SIZE，以及（有扩展时）MAX_COLOR_ATTACHMENTS_WEBGL、MAX_DRAW_BUFFERS_WEBGL，再算一下 HW1 的 2048² 阴影贴图在这台机器上能不能建。',
+              note: '课程写的部分：整段都是原生 GL 查询。这张卡片的数字因机器而异，答案只看是否能建 2048²。',
+              question: '2048 × 2048 的阴影贴图，在你的机器上能建吗？',
+              choices: ['能：两个上限都不小于 2048', '不能：超过了 MAX_RENDERBUFFER_SIZE', '要看 MAX_DRAW_BUFFERS'],
+              answer: 0,
+              explain: 'WebGL 只保证很小的最低值，实际上限由设备决定；桌面和手机的 GPU 一般都在 4096 以上，2048 不成问题。一个颜色槽用不到 MAX_DRAW_BUFFERS。如果你的机器真的打印出小于 2048 的数，validate 会在建任何东西之前拒绝它（3.3 节）。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const texture = gl.getParameter(gl.MAX_TEXTURE_SIZE)
+                  const renderbuffer = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE)
+                  lines.push({ text: 'MAX_TEXTURE_SIZE → ' + texture + '；MAX_RENDERBUFFER_SIZE → ' + renderbuffer, kind: 'server' })
+                  const extension = gl.getExtension('WEBGL_draw_buffers')
+                  lines.push({ text: extension ? 'MAX_COLOR_ATTACHMENTS_WEBGL → ' + gl.getParameter(extension.MAX_COLOR_ATTACHMENTS_WEBGL) + '；MAX_DRAW_BUFFERS_WEBGL → ' + gl.getParameter(extension.MAX_DRAW_BUFFERS_WEBGL) : '没有 WEBGL_draw_buffers：只能建单颜色槽的目标', kind: 'server' })
+                  lines.push({ t: '结果', text: '2048² + depth16 能建吗 → ' + (Math.min(texture, renderbuffer) >= 2048), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.1 第 1 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v1'),
+          storageKey: 'lesson-0027-v1',
+          cards: [
+            {
+              title: '第 1 版：画 GBuffer 的半路上建阴影贴图',
+              tags: ['真实 WebGL', '只跑第 1 版'],
+              desc: '先模拟「调用者正在画 GBuffer」：外层 FBO 绑着，单元 0 的 2D 格子里是外层的纹理。这时第一次用到阴影贴图，调用第 1 版建一个 2 × 2 的。建完，调用者以为自己还在画 GBuffer，把它清成绿色。',
+              note: HELPER_NOTE,
+              question: '绿色写到哪里去了？',
+              choices: ['canvas：第 1 版收尾时把 framebuffer 绑成了 null', '外层 GBuffer 的纹理', '新建的阴影贴图'],
+              answer: 0,
+              explain: '第 1 版最后三行一律绑 null。调用者不知道这件事，以为 GBuffer 还绑着，后面的 clear、draw 全进了 canvas：外层纹理还是 0，canvas 变成了绿色。单元 0 的 2D 格子也被清成 null，renderbuffer 绑定同理。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const outer = outerTarget(gl)
+                  gl.activeTexture(gl.TEXTURE0)
+                  gl.bindTexture(gl.TEXTURE_2D, outer.texture)
+                  createTargetV1(gl, 2)
+                  lines.push({ text: '建完：FRAMEBUFFER_BINDING 是外层 → ' + (gl.getParameter(gl.FRAMEBUFFER_BINDING) === outer.framebuffer) + '；单元 0 的 2D 格子是外层纹理 → ' + (gl.getParameter(gl.TEXTURE_BINDING_2D) === outer.texture), kind: 'server' })
+                  gl.clearColor(0, 1, 0, 1)
+                  gl.clear(gl.COLOR_BUFFER_BIT)
+                  const canvasPixel = readBound(gl)
+                  lines.push({ t: '结果', text: '清成绿色以后：外层纹理 → ' + read2D(gl, outer.texture) + '；canvas → ' + canvasPixel, kind: 'result' })
+                })
+            },
+            {
+              title: '第 1 版：完整性检查失败',
+              tags: ['真实 WebGL', '只跑第 1 版', '故障注入'],
+              desc: '让 checkFramebufferStatus 假装返回 36054（INCOMPLETE_ATTACHMENT），用第 1 版建一个 2 × 2 的。数它建了哪些对象、失败后还活着几个。',
+              note: HELPER_NOTE,
+              question: '抛错以后，还活着几个 GPU 对象？',
+              choices: ['3 个：framebuffer、纹理、renderbuffer 都没删', '0 个：抛错时 GL 自动回收', '1 个：只剩 framebuffer'],
+              answer: 0,
+              explain: '第 1 版检查到不完整就抛错，前面建的三样没人删。它们也没有出现在任何返回值里，调用者拿不到、删不了：每失败一次，就漏 16 MiB + 8 MiB（按 2048² 算）。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const t = tracked(gl, () => true)
+                  lines.push({ text: 'createTargetV1 → ' + attempt(() => createTargetV1(t.gl, 2)), kind: 'server' })
+                  lines.push({ t: '结果', text: '建了：' + t.made.map(([kind]) => kind).join('、') + '；还活着 ' + t.alive() + ' 个', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.2 第 2 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v2'),
+          storageKey: 'lesson-0027-v2',
+          cards: [
+            {
+              title: '第 2 版：画 GBuffer 的半路上建阴影贴图',
+              tags: ['真实 WebGL', '只跑第 2 版'],
+              desc: '和 3.1 节第一张卡片同样的外层，换成第 2 版建，再清成绿色。',
+              note: HELPER_NOTE,
+              question: '这次绿色写到哪里？',
+              choices: ['外层 GBuffer 的纹理：绑定被原样还回了', 'canvas', '新建的阴影贴图'],
+              answer: 0,
+              explain: '第 2 版进来先记下 framebuffer、renderbuffer、纹理三个绑定，finally 里原样还回，所以建完以后外层还绑着，单元 0 里也还是外层的纹理；调用者接着清的绿色进了外层纹理，canvas 没被碰过。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const outer = outerTarget(gl)
+                  gl.activeTexture(gl.TEXTURE0)
+                  gl.bindTexture(gl.TEXTURE_2D, outer.texture)
+                  createTargetV2(gl, 2)
+                  lines.push({ text: '建完：FRAMEBUFFER_BINDING 是外层 → ' + (gl.getParameter(gl.FRAMEBUFFER_BINDING) === outer.framebuffer) + '；单元 0 的 2D 格子是外层纹理 → ' + (gl.getParameter(gl.TEXTURE_BINDING_2D) === outer.texture), kind: 'server' })
+                  gl.clearColor(0, 1, 0, 1)
+                  gl.clear(gl.COLOR_BUFFER_BIT)
+                  const outerPixel = read2D(gl, outer.texture)
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+                  lines.push({ t: '结果', text: '清成绿色以后：外层纹理 → ' + outerPixel + '；canvas → ' + readBound(gl), kind: 'result' })
+                })
+            },
+            {
+              title: '第 2 版：完整性检查失败',
+              tags: ['真实 WebGL', '只跑第 2 版', '故障注入'],
+              desc: '同样让 checkFramebufferStatus 假装返回 36054，换成第 2 版。',
+              note: HELPER_NOTE,
+              question: '抛错以后，还活着几个？',
+              choices: ['0 个：catch 删掉了账本里的三样', '3 个', '1 个'],
+              answer: 0,
+              explain: '三样都在建出来的那一刻写进了账本（framebuffer、color、depth 三个变量）；抛错时 catch 按账本删，finally 再还原绑定。调用者收到错误，GPU 上没有多出任何东西，下次可以重试。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const t = tracked(gl, () => true)
+                  lines.push({ text: 'createTargetV2 → ' + attempt(() => createTargetV2(t.gl, 2)), kind: 'server' })
+                  lines.push({ t: '结果', text: '建了：' + t.made.map(([kind]) => kind).join('、') + '；还活着 ' + t.alive() + ' 个', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.3 validate ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-validate'),
+          storageKey: 'lesson-0027-validate',
+          cards: [
+            {
+              title: '三种设备做不到的描述',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '① 宽度比 MAX_TEXTURE_SIZE 大 1；② 三个颜色槽的 gbuffer，但假装这台设备没有 WEBGL_draw_buffers（传给 Manager 的能力里 drawBuffers 是 null）；③ 九个颜色槽。都交给真实的 RenderTargetManager.get，数 createFramebuffer 和 createTexture。最后用真实能力建一次三个颜色槽的 gbuffer。',
+              note: HELPER_NOTE + ' 第 ② 项把能力快照换成了 { drawBuffers: null }，这是课程构造的。',
+              question: '三次被拒，一共建了几个 framebuffer？',
+              choices: ['0 个：validate 只查询，全在 create 之前', '3 个：建了再删', '1 个：只有第一次建了'],
+              answer: 0,
+              explain: 'validate 在 get 里排在 create 前面（第 29 课 6.2 节的节选），三种描述都在问完上限、查完扩展后就抛 UnsupportedRenderFeatureError，GPU 上一个对象都没建。九个槽超过了 MAX_COLOR_ATTACHMENTS 和 MAX_DRAW_BUFFERS 中较小的那个（本机都是 8）。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const t = tracked(gl)
+                  const max = gl.getParameter(gl.MAX_TEXTURE_SIZE)
+                  const manager = new R.WebGL1RenderTargetManager(t.gl, caps(gl), hooks)
+                  const noMRT = new R.WebGL1RenderTargetManager(t.gl, { drawBuffers: null }, hooks)
+                  const big = new R.RenderTarget({ width: max + 1, height: 4, colors: [{ format: 'rgba8' }] }, { label: 'too-big' })
+                  const gbuffer = new R.RenderTarget({ width: 4, height: 4, colors: [{ format: 'rgba8' }, { format: 'rgba8' }, { format: 'rgba8' }] }, { label: 'gbuffer/main' })
+                  const nine = new R.RenderTarget({ width: 4, height: 4, colors: Array.from({ length: 9 }, () => ({ format: 'rgba8' })) }, { label: 'nine' })
+                  lines.push({ text: '① 宽 ' + (max + 1) + ' → ' + attempt(() => manager.get(big)), kind: 'server' })
+                  lines.push({ text: '② 三个槽、没有扩展 → ' + attempt(() => noMRT.get(gbuffer)), kind: 'server' })
+                  lines.push({ text: '③ 九个槽 → ' + attempt(() => manager.get(nine)), kind: 'server' })
+                  const made = t.made.length
+                  let note = ''
+                  if (caps(gl).drawBuffers !== null) note = '；用真实能力建三个槽的 gbuffer → 颜色纹理 ' + manager.get(gbuffer).colorTextures.length + ' 张'
+                  lines.push({ t: '结果', text: '三次被拒时一共建了 ' + made + ' 个 GPU 对象' + note, kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.4 create ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-create'),
+          storageKey: 'lesson-0027-create',
+          cards: [
+            {
+              title: '真实 create：失败一次、成功一次，都在别人的状态里',
+              tags: ['真实 WebGL', '项目代码（工作区版本）', '故障注入'],
+              desc: '先模拟别人的状态：外层 FBO 绑着，绑着一个外层 renderbuffer，当前单元是 3，单元 3 的 2D 格子里是外层纹理。第一次让 checkFramebufferStatus 假装返回 36054，get 一个 4 × 4 的 shadow/main（带 depth16）；第二次不注入，再 get。每次之后检查四样状态和还活着的对象。',
+              note: HELPER_NOTE,
+              question: '失败那一次之后，还活着几个这次建的对象？外层状态还在吗？',
+              choices: ['0 个；四样外层状态都在', '3 个；外层状态都在', '0 个；但 framebuffer 绑成了 null'],
+              answer: 0,
+              explain: 'create 的 catch 删掉了账本里的 framebuffer、颜色纹理、renderbuffer；finally 还回 framebuffer、renderbuffer，上传作用域还回单元 3 的纹理格子和当前单元。错误是 IncompleteFramebufferError，带着状态码 36054 和「shadow/main (RenderTarget revision 0)」这样的 label。第二次成功，同样不动外层状态，交回一个冻结的结果。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  let fail = true
+                  const t = tracked(gl, () => fail)
+                  const outer = outerTarget(gl)
+                  const outerRenderbuffer = gl.createRenderbuffer()
+                  gl.bindRenderbuffer(gl.RENDERBUFFER, outerRenderbuffer)
+                  gl.activeTexture(gl.TEXTURE3)
+                  gl.bindTexture(gl.TEXTURE_2D, outer.texture)
+                  const intact = () =>
+                    [
+                      gl.getParameter(gl.FRAMEBUFFER_BINDING) === outer.framebuffer,
+                      gl.getParameter(gl.RENDERBUFFER_BINDING) === outerRenderbuffer,
+                      gl.getParameter(gl.ACTIVE_TEXTURE) === gl.TEXTURE3,
+                      gl.getParameter(gl.TEXTURE_BINDING_2D) === outer.texture
+                    ].every(Boolean)
+                  const manager = new R.WebGL1RenderTargetManager(t.gl, caps(gl), hooks)
+                  const shadow = target('shadow/main', 4, DEPTH)
+                  lines.push({ text: '第一次（假装不完整）→ ' + attempt(() => manager.get(shadow)), kind: 'server' })
+                  lines.push({ text: '　建了：' + t.made.map(([kind]) => kind).join('、') + '；还活着 ' + t.alive() + ' 个；外层四样状态都在 → ' + intact(), kind: 'server' })
+                  fail = false
+                  const before = t.made.length
+                  const resource = manager.get(shadow)
+                  lines.push({ t: '结果', text: '第二次 → 成功，新建 ' + (t.made.length - before) + ' 个对象；结果冻结 → ' + Object.isFrozen(resource) + '，revision → ' + resource.revision + '；外层四样状态都在 → ' + intact(), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.5 替换失败 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-replace'),
+          storageKey: 'lesson-0027-replace',
+          cards: [
+            {
+              title: 'resize 以后，新的建失败了',
+              tags: ['真实 WebGL', '项目代码（工作区版本）', '故障注入'],
+              desc: '建一个 4 × 4 的 shadow/main，记下它的 FBO。resize(8, 8)，让下一次完整性检查假装失败，get；再取消注入，get 一次。',
+              note: HELPER_NOTE,
+              question: '换新失败以后，旧的 4 × 4 FBO 还在吗？',
+              choices: ['在：新的建失败时旧的原封不动；下次成功时才删旧的', '不在：resize 时就删了', '不在：失败时连旧的一起删了'],
+              answer: 0,
+              explain: 'get 的顺序是「建新的 → 发布新的 → 删旧的」，新的在第一步就失败了，后两步没发生，缓存里还是旧条目，旧 FBO 还活着。但 get 不会把旧的当成新版本交出去（尺寸已经对不上了），而是抛错。下一次 get 重新建，成功以后才删旧的。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  let fail = false
+                  const t = tracked(gl, () => fail)
+                  const manager = new R.WebGL1RenderTargetManager(t.gl, caps(gl), hooks)
+                  const shadow = target('shadow/main', 4)
+                  const first = manager.get(shadow)
+                  shadow.resize(8, 8)
+                  fail = true
+                  lines.push({ text: 'resize(8, 8) 后 get（新的建失败）→ ' + attempt(() => manager.get(shadow)), kind: 'server' })
+                  lines.push({ text: '　旧 FBO 还活着 → ' + gl.isFramebuffer(first.framebuffer) + '；旧颜色纹理还活着 → ' + gl.isTexture(first.colorTextures[0]), kind: 'server' })
+                  fail = false
+                  const second = manager.get(shadow)
+                  lines.push({ t: '结果', text: '再 get → 成功，' + second.width + ' × ' + second.height + '，revision ' + second.revision + '；旧 FBO 还活着 → ' + gl.isFramebuffer(first.framebuffer), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.6 释放 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-release'),
+          storageKey: 'lesson-0027-release',
+          cards: [
+            {
+              title: 'CPU 的 dispose 一路删到 GPU',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '一个两个颜色槽、带 depth16 的 gbuffer/main。Manager get 一次，然后只调用 CPU 那边的 target.dispose()，不碰 Manager。数这之后还活着几个 GPU 对象，再让 Manager get 一次。',
+              note: HELPER_NOTE,
+              question: 'target.dispose() 之后，GPU 上还剩几个这次建的对象？',
+              choices: ['0 个：onDispose 通知 Manager 删了 FBO、两张纹理、renderbuffer', '4 个：Manager 不知道 CPU 那边 dispose 了', '0 个，而且之后 get 会自动重建'],
+              answer: 0,
+              explain: 'get 第一次建好时订阅了 target.onDispose；CPU dispose 时 Resource 同步通知，release 从表里删掉条目、退订、删 1 个 FBO + 2 张颜色纹理 + 1 个 renderbuffer。之后再 get，target.assertUsable() 先拒绝：ResourceDisposedError。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const t = tracked(gl)
+                  if (caps(gl).drawBuffers === null) {
+                    lines.push({ t: '结果', text: '这个浏览器没有 WEBGL_draw_buffers，跳过两颜色槽的例子', kind: 'late' })
+                    return
+                  }
+                  const manager = new R.WebGL1RenderTargetManager(t.gl, caps(gl), hooks)
+                  const gbuffer = new R.RenderTarget({ width: 4, height: 4, colors: [{ format: 'rgba8' }, { format: 'rgba8' }], ...DEPTH }, { label: 'gbuffer/main' })
+                  manager.get(gbuffer)
+                  lines.push({ text: 'get 之后：建了 ' + t.made.map(([kind]) => kind).join('、') + '；活着 ' + t.alive() + ' 个', kind: 'server' })
+                  gbuffer.dispose()
+                  lines.push({ text: 'gbuffer.dispose() 之后：活着 ' + t.alive() + ' 个', kind: 'server' })
+                  lines.push({ t: '结果', text: '再 get → ' + attempt(() => manager.get(gbuffer)), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 4.1 SurfaceScope ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-scope'),
+          storageKey: 'lesson-0027-scope',
+          cards: [
+            {
+              title: '嵌套三层：canvas → gbuffer → shadow',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: 'canvas 是 4 × 4。外层 scope 画 canvas；里面一层画 gbuffer/main（8 × 8，带深度，入口清成绿色、深度 1）；再里面一层画 shadow/main（2 × 2，不带深度，入口清成红色）。每一层进去、出来都打印绑着谁、viewport 多大。最后试一次「对没有深度的 shadow 清深度」。',
+              note: HELPER_NOTE + SCOPE_NOTE,
+              question: '从 shadow 那层出来，回到 gbuffer 那层时，viewport 是多少？',
+              choices: ['0, 0, 8, 8：还回了进 shadow 之前记下的值', '0, 0, 2, 2：沿用 shadow 的', '0, 0, 4, 4：一律回到 canvas 尺寸'],
+              answer: 0,
+              explain: '每次 run 进来先 capture 当前真实的绑定和 viewport，出去时还回这一份。进 shadow 前记下的是「gbuffer 的 FBO、0, 0, 8, 8」，所以出来就回到它；再出来回到 canvas、0, 0, 4, 4。这正是旧引擎 unbind 做不到的：它只会回 canvas。对 shadow 清深度被拒：它没有深度附件，clearAttachments 查 DEPTH_BITS 是 0 就报错，而不是悄悄什么都不做。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const { manager, scope } = makeScope(gl)
+                  const gbuffer = target('gbuffer/main', 8, DEPTH)
+                  const shadow = target('shadow/main', 2)
+                  const viewport = () => Array.from(gl.getParameter(gl.VIEWPORT)).join(', ')
+                  const bound = () => {
+                    const framebuffer = gl.getParameter(gl.FRAMEBUFFER_BINDING)
+                    if (framebuffer === null) return 'null（canvas）'
+                    if (framebuffer === manager.get(gbuffer).framebuffer) return 'gbuffer'
+                    if (framebuffer === manager.get(shadow).framebuffer) return 'shadow'
+                    return '其他'
+                  }
+                  scope.run({ surface: { kind: 'default-framebuffer' } }, () => {
+                    lines.push({ text: '进 canvas：' + bound() + '，viewport ' + viewport(), kind: 'user' })
+                    scope.run({ surface: { kind: 'render-target', target: gbuffer }, clear: { color: [0, 1, 0, 1], depth: 1 } }, () => {
+                      lines.push({ text: '　进 gbuffer：' + bound() + '，viewport ' + viewport() + '，像素 ' + readBound(gl), kind: 'server' })
+                      scope.run({ surface: { kind: 'render-target', target: shadow }, clear: { color: [1, 0, 0, 1] } }, () => {
+                        lines.push({ text: '　　进 shadow：' + bound() + '，viewport ' + viewport() + '，像素 ' + readBound(gl), kind: 'server' })
+                        return undefined
+                      })
+                      lines.push({ text: '　出 shadow，回到：' + bound() + '，viewport ' + viewport(), kind: 'server' })
+                      return undefined
+                    })
+                    lines.push({ text: '出 gbuffer，回到：' + bound() + '，viewport ' + viewport(), kind: 'user' })
+                    return undefined
+                  })
+                  lines.push({ t: '结果', text: '对 shadow 清深度 → ' + attempt(() => scope.run({ surface: { kind: 'render-target', target: shadow }, clear: { depth: 1 } }, () => undefined)), kind: 'result' })
+                }, 4)
+            }
+          ]
+        })
+
+        // ---------------- 4.2 反馈环 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-feedback'),
+          storageKey: 'lesson-0027-feedback',
+          cards: [
+            {
+              title: '谁能读、谁不能读',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '外层 scope 画 gbuffer/main，内层画 shadow/main。在内层分别检查「读 gbuffer」「读 shadow」；回到外层再分别检查一次。真实 draw 时，这个检查由 Backend 的闭包在解析附件之前调用，这里直接调用 scope.assertCanSample。',
+              note: HELPER_NOTE + SCOPE_NOTE,
+              question: '在 shadow 那层里，读 gbuffer 可以吗？',
+              choices: ['可以：gbuffer 暂停了，GL 只往 shadow 里写', '不行：gbuffer 还在栈里，算正在写', '不行：嵌套 scope 里不能采样任何附件'],
+              answer: 0,
+              explain: 'assertCanSample 只比栈顶。在 shadow 里：栈顶是 shadow，读 gbuffer 可以，读 shadow 被拒（uniform uShadowMap cannot sample the current render target）。回到 gbuffer：栈顶变成 gbuffer，读 shadow 可以，读 gbuffer 被拒。这正好对应 GL 的规则：只有当前绑着的 FBO 在被写。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const { scope } = makeScope(gl)
+                  const gbuffer = target('gbuffer/main', 4, DEPTH)
+                  const shadow = target('shadow/main', 2)
+                  scope.run({ surface: { kind: 'render-target', target: gbuffer } }, () => {
+                    scope.run({ surface: { kind: 'render-target', target: shadow } }, () => {
+                      lines.push({ text: '在 shadow 里：读 gbuffer → ' + attempt(() => scope.assertCanSample(gbuffer, 'uGBuffer')), kind: 'server' })
+                      lines.push({ text: '在 shadow 里：读 shadow → ' + attempt(() => scope.assertCanSample(shadow, 'uShadowMap')), kind: 'server' })
+                      return undefined
+                    })
+                    lines.push({ text: '回到 gbuffer：读 shadow → ' + attempt(() => scope.assertCanSample(shadow, 'uShadowMap')), kind: 'server' })
+                    lines.push({ t: '结果', text: '回到 gbuffer：读 gbuffer → ' + attempt(() => scope.assertCanSample(gbuffer, 'uGBuffer')), kind: 'result' })
+                    return undefined
+                  })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 4.3 scope 里改目标 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-unchanged'),
+          storageKey: 'lesson-0027-unchanged',
+          cards: [
+            {
+              title: '在 shadow 里把外层的 gbuffer resize 了',
+              tags: ['真实 WebGL', '项目代码（工作区版本）', '违规操作'],
+              desc: '外层画 gbuffer/main（4 × 4），内层画 shadow/main。内层回调里先把 gbuffer resize 成 16 × 16（违反「scope 里不能改目标」的约定），再检查读 gbuffer。数 Manager 建了几个 FBO；最后看两层 scope 各抛了什么、绑定回到了哪里。',
+              note: HELPER_NOTE + SCOPE_NOTE + ' 这里给 Manager 的 gl 套了 tracked 代理，用来数 FBO。',
+              question: '读 gbuffer 那一步，Manager 重建 gbuffer 了吗？',
+              choices: ['没有：assertCanSample 先跑 assertDrawable，发现 revision 变了就抛错，轮不到解析', '重建了：resolveSampledColor 按新 revision 建了 16 × 16 的', '没有：Manager 发现 gbuffer 正绑着，拒绝重建'],
+              answer: 0,
+              explain: 'gbuffer 的「身份证」记着 revision 0，resize 后变成 1，assertUnchanged 逐层比对时发现，抛「target was disposed or resized」，这一切发生在解析附件之前，所以 FBO 只建了进 scope 时的两个。第三个选项说的检查在 get 里，但这时绑着的是 shadow，它看不出 gbuffer 有问题。之后内层 run 的操作和还原都失败，抛 AggregateError；外层把它原样抛出，但外层自己的还原成功了，绑定回到 canvas。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const t = tracked(gl)
+                  const { scope } = makeScope(gl, t.gl)
+                  const gbuffer = target('gbuffer/main', 4, DEPTH)
+                  const shadow = target('shadow/main', 2)
+                  let inner = null
+                  const outer = attempt(() =>
+                    scope.run({ surface: { kind: 'render-target', target: gbuffer } }, () => {
+                      try {
+                        scope.run({ surface: { kind: 'render-target', target: shadow } }, () => {
+                          gbuffer.resize(16, 16)
+                          lines.push({ text: '在 shadow 里 resize gbuffer → revision ' + gbuffer.revision + '；读 gbuffer → ' + attempt(() => scope.assertCanSample(gbuffer, 'uGBuffer')), kind: 'server' })
+                          lines.push({ text: '　到这里一共建了 FBO ' + t.made.filter(([kind]) => kind === 'framebuffer').length + ' 个', kind: 'server' })
+                          return undefined
+                        })
+                      } catch (error) {
+                        inner = error
+                        throw error
+                      }
+                      return undefined
+                    })
+                  )
+                  const parts = inner && Array.isArray(inner.errors) ? '（里面 ' + inner.errors.length + ' 个：' + inner.errors.map((e) => e.name).join('、') + '）' : ''
+                  lines.push({ text: '内层 run 抛出 → ' + (inner ? inner.name : '无') + parts, kind: 'server' })
+                  lines.push({ t: '结果', text: '外层 run → ' + outer.split('：')[0] + '；最后 FRAMEBUFFER_BINDING 是 null → ' + (gl.getParameter(gl.FRAMEBUFFER_BINDING) === null) + '，viewport ' + Array.from(gl.getParameter(gl.VIEWPORT)).join(', '), kind: 'result' })
+                }, 4)
+            }
+          ]
+        })
+
+        // ---------------- 5 Lifecycle ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-lifecycle'),
+          storageKey: 'lesson-0027-lifecycle',
+          cards: [
+            {
+              title: '画过的阴影贴图，丢失、恢复',
+              tags: ['真实 WebGL', '项目代码（工作区版本）', '真的丢一次 context'],
+              desc: '第 1 代建两个 Manager，都 get 同一个 2 × 2 的 shadow/main，用 clear 把它涂成绿色（假装阴影 pass 画过）。Manager A 像 Backend 接线那样，在 webglcontextlost 事件里收到 invalidateForContextLoss；Manager B 没人通知。丢失、恢复以后，A、B 各 get 一次；再新建第 2 代的 Manager，get 同一个 RenderTarget，读颜色。',
+              note: HELPER_NOTE + LOSE_NOTE + ' 「在 lost 事件里调用 invalidateForContextLoss」是课程照 Backend → ResourceManager 的通知链简化写的；Manager B 故意不接。',
+              question: '恢复以后，没人通知的 Manager B 再 get，会怎样？',
+              choices: ['交回缓存里那个已经失效的 FBO（isFramebuffer 是 false），不报错', '抛 WebGLContextLostError', '自动建一个新的 FBO'],
+              answer: 0,
+              explain: 'B 的 lost 标记只有两个来源：有人调用 invalidateForContextLoss，或者丢失期间有人调用 get、它自己看到 isContextLost。两样都没发生；恢复后 isContextLost 又是 false，缓存命中，交回的是旧 context 的 FBO。A 收到了通知，记着 lost，永远拒绝。所以 lost 事件必须通知到每个 Manager（第 13 课第 2 节），真实 Backend 恢复后也只用新一代。第 2 代能建出一样大的 FBO（描述和 revision 都在 CPU 上），但绿色是 GPU 画的，CPU 上从来没有，新存储只能是全 0，要等阴影 pass 重画。',
+              run: () =>
+                withGL(async (gl, lines, lose) => {
+                  const shadow = target('shadow/main', 2)
+                  const notified = new R.WebGL1RenderTargetManager(gl, caps(gl), hooks)
+                  const silent = new R.WebGL1RenderTargetManager(gl, caps(gl), hooks)
+                  gl.canvas.addEventListener('webglcontextlost', () => notified.invalidateForContextLoss())
+                  const oldA = notified.get(shadow)
+                  const oldB = silent.get(shadow)
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, oldA.framebuffer)
+                  gl.clearColor(0, 1, 0, 1)
+                  gl.clear(gl.COLOR_BUFFER_BIT)
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+                  lines.push({ text: '第 1 代：A 画过以后读颜色 → ' + read2D(gl, oldA.colorTextures[0]), kind: 'server' })
+                  if (!lose) {
+                    lines.push({ text: '这个浏览器没有 WEBGL_lose_context', kind: 'late' })
+                    return
+                  }
+                  lose.loseContext()
+                  await new Promise((resolve) => setTimeout(resolve, 50))
+                  const restored = new Promise((resolve) => gl.canvas.addEventListener('webglcontextrestored', resolve, { once: true }))
+                  lose.restoreContext()
+                  const outcome = await Promise.race([restored.then(() => 'restored'), new Promise((resolve) => setTimeout(() => resolve('timeout'), 3000))])
+                  if (outcome !== 'restored') {
+                    lines.push({ text: '3 秒内没等到恢复事件，实验停在这里', kind: 'late' })
+                    return
+                  }
+                  lines.push({ text: '恢复以后，收到通知的 A get → ' + attempt(() => notified.get(shadow)), kind: 'user' })
+                  let stale = null
+                  const silentResult = attempt(() => {
+                    stale = silent.get(shadow)
+                  })
+                  lines.push({ text: '恢复以后，没人通知的 B get → ' + silentResult + (stale ? '；交回的是旧 FBO → ' + (stale === oldB) + '，isFramebuffer → ' + gl.isFramebuffer(stale.framebuffer) : ''), kind: 'late' })
+                  const second = new R.WebGL1RenderTargetManager(gl, caps(gl), hooks)
+                  const fresh = second.get(shadow)
+                  lines.push({ t: '结果', text: '第 2 代：' + fresh.width + ' × ' + fresh.height + '，revision ' + fresh.revision + '，颜色 → ' + read2D(gl, fresh.colorTextures[0]), kind: 'result' })
+                }, 2, true)
+            }
+          ]
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0027"]'), [
+          {
+            q: 'HW1 的阴影贴图为什么用 nearest 过滤？',
+            opts: ['线性过滤会在阴影边缘编出一个没有任何表面的深度（比如 0.3 和 0.7 之间的 0.6），比较结果出错', '线性过滤会把打包的四个字节解码错乱，得到随机值', 'RGBA8 纹理不支持线性过滤'],
+            answer: 0,
+            why: '解码是线性的，线性过滤正好得到两个深度的加权平均；问题在于这个平均深度不对应任何真实表面（1.1 节）。'
+          },
+          {
+            q: '一个 FBO 只挂了颜色纹理，没挂深度附件，开了 DEPTH_TEST 画两个重叠的三角形，结果是？',
+            opts: ['后画的盖住先画的：没有深度缓冲，深度测试不起作用', '近的挡住远的', '什么都画不进去：FBO 不完整'],
+            answer: 0,
+            why: '2.2 节卡片：DEPTH_BITS 是 0，后画的蓝色盖住了更近的红色。只挂颜色的 FBO 是完整的（2.3 节）。'
+          },
+          {
+            q: '往一个不完整的 FBO 上 clear，会怎样？',
+            opts: ['不抛异常；留下 1286（INVALID_FRAMEBUFFER_OPERATION），什么都没写', '抛出 JavaScript 异常', '写进 canvas'],
+            answer: 0,
+            why: '所以建完必须自己问 checkFramebufferStatus，create 把不完整变成 IncompleteFramebufferError（2.3、3.4 节）。'
+          },
+          {
+            q: '在 FBO A 绑着时调用 drawBuffersWEBGL([C0, C1])，之后绑 FBO B，B 的第 1 项写到哪？',
+            opts: ['NONE：drawBuffers 是每个 FBO 自己的', 'C1：整个 context 一份', 'BACK'],
+            answer: 0,
+            why: '2.4 节实测。所以 create 只在新 FBO 上设一次，不碰外层 FBO。'
+          },
+          {
+            q: '旧引擎 FBO 的 initFrameBuffer 收尾时把 framebuffer 绑成 null，会出什么问题？',
+            opts: ['调用者正在画别的离屏画布时，后面的 draw 全画到 canvas 上', '没有问题，null 就是「不绑」', '新 FBO 会被删掉'],
+            answer: 0,
+            why: '3.1 节卡片：GBuffer 画到一半触发创建，之后的绿色进了 canvas。第 2 版和真实 create 都记下再还回。'
+          },
+          {
+            q: 'RenderTargetManager 在什么时候检查「尺寸超过设备上限」？',
+            opts: ['validate 里，在第一次 createFramebuffer 之前', 'create 里，建完再查', '构造 RenderTarget 时'],
+            answer: 0,
+            why: '上限是设备的事，所以不在 CPU 资源里；又要在动手之前查，所以在 validate（3.3 节，三次被拒建了 0 个对象）。'
+          },
+          {
+            q: 'resize 以后新的 FBO 建失败了，旧的怎样？',
+            opts: ['原封不动还在缓存里；get 抛错，不把旧的当新版本交出；下次成功才删旧的', '已经被删了', '被当成新版本交回'],
+            answer: 0,
+            why: '「先建新、发布新、最后删旧」（3.5 节卡片）。'
+          },
+          {
+            q: '外层 scope 画 gbuffer，内层画 shadow。在内层采样 gbuffer 可以吗？',
+            opts: ['可以：assertCanSample 只比栈顶，GL 只往当前绑着的 FBO 写', '不行：gbuffer 还在栈里', '不行：嵌套时不能采样附件'],
+            answer: 0,
+            why: '4.2 节卡片。回到 gbuffer 那层以后，再采样 gbuffer 才被拒。'
+          },
+          {
+            q: 'context 恢复以后，阴影贴图里是什么？',
+            opts: ['同样大小的新 FBO，内容全是 0，要阴影 pass 重画', 'Manager 从 CPU 数据重新上传的内容', '丢失之前画的内容'],
+            answer: 0,
+            why: 'RenderTarget 只有描述没有像素（第 5 节卡片）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

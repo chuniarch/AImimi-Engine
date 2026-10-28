@@ -1,0 +1,1912 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 30 课 · 帧编排</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/frame-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 详细篇 12 前 · 帧编排 · 约 85 分钟</p>
+    <h1>帧编排：从 Scene 到一次次 draw——RenderListBuilder、RenderPipeline、ForwardPass 与 Renderer</h1>
+    <p class="lede">
+      前面二十多课讲的都在「一次 draw 之下」：资源怎样上传、状态怎样缓存、FBO 怎样建。可 Backend 每帧收到的那几次 draw 是从哪来的？HW2 的画面每帧只有两次 draw：先画背景盒，再画 Mary。这两次调用之上有四个类、约 670 行代码：RenderListBuilder 把会变的场景树抄成这一帧的值，RenderPipeline 按顺序执行各个 Pass，ForwardPass 说明画到哪里、先画谁，Renderer 把它们串起来并管释放顺序。这一课从 Engine 交来的原始输入出发，先写一个「边遍历边画」的第 1 版，看它错在哪里，再一版一版推到真实代码。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW1 的阴影要两个 Pass（先画阴影贴图，再正常画），HW3 要 GBuffer Pass，FFT 海面要好几个计算 Pass。它们都是往 RenderPipeline 里加 Pass，拿到的不是 Scene，而是这一课讲的 RenderPassContext。第 19 课重写时也从这一课接着讲。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 第 6 课：RenderBackend 只收「意图」，withRenderSurface 开一个作用域（入口清屏、退出恢复），draw 只能在作用域里提交 <code>{ item, view }</code>；② 第 8、9 课：copyWorldMatrixTo 先更新自己和祖先再复制，traverseVisible 遇到 <code>visible = false</code> 跳过整个子树，Mesh 的 geometry、material getter 每次先检查资源有没有释放；③ 第 25 课：视图矩阵 V = C⁻¹（C 是相机的世界矩阵），RenderListBuilder.ts:54–95 那一段你读过；④ 第 11 课：Material.queue 只有 <code>'background'</code> 和 <code>'opaque'</code>；⑤ 第 13 课：<code>backend.ready</code> 回答「现在能不能画」。如果其中哪一条其实没懂，告诉我，我先补那一块。第 19 课不是前置。<br />
+      <strong>这一课从零讲的</strong>：Engine 每帧交来的三样东西；Backend 要的两种值（RenderItem、ViewState）；第 1 版、第 2 版各错在哪里；RenderListBuilder 的五步、copyMat4Snapshot、RenderList 为什么再复制一次、哪些复制哪些借用；RenderPass 接口为什么返回 <code>undefined</code>；ForwardPass 做什么、不做什么；RenderPipeline 的所有权和三个状态；Renderer 的 render 与 dispose 顺序；和 Lifecycle 的关系。<br />
+      <strong>版本</strong>：frame/、passes/、Renderer.ts 已经提交（184ce7d、2f7ba76、f2bf761），本课按 2026-10-13 的代码讲。engine.ts、WebGL1Backend.ts 有未提交的改动，只在 1.1 节和一张卡片里用到。<br />
+      <strong>页面会用到你的显卡</strong>：只有 6.3 节的一张卡片建真实的 WebGL context，其余卡片只跑 CPU 代码。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">原始输入</a>：<a href="#s1-1">Engine 交来什么</a> <a href="#s1-2">HW2 的场景树</a> <a href="#s1-3">Backend 要什么</a> <a href="#s1-4">中间要做的事</a></li>
+        <li><a href="#s2">需求</a></li>
+        <li><a href="#s3">第 1 版：边遍历边画</a>：<a href="#s3-1">旧引擎</a> <a href="#s3-2">课程写的第 1 版</a> <a href="#s3-3">错在哪</a></li>
+        <li><a href="#s4">第 2 版：先提取，再画</a>：<a href="#s4-1">代码</a> <a href="#s4-2">还缺什么</a></li>
+        <li><a href="#s5">真实代码 ①：提取</a>：<a href="#s5-1">build 的五步</a> <a href="#s5-2">copyMat4Snapshot</a> <a href="#s5-3">RenderList</a> <a href="#s5-4">复制与借用</a></li>
+        <li><a href="#s6">真实代码 ②：Pass</a>：<a href="#s6-1">RenderPass 接口</a> <a href="#s6-2">RenderPassContext</a> <a href="#s6-3">ForwardPass</a></li>
+        <li><a href="#s7">真实代码 ③：RenderPipeline</a>：<a href="#s7-1">第 1 版：一个数组</a> <a href="#s7-2">真实代码</a> <a href="#s7-3">状态表</a></li>
+        <li><a href="#s8">真实代码 ④：Renderer</a>：<a href="#s8-1">render</a> <a href="#s8-2">dispose</a></li>
+        <li><a href="#s9">一帧走一遍</a></li>
+        <li><a href="#s10">和 Lifecycle 的关系</a></li>
+        <li><a href="#s11">架构视角：对照 three.js r177</a></li>
+        <li><a href="#s12">审查视角</a></li>
+        <li><a href="#s13">检查题</a></li>
+        <li><a href="#s14">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 原始输入</h2>
+    <h3 id="s1-1">1.1 Engine 每帧交来什么</h3>
+    <p>浏览器每次刷新屏幕前调用一次 requestAnimationFrame 的回调（rAF），Engine 在这个回调里推进一帧（<a data-src="src/engine.ts:505">engine.ts:505–525</a>，工作区版本）：</p>
+    <pre><code>// engine.ts:505–525（节选，注释是课程加的；工作区版本，未提交）
+private readonly loop = (): void =&gt; {
+  // …
+    const oldFrame = this.frameClock.tick() // 旧引擎的计时器：帧号、累计时间、步长
+    if (this.session !== null) {            // HW2 走新链路
+      if (!this.hw2Closing) {
+        // 抄出六个数，冻结
+        const frame: FrameSnapshot = Object.freeze({
+          frameNumber: oldFrame.frame,
+          timeSeconds: oldFrame.elapsedTime,
+          deltaSeconds: oldFrame.deltaTime,
+          drawingBufferWidth: this.gl.drawingBufferWidth,
+          drawingBufferHeight: this.gl.drawingBufferHeight,
+          pixelRatio: this.appliedPixelRatio
+        })
+        this.update(frame) // HW2 是静态场景，现在什么都不做
+        this.render(frame) // → :300 renderer.render({ ...binding, frame })
+      }
+    }
+  // …
+}</code></pre>
+    <p>
+      <code>binding</code> 是当前装进 Engine 的那一对 <code>{ scene, camera }</code>。所以 Renderer 每帧收到一个 RenderView（<a data-src="src/rendering/frame/RenderView.ts:6">RenderView.ts:6–10</a>），里面三样东西：
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>字段</th><th>是什么</th><th>举例（CSS 尺寸 800 × 450 的画布，第 10 秒）</th></tr></thead>
+      <tbody>
+        <tr><td><code>scene</code></td><td>整棵场景树，<strong>会变</strong>：轨道控制每次拖动都改相机（第 26 课）</td><td>见 1.2 节</td></tr>
+        <tr><td><code>camera</code></td><td>树里的一个节点，也会变</td><td>位置 (0, 20, 50)</td></tr>
+        <tr><td><code>frame</code></td><td>六个数（<a data-src="src/rendering/frame/FrameSnapshot.ts:5">FrameSnapshot.ts:5–21</a>）：帧号、累计秒数、这一帧的秒数、drawing buffer 的像素宽高、像素倍率</td><td>600、10、0.0167、1600、900、2</td></tr>
+      </tbody>
+    </table></div>
+    <p>HW2 现在用不到 frame 里的任何一个数（没有动画），但 Renderer 照样复制它往下传：FFT 海面要 <code>timeSeconds</code>，后处理要 drawing buffer 的尺寸。</p>
+
+    <h3 id="s1-2">1.2 HW2 的场景树</h3>
+    <p>场景是 createHW2Scene 建的（<a data-src="src/scenes/games202/hw2/createHW2Scene.ts:314">createHW2Scene.ts:314–318</a>、<a data-src="src/scenes/games202/hw2/createHW2Scene.ts:354">:354–370</a>、<a data-src="src/scenes/games202/hw2/createHW2Scene.ts:373">:373–384</a>），和这一课有关的是这几行：</p>
+    <pre><code>// createHW2Scene.ts（节选，注释是课程加的）
+const mesh = new Mesh(geometry, material)          // Mary；材质没写 queue，默认 opaque
+mesh.name = settings.model.name                    // 'mary'
+mesh.transform.setScale(settings.model.meshTransform.scale) // [10, 10, 10]
+
+const backgroundMaterial = retain(
+  new Material({
+    shaderModule: backgroundShader,
+    queue: 'background',                           // 背景队列
+    state: {
+      depthTest: true,                             // 做深度测试
+      depthWrite: false,                           // 但不写深度
+      depthFunction: 'less-equal',
+      cullMode: 'front'                            // 相机在盒子里面，看到的是背面
+    },
+    parameters: { uSkyboxMap: { type: 'cubeTexture', value: texture } }
+  })
+)
+const background = new Mesh(backgroundGeometry, backgroundMaterial)
+background.transform.setScale([size, size, size]) // size = cubeMapsize = 100
+
+camera.transform.setPosition([0, 20, 50])
+camera.transform.setRotation([-Math.atan2(10, 50), 0, 0]) // 绕 X 向下转 11.31°
+
+scene.add(mesh, background, camera)                // 树里的顺序：Mary、背景、相机</code></pre>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Scene 的孩子（按顺序）</th><th>类型</th><th>局部变换</th><th>材质</th></tr></thead>
+      <tbody>
+        <tr><td>mary</td><td>Mesh</td><td>位置 (0, 0, 0)，缩放 10</td><td>queue = opaque；深度测试开、写深度</td></tr>
+        <tr><td>HW2 background</td><td>Mesh</td><td>缩放 100</td><td>queue = background；深度测试开、不写深度、less-equal、剔除正面</td></tr>
+        <tr><td>HW2 camera</td><td>PerspectiveCamera</td><td>位置 (0, 20, 50)，绕 X 转 −0.19740 rad</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3 id="s1-3">1.3 Backend 要什么</h3>
+    <p>第 6 课读过 RenderBackend：一次 draw 只收两样值（<a data-src="src/rendering/backend/RenderBackend.ts:6">RenderBackend.ts:6–9</a>）。把它们的字段摊开：</p>
+    <pre><code>// RenderBackend.ts:6–9、RenderItem.ts:15–20、ViewState.ts:13–20
+//（三处合在一起，注释是课程加的）
+interface DrawSubmission {
+  readonly item: RenderItem // 画什么
+  readonly view: ViewState  // 从哪里看
+}
+interface RenderItem {
+  readonly geometry: Geometry     // 借来的资源（同一个对象）
+  readonly material: Material     // 借来的资源（同一个对象）
+  readonly worldMatrix: Mat4Tuple // local → world，16 个数，列主序
+}
+interface ViewState {
+  readonly viewMatrix: Mat4Tuple          // world → view，V = C⁻¹
+  readonly projectionMatrix: Mat4Tuple    // view → clip，P
+  readonly cameraWorldPosition: Vec3Tuple // 相机在世界里的位置
+}</code></pre>
+    <p>
+      Backend 拿到以后，Uniforms 按 ShaderModule 的 builtInUniforms 把它们对到 shader 的变量上（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:273">WebGL1Uniforms.ts:273–290</a>）：<code>modelMatrix</code> ← <code>item.worldMatrix</code>，<code>viewMatrix</code> ← <code>view.viewMatrix</code>，<code>projectionMatrix</code> ← <code>view.projectionMatrix</code>，<code>cameraPosition</code> ← <code>view.cameraWorldPosition</code>。HW2 的 shader 里就是 <code>uModelMatrix</code>、<code>uViewMatrix</code>、<code>uProjectionMatrix</code>（第 11 课）。
+    </p>
+    <p>注意 Backend 收不到 Scene，也收不到 Camera：它只认值（第 6 课「DrawSubmission 是值快照」）。<code>Mat4Tuple</code> 的注释写着「它只是数值，不是对任何矩阵存储（例如 Float32Array）的引用」（<a data-src="src/rendering/core/math/tuples.ts:22">tuples.ts:22</a>）。</p>
+
+    <h3 id="s1-4">1.4 中间要做的事</h3>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 290" role="img" aria-label="左边是 HW2 的场景树：Scene 下面依次是 mary（opaque，缩放 10）、HW2 background（background，缩放 100）、HW2 camera（位置 0、20、50）。右边是 Backend 这一帧收到的调用：进入屏幕的 scope 并清屏，draw 背景，draw Mary，两次共用同一个 view。中间的箭头是帧编排的五件事。">
+          <defs>
+            <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+          </defs>
+          <text x="20" y="24" class="title">场景树（会变）</text>
+          <rect x="20" y="40" width="90" height="30" rx="4" class="box" />
+          <text x="65" y="60" text-anchor="middle">Scene</text>
+          <path d="M40 70 L40 220" class="line" />
+          <path d="M40 100 L60 100" class="line" />
+          <rect x="60" y="84" width="210" height="34" rx="4" class="box" />
+          <text x="70" y="100">mary · Mesh</text>
+          <text x="70" y="113" class="small">opaque · 缩放 10</text>
+          <path d="M40 152 L60 152" class="line" />
+          <rect x="60" y="136" width="210" height="34" rx="4" class="box hl" />
+          <text x="70" y="152">HW2 background · Mesh</text>
+          <text x="70" y="165" class="small">background · 缩放 100</text>
+          <path d="M40 204 L60 204" class="line" />
+          <rect x="60" y="188" width="210" height="34" rx="4" class="box" />
+          <text x="70" y="204">HW2 camera</text>
+          <text x="70" y="217" class="small">位置 (0, 20, 50)</text>
+
+          <path d="M290 150 L420 150" class="line accent" marker-end="url(#f1a)" />
+          <text x="355" y="112" text-anchor="middle" class="small">① 找可见的 Mesh</text>
+          <text x="355" y="128" text-anchor="middle" class="small">② 算世界矩阵</text>
+          <text x="355" y="172" text-anchor="middle" class="small">③ 算 V、P、相机位置</text>
+          <text x="355" y="188" text-anchor="middle" class="small">④ 按 queue 排</text>
+          <text x="355" y="204" text-anchor="middle" class="small">⑤ 开 scope、逐个 draw</text>
+
+          <text x="430" y="24" class="title">Backend 收到的调用</text>
+          <rect x="430" y="40" width="310" height="214" rx="6" class="box" />
+          <text x="444" y="62">withRenderSurface</text>
+          <text x="444" y="78" class="small">画到屏幕；清成黑色，深度清成 1</text>
+          <rect x="452" y="92" width="270" height="40" rx="4" class="box hl" />
+          <text x="464" y="109">draw #1 背景</text>
+          <text x="464" y="124" class="small">worldMatrix = 缩放 100</text>
+          <rect x="452" y="140" width="270" height="40" rx="4" class="box" />
+          <text x="464" y="157">draw #2 Mary</text>
+          <text x="464" y="172" class="small">worldMatrix = 缩放 10</text>
+          <text x="444" y="204" class="small">两次共用同一个 view：</text>
+          <text x="444" y="220" class="small">V 的平移列 (0, −9.806, −52.951)</text>
+          <text x="444" y="236" class="small">P[0] = 1.358，P[5] = 2.414</text>
+        </svg>
+      </div>
+      <figcaption>图 1　左边是 Engine 借给 Renderer 的场景树，右边是这一帧 Backend 收到的全部调用（数是用项目代码算的，见第 9 节的卡片）。背景在树里排第二，却第一个画。中间这五件事就是「帧编排」。</figcaption>
+    </figure>
+
+    <h2 id="s2">2. 需求</h2>
+    <p>五件事听起来一个函数就能做完。难的是下面这些要求，每一条都来自一个具体场景（实施计划的 Task 16–18 写了验收条件，<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-28-hw2-complete-webgl1-architecture-implementation-plan.md:764">实施计划 :764–797</a>）：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>#</th><th>需求</th><th>具体场景</th><th>谁来管</th></tr></thead>
+      <tbody>
+        <tr><td>①</td><td>背景先画，不管它在树里排第几</td><td>HW2 先加 Mary、后加背景；背景如果关掉深度测试（常见的天空写法），后画就会盖住 Mary</td><td>Material.queue、ForwardPass</td></tr>
+        <tr><td>②</td><td>一帧只读一次场景，几个 Pass 看到同一份</td><td>HW1 阴影要两个 Pass，两个都要 Mary 的世界矩阵</td><td>RenderListBuilder、Renderer</td></tr>
+        <tr><td>③</td><td>交出去的是值：Pass 之间互不干扰，之后改场景也不影响已经交出去的</td><td>一个 Pass 想按远近排自己的绘制顺序</td><td>RenderList 的复制与冻结</td></tr>
+        <tr><td>④</td><td>坏输入在第一个 draw 之前拒绝，不留半帧</td><td>背景的 Geometry 被提前释放；相机缩放成 0</td><td>RenderListBuilder 的检查</td></tr>
+        <tr><td>⑤</td><td>Pass 有主人：谁加进来、谁释放、按什么顺序</td><td>阴影 Pass 拥有自己的 RenderTarget，删 FBO 时 Backend 必须还活着</td><td>RenderPipeline、Renderer.dispose</td></tr>
+        <tr><td>⑥</td><td>context 丢了就跳过这一帧；render 里不能再 render</td><td>第 13 课：丢失到恢复之间</td><td>Renderer</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="s3">3. 第 1 版：边遍历边画</h2>
+    <h3 id="s3-1">3.1 旧引擎怎样画一帧</h3>
+    <p>旧引擎的 WebGLRenderer 每帧清屏，然后把同一个活的相机交给每个 Pass：</p>
+    <pre><code>// 旧引擎 src/renderers/WebGLRenderer.ts:198–217（节选，注释是课程加的）
+render(context: FrameContext): void {
+  this.withRenderTarget(null, () =&gt; { // null 表示画到屏幕
+    const gl = this.gl
+    gl.clearColor(0.0, 0.0, 0.0, 1.0)
+    // …
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+
+    for (const pass of this.renderPasses) {
+      // …
+      pass.execute(context, this.camera, this) // 每个 Pass 拿到同一个活的相机
+    }
+
+    this.overlayRenderPass.execute(context, this.camera, this)
+  })
+}</code></pre>
+    <p>ForwardRenderPass 自己存着「要画哪些 renderer」，逐个往共享的材质里写 uniform，然后 draw：</p>
+    <pre><code>// 旧引擎 src/renderers/passes/forward/ForwardRenderPass.ts:56–89（节选）
+execute(
+  context: FrameContext,
+  camera: PerspectiveCamera,
+  _renderTargets: RenderTargetScope
+): void {
+  // …
+  for (const meshRenderer of this.meshRenderers) { // Pass 自己的列表，不是场景树
+    // …
+    this.lightSystem?.applyPerFrameLightUniforms(meshRenderer)
+
+    if ('uCameraPos' in meshRenderer.material.uniforms) {
+      meshRenderer.updateMaterialUniforms({ // 往共享的材质里写
+        uCameraPos: {
+          type: UniformType.THREE_FV,
+          value: camera.position.toArray()
+        }
+      })
+    }
+    // …
+    meshRenderer.draw(context, camera)
+  }
+}</code></pre>
+    <p>每个 draw 里，BaseRenderer 都重新读一次相机、求一次逆：</p>
+    <pre><code>// 旧引擎 src/renderers/BaseRenderer.ts:166–179（节选）
+protected bindCameraParameters(camera: PerspectiveCamera): void {
+  // …
+  const modelMatrix = this.mesh.getModelMatrix()
+
+  // …
+  const viewMatrix = mat4.create()
+  camera.updateMatrix()                                // 每个 draw 都更新一次相机
+  mat4.invert(viewMatrix, camera.matrixWorld.elements) // 每个 draw 都求一次逆
+
+  // …
+  const projectionMatrix = mat4.create()
+  mat4.copy(projectionMatrix, camera.projectionMatrix.elements)
+  // …
+}</code></pre>
+    <p>四个特点：「要画谁」存在每个 Pass 自己的列表里（阴影 Pass 另有 casters、receivers），没有一棵统一的树；绘制顺序就是登记顺序；相机每个 draw 现读现算；Pass 往共享的材质里写东西。</p>
+
+    <h3 id="s3-2">3.2 课程写的第 1 版</h3>
+    <p>把旧引擎的思路搬到新接口上：Pass 拿着 scene 和 camera，自己遍历，遇到一个 Mesh 就交给 Backend。<strong>这段是课程写的，项目里没有</strong>（下面卡片跑的就是这份代码）：</p>
+    <pre><code>// 课程写的第 1 版（assets/build/frame-course.ts）
+const SCREEN: RenderSurfaceScopeDescriptor = {
+  surface: { kind: 'default-framebuffer' },
+  clear: { color: [0, 0, 0, 1], depth: 1 }
+}
+
+export function renderFrameV1(
+  passes: readonly PassV1[],
+  scene: Scene,
+  camera: Camera,
+  backend: RenderBackend
+): void {
+  for (const pass of passes) pass.execute(scene, camera, backend)
+}
+
+export class ForwardPassV1 implements PassV1 {
+  execute(scene: Scene, camera: Camera, backend: RenderBackend): void {
+    backend.withRenderSurface(SCREEN, () =&gt; {
+      // 先清屏（scope 入口），再按树的顺序遍历
+      scene.traverseVisible((node) =&gt; {
+        if (!(node instanceof Mesh)) return
+
+        // 每画一个 Mesh 都重读一次相机、求一次逆
+        const cameraWorld = mat4.create()
+        camera.copyWorldMatrixTo(cameraWorld)
+        const view = mat4.create()
+        mat4.invert(view, cameraWorld)
+        const projection = mat4.create()
+        camera.copyProjectionMatrixTo(projection)
+
+        const world = mat4.create()
+        node.copyWorldMatrixTo(world)
+
+        // node.geometry 是 getter，资源已释放时在这里抛错；
+        // 这时前面的 Mesh 已经画了
+        backend.draw({
+          item: {
+            geometry: node.geometry,
+            material: node.material,
+            worldMatrix: toTuple(world)
+          },
+          view: {
+            viewMatrix: toTuple(view),
+            projectionMatrix: toTuple(projection),
+            cameraWorldPosition: [cameraWorld[12]!, cameraWorld[13]!, cameraWorld[14]!]
+          }
+        })
+      })
+      return undefined
+    })
+  }
+}</code></pre>
+    <p><code>toTuple</code> 也是课程写的：把 mat4 的 16 个数抄进普通数组，不检查、不冻结。下面两张卡片用一个和 HW2 形状相同的场景（Mary、背景、相机），Backend 换成只记录调用的替身。</p>
+    <div id="lab-v1"></div>
+
+    <h3 id="s3-3">3.3 第 1 版错在哪</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>需求</th><th>第 1 版</th><th>原因</th></tr></thead>
+      <tbody>
+        <tr><td>① 背景先画</td><td>✗ 先画 Mary</td><td>遇到一个画一个，没有机会看 queue；要按 queue 排，就得先把 Mesh 收齐</td></tr>
+        <tr><td>② 只读一次</td><td>✗ 每个 Pass 遍历一次，每个 draw 读一次相机</td><td>实测：一个 Pass 读相机 2 次，两个 Pass 读 4 次（HW2 有两个 Mesh）</td></tr>
+        <tr><td>③ 交出去的是值</td><td>✗ Pass 手里是活的 scene、camera</td><td>哪个 Pass 改了相机，后面的 Pass 就看到改过的</td></tr>
+        <tr><td>④ 不留半帧</td><td>✗ 清屏、画完 Mary 以后才发现背景坏了</td><td>检查（getter）和绘制交错进行</td></tr>
+      </tbody>
+    </table></div>
+    <p>四个问题的根源是同一个：<strong>读场景</strong>和<strong>发命令</strong>混在一起。把它们拆成两步，就是第 2 版。</p>
+
+    <h2 id="s4">4. 第 2 版：先提取，再画</h2>
+    <h3 id="s4-1">4.1 代码</h3>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 214" role="img" aria-label="两版对比。第 1 版：清屏、遍历到 Mary 就 draw、遍历到背景时 getter 抛错，这时清屏和 Mary 已经提交，留下半帧。第 2 版：先遍历全部、所有 getter 都查过、分成两队，出错时还没清屏；然后清屏、draw 背景、draw Mary。">
+          <defs>
+            <marker id="f2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+          </defs>
+          <text x="20" y="24" class="title">第 1 版：边遍历边画</text>
+          <rect x="20" y="38" width="120" height="40" rx="4" class="box" />
+          <text x="80" y="62" text-anchor="middle">清屏</text>
+          <path d="M140 58 L170 58" class="line" marker-end="url(#f2a)" />
+          <rect x="172" y="38" width="140" height="40" rx="4" class="box" />
+          <text x="242" y="56" text-anchor="middle">遍历到 Mary</text>
+          <text x="242" y="71" text-anchor="middle" class="small">立刻 draw</text>
+          <path d="M312 58 L342 58" class="line" marker-end="url(#f2a)" />
+          <rect x="344" y="38" width="170" height="40" rx="4" class="box bad" />
+          <text x="429" y="56" text-anchor="middle" class="bad">遍历到背景</text>
+          <text x="429" y="71" text-anchor="middle" class="small">getter 抛错</text>
+          <text x="530" y="56" class="bad">屏幕上：黑底 + Mary</text>
+          <text x="530" y="71" class="small">清屏和 draw 都撤不回来</text>
+
+          <text x="20" y="118" class="title">第 2 版：先提取，再画</text>
+          <rect x="20" y="132" width="200" height="56" rx="4" class="box hl" />
+          <text x="120" y="152" text-anchor="middle">提取：遍历全部</text>
+          <text x="120" y="167" text-anchor="middle" class="small">getter 全查过、相机算一次</text>
+          <text x="120" y="181" text-anchor="middle" class="small">分成两队</text>
+          <path d="M220 160 L250 160" class="line" marker-end="url(#f2a)" />
+          <rect x="252" y="140" width="90" height="40" rx="4" class="box" />
+          <text x="297" y="164" text-anchor="middle">清屏</text>
+          <path d="M342 160 L372 160" class="line" marker-end="url(#f2a)" />
+          <rect x="374" y="140" width="110" height="40" rx="4" class="box" />
+          <text x="429" y="164" text-anchor="middle">draw 背景</text>
+          <path d="M484 160 L514 160" class="line" marker-end="url(#f2a)" />
+          <rect x="516" y="140" width="110" height="40" rx="4" class="box" />
+          <text x="571" y="164" text-anchor="middle">draw Mary</text>
+          <text x="120" y="206" text-anchor="middle" class="small accent">出错只会发生在这里，还没清屏</text>
+        </svg>
+      </div>
+      <figcaption>图 2　同一个坏输入（背景的 Geometry 已释放）。第 1 版发现错误时已经清屏、画了 Mary；第 2 版把所有检查挪到第一个 GL 命令之前。</figcaption>
+    </figure>
+    <pre><code>// 课程写的第 2 版（assets/build/frame-course.ts）
+export interface FrameV2 {
+  readonly view: ViewState
+  readonly background: RenderItem[]
+  readonly opaque: RenderItem[]
+}
+
+/** 读一遍场景，相机只算一次，按 material.queue 分成两队。 */
+export function buildFrameV2(scene: Scene, camera: Camera): FrameV2 {
+  const cameraWorld = mat4.create()
+  camera.copyWorldMatrixTo(cameraWorld)
+  const view = mat4.create()     // create() 给的是单位矩阵
+  mat4.invert(view, cameraWorld) // 不可逆时返回 null，view 原样不动
+  const projection = mat4.create()
+  camera.copyProjectionMatrixTo(projection)
+
+  const frame: FrameV2 = {
+    view: {
+      viewMatrix: toTuple(view),
+      projectionMatrix: toTuple(projection),
+      cameraWorldPosition: [cameraWorld[12]!, cameraWorld[13]!, cameraWorld[14]!]
+    },
+    background: [],
+    opaque: []
+  }
+
+  scene.traverseVisible((node) =&gt; {
+    if (!(node instanceof Mesh)) return
+    const world = mat4.create()
+    node.copyWorldMatrixTo(world)
+    // 资源已释放时 getter 在这里抛错：还没开始画，不会留下半帧
+    const item: RenderItem = {
+      geometry: node.geometry,
+      material: node.material,
+      worldMatrix: toTuple(world)
+    }
+    if (item.material.queue === 'background') frame.background.push(item)
+    else frame.opaque.push(item)
+  })
+
+  return frame
+}
+
+/** 第 2 版的 ForwardPass：先 background，再 opaque。 */
+export class ForwardPassV2 implements PassV2 {
+  execute(frame: FrameV2, backend: RenderBackend): void {
+    backend.withRenderSurface(SCREEN, () =&gt; {
+      for (const item of frame.background) backend.draw({ item, view: frame.view })
+      for (const item of frame.opaque) backend.draw({ item, view: frame.view })
+      return undefined
+    })
+  }
+}
+
+/** 提取一次，所有 Pass 共用同一份结果。 */
+export function renderFrameV2(
+  passes: readonly PassV2[],
+  scene: Scene,
+  camera: Camera,
+  backend: RenderBackend
+): void {
+  const frame = buildFrameV2(scene, camera)
+  for (const pass of passes) pass.execute(frame, backend)
+}</code></pre>
+    <p>
+      第 1 版的四个问题，第 2 版解决了三个半：背景先画了；两个 Pass 时相机只读 1 次（实测）；背景坏了在提取时就抛错，Backend 一次调用都没收到（实测）；Pass 拿不到 scene、camera 了。剩下的半个是③：Pass 拿到的数组和矩阵还是可以改的。下面两张卡片看第 2 版还会出什么事。第二张卡片里的「小球」是另加的一个 opaque Mesh，放在 (0, 0, 30)，离相机 28.3；Mary 在原点，离相机 53.9。
+    </p>
+    <div id="lab-v2"></div>
+
+    <h3 id="s4-2">4.2 第 2 版还缺什么</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>缺口</th><th>卡片里看到的</th><th>真实代码怎样补</th></tr></thead>
+      <tbody>
+        <tr><td>交出去的数组能改</td><td>预 Pass 就地 sort，ForwardPass 的顺序跟着变</td><td>RenderList 冻结队列、item、矩阵（5.3 节）</td></tr>
+        <tr><td>坏的相机被悄悄放过</td><td>不可逆的相机变成单位矩阵，照常画</td><td>检查 invert 的返回值；矩阵逐个分量查有限数（5.1、5.2 节）</td></tr>
+        <tr><td>矩阵是普通数组</td><td>谁都能改 <code>worldMatrix[12]</code></td><td>copyMat4Snapshot 交回冻结的数组（5.2 节）</td></tr>
+        <tr><td>谁来调用 buildFrameV2</td><td>renderFrameV2 是个裸函数：context 丢了照样提取，Pass 也没有主人</td><td>Renderer（第 8 节）、RenderPipeline（第 7 节）</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="s5">5. 真实代码 ①：提取</h2>
+    <h3 id="s5-1">5.1 RenderListBuilder.build 的五步</h3>
+    <p>第 25 课读过相机那一段，这里把整个函数读完。源码里每一步都有很长的注释，下面换成了短的：</p>
+    <pre><code>// RenderListBuilder.ts:42–125（注释是课程加的）
+build(view: RenderView): RenderListBuildResult {
+  // 0. 入口检查：类型对不对、Scene 释放了没有
+  if (view === null || typeof view !== 'object')
+    throw new InvalidRenderViewError('view', 'must be an object')
+
+  const { scene, camera } = view
+
+  if (!(scene instanceof Scene))
+    throw new InvalidRenderViewError('scene', 'must be a Scene')
+
+  if (!(camera instanceof Camera))
+    throw new InvalidRenderViewError('camera', 'must be a Camera')
+
+  if (scene.disposed) throw new ResourceDisposedError('Scene')
+
+  // 三块临时缓冲，每次 build 新建，不会交出去
+  const cameraWorld = new Float32Array(16)
+  const viewMatrix = new Float32Array(16)
+  const projection = new Float32Array(16)
+
+  // 1. 相机：先更新相机和它的祖先，再复制世界矩阵 C
+  camera.copyWorldMatrixTo(cameraWorld)
+
+  // 验证 16 个分量都是有限数，得到冻结的普通数组
+  const world = copyMat4Snapshot(cameraWorld, 'camera.worldMatrix')
+
+  // V = C⁻¹；不可逆（比如缩放为 0）就拒绝，不用单位矩阵顶替
+  if (mat4.invert(viewMatrix, world) === null)
+    throw new InvalidRenderViewError('camera.worldMatrix', 'must be invertible')
+
+  camera.copyProjectionMatrixTo(projection)
+
+  // 相机位置就是 C 的平移列（第 25 课）
+  const position: Vec3Tuple = Object.freeze([world[12], world[13], world[14]])
+
+  const viewState: ViewState = Object.freeze({
+    viewMatrix: copyMat4Snapshot(viewMatrix, 'camera.viewMatrix'),
+    projectionMatrix: copyMat4Snapshot(projection, 'camera.projectionMatrix'),
+    cameraWorldPosition: position
+  })
+
+  // 2. 更新根节点（只更新它自己；后代在第 3 步按需更新）
+  scene.updateWorldMatrix()
+
+  const background: RenderItem[] = []
+  const opaque: RenderItem[] = []
+  const scratch = new Float32Array(16) // 所有 Mesh 共用的临时缓冲
+
+  // 3. 可见遍历：visible = false 的节点连同整个子树跳过
+  scene.traverseVisible((node) =&gt; {
+    if (!(node instanceof Mesh)) return
+
+    // 先按需更新这个 Mesh 和它的祖先，再复制进 scratch
+    node.copyWorldMatrixTo(scratch)
+
+    const renderItem: RenderItem = {
+      geometry: node.geometry, // getter：资源释放了就在这里抛错
+      material: node.material,
+      // 从 scratch 抄出一份自己的、冻结的（scratch 下一个 Mesh 还要用）
+      worldMatrix: copyMat4Snapshot(scratch, 'mesh.worldMatrix')
+    }
+
+    // 4. 分类：只看 queue，保持树里的先后
+    if (renderItem.material.queue === 'background') {
+      background.push(renderItem)
+    } else {
+      opaque.push(renderItem)
+    }
+  })
+
+  // 5. 冻结：RenderList 构造时再复制、冻结一遍
+  return Object.freeze({
+    viewState,
+    renderList: new RenderList(background, opaque)
+  })
+}</code></pre>
+    <div class="table-scroll"><table>
+      <thead><tr><th>步</th><th>做什么</th><th>为什么在这个位置</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>查 view、scene、camera 的类型，scene 没有释放</td><td>RenderView 来自 Engine，类型只是约定；最便宜的检查放最前</td></tr>
+        <tr><td>1</td><td>相机：C → 验证 → V → P → 位置，冻结成 ViewState</td><td>相机坏了（不可逆、NaN）就不用再遍历；所有 Mesh 共用这一份</td></tr>
+        <tr><td>2</td><td>更新根节点</td><td>计划里的「每次 build 更新一次 Scene」；实际效果见第 12 节</td></tr>
+        <tr><td>3</td><td>可见遍历，复制每个 Mesh 的世界矩阵</td><td>copyWorldMatrixTo 只更新这个 Mesh 和它的祖先；共享的祖先靠 worldVersion 缓存，每次变化只重算一次（测试 <a data-src="tests/unit/rendering/frame/RenderListBuilder.test.ts:157">RenderListBuilder.test.ts:157</a>）</td></tr>
+        <tr><td>4</td><td>按 queue 分两队</td><td>同一队里保持树的顺序，不排序（计划不做 renderOrder、透明）</td></tr>
+        <tr><td>5</td><td>RenderList 冻结</td><td>5.3 节</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      和第 9 课第 4 节那段「示意」比一下：示意里写的是 <code>scene.traverse((node) =&gt; node.updateWorldMatrix())</code>，先把整棵树更新一遍，再遍历一遍。真实代码只更新根节点，更新后代的事交给第 3 步里每个 Mesh 的 copyWorldMatrixTo，这样整棵树只走一遍。相机不在 Mesh 里，所以第 1 步单独处理它。
+    </p>
+    <p>第 2 版的两个坏输入，换真实代码再跑一次：</p>
+    <div id="lab-build"></div>
+
+    <h3 id="s5-2">5.2 copyMat4Snapshot：验证、复制、冻结</h3>
+    <pre><code>// copyMat4Snapshot.ts:11–41（注释是课程加的）
+export function copyMat4Snapshot(source: ArrayLike&lt;number&gt;, fieldName: string): Mat4Tuple {
+  // 长度必须正好 16
+  if (source === null || typeof source !== 'object' || source.length !== 16)
+    throw new InvalidRenderViewError(fieldName, 'must contain exactly 16 components')
+
+  // 每个分量都要是有限数：NaN、Infinity 都拒绝，错误里写出是第几个
+  for (let i = 0; i &lt; 16; i++) {
+    if (!Number.isFinite(source[i]))
+      throw new InvalidRenderViewError(fieldName, 'component ' + i + ' must be finite')
+  }
+
+  // 抄进一个普通数组，不是 Float32Array（不泄露可变的类型化数组）
+  const result: Mat4Tuple = [
+    source[0]!,
+    source[1]!,
+    // … 一直写到 source[15]!，固定长度让 TypeScript 知道恰好 16 项
+    source[15]!
+  ]
+
+  return Object.freeze(result)
+}</code></pre>
+    <p>
+      一帧里 Builder 调用它 3 + N 次（N 是可见 Mesh 数）：相机的世界矩阵、V、P，各个 Mesh 的世界矩阵；RenderList 再调用 N 次（5.3 节）。<code>fieldName</code> 只用来写错误信息，比如 <code>mesh.worldMatrix: component 12 must be finite</code>，一看就知道是哪个矩阵的平移出了 NaN。
+    </p>
+    <p>
+      为什么复制成普通数组而不是 Float32Array？<code>Object.freeze</code> 冻不住类型化数组的元素（对有元素的 Float32Array 调用 freeze 会抛 TypeError），而 Mat4Tuple 约定「只是数值」。代价是数值从 Float32 变成了 Float64 表示的同一个值，不损失精度。
+    </p>
+
+    <h3 id="s5-3">5.3 RenderList：再复制一次</h3>
+    <pre><code>// RenderList.ts:5–33（注释是课程加的）
+function snapshotItem(item: RenderItem): RenderItem {
+  return Object.freeze({
+    geometry: item.geometry, // 同一个对象：借用
+    material: item.material, // 同一个对象：借用
+    worldMatrix: copyMat4Snapshot(item.worldMatrix, 'item.worldMatrix') // 再验证、复制一次
+  })
+}
+
+export class RenderList {
+  public readonly background: readonly RenderItem[]
+  public readonly opaque: readonly RenderItem[]
+
+  constructor(backgroundList: RenderItem[], opaque: RenderItem[]) {
+    // map 生成新数组：调用者之后再 push 进原数组，不影响这里
+    this.background = Object.freeze(backgroundList.map(snapshotItem))
+    this.opaque = Object.freeze(opaque.map(snapshotItem))
+
+    Object.freeze(this) // 连字段也不能换
+  }
+}</code></pre>
+    <p>
+      Builder 已经复制、冻结过矩阵，RenderList 为什么还要再复制一次？因为 RenderList 的构造函数是公开的：谁都能 <code>new RenderList(...)</code>，传进来的数组和矩阵可能还在别人手里。RenderList 不知道调用者是不是 Builder，只能自己保证。代价是每个 Mesh 每帧复制两次矩阵（32 个数）；HW2 只有两个 Mesh，可以忽略。
+    </p>
+    <div id="lab-freeze"></div>
+
+    <h3 id="s5-4">5.4 什么复制，什么借用</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>东西</th><th>怎么交出去</th><th>为什么</th></tr></thead>
+      <tbody>
+        <tr><td>世界矩阵、V、P、相机位置</td><td>复制并冻结</td><td>只有 16 个（或 3 个）数，复制便宜；它们每帧都可能变（轨道控制拖相机）</td></tr>
+        <tr><td>两条队列、每个 item 的外壳</td><td>复制并冻结</td><td>Pass 之间互不干扰</td></tr>
+        <tr><td>FrameSnapshot</td><td>Renderer 复制六个数并冻结（8.1 节）</td><td>调用者可能每帧改同一个对象</td></tr>
+        <tr><td>Geometry、Material</td><td><strong>借用</strong>：同一个对象</td><td>它们大（顶点、纹理），而且对象身份就是 Manager 缓存的 key（第 4 课）。复制一份，Manager 每帧都会当成新资源重新上传</td></tr>
+        <tr><td>backend</td><td>借用</td><td>只有一个设备</td></tr>
+      </tbody>
+    </table></div>
+    <p>所以 RenderItem 的注释专门写了一句：「readonly material 不会使 Material.setParameter 失效」（<a data-src="src/rendering/frame/RenderItem.ts:12">RenderItem.ts:12</a>）。readonly 只说这个字段不能换成别的 Material，不说 Material 里面不能变。</p>
+    <div id="lab-borrow"></div>
+
+    <h2 id="s6">6. 真实代码 ②：Pass</h2>
+    <h3 id="s6-1">6.1 RenderPass 接口</h3>
+    <pre><code>// RenderPass.ts:4–17（注释是课程加的）
+export interface RenderPass {
+  readonly name: string // 只用来诊断
+
+  // 必须同步完成：返回类型是 undefined，不是 void
+  execute(context: RenderPassContext): undefined
+
+  // 只释放这个 Pass 自己持有的资源（比如它建的 RenderTarget）；
+  // 必须幂等：调两次和调一次一样
+  dispose(): void
+}</code></pre>
+    <p>
+      <code>undefined</code> 和 <code>void</code> 差在哪？TypeScript 允许把「返回任何东西的函数」赋给返回 <code>void</code> 的函数类型，所以 <code>async execute()</code>（返回 Promise）能实现一个 <code>void</code> 的接口；返回类型写成 <code>undefined</code> 就不行。我用 strict 的 tsc 实测：
+    </p>
+    <pre><code>// 课程写的类型实验（tsc --noEmit，项目的 tsconfig）
+class AsyncPass implements RenderPass {
+  readonly name = 'AsyncPass'
+  async execute(_context: RenderPassContext): Promise&lt;undefined&gt; { return undefined }
+  dispose(): void {}
+}
+// error TS2416: Property 'execute' in type 'AsyncPass' is not assignable
+//   to the same property in base type 'RenderPass'.
+//   Type 'Promise&lt;undefined&gt;' is not assignable to type 'undefined'.
+
+interface VoidPass { execute(context: RenderPassContext): void }
+class AsyncVoidPass implements VoidPass {
+  async execute(_context: RenderPassContext): Promise&lt;void&gt; {} // 没有报错
+}</code></pre>
+    <p>为什么不许异步？Pass 会在 scope 里 draw（6.3 节），scope 必须同步地进、同步地出（第 6 课、第 27 课 4.1 节）：如果 execute 在中间 await，别的代码会在 FBO 还绑着的时候插进来，scope 的「退出时恢复」也会提前发生。<code>withRenderSurface</code> 的 callback 是同样的写法（<a data-src="src/rendering/backend/RenderBackend.ts:37">RenderBackend.ts:37</a>）。</p>
+
+    <h3 id="s6-2">6.2 RenderPassContext：Pass 能看到的全部</h3>
+    <pre><code>// RenderPassContext.ts:10–15（注释是课程加的）
+export interface RenderPassContext {
+  readonly frame: FrameSnapshot   // 六个数
+  readonly view: ViewState        // 这一帧相机的值
+  readonly renderList: RenderList // 两条冻结的队列
+  readonly backend: RenderBackend // 发命令用
+}</code></pre>
+    <p>没有 Scene，也没有 Camera。这是需求②③在类型上的样子：Pass 读不到场景，也就不会去改它，更不会各自再遍历一遍。</p>
+
+    <h3 id="s6-3">6.3 ForwardPass</h3>
+    <pre><code>// ForwardPass.ts:15–49（注释是课程加的）
+export class ForwardPass implements RenderPass {
+  public readonly name: string = 'ForwardPass'
+
+  execute(context: RenderPassContext): undefined {
+    context.backend.withRenderSurface(
+      {
+        surface: { kind: 'default-framebuffer' }, // 画到屏幕
+        clear: {                                  // scope 入口清一次
+          color: [0, 0, 0, 1],
+          depth: 1
+        }
+      },
+      () =&gt; {
+        // 先 background 队列
+        for (const item of context.renderList.background) {
+          context.backend.draw({
+            item,
+            view: context.view // 所有 draw 共用同一个 ViewState
+          })
+        }
+
+        // 再 opaque 队列
+        for (const item of context.renderList.opaque) {
+          context.backend.draw({
+            item,
+            view: context.view
+          })
+        }
+
+        return undefined
+      }
+    )
+  }
+
+  // 不持有自己的资源，所以什么都不用释放
+  dispose(): void {}
+}</code></pre>
+    <p>
+      它的注释列了四件「不做」的事（<a data-src="src/rendering/passes/ForwardPass.ts:13">ForwardPass.ts:13</a>）：不遍历 Scene、不计算矩阵、不创建资源、不捕获并吞掉 draw 错误。前三件交给了 Builder 和 Backend；第四件的意思是 draw 抛错时，ForwardPass 立刻停下，错误原样往上传（测试 <a data-src="tests/unit/rendering/passes/ForwardPass.test.ts:77">ForwardPass.test.ts:77</a>），scope 的 finally 负责恢复绑定。
+    </p>
+    <p>HW2 的背景开着深度测试，先画后画画面都一样。下面这张卡片换一个关掉深度测试的背景，在你的显卡上真画一次：</p>
+    <div id="lab-pixels"></div>
+
+    <h2 id="s7">7. 真实代码 ③：RenderPipeline</h2>
+    <h3 id="s7-1">7.1 第 1 版：一个数组</h3>
+    <p>旧引擎的 WebGLRenderer 用一个数组存 Pass（<a data-src="src/renderers/WebGLRenderer.ts:45">WebGLRenderer.ts:45–59</a>、<a data-src="src/renderers/WebGLRenderer.ts:219">:219–226</a>）。照它的写法、换上新的 RenderPass 接口，<strong>课程写的</strong>第 1 版：</p>
+    <pre><code>// 课程写的第 1 版 Pipeline（assets/build/frame-course.ts）
+export class PipelineV1 {
+  private passes: RenderPass[] = []
+
+  addPass(pass: RenderPass): void {
+    this.passes.push(pass)
+  }
+
+  removePass(pass: RenderPass): void {
+    const index = this.passes.indexOf(pass)
+    if (index &gt; -1) {
+      this.passes[index]!.dispose()
+      this.passes.splice(index, 1)
+    }
+  }
+
+  execute(context: RenderPassContext): void {
+    for (const pass of this.passes) pass.execute(context)
+  }
+
+  dispose(): void {
+    for (const pass of this.passes) pass.dispose()
+    this.passes = []
+  }
+}</code></pre>
+    <p>看着没毛病。下面三张卡片各给它一个真实的用法：一次性的烘焙 Pass 跑完第一帧就把自己移除；同一个 Pass 不小心加了两次；某个 Pass 释放 FBO 时失败。每张卡片都先跑第 1 版，再跑真实的 RenderPipeline。</p>
+    <div id="lab-pipeline"></div>
+
+    <h3 id="s7-2">7.2 真实代码</h3>
+    <pre><code>// RenderPipeline.ts:19–102（注释是课程加的）
+export class RenderPipeline {
+  private readonly passes: RenderPass[] = []
+
+  // 收过的 Pass 都记在这里，移除以后也不删：
+  // 拒绝重复加入，也拒绝加回已经释放的；WeakSet 不妨碍 GC
+  private readonly accepted = new WeakSet&lt;RenderPass&gt;()
+
+  // 生命周期：closing 表示「只能继续清理」
+  private state: 'active' | 'closing' | 'disposed' = 'active'
+
+  // 正在 execute 或 dispose：拒绝回调里的同步重入
+  private busy: boolean = false
+
+  addPass(pass: RenderPass): void {
+    this.assertIdle('addPass')
+
+    if (this.accepted.has(pass))
+      throw new RenderExecutionError(
+        'RenderPipeline',
+        'addPass',
+        'pass was already accepted'
+      )
+
+    this.accepted.add(pass)
+    this.passes.push(pass) // 从此 Pipeline 是它的主人
+  }
+
+  removePass(pass: RenderPass): boolean {
+    this.assertIdle('removePass')
+
+    const index = this.passes.indexOf(pass)
+    if (index === -1) return false
+
+    this.busy = true
+
+    try {
+      pass.dispose()               // 先释放
+      this.passes.splice(index, 1) // 成功了才移出
+      return true
+    } catch (error) {
+      this.state = 'closing'       // 失败：它可能释放了一半，不能再执行
+      throw error
+    } finally {
+      this.busy = false
+    }
+  }
+
+  execute(context: RenderPassContext): undefined {
+    this.assertIdle('execute')
+
+    this.busy = true
+
+    try {
+      for (const pass of this.passes) {
+        pass.execute(context) // 抛错就停，后面的 Pass 不执行，错误往上传
+      }
+    } finally {
+      this.busy = false       // 下一帧还能执行
+    }
+  }</code></pre>
+    <pre><code>// RenderPipeline.ts:132–180（注释是课程加的）
+  dispose(): void {
+    if (this.state === 'disposed') return // 全部清理完了：幂等
+
+    this.assertNotBusy('dispose') // closing 允许重试，但不许在清理回调里重入
+
+    this.state = 'closing'
+    this.busy = true
+
+    try {
+      while (this.passes.length &gt; 0) {
+        const pass = this.passes[0]!
+
+        pass.dispose()      // 抛错时下一行不执行，失败的留在队首
+
+        this.passes.shift() // 成功一个移出一个，进度就记在数组里
+      }
+
+      this.state = 'disposed' // 全部成功才算完
+    } finally {
+      this.busy = false
+    }
+  }
+
+  // 公共入口统一检查：必须 active，而且不忙
+  private assertIdle(operation: string): void {
+    if (this.state !== 'active') throw new ResourceDisposedError('RenderPipeline')
+
+    this.assertNotBusy(operation)
+  }
+
+  private assertNotBusy(operation: string): void {
+    if (this.busy)
+      throw new RenderExecutionError('RenderPipeline', operation, 'operation in progress')
+  }</code></pre>
+    <p>
+      源码 :104–119 还有一段 TODO，记的是以后 Pass 多了要重新考虑的事：清理顺序该按依赖而不是登记顺序；反复 <code>shift</code> 是 O(n²)，可以换成游标；但不能为了性能直接换成 <code>pop</code>，那会改变清理顺序。现在 HW2 只有一个 ForwardPass，这些都还不是问题。
+    </p>
+
+    <h3 id="s7-3">7.3 状态表</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>状态</th><th>addPass</th><th>removePass</th><th>execute</th><th>dispose</th></tr></thead>
+      <tbody>
+        <tr><td>active，不忙</td><td>✓</td><td>✓（失败 → closing）</td><td>✓</td><td>✓（→ closing → disposed）</td></tr>
+        <tr><td>active，忙（某个回调正在执行）</td><td colspan="4">全部抛 RenderExecutionError：operation in progress</td></tr>
+        <tr><td>closing（清理失败过）</td><td>✗</td><td>✗</td><td>✗</td><td>✓ 从失败的那个接着做</td></tr>
+        <tr><td>disposed</td><td>✗</td><td>✗</td><td>✗</td><td>直接返回</td></tr>
+      </tbody>
+    </table></div>
+    <p>✗ 抛的是 ResourceDisposedError（「RenderPipeline has been disposed」）；closing 时也是这句，第 12 节会再说。</p>
+
+    <h2 id="s8">8. 真实代码 ④：Renderer</h2>
+    <h3 id="s8-1">8.1 render</h3>
+    <pre><code>// Renderer.ts:16–80（节选，注释是课程加的）
+export class Renderer {
+  private readonly backend: RenderBackend
+  private readonly pipeline: RenderPipeline
+  private readonly renderListBuilder: RenderListBuilder
+
+  // 和 RenderPipeline 同一套：生命周期 + 忙
+  private state: 'active' | 'closing' | 'disposed' = 'active'
+  private busy = false
+
+  // …
+
+  render(view: RenderView): void {
+    if (this.state !== 'active') {
+      throw new ResourceDisposedError('Renderer')
+    }
+
+    this.assertNotBusy('render') // 某个 Pass 在 execute 里又调 render：拒绝
+
+    if (!this.backend.ready) return // context 丢了：这一帧什么都不做，连场景都不读
+
+    this.busy = true
+
+    try {
+      const source = view.frame
+
+      // 显式抄六个数：调用者之后改原对象，影响不到 Pass
+      const frame: FrameSnapshot = Object.freeze({
+        frameNumber: source.frameNumber,
+        timeSeconds: source.timeSeconds,
+        deltaSeconds: source.deltaSeconds,
+        drawingBufferWidth: source.drawingBufferWidth,
+        drawingBufferHeight: source.drawingBufferHeight,
+        pixelRatio: source.pixelRatio
+      })
+
+      // 提取，整帧只有这一次
+      const { renderList, viewState } = this.renderListBuilder.build(view)
+
+      // 所有 Pass 共用同一个冻结的 context
+      const context: RenderPassContext = Object.freeze({
+        frame,
+        view: viewState,
+        renderList,
+        backend: this.backend
+      })
+
+      this.pipeline.execute(context)
+    } finally {
+      this.busy = false // 出错也复位：修好以后下一帧照常
+    }
+  }</code></pre>
+    <p>
+      顺序有讲究：先问 <code>ready</code>，再提取。context 丢了的时候（第 13 课），提取了也白提取；而且「不读场景」意味着丢失期间场景里坏掉的东西（比如刚释放的 Geometry）不会在这里抛错。Renderer 不保存 Scene、Camera：<code>view</code> 只在这一次调用里用（测试 <a data-src="tests/unit/rendering/Renderer.test.ts:59">Renderer.test.ts:59</a>「不保留上次 Scene」）。
+    </p>
+    <p>
+      复制 frame 防的是什么？Engine 现在每帧新建冻结对象（1.1 节），但 Renderer 不依赖这一点。我实测过：调用者每帧改同一个对象（帧号 600 改成 601），一个 Pass 把两帧的 <code>context.frame</code> 都存下来，读到的是 600 和 601，不会两个都变成 601。
+    </p>
+    <div id="lab-render"></div>
+
+    <h3 id="s8-2">8.2 dispose：先 Pipeline，后 Backend</h3>
+    <pre><code>// Renderer.ts:94–131（注释是课程加的）
+dispose(): void {
+  if (this.state === 'disposed') return
+
+  this.assertNotBusy('dispose') // 不能在 render 里面拆掉自己
+
+  this.state = 'closing'
+  this.busy = true
+
+  try {
+    // 先释放 Pass。Pass 拥有的 RenderTarget 被 dispose 时，会通知 Backend 的
+    // RenderTargetManager 删 FBO（第 27 课 3.6 节），所以 Backend 这时必须还活着
+    this.pipeline.dispose()
+
+    // Pipeline 清理成功才走到这里。不能放进 finally：
+    // 否则 Pipeline 失败时也会拆掉它清理要用的 Backend
+    this.backend.dispose()
+    this.state = 'disposed'
+  } finally {
+    this.busy = false
+  }
+}</code></pre>
+    <p>
+      重试为什么安全？Pipeline 失败时 Renderer 停在 closing，下次 dispose 再从 <code>pipeline.dispose()</code> 开始，Pipeline 自己从失败的 Pass 接着做（7.2 节）。Backend 失败时 Pipeline 已经是 disposed，下次 <code>pipeline.dispose()</code> 直接返回，只重试 <code>backend.dispose()</code>。每一层都把「做到哪了」记在自己身上，上一层只要重新调用就行。
+    </p>
+    <div id="lab-dispose"></div>
+
+    <h2 id="s9">9. 一帧走一遍</h2>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 352" role="img" aria-label="一帧的调用顺序。Engine 调 Renderer.render；Renderer 问 ready、复制 frame，调 Builder.build；Builder 交回 viewState 和 renderList；Renderer 冻结 context，调 Pipeline.execute；Pipeline 调 ForwardPass.execute；ForwardPass 对 Backend 调 withRenderSurface（清屏），draw 背景，draw Mary；离开 scope。">
+          <defs>
+            <marker id="f3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+          </defs>
+          <text x="60" y="24" text-anchor="middle" class="title">Engine</text>
+          <text x="200" y="24" text-anchor="middle" class="title">Renderer</text>
+          <text x="350" y="24" text-anchor="middle" class="title">Builder</text>
+          <text x="510" y="24" text-anchor="middle" class="title">Pipeline</text>
+          <text x="510" y="38" text-anchor="middle" class="small">+ ForwardPass</text>
+          <text x="680" y="24" text-anchor="middle" class="title">Backend</text>
+          <path d="M60 46 L60 340" class="line dash" />
+          <path d="M200 46 L200 340" class="line dash" />
+          <path d="M350 46 L350 340" class="line dash" />
+          <path d="M510 46 L510 340" class="line dash" />
+          <path d="M680 46 L680 340" class="line dash" />
+
+          <path d="M60 72 L198 72" class="line" marker-end="url(#f3a)" />
+          <text x="130" y="66" text-anchor="middle" class="small">render(view)</text>
+          <text x="208" y="96" class="small">ready？复制 frame</text>
+          <path d="M200 124 L348 124" class="line" marker-end="url(#f3a)" />
+          <text x="275" y="118" text-anchor="middle" class="small">build(view)</text>
+          <text x="358" y="146" class="small">相机 → 遍历 → 两队</text>
+          <path d="M350 172 L202 172" class="line dash" marker-end="url(#f3a)" />
+          <text x="275" y="166" text-anchor="middle" class="small">viewState, renderList</text>
+          <path d="M200 206 L508 206" class="line" marker-end="url(#f3a)" />
+          <text x="355" y="200" text-anchor="middle" class="small">execute(冻结的 context)</text>
+          <path d="M510 236 L678 236" class="line accent" marker-end="url(#f3a)" />
+          <text x="595" y="230" text-anchor="middle" class="small">withRenderSurface（清屏）</text>
+          <path d="M510 264 L678 264" class="line accent" marker-end="url(#f3a)" />
+          <text x="595" y="258" text-anchor="middle" class="small">draw(背景)</text>
+          <path d="M510 292 L678 292" class="line accent" marker-end="url(#f3a)" />
+          <text x="595" y="286" text-anchor="middle" class="small">draw(Mary)</text>
+          <path d="M680 322 L512 322" class="line dash" marker-end="url(#f3a)" />
+          <text x="595" y="316" text-anchor="middle" class="small">离开 scope，恢复绑定</text>
+        </svg>
+      </div>
+      <figcaption>图 3　HW2 一帧的调用顺序。实线是调用，虚线是返回。只有蓝色那三条到了 Backend；在它们之前，所有检查都已经做完。</figcaption>
+    </figure>
+    <div class="table-scroll"><table>
+      <thead><tr><th>#</th><th>谁</th><th>做什么</th><th>这一帧的值（用项目代码算的）</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Engine.loop</td><td>冻结 FrameSnapshot，调 render</td><td>帧号 600、10 s、1/60 s、1600 × 900、倍率 2</td></tr>
+        <tr><td>2</td><td>Renderer.render</td><td>active、不忙、<code>backend.ready</code> 是 true；复制 frame</td><td></td></tr>
+        <tr><td>3</td><td>Builder 第 0 步</td><td>scene 是 Scene、camera 是 Camera、scene 没释放</td><td></td></tr>
+        <tr><td>4</td><td>Builder 第 1 步</td><td>C → 验证 → V → P → 位置</td><td>V 的平移列 (0, −9.8058, −52.9514)；P[0] = 1.3580，P[5] = 2.4142；位置 (0, 20, 50)</td></tr>
+        <tr><td>5</td><td>Builder 第 2 步</td><td>更新根节点</td><td>第 4 步已经更新过，缓存命中</td></tr>
+        <tr><td>6</td><td>Builder 第 3、4 步</td><td>Scene（不是 Mesh，跳过）→ mary → opaque；HW2 background → background；HW2 camera（跳过）</td><td>Mary 的 worldMatrix 对角线 10、10、10、1；背景 100、100、100、1</td></tr>
+        <tr><td>7</td><td>Builder 第 5 步</td><td>new RenderList(background, opaque)</td><td>background: [背景]，opaque: [Mary]</td></tr>
+        <tr><td>8</td><td>Renderer</td><td>冻结 context，调 pipeline.execute</td><td></td></tr>
+        <tr><td>9</td><td>Pipeline</td><td>busy = true，逐个执行（只有 ForwardPass）</td><td></td></tr>
+        <tr><td>10</td><td>ForwardPass</td><td>withRenderSurface：画到屏幕，清成黑色、深度 1</td><td></td></tr>
+        <tr><td>11</td><td>ForwardPass</td><td>draw(背景)，draw(Mary)，共用同一个 view</td><td>第 16 课：Backend 里每次 draw 再走资源解析 → uniform → 状态 → 顶点输入</td></tr>
+        <tr><td>12</td><td>退出</td><td>离开 scope（恢复绑定）；Pipeline、Renderer 的 busy 复位</td><td></td></tr>
+      </tbody>
+    </table></div>
+    <div id="lab-frame"></div>
+
+    <h2 id="s10">10. 和 Lifecycle 的关系</h2>
+    <p>第 13 课讲过 WebGLContextLifecycle 回答「现在能不能画」。帧编排这一层只通过一个问题和它打交道：<code>backend.ready</code>（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:114">WebGL1Backend.ts:114–120</a>：没有 dispose、context 没丢、Lifecycle 处于 ready、当前这一代有效）。</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>时刻</th><th>帧编排这一层发生什么</th></tr></thead>
+      <tbody>
+        <tr><td>丢失之后、恢复之前</td><td><code>ready</code> 是 false，Renderer.render 直接返回（Renderer.ts:51），不读场景、不调 Builder、不开 scope。画布上留着浏览器给的空白</td></tr>
+        <tr><td>render 正在进行时 context 丢了</td><td>Backend.draw 的 assertCurrentDraw 抛 WebGLContextLostError（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:357">WebGL1Backend.ts:357–363</a>）→ ForwardPass 不接 → Pipeline、Renderer 的 finally 复位 busy → Engine 的 loop 接住：context lost 不停循环（<a data-src="src/engine.ts:537">engine.ts:537–540</a>），其他错误停循环</td></tr>
+        <tr><td>恢复之后</td><td><code>ready</code> 变回 true，下一帧照常提取。RenderList 里本来就没有 GPU handle（只有 Geometry、Material 的身份），所以不存在「旧列表里的旧 handle」；Backend 的新一代 Manager 按身份懒上传（第 13、16、17、27 课）</td></tr>
+        <tr><td>退出 HW2</td><td>Engine 调 <code>renderer.dispose()</code>（<a data-src="src/engine.ts:241">engine.ts:241</a>）：先 Pipeline，后 Backend；Backend 的 dispose 会停掉 Lifecycle 的监听</td></tr>
+      </tbody>
+    </table></div>
+    <p>反过来，Lifecycle 不知道 Renderer、Pipeline 的存在：恢复时它只重建 Backend 里的一代 Manager。帧编排这一层每帧从头提取，所以什么都不用通知它。</p>
+
+    <h2 id="s11">11. 架构视角：对照 three.js r177</h2>
+    <p>
+      three.js 新渲染器的一帧（<a data-src="node_modules/three/src/renderers/common/Renderer.js:1278">common/Renderer.js:1278</a> 的 _renderScene）：更新整棵树的世界矩阵（:1357），算视锥（:1410–1416），取这一对 scene、camera 的 RenderList（:1419），<code>begin()</code> 把下标归零（<a data-src="node_modules/three/src/renderers/common/RenderList.js:195">RenderList.js:195–199</a>），_projectObject 递归把可见物体 push 进去（:2621），排序（:1428），背景塞到队首（<a data-src="node_modules/three/src/renderers/common/Background.js:147">Background.js:147</a>），然后逐个 renderObject：先调 <code>object.onBeforeRender</code>（:2858），最后 <code>backend.draw</code>（:3001）。旧的 WebGLRenderer 是同一个骨架：render（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1524">WebGLRenderer.js:1524</a>）→ projectObject（:1710）→ sort（:1588）→ renderObjects（:1972）→ renderObject 里的两个 onBeforeRender（:2003、:2008）→ renderBufferDirect（:1096）。
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>问题</th><th>three.js r177</th><th>本项目</th></tr></thead>
+      <tbody>
+        <tr><td>提取和画分开吗</td><td>分开：先 project 成 RenderList，再 render</td><td>分开：Builder 产出 RenderList，Pass 再画</td></tr>
+        <tr><td>列表每帧新建吗</td><td>不：同一对 scene、camera 每帧拿到同一个 RenderList；item 对象也复用，下一帧改字段（RenderList.js:228–262）。零分配，代价是 item 留不到下一帧</td><td>每帧新建并冻结（HW2 每帧十几个小数组）。交出去的值不会变，Pass 可以放心存</td></tr>
+        <tr><td>排序</td><td>不透明按 groupOrder → renderOrder → 深度 z → id（RenderList.js:12–29）；透明从远到近</td><td>不排序，只按 queue 分两队；计划明确不做透明、renderOrder、视锥裁剪</td></tr>
+        <tr><td>背景</td><td>scene.background 特殊处理，unshift 到队首</td><td>背景就是普通 Mesh，靠 Material.queue</td></tr>
+        <tr><td>钩子</td><td>onBeforeRender：每次 draw 前调用户代码，可以改 uniform、矩阵</td><td>没有；Builder 的注释写明「本版不提供提取过程的用户钩子」</td></tr>
+        <tr><td>render 里再 render</td><td>允许：保存、恢复当前的 render context（common/Renderer.js:1289、:1496），用来做镜面反射、传送门</td><td>拒绝：busy 检查（8.1 节）。要画两遍就加两个 Pass</td></tr>
+        <tr><td>多个 Pass</td><td>旧版没有 Pass，后处理在 examples 的 EffectComposer；新版有 PostProcessing（<a data-src="node_modules/three/src/renderers/common/PostProcessing.js:20">PostProcessing.js:20</a>），用节点描述</td><td>RenderPipeline 持有有序的 Pass，并负责释放</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      共同点是更重要的那一条：两边都在 draw 之前把场景「投影」成一张列表，Backend 只看列表，不看场景。区别在于 three.js 要服务所有人（成千上万个物体、每帧不能分配、用户要钩子），本项目只服务 HW2 到 FFT 这几个场景，所以选了「每帧新建、冻结、不给钩子」这种好推理的写法。哪天物体多到分配成为瓶颈，再学 three.js 复用 item；那时候「item 留不到下一帧」就要写进 RenderPassContext 的契约里。
+    </p>
+
+    <h2 id="s12">12. 审查视角</h2>
+    <h3 id="s12-1">12.1 三处可以改的地方</h3>
+    <ol>
+      <li>
+        <strong>Renderer 先读 view.frame，再让 Builder 检查 view。</strong>Renderer.ts:56 的 <code>view.frame</code> 在 build 之前，所以 <code>renderer.render(null)</code> 得到的是 <code>TypeError: Cannot read properties of null (reading 'frame')</code>，而不是 Builder :43 准备好的 InvalidRenderViewError（实测）；经过 Renderer 调用时，Builder 的这条检查永远走不到。frame 的六个数也没有验证：<code>deltaSeconds: NaN</code> 照样传给所有 Pass（实测）。FrameSnapshot 的注释说「由 Engine 提供合法值」，这是有意的分工，但 Renderer 是公开类，入口先检查 <code>view</code> 是对象、六个数是有限数，代价很小。
+      </li>
+      <li>
+        <strong>closing 状态的报错说「已经释放」。</strong>Pipeline 清理失败以后是 closing，这时调用 execute 得到的是 <code>ResourceDisposedError: RenderPipeline has been disposed</code>（:164），可清理其实还没完成。Renderer（:46）同样如此。看错误的人会以为「已经释放干净了」，不会想到要重试 dispose。另外 addPass 的文档注释（:43）抄了 busy 字段的注释，没有说明 addPass 本身做什么。
+      </li>
+      <li>
+        <strong>Builder 第 2 步实测不改变任何结果。</strong>相机是 Scene 的后代，第 1 步 copyWorldMatrixTo 已经顺带更新了根节点：Scene 的 worldVersion 在复制相机后从 0 变成 1，执行 :97 以后还是 1（实测）。就算相机不在树里，第 3 步第一个 Mesh 也会更新根节点。这一行不是错，但「更新根节点」容易让人以为它负责更新整棵树；真正保证「每个节点最多重算一次」的是 worldVersion 缓存。
+      </li>
+    </ol>
+    <h3 id="s12-2">12.2 想一想（直接在对话里回答）</h3>
+    <ol>
+      <li>场景里某个 Mesh 的 Geometry 被释放了，Builder 抛错，整帧都画不出来，而且之后每帧都这样（Engine 会停掉循环）。另一种做法是跳过这个 Mesh、画其余的。你选哪种？各自的代价是什么？</li>
+      <li>一次性的烘焙 Pass 不能在 execute 里移除自己（7.1 节的卡片）。你会把「移除」放在哪里？</li>
+      <li>HW1 的阴影 Pass 要用光源的 V、P，不是相机的。按现在的接口，它从哪里拿？要不要改 RenderPassContext？</li>
+    </ol>
+
+    <h2 id="s13">13. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0030"></div>
+
+    <h2 id="s14">14. 延伸阅读</h2>
+    <ul>
+      <li><a href="https://threejs.org/docs/#api/en/core/Object3D.renderOrder">three.js 文档：Object3D.renderOrder</a>、<a href="https://threejs.org/docs/#api/en/core/Object3D.onBeforeRender">onBeforeRender</a>：本项目没有的两样东西。</li>
+      <li><a href="https://threejs.org/docs/#api/en/renderers/WebGLRenderer.sortObjects">three.js 文档：WebGLRenderer.sortObjects</a>：排序的开关和排序依据。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Window/requestAnimationFrame">MDN：requestAnimationFrame</a>：Engine 每帧回调的来源。</li>
+      <li><a href="https://www.typescriptlang.org/docs/handbook/2/functions.html#return-type-void">TypeScript 手册：Return type void</a>：为什么返回 void 的函数类型能接受 async 函数。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：实验卡片和检查题各错了哪几题；第 12 节的三个想一想，直接在对话里回答。哪一步还接不上，把那几行贴给我。
+    </aside>
+
+    <div class="nav">
+      <a href="0027-render-target-manager.html">← 第 27 课：RenderTargetManager 与 FBO</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0039-why-fft-queries-so-often.html">第 39 课（插课）：FFT 为什么频繁查询 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 30 课 · 2026-10-13</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        const F = window.RTeachFrame
+        const C = F.course
+
+        // ---------------- 课程写的小工具 ----------------
+        const HELPER_NOTE =
+          '课程写的部分：hw2Scene（照 createHW2Scene.ts 搭一个形状相同的场景：mary 缩放 10、HW2 background 缩放 100 且 queue 是 background、相机在 (0, 20, 50)；几何体用一个三角形代替，shader 只是占位）、RecordingBackend（不碰 GPU，只按顺序记下 Backend 收到的调用，照 tests/unit/rendering/helpers/createRenderFixture.ts 的同名替身写的）。'
+        const V1_NOTE = ' 第 1 版的 ForwardPassV1、renderFrameV1 是课程写的（3.2 节的代码）。'
+        const V2_NOTE = ' 第 2 版的 buildFrameV2、ForwardPassV2、renderFrameV2 是课程写的（4.1 节的代码）。'
+        const PIPE_NOTE =
+          '课程写的部分：PipelineV1（7.1 节的代码）；三个 Pass 是课程写的空壳，execute、dispose 只记一行日志，按卡片需要在某一次调用里抛错或移除自己。'
+
+        const err = (e) => (e && e.name ? e.name : 'Error') + '：' + (e && e.message ? e.message : String(e))
+        const fmt = (x) => (Math.abs(x) < 5e-5 ? 0 : Number(x.toFixed(4)))
+        const diag = (m) => [m[0], m[5], m[10], m[15]].map(fmt).join('、')
+        const FRAME = Object.freeze({
+          frameNumber: 600,
+          timeSeconds: 10,
+          deltaSeconds: 1 / 60,
+          drawingBufferWidth: 1600,
+          drawingBufferHeight: 900,
+          pixelRatio: 2
+        })
+
+        function triangle() {
+          return new F.Geometry({
+            attributes: {
+              [F.VertexAttributeSemantic.Position]: new F.VertexAttribute({
+                data: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]),
+                itemSize: 3
+              })
+            }
+          })
+        }
+
+        /** 和 HW2 形状相同的场景。separateBackgroundGeometry 为 true 时背景用自己的几何体（好单独释放）。 */
+        function hw2Scene(separateBackgroundGeometry = false) {
+          const scene = new F.Scene()
+          const geometry = triangle()
+          const shader = new F.ShaderModule({
+            name: 'lesson30/placeholder',
+            language: 'glsl-es-100',
+            vertexSource: 'void main() { gl_Position = vec4(0.0); }',
+            fragmentSource: 'void main() { gl_FragColor = vec4(1.0); }'
+          })
+          const maryMaterial = new F.Material({ shaderModule: shader })
+          const backgroundMaterial = new F.Material({
+            shaderModule: shader,
+            queue: 'background',
+            state: { depthTest: true, depthWrite: false, depthFunction: 'less-equal', cullMode: 'front' }
+          })
+          const mary = new F.Mesh(geometry, maryMaterial)
+          mary.name = 'mary'
+          mary.transform.setScale([10, 10, 10])
+          const backgroundGeometry = separateBackgroundGeometry ? triangle() : geometry
+          const background = new F.Mesh(backgroundGeometry, backgroundMaterial)
+          background.name = 'HW2 background'
+          background.transform.setScale([100, 100, 100])
+          const camera = new F.PerspectiveCamera({ fovY: Math.PI / 4, aspect: 1600 / 900, near: 0.1, far: 1000 })
+          camera.name = 'HW2 camera'
+          camera.transform.setPosition([0, 20, 50])
+          camera.transform.setRotation([-Math.atan2(10, 50), 0, 0])
+          scene.add(mary, background, camera)
+          const names = new Map([
+            [maryMaterial, 'Mary'],
+            [backgroundMaterial, '背景']
+          ])
+          return { scene, camera, mary, background, backgroundGeometry, geometry, shader, names }
+        }
+
+        /** 只记录调用的 Backend 替身。 */
+        class RecordingBackend {
+          constructor(names) {
+            this.ready = true
+            this.names = names
+            this.lines = []
+            this.submissions = []
+          }
+          resizeDrawingBuffer() {
+            this.lines.push({ text: 'resizeDrawingBuffer', kind: 'late' })
+          }
+          withRenderSurface(descriptor, callback) {
+            const clear = descriptor.clear || {}
+            this.lines.push({
+              text: '进入 scope：' + (descriptor.surface.kind === 'default-framebuffer' ? '屏幕' : descriptor.surface.kind) + '，清屏 color [' + (clear.color || []).join(', ') + ']、depth ' + clear.depth,
+              kind: 'user'
+            })
+            try {
+              callback()
+            } finally {
+              this.lines.push({ text: '离开 scope', kind: 'user' })
+            }
+          }
+          draw(submission) {
+            this.submissions.push(submission)
+            this.lines.push({ text: 'draw ' + (this.names.get(submission.item.material) || '?'), kind: 'server' })
+          }
+          dispose() {
+            this.lines.push({ text: 'backend.dispose', kind: 'muted' })
+            this.ready = false
+          }
+        }
+
+        function realRenderer(backend, passes) {
+          const pipeline = new F.RenderPipeline()
+          for (const pass of passes || [new F.ForwardPass()]) pipeline.addPass(pass)
+          return new F.Renderer(backend, pipeline, new F.RenderListBuilder())
+        }
+
+        /** 数一数相机的 copyWorldMatrixTo 被调用几次（只包一层计数，原样转发）。 */
+        function countCameraReads(camera) {
+          const original = camera.copyWorldMatrixTo.bind(camera)
+          const counter = { reads: 0 }
+          camera.copyWorldMatrixTo = (out) => {
+            counter.reads++
+            original(out)
+          }
+          return counter
+        }
+
+        const distance = (item, view) =>
+          Math.hypot(
+            item.worldMatrix[12] - view.cameraWorldPosition[0],
+            item.worldMatrix[13] - view.cameraWorldPosition[1],
+            item.worldMatrix[14] - view.cameraWorldPosition[2]
+          )
+
+        /** 加一个 opaque 的「小球」在 (0, 0, 30)，离相机比 Mary 近。 */
+        function addBall(h) {
+          const material = new F.Material({ shaderModule: h.shader })
+          const ball = new F.Mesh(h.geometry, material)
+          ball.name = 'ball'
+          ball.transform.setPosition([0, 0, 30])
+          h.scene.add(ball)
+          h.names.set(material, '小球')
+          return ball
+        }
+
+        // ---------------- 3.2 第 1 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v1'),
+          storageKey: 'lesson-0030-v1',
+          cards: [
+            {
+              title: '第 1 版画 HW2：Backend 先收到谁',
+              tags: ['CPU', '课程版 + 项目的场景类'],
+              desc: '用第 1 版画一帧 HW2 形状的场景，记下 Backend 收到的调用；顺便数相机被读了几次。最后再用两个 ForwardPassV1 各跑一帧，模拟 HW1 那样的两个 Pass。',
+              note: HELPER_NOTE + V1_NOTE + ' countCameraReads 也是课程写的：给 camera.copyWorldMatrixTo 包一层计数。',
+              question: 'Backend 先收到哪个 draw？',
+              choices: ['Mary：第 1 版按树的顺序画，Mary 先加进 Scene', '背景：它的 queue 是 background', '两个一起：一次 draw 画两个 Mesh'],
+              answer: 0,
+              explain:
+                'traverseVisible 先父后子，孩子按 add 的顺序（<a data-src="src/rendering/scene/SceneNode.ts:303">SceneNode.ts:303–313</a>）：mary、HW2 background、HW2 camera。第 1 版遇到一个 Mesh 就 draw，根本没有机会看 queue：要按 queue 排，就得先把所有 Mesh 收齐。相机每个 draw 读一次，两个 Mesh 读 2 次；两个 Pass 各遍历一遍，读 4 次。HW2 的背景开着深度测试，这个顺序碰巧画面也对（6.3 节的卡片换一个关掉深度测试的背景，就看得出差别）。',
+              run: () => {
+                const h = hw2Scene()
+                const counter = countCameraReads(h.camera)
+                const backend = new RecordingBackend(h.names)
+                C.renderFrameV1([new C.ForwardPassV1()], h.scene, h.camera, backend)
+                const one = counter.reads
+                counter.reads = 0
+                const twice = new RecordingBackend(h.names)
+                C.renderFrameV1([new C.ForwardPassV1(), new C.ForwardPassV1()], h.scene, h.camera, twice)
+                return {
+                  lines: [
+                    ...backend.lines,
+                    { t: '结果', text: '一个 Pass：相机读了 ' + one + ' 次；两个 Pass：读了 ' + counter.reads + ' 次，Backend 收到 ' + twice.submissions.length + ' 次 draw', kind: 'result' }
+                  ]
+                }
+              }
+            },
+            {
+              title: '背景的 Geometry 被提前释放了',
+              tags: ['CPU', '课程版 + 项目的场景类'],
+              desc: '背景换成自己单独的 Geometry，画之前先把它 dispose（比如切换场景时释放顺序写错了）。用第 1 版画一帧。',
+              note: HELPER_NOTE + V1_NOTE,
+              question: '这一帧结束时，屏幕上是什么？',
+              choices: ['清过的黑底，上面只有 Mary：清屏和 Mary 的 draw 都已经提交了', '和上一帧一样：出错时整帧作废', '全黑：出错时 Backend 撤销了 Mary'],
+              answer: 0,
+              explain:
+                '第 1 版边遍历边画：进入 scope 时已经清屏，Mary 已经 draw；遍历到背景时，<code>node.geometry</code> 这个 getter 才发现资源已释放（<a data-src="src/rendering/scene/Mesh.ts:56">Mesh.ts:56–59</a>），抛错。scope 退出时只恢复绑定，不回滚像素：GL 没有「撤销」。Engine 的 loop 接住错误后会停掉循环（<a data-src="src/engine.ts:537">engine.ts:537–540</a>），屏幕就停在这个半帧。要避免它，只有一个办法：在清屏之前把所有 getter 都查一遍，也就是先提取、再画。',
+              run: () => {
+                const h = hw2Scene(true)
+                h.backgroundGeometry.dispose()
+                const backend = new RecordingBackend(h.names)
+                const lines = [{ text: '背景的 Geometry dispose 了 → disposed = ' + h.backgroundGeometry.disposed, kind: 'muted' }]
+                try {
+                  C.renderFrameV1([new C.ForwardPassV1()], h.scene, h.camera, backend)
+                } catch (error) {
+                  backend.lines.push({ text: '抛出 ' + err(error), kind: 'abort' })
+                }
+                return { lines: [...lines, ...backend.lines, { t: '结果', text: 'Backend 已经收到：清屏 + draw Mary', kind: 'result' }] }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 4.1 第 2 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v2'),
+          storageKey: 'lesson-0030-v2',
+          cards: [
+            {
+              title: '第 2 版：深度预 Pass 就地排序',
+              tags: ['CPU', '课程版 + 项目的场景类'],
+              desc: '场景里再加一个 opaque 的小球（在 Mary 后面加进树）。Pipeline 里放两个 Pass：先是一个「深度预 Pass」，它想从近到远画，于是对 frame.opaque 调用 sort；然后是 ForwardPassV2。',
+              note: HELPER_NOTE + V2_NOTE + ' 深度预 Pass 和 addBall 是课程写的；预 Pass 只排序，不 draw。',
+              question: 'ForwardPassV2 画 opaque 的顺序是？',
+              choices: ['小球 → Mary：预 Pass 把共享的数组排过了', 'Mary → 小球：预 Pass 排的是自己的副本', '抛错：数组不能排序'],
+              answer: 0,
+              explain:
+                '第 2 版的 <code>FrameV2.opaque</code> 是普通数组，两个 Pass 拿到的是同一个数组对象。<code>Array.prototype.sort</code> 就地排序，预 Pass 一排，ForwardPassV2 看到的顺序也变了（树里的顺序是 Mary、小球）。这次只是顺序变了，后果不大；如果预 Pass 用 splice 删掉了它不画的 item，ForwardPass 就会漏画。要让 Pass 之间互不干扰，交出去的数组就不能被改（5.3 节）。',
+              run: () => {
+                const h = hw2Scene()
+                addBall(h)
+                const backend = new RecordingBackend(h.names)
+                const prepass = {
+                  execute(frame) {
+                    frame.opaque.sort((a, b) => distance(a, frame.view) - distance(b, frame.view))
+                    backend.lines.push({ text: '预 Pass：opaque 排成 ' + frame.opaque.map((item) => h.names.get(item.material)).join(' → '), kind: 'muted' })
+                  }
+                }
+                C.renderFrameV2([prepass, new C.ForwardPassV2()], h.scene, h.camera, backend)
+                return { lines: [{ text: '树里 opaque 的顺序：Mary、小球', kind: 'muted' }, ...backend.lines] }
+              }
+            },
+            {
+              title: '第 2 版：相机缩放成 0',
+              tags: ['CPU', '课程版 + 项目的场景类'],
+              desc: '把相机的缩放设成 (0, 1, 1)（setScale 接受 0），用第 2 版画一帧，看交出去的 viewMatrix。',
+              note: HELPER_NOTE + V2_NOTE,
+              question: '第 2 版会怎样？',
+              choices: ['照常提交两次 draw，viewMatrix 是单位矩阵，不报错', '抛错：矩阵不可逆', '跳过这一帧，什么都不画'],
+              answer: 0,
+              explain:
+                '缩放 0 的世界矩阵行列式是 0，没有逆。gl-matrix 的 <code>mat4.invert</code> 这时返回 null、不写 out；view 还是 <code>mat4.create()</code> 给的单位矩阵，就这样交了出去。画面是错的（相当于相机在原点、朝 −Z 看），却没有任何错误。真实代码检查了返回值，不可逆就抛错（5.1 节）；注释原话是「不用单位矩阵掩盖错误」。',
+              run: () => {
+                const h = hw2Scene()
+                h.camera.transform.setScale([0, 1, 1])
+                const backend = new RecordingBackend(h.names)
+                C.renderFrameV2([new C.ForwardPassV2()], h.scene, h.camera, backend)
+                const view = backend.submissions[0].view.viewMatrix
+                return {
+                  lines: [
+                    { text: 'camera.transform.setScale([0, 1, 1]) → 成功', kind: 'muted' },
+                    ...backend.lines,
+                    { t: '结果', text: '交出去的 viewMatrix = [' + Array.from(view).map(fmt).join(', ') + ']', kind: 'result' }
+                  ]
+                }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 5.1 真实 build ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-build'),
+          storageKey: 'lesson-0030-build',
+          cards: [
+            {
+              title: '真实代码：同样的两个坏输入',
+              tags: ['CPU', '项目代码'],
+              desc: '第一次：背景的 Geometry 先 dispose。第二次：相机缩放成 (0, 1, 1)。都用真实的 Renderer、RenderListBuilder、RenderPipeline、ForwardPass 画一帧。',
+              note: HELPER_NOTE,
+              question: '相机缩放成 0，真实代码的 Backend 收到了什么？',
+              choices: ['什么都没收到，连清屏都没有', '先清屏，再抛错', '两次 draw，viewMatrix 是单位矩阵'],
+              answer: 0,
+              explain:
+                'Renderer 先 build、再 <code>pipeline.execute</code>（<a data-src="src/rendering/Renderer.ts:67">Renderer.ts:67–76</a>）。相机在 build 的第 1 步，求逆失败就抛 InvalidRenderViewError；背景的 Geometry 释放了，第 3 步遍历到它时 getter 抛 ResourceDisposedError。两种情况都还没开 scope，Backend 一次调用都没收到，屏幕保留上一帧。',
+              run: () => {
+                const lines = []
+                const a = hw2Scene(true)
+                a.backgroundGeometry.dispose()
+                const backendA = new RecordingBackend(a.names)
+                try {
+                  realRenderer(backendA).render({ scene: a.scene, camera: a.camera, frame: FRAME })
+                } catch (error) {
+                  lines.push({ t: '第一次', text: '背景 Geometry 已释放 → 抛出 ' + err(error), kind: 'abort' })
+                }
+                lines.push({ text: 'Backend 收到 ' + backendA.lines.length + ' 次调用', kind: 'muted' })
+                const b = hw2Scene()
+                b.camera.transform.setScale([0, 1, 1])
+                const backendB = new RecordingBackend(b.names)
+                try {
+                  realRenderer(backendB).render({ scene: b.scene, camera: b.camera, frame: FRAME })
+                } catch (error) {
+                  lines.push({ t: '第二次', text: '相机缩放 0 → 抛出 ' + err(error), kind: 'abort' })
+                }
+                lines.push({ t: '结果', text: 'Backend 收到 ' + backendB.lines.length + ' 次调用', kind: 'result' })
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 5.3 冻结 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-freeze'),
+          storageKey: 'lesson-0030-freeze',
+          cards: [
+            {
+              title: '真实代码：深度预 Pass 就地排序',
+              tags: ['CPU', '项目代码'],
+              desc: '和 4.1 节第一张卡片一样的场景和预 Pass，换成真实链路：预 Pass 对 context.renderList.opaque 调用 sort。第二次运行换一种写法：先复制再排。',
+              note: HELPER_NOTE + ' 两个预 Pass（就地排序、复制后排序）是课程写的，只排序、不 draw。',
+              question: '预 Pass 对 context.renderList.opaque 就地 sort，会怎样？',
+              choices: ['抛 TypeError：数组被冻结了', '排序成功，ForwardPass 看到新顺序', '排序被悄悄忽略，ForwardPass 照原顺序画'],
+              answer: 0,
+              explain:
+                'RenderList 构造时冻结了两条队列（<a data-src="src/rendering/frame/RenderList.ts:28">RenderList.ts:28–29</a>）。sort 要写回数组元素，冻结的数组不让写，抛 TypeError（内置方法不管是不是严格模式都抛）。TypeScript 里 <code>readonly RenderItem[]</code> 本来就没有 sort 方法，冻结这一层是给 JavaScript 调用者和类型断言准备的。错误从 Pass 原样传出 Renderer：Pipeline 不吞错（7.2 节）。想要自己的顺序，就先复制再排：<code>[...opaque].sort(…)</code>，第二次运行就是这样，ForwardPass 照树的顺序画。',
+              run: () => {
+                const h = hw2Scene()
+                addBall(h)
+                const lines = []
+                const inPlace = {
+                  name: 'DepthPrepass',
+                  execute(context) {
+                    context.renderList.opaque.sort((a, b) => distance(a, context.view) - distance(b, context.view))
+                    return undefined
+                  },
+                  dispose() {}
+                }
+                const backendA = new RecordingBackend(h.names)
+                try {
+                  realRenderer(backendA, [inPlace, new F.ForwardPass()]).render({ scene: h.scene, camera: h.camera, frame: FRAME })
+                } catch (error) {
+                  lines.push({ t: '就地排', text: '抛出 ' + err(error) + '；Backend 收到 ' + backendA.lines.length + ' 次调用', kind: 'abort' })
+                }
+                const backendB = new RecordingBackend(h.names)
+                const copied = {
+                  name: 'DepthPrepass',
+                  execute(context) {
+                    const order = [...context.renderList.opaque].sort((a, b) => distance(a, context.view) - distance(b, context.view))
+                    backendB.lines.push({ text: '预 Pass 自己的顺序：' + order.map((item) => h.names.get(item.material)).join(' → '), kind: 'muted' })
+                    return undefined
+                  },
+                  dispose() {}
+                }
+                realRenderer(backendB, [copied, new F.ForwardPass()]).render({ scene: h.scene, camera: h.camera, frame: FRAME })
+                lines.push({ t: '复制后排', text: '第二次运行：', kind: 'muted' })
+                return { lines: [...lines, ...backendB.lines] }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 5.4 复制与借用 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-borrow'),
+          storageKey: 'lesson-0030-borrow',
+          cards: [
+            {
+              title: 'build 之后挪位置、改材质参数',
+              tags: ['CPU', '项目代码'],
+              desc: '场景里加一个小球：位置 x = 2，材质有个参数 uTint = [1, 1, 1]。直接调用真实的 RenderListBuilder.build 拿到 RenderList，然后把小球挪到 x = 5、把 uTint 改成 [1, 0, 0]，再看手里那个 item。',
+              note: HELPER_NOTE + ' 小球是课程加的。',
+              question: '拿着这个 item 去 draw，Backend 收到的是？',
+              choices: ['位置还是 x = 2（矩阵是复制的），uTint 是 [1, 0, 0]（Material 是借来的）', '位置 x = 5，uTint 是 [1, 0, 0]：两样都是活的', '位置 x = 2，uTint 是 [1, 1, 1]：整份都是快照'],
+              answer: 0,
+              explain:
+                '矩阵在 build 时复制、冻结（5.1、5.2 节），之后挪位置改的是 Transform，影响不到它；写它也写不进去。Material 是同一个对象（<code>item.material === 小球的材质</code> 是 true），setParameter 改了它，item 里看到的就是新值。这是有意的分工：Material 的身份是 Manager 缓存的 key（第 4 课），复制它会让 Backend 每帧重新上传。代价是「这一帧的值」只对矩阵和队列成立，对材质参数不成立：如果某个 Pass 在两个 draw 之间改了材质参数，后一个 draw 看到的就是新值。',
+              run: () => {
+                const h = hw2Scene()
+                const material = new F.Material({ shaderModule: h.shader, parameters: { uTint: { type: 'vec3', value: [1, 1, 1] } } })
+                const ball = new F.Mesh(h.geometry, material)
+                ball.transform.setPosition([2, 0, 0])
+                h.scene.add(ball)
+                const { renderList } = new F.RenderListBuilder().build({ scene: h.scene, camera: h.camera, frame: FRAME })
+                const item = renderList.opaque.find((entry) => entry.material === material)
+                const lines = [{ text: 'build 完：item.worldMatrix[12] = ' + item.worldMatrix[12] + '，uTint = ' + JSON.stringify(item.material.getParameter('uTint').value), kind: 'muted' }]
+                ball.transform.setPosition([5, 0, 0])
+                material.setParameter('uTint', { type: 'vec3', value: [1, 0, 0] })
+                lines.push({ text: '小球挪到 x = 5，uTint 改成 [1, 0, 0]', kind: 'user' })
+                let write = '成功'
+                try {
+                  item.worldMatrix[12] = 99
+                } catch (error) {
+                  write = err(error)
+                }
+                lines.push({ text: '试着写 item.worldMatrix[12] = 99 → ' + write, kind: 'abort' })
+                lines.push({
+                  t: '结果',
+                  text: 'item.worldMatrix[12] = ' + item.worldMatrix[12] + '，uTint = ' + JSON.stringify(item.material.getParameter('uTint').value) + '，同一个 Material → ' + (item.material === material) + '，同一个 Geometry → ' + (item.geometry === h.geometry),
+                  kind: 'result'
+                })
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 6.3 真实像素 ----------------
+        const GL_NOTE =
+          '课程写的部分：quad（两个逆时针三角形组成的矩形 Geometry）、单色 shader（顶点直接当裁剪坐标，片元输出 uColor）。WebGL1Backend、Renderer、RenderPipeline、ForwardPass、RenderListBuilder 都是项目代码（WebGL1Backend 是工作区版本）；读像素用的 gl 是 canvas.getContext 再取一次得到的同一个 context。' + V1_NOTE
+        function quad(x0, y0, x1, y1) {
+          return new F.Geometry({
+            attributes: {
+              [F.VertexAttributeSemantic.Position]: new F.VertexAttribute({
+                data: new Float32Array([x0, y0, 0, x1, y0, 0, x1, y1, 0, x0, y0, 0, x1, y1, 0, x0, y1, 0]),
+                itemSize: 3
+              })
+            }
+          })
+        }
+        function pixelRun(useV1) {
+          const canvas = document.createElement('canvas')
+          canvas.width = 4
+          canvas.height = 4
+          const backend = new F.WebGL1Backend(canvas, 'lesson30')
+          const gl = canvas.getContext('webgl')
+          try {
+            const shader = new F.ShaderModule({
+              name: 'lesson30/flat',
+              language: 'glsl-es-100',
+              vertexSource: 'attribute vec3 position;\nvoid main() { gl_Position = vec4(position, 1.0); }',
+              fragmentSource: 'precision mediump float;\nuniform vec4 uColor;\nvoid main() { gl_FragColor = uColor; }'
+            })
+            const scene = new F.Scene()
+            const green = new F.Mesh(quad(-0.5, -0.5, 0.5, 0.5), new F.Material({ shaderModule: shader, parameters: { uColor: { type: 'vec4', value: [0, 1, 0, 1] } } }))
+            const sky = new F.Mesh(
+              quad(-1, -1, 1, 1),
+              new F.Material({ shaderModule: shader, queue: 'background', state: { depthTest: false, depthWrite: false }, parameters: { uColor: { type: 'vec4', value: [1, 0, 0, 1] } } })
+            )
+            const camera = new F.PerspectiveCamera({ fovY: Math.PI / 4, aspect: 1, near: 0.1, far: 100 })
+            scene.add(green, sky, camera)
+            const frame = Object.freeze({ frameNumber: 1, timeSeconds: 0, deltaSeconds: 1 / 60, drawingBufferWidth: 4, drawingBufferHeight: 4, pixelRatio: 1 })
+            if (useV1) C.renderFrameV1([new C.ForwardPassV1()], scene, camera, backend)
+            else realRenderer(backend).render({ scene, camera, frame })
+            const read = (x, y) => {
+              const pixel = new Uint8Array(4)
+              gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel)
+              return '(' + Array.from(pixel).join(', ') + ')'
+            }
+            return { center: read(2, 2), corner: read(0, 0), error: gl.getError() }
+          } finally {
+            backend.dispose()
+          }
+        }
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-pixels'),
+          storageKey: 'lesson-0030-pixels',
+          cards: [
+            {
+              title: '关掉深度测试的背景：先画还是后画',
+              tags: ['真实 WebGL', '项目代码（WebGL1Backend 是工作区版本）'],
+              desc: '4 × 4 的画布。绿色矩形在中间（opaque，深度测试开），先加进树；红色矩形铺满全屏（queue 是 background，深度测试关、不写深度），后加进树。先用第 1 版画一次，再用真实链路画一次，各读中间和角上的像素。',
+              note: GL_NOTE,
+              question: '真实代码画完，中间那个像素是什么颜色？',
+              choices: ['绿：红的在 background 队列，先画；绿的后画，盖在上面', '红：红的后加进树，最后画', '红绿混合：两个都画在同一个像素上'],
+              answer: 0,
+              explain:
+                '第 1 版按树的顺序先画绿、再画红；红的关了深度测试，整屏盖过去，中间读到 (255, 0, 0, 255)。真实 ForwardPass 先走 background 队列（<a data-src="src/rendering/passes/ForwardPass.ts:28">ForwardPass.ts:28–33</a>），红的先画，绿的后画盖在中间，读到 (0, 255, 0, 255)；角上两次都是红色。没有开混合，所以不会混色（Backend 每次 draw 都关掉 BLEND，<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:311">WebGL1Backend.ts:311–320</a>）。queue 把「谁在最底下」写进材质，而不是依赖它在树里的位置。',
+              run: () => {
+                try {
+                  const v1 = pixelRun(true)
+                  const real = pixelRun(false)
+                  return {
+                    lines: [
+                      { t: '第 1 版', text: '中间 ' + v1.center + '，角上 ' + v1.corner + '，getError ' + v1.error, kind: 'late' },
+                      { t: '真实', text: '中间 ' + real.center + '，角上 ' + real.corner + '，getError ' + real.error, kind: 'result' }
+                    ]
+                  }
+                } catch (error) {
+                  return { lines: [{ text: '实验里抛出了没有预料到的错误：' + err(error), kind: 'late' }] }
+                }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 7.1 Pipeline ----------------
+        const fakeContext = Object.freeze({ frame: FRAME, view: {}, renderList: { background: [], opaque: [] }, backend: {} })
+        function logPass(name, lines, hooks = {}) {
+          return {
+            name,
+            execute(context) {
+              lines.push({ text: name + '.execute', kind: 'server' })
+              if (hooks.execute) hooks.execute(context)
+              return undefined
+            },
+            dispose() {
+              lines.push({ text: name + '.dispose', kind: 'muted' })
+              if (hooks.dispose) hooks.dispose()
+            }
+          }
+        }
+        const attempt = (lines, label, action) => {
+          try {
+            action()
+          } catch (error) {
+            lines.push({ text: label + '抛出 ' + err(error), kind: 'abort' })
+          }
+        }
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-pipeline'),
+          storageKey: 'lesson-0030-pipeline',
+          cards: [
+            {
+              title: '一次性的烘焙 Pass，跑完就把自己移除',
+              tags: ['CPU', '课程版 + 项目代码'],
+              desc: 'Pipeline 里依次是 Bake、Shadow、Forward。Bake 在 execute 里调用 pipeline.removePass(自己)（比如环境贴图只需要烘焙一次）。先用第 1 版跑两帧，再用真实的 RenderPipeline 跑两帧。',
+              note: PIPE_NOTE,
+              question: '第 1 版第 1 帧，Shadow 执行了吗？',
+              choices: ['没有：Bake 删掉自己后数组左移，for…of 的下一个下标落到了 Forward', '执行了：for…of 遍历的是开始时的副本', '执行了两次'],
+              answer: 0,
+              explain:
+                'for…of 遍历数组靠的是下标：Bake 在下标 0，执行时把自己 splice 掉，Shadow 移到 0、Forward 移到 1；迭代器接着取下标 1，就是 Forward。Shadow 这一帧被跳过了（第 8 课卡片 E「遍历时改树，b 被跳过」是同一件事）。真实 Pipeline 在 execute 期间 busy = true，removePass 直接抛 RenderExecutionError，这一帧中断；第 2 帧 Bake 还在，又抛一次。正确做法：等 render 返回以后再 removePass，或者让 Bake 自己记「做过了」，之后 execute 什么都不做。',
+              run: () => {
+                const lines = []
+                for (const [label, Pipeline] of [
+                  ['第 1 版', C.PipelineV1],
+                  ['真实', F.RenderPipeline]
+                ]) {
+                  const pipeline = new Pipeline()
+                  const bake = logPass('Bake', lines, { execute: () => pipeline.removePass(bake) })
+                  pipeline.addPass(bake)
+                  pipeline.addPass(logPass('Shadow', lines))
+                  pipeline.addPass(logPass('Forward', lines))
+                  lines.push({ t: label, text: '第 1 帧', kind: 'user' })
+                  attempt(lines, '', () => pipeline.execute(fakeContext))
+                  lines.push({ t: label, text: '第 2 帧', kind: 'user' })
+                  attempt(lines, '', () => pipeline.execute(fakeContext))
+                }
+                return { lines }
+              }
+            },
+            {
+              title: '同一个 Pass 加了两次',
+              tags: ['CPU', '课程版 + 项目代码'],
+              desc: '对同一个 Forward 调用两次 addPass，执行一帧，再 dispose 整个 Pipeline。先第 1 版，再真实的。',
+              note: PIPE_NOTE,
+              question: '第 1 版每帧 execute Forward 几次、dispose 时释放它几次？',
+              choices: ['execute 2 次，dispose 2 次', 'execute 1 次，dispose 1 次', 'execute 2 次，dispose 1 次'],
+              answer: 0,
+              explain:
+                '数组不管重复。Forward 如果拥有一个 RenderTarget，第二次 dispose 就是对已经释放的资源再释放一次。RenderPass 的契约要求 dispose 幂等（<a data-src="src/rendering/passes/RenderPass.ts:10">RenderPass.ts:10–16</a>），但 Pipeline 不该靠别人做到。真实 Pipeline 用 accepted（WeakSet）记住收过的每个 Pass，第二次 addPass 抛错；移除以后也不能再加回来，因为它已经被 dispose 了（测试 <a data-src="tests/unit/rendering/passes/RenderPipeline.test.ts:68">RenderPipeline.test.ts:68</a>）。',
+              run: () => {
+                const lines = []
+                for (const [label, Pipeline] of [
+                  ['第 1 版', C.PipelineV1],
+                  ['真实', F.RenderPipeline]
+                ]) {
+                  const pipeline = new Pipeline()
+                  const forward = logPass('Forward', lines)
+                  lines.push({ t: label, text: 'addPass 两次', kind: 'user' })
+                  pipeline.addPass(forward)
+                  attempt(lines, '第二次 addPass ', () => pipeline.addPass(forward))
+                  lines.push({ t: label, text: '执行一帧', kind: 'user' })
+                  pipeline.execute(fakeContext)
+                  lines.push({ t: label, text: 'dispose', kind: 'user' })
+                  pipeline.dispose()
+                }
+                return { lines }
+              }
+            },
+            {
+              title: 'Bloom 的 dispose 第一次失败',
+              tags: ['CPU', '课程版 + 项目代码'],
+              desc: 'Pipeline 里依次是 Shadow、Bloom、Forward。Bloom 第一次 dispose 时抛错（比如删 FBO 时 context 正好丢了），第二次成功。dispose 一次 → 试着再执行一帧 → 重试 dispose → 再调一次 dispose。',
+              note: PIPE_NOTE,
+              question: '真实 Pipeline 重试 dispose 时，哪几个 Pass 的 dispose 被调用？',
+              choices: ['Bloom、Forward', 'Shadow、Bloom、Forward', '只有 Forward'],
+              answer: 0,
+              explain:
+                '第 1 版：Shadow、Bloom 释放，Bloom 抛错，<code>this.passes = []</code> 没执行到；之后 execute 照样跑（三个 Pass 里两个已经释放了一半）；重试时 Shadow 又释放一次。真实代码每成功一个就 shift 掉（<a data-src="src/rendering/passes/RenderPipeline.ts:143">RenderPipeline.ts:143–152</a>），失败的 Bloom 留在队首；状态变成 closing，execute、addPass、removePass 都被拒绝，只能重试 dispose，从 Bloom 接着做。全部成功才是 disposed，再调直接返回。',
+              run: () => {
+                const lines = []
+                for (const [label, Pipeline] of [
+                  ['第 1 版', C.PipelineV1],
+                  ['真实', F.RenderPipeline]
+                ]) {
+                  const pipeline = new Pipeline()
+                  let fail = true
+                  pipeline.addPass(logPass('Shadow', lines))
+                  pipeline.addPass(
+                    logPass('Bloom', lines, {
+                      dispose: () => {
+                        if (fail) {
+                          fail = false
+                          throw new Error('deleteFramebuffer 失败')
+                        }
+                      }
+                    })
+                  )
+                  pipeline.addPass(logPass('Forward', lines))
+                  lines.push({ t: label, text: 'dispose', kind: 'user' })
+                  attempt(lines, '', () => pipeline.dispose())
+                  lines.push({ t: label, text: '再执行一帧', kind: 'user' })
+                  attempt(lines, '', () => pipeline.execute(fakeContext))
+                  lines.push({ t: label, text: '重试 dispose', kind: 'user' })
+                  attempt(lines, '', () => pipeline.dispose())
+                  lines.push({ t: label, text: '再调一次 dispose', kind: 'user' })
+                  attempt(lines, '', () => pipeline.dispose())
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 8.1 render ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-render'),
+          storageKey: 'lesson-0030-render',
+          cards: [
+            {
+              title: 'context 丢了：ready 是 false',
+              tags: ['CPU', '项目代码'],
+              desc: 'RecordingBackend 的 ready 设成 false，render 一帧；再把 ready 改回 true，render 一帧。数 RenderListBuilder.build 被调用了几次。',
+              note: HELPER_NOTE + ' 给 build 包一层计数也是课程写的。',
+              question: 'ready 是 false 时 render，build 被调用几次？',
+              choices: ['0 次：Renderer 先问 ready，连场景都不读', '1 次：先提取，到 Backend 再跳过', '抛 WebGLContextLostError'],
+              answer: 0,
+              explain:
+                '<code>if (!this.backend.ready) return</code> 在 build 之前（<a data-src="src/rendering/Renderer.ts:51">Renderer.ts:51</a>）。不抛错是有意的：context 丢失是一种会自己恢复的状态（第 6 课第 5 节、第 13 课），每帧抛错会让 Engine 停掉循环。ready 变回 true 以后，下一帧照常提取、照常画（测试 <a data-src="tests/unit/rendering/RendererFlow.test.ts:172">RendererFlow.test.ts:172</a>）。',
+              run: () => {
+                const h = hw2Scene()
+                const backend = new RecordingBackend(h.names)
+                backend.ready = false
+                const builder = new F.RenderListBuilder()
+                const build = builder.build.bind(builder)
+                let builds = 0
+                builder.build = (view) => {
+                  builds++
+                  return build(view)
+                }
+                const pipeline = new F.RenderPipeline()
+                pipeline.addPass(new F.ForwardPass())
+                const renderer = new F.Renderer(backend, pipeline, builder)
+                renderer.render({ scene: h.scene, camera: h.camera, frame: FRAME })
+                const lines = [{ t: 'ready = false', text: 'build 调用 ' + builds + ' 次，Backend 收到 ' + backend.lines.length + ' 次调用', kind: 'late' }]
+                backend.ready = true
+                renderer.render({ scene: h.scene, camera: h.camera, frame: FRAME })
+                lines.push({ t: 'ready = true', text: 'build 累计 ' + builds + ' 次', kind: 'user' })
+                return { lines: [...lines, ...backend.lines] }
+              }
+            },
+            {
+              title: 'Pass 里再调 renderer.render',
+              tags: ['CPU', '项目代码'],
+              desc: 'Pipeline 里依次是 Minimap、ForwardPass。Minimap 第一次执行时在 execute 里调用 renderer.render（想再画一遍小地图）。画两帧。',
+              note: HELPER_NOTE + ' Minimap Pass 是课程写的。',
+              question: '会怎样？',
+              choices: ['抛 RenderExecutionError，这一帧中断；下一帧正常', '递归画一遍，再接着画外层', '内层被悄悄忽略，外层照常画完'],
+              answer: 0,
+              explain:
+                '外层 render 已经把 busy 设成 true，内层一进来就被 assertNotBusy 拒绝（<a data-src="src/rendering/Renderer.ts:49">Renderer.ts:49</a>）。错误从 Minimap 传出，ForwardPass 这一帧没执行；Pipeline 和 Renderer 的 finally 把 busy 复位，所以第 2 帧（Minimap 不再调用 render）一切正常。three.js 允许这种嵌套（第 11 节），本项目的做法是：要画两遍，就加两个 Pass。',
+              run: () => {
+                const h = hw2Scene()
+                const backend = new RecordingBackend(h.names)
+                const view = { scene: h.scene, camera: h.camera, frame: FRAME }
+                let renderer = null
+                let first = true
+                const minimap = {
+                  name: 'Minimap',
+                  execute() {
+                    if (first) {
+                      first = false
+                      renderer.render(view)
+                    }
+                    return undefined
+                  },
+                  dispose() {}
+                }
+                renderer = realRenderer(backend, [minimap, new F.ForwardPass()])
+                backend.lines.push({ t: '第 1 帧', text: 'render', kind: 'muted' })
+                attempt(backend.lines, '', () => renderer.render(view))
+                backend.lines.push({ t: '第 2 帧', text: 'render', kind: 'muted' })
+                renderer.render(view)
+                return { lines: backend.lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 8.2 dispose ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-dispose'),
+          storageKey: 'lesson-0030-dispose',
+          cards: [
+            {
+              title: 'Backend 的 dispose 第一次失败',
+              tags: ['CPU', '项目代码'],
+              desc: 'Pipeline 里有 Shadow、Forward。Backend 是课程写的替身，第一次 dispose 抛错、第二次成功。renderer.dispose 一次 → 试着 render → 重试 dispose → 再调一次。',
+              note: PIPE_NOTE + ' 这张卡片的 Backend 也是课程写的替身：dispose 第一次抛错。Renderer、RenderPipeline 是项目代码。',
+              question: '重试 renderer.dispose 时，调用了谁？',
+              choices: ['只有 backend.dispose：Pipeline 已经 disposed，直接返回', 'Shadow、Forward、backend 全部再来一遍', '什么都不调：Renderer 已经算释放了'],
+              answer: 0,
+              explain:
+                '第一次：Pipeline 先清理（Shadow、Forward），成功；backend.dispose 抛错，Renderer 停在 closing，render 被拒绝。重试时 <code>pipeline.dispose()</code> 看到自己是 disposed，直接返回（<a data-src="src/rendering/passes/RenderPipeline.ts:134">RenderPipeline.ts:134</a>），只有 backend.dispose 再执行一次；成功后 Renderer 是 disposed，第三次调用直接返回。每一层都把进度记在自己身上，上一层只需要重新调用。',
+              run: () => {
+                const lines = []
+                let fail = true
+                const backend = {
+                  ready: true,
+                  resizeDrawingBuffer() {},
+                  withRenderSurface(descriptor, callback) {
+                    callback()
+                  },
+                  draw() {},
+                  dispose() {
+                    lines.push({ text: 'backend.dispose', kind: 'muted' })
+                    if (fail) {
+                      fail = false
+                      throw new Error('释放失败')
+                    }
+                  }
+                }
+                const pipeline = new F.RenderPipeline()
+                pipeline.addPass(logPass('Shadow', lines))
+                pipeline.addPass(logPass('Forward', lines))
+                const renderer = new F.Renderer(backend, pipeline, new F.RenderListBuilder())
+                lines.push({ t: '第 1 次', text: 'renderer.dispose()', kind: 'user' })
+                attempt(lines, '', () => renderer.dispose())
+                lines.push({ t: '之后', text: 'renderer.render(…)', kind: 'user' })
+                attempt(lines, '', () => renderer.render({ scene: null, camera: null, frame: FRAME }))
+                lines.push({ t: '重试', text: 'renderer.dispose()', kind: 'user' })
+                attempt(lines, '', () => renderer.dispose())
+                lines.push({ t: '再调', text: 'renderer.dispose()', kind: 'user' })
+                attempt(lines, '', () => renderer.dispose())
+                lines.push({ t: '结果', text: '再调一次时没有任何输出', kind: 'result' })
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 9 一帧走一遍 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-frame'),
+          storageKey: 'lesson-0030-frame',
+          cards: [
+            {
+              title: 'HW2 一帧，真实链路',
+              tags: ['CPU', '项目代码'],
+              desc: '用真实的 Renderer、RenderListBuilder、RenderPipeline、ForwardPass 画一帧 HW2 形状的场景，打印 Backend 收到的调用和交出去的值。',
+              note: HELPER_NOTE,
+              question: 'Backend 收到的调用依次是？',
+              choices: ['进入 scope（入口清屏）→ draw 背景 → draw Mary → 离开 scope', '进入 scope → draw Mary → draw 背景 → 离开 scope', '单独一次 clear → 进入 scope → draw 背景 → draw Mary → 离开 scope'],
+              answer: 0,
+              explain:
+                '清屏是 scope 的入口描述，不是单独的调用（RenderBackend 没有公共的 clear，<a data-src="src/rendering/backend/RenderBackend.ts:15">RenderBackend.ts:15</a>）。背景在 background 队列，先画。两次 draw 拿到的是同一个 ViewState 对象，矩阵都冻结了。V 的平移列 (0, −9.8058, −52.9514) 就是第 25 课算过的 −Rᵀp；P[0] = 2.4142 ÷ (1600 / 900) = 1.3580。',
+              run: () => {
+                const h = hw2Scene()
+                const backend = new RecordingBackend(h.names)
+                realRenderer(backend).render({ scene: h.scene, camera: h.camera, frame: FRAME })
+                const [first, second] = backend.submissions
+                const view = first.view
+                return {
+                  lines: [
+                    ...backend.lines,
+                    { text: 'V 的平移列 (' + [12, 13, 14].map((i) => fmt(view.viewMatrix[i])).join(', ') + ')；P[0] = ' + fmt(view.projectionMatrix[0]) + '，P[5] = ' + fmt(view.projectionMatrix[5]) + '；位置 (' + view.cameraWorldPosition.join(', ') + ')', kind: 'muted' },
+                    { text: '背景 worldMatrix 对角线 ' + diag(first.item.worldMatrix) + '；Mary ' + diag(second.item.worldMatrix), kind: 'muted' },
+                    {
+                      t: '结果',
+                      text: '两次 draw 共用同一个 view → ' + (first.view === second.view) + '；view、矩阵、item 都冻结 → ' + (Object.isFrozen(view) && Object.isFrozen(view.viewMatrix) && Object.isFrozen(first.item) && Object.isFrozen(first.item.worldMatrix)),
+                      kind: 'result'
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0030"]'), [
+          {
+            q: 'HW2 场景先加 Mary、后加背景，ForwardPass 却先画背景。决定这个顺序的是什么？',
+            opts: ['背景材质的 queue 是 background，Builder 把它分进 background 队列，ForwardPass 先走这一队', 'Builder 按离相机的远近排序，背景更远', 'Scene.add 会把背景挪到孩子列表的最前面'],
+            answer: 0,
+            why: '同一队里保持树的顺序，不排序；两队之间 background 在前（5.1 节第 4 步、6.3 节）。'
+          },
+          {
+            q: 'HW1 那样的两个 Pass（阴影 + 前向），一帧里 RenderListBuilder.build 调用几次？',
+            opts: ['1 次：Renderer 提取一次，两个 Pass 拿到同一个冻结的 context', '2 次：每个 Pass 各提取一次', '0 次：Pass 自己遍历场景'],
+            answer: 0,
+            why: 'Renderer.ts:67 只调用一次 build；RenderPassContext 里没有 Scene，Pass 想遍历也没有入口（6.2 节、8.1 节）。'
+          },
+          {
+            q: '相机缩放成 0 时，为什么要在 build 里拒绝，而不是用单位矩阵继续画？',
+            opts: ['矩阵不可逆；用单位矩阵画面是错的却不报错，而在第一个 draw 之前拒绝不会留下半帧', '因为 GPU 遇到单位矩阵会报 INVALID_VALUE', '因为单位矩阵会让 Backend 的缓存失效'],
+            answer: 0,
+            why: '第 2 版卡片：单位矩阵照常交出去，没有任何错误；真实代码检查 invert 的返回值（5.1 节）。'
+          },
+          {
+            q: 'RenderItem 为什么复制矩阵、却借用 Material？',
+            opts: ['矩阵只有 16 个数、每帧都可能变；Material 大，而且它的身份是 Manager 缓存的 key，复制会让 Backend 每帧重新上传', 'Material 不能复制，因为它有私有字段', '矩阵是 Float32Array，必须复制才能上传'],
+            answer: 0,
+            why: '5.4 节的表；卡片里 build 之后改 uTint，item 看到新值，改位置则看不到。'
+          },
+          {
+            q: 'RenderPass.execute 的返回类型写成 undefined 而不是 void，挡住的是什么？',
+            opts: ['async 的 execute：返回 Promise 的实现通不过类型检查', '忘记写 return 的实现', '返回数字的实现在运行时会被拒绝'],
+            answer: 0,
+            why: '返回 void 的函数类型能接受返回任何东西的函数，包括 async 函数；undefined 不行（6.1 节的 tsc 实测）。不写 return 的函数本来就返回 undefined，能通过。'
+          },
+          {
+            q: '真实 Pipeline 的 dispose 在第 2 个 Pass 失败。重试时，第 1 个 Pass 的 dispose 会再被调用吗？',
+            opts: ['不会：成功的那个已经从数组里 shift 掉了', '会：重试从头开始', '不会：重试只调用失败的那一个，第 3 个也跳过'],
+            answer: 0,
+            why: '进度就记在数组里：成功一个移出一个，失败的留在队首，重试从它接着做，后面的也会做（7.2 节、卡片）。'
+          },
+          {
+            q: 'Renderer.dispose 为什么先 Pipeline、后 Backend，而且不把 backend.dispose 放进 finally？',
+            opts: ['Pass 拥有的 RenderTarget 释放时要靠 Backend 的 Manager 删 FBO；放进 finally 会在 Pipeline 失败时拆掉清理还要用的 Backend', '因为 Backend 释放得慢，放后面可以让画面先消失', '因为 finally 里不能抛错'],
+            answer: 0,
+            why: 'Renderer.ts:103–125 的注释；重试时已完成的 pipeline.dispose 直接返回（8.2 节）。'
+          },
+          {
+            q: 'backend.ready 是 false 时，Renderer.render 做什么？',
+            opts: ['直接返回：不调用 Builder，不读场景，不开 scope', '提取场景，但跳过所有 draw', '抛 WebGLContextLostError，让 Engine 停掉循环'],
+            answer: 0,
+            why: 'Renderer.ts:51；context 丢失是会自己恢复的状态，不应该让循环停下（第 10 节）。'
+          },
+          {
+            q: '在某个 Pass 的 execute 里调用 renderer.render，会怎样？',
+            opts: ['抛 RenderExecutionError（operation in progress），这一帧中断；busy 在 finally 复位，下一帧正常', '递归画一遍，像 three.js 那样', '被悄悄忽略'],
+            answer: 0,
+            why: 'Renderer.ts:49 的 assertNotBusy；three.js 允许嵌套 render，本项目用「多加一个 Pass」代替（8.1 节、第 11 节）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

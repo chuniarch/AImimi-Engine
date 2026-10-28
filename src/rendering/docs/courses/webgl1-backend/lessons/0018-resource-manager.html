@@ -1,0 +1,1135 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 18 课 · 资源协调器</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/resource-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 详细篇 12 · backend ⑥ · 约 75 分钟</p>
+    <h1>backend ⑥：一代 GPU 资源的组合根——WebGL1ResourceManager</h1>
+    <p class="lede">
+      第 15、16、17、29、27 课各讲了一个 Manager：program、buffer、顶点输入、二维纹理、cubemap、离屏目标。每个 Manager 都管得很好，可它们要一起工作：顶点输入的 VAO 记着 GeometryManager 的 buffer、按 ProgramManager 的 program 配置；context 丢了，六个都得知道；Backend 关闭时，六个要按一个安全的顺序删。WebGL1ResourceManager 只有 228 行，不画图、不上传、不缓存任何资源，专门回答「谁来建、谁来接线、谁来借出、谁来通知、按什么顺序关」。这一课先看一代里到底有哪些 GPU 对象，再写一个让 Backend 自己拿着六个 Manager 的第 1 版，看它在哪几处出事，最后读真实代码。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW1 的阴影会多出一个 RenderTarget 和一张 Mary 的颜色贴图，HW3 会多出 GBuffer；它们的 GPU 对象全都住在这一课讲的「一代」里。切换场景、退出 HW2、context 丢失再恢复时，这些对象是怎样被一次性忘掉或删掉的，答案都在 ResourceManager。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 第 4 课：CPU 资源和每个 context 的 GPU 表示是一对多，Manager 用 <code>Map&lt;CPU 对象, entry&gt;</code> 按对象身份缓存；② 第 13 课第 2 节：「一代」——context 丢失后旧 handle 全部作废，恢复后建一套新的 Manager；③ 第 15 课 2.6 节：beforeDelete 钩子——ProgramManager 删 program 之前，先调一个从外面递进来的函数，让顶点输入放掉相关的 VAO；④ 第 16 课 4.4 节：OES 顶点输入按「Geometry、program」两层缓存 VAO；⑤ 第 17、29、27 课：二维纹理、cubemap、离屏目标三个 Manager 各自的 get、release、invalidateForContextLoss、dispose；⑥ 第 30 课 8.2 节：Renderer.dispose 先 Pipeline、后 Backend。如果其中哪一条其实没懂，告诉我，我先补那一块。第 19 课不是前置。<br />
+      <strong>这一课从零讲的</strong>：一代里有哪些 GPU 对象、谁拥有谁借用；「组合根」是什么，为什么 Manager 之间互不 import；六个 getter 和 assertAvailable；一次丢失怎样通知到全部六个；关闭顺序怎么定、为什么已经有 beforeDelete 还要排顺序；失败后停在原地、重试从失败那一步接着做；关闭途中 context 丢了怎么办；它和 Backend、Lifecycle 怎样接；对照 three.js。<br />
+      <strong>版本</strong>：WebGL1ResourceManager.ts 在 ced2906 提交过，工作区里有 10 月 12 日的未提交改动（加了 Texture2DManager）；本课按 2026-10-14 的工作区版本讲。<br />
+      <strong>页面会用到你的显卡</strong>：卡片都在你的浏览器里创建真实的 WebGL context，用完释放。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">原始输入：一代里有什么</a>：<a href="#s1-1">Backend 在哪里用它</a> <a href="#s1-2">一代里的 GPU 对象</a></li>
+        <li><a href="#s2">需求</a></li>
+        <li><a href="#s3">第 1 版：Backend 自己拿着六个 Manager</a></li>
+        <li><a href="#s4">真实代码 ①：构造——组合根</a>：<a href="#s4-1">代码</a> <a href="#s4-2">谁 import 谁</a> <a href="#s4-3">两种钩子</a></li>
+        <li><a href="#s5">真实代码 ②：借出——六个 getter</a></li>
+        <li><a href="#s6">真实代码 ③：丢失——一次通知六个</a></li>
+        <li><a href="#s7">真实代码 ④：关闭</a>：<a href="#s7-1">顺序怎么定</a> <a href="#s7-2">屏障与重试</a> <a href="#s7-3">关闭途中丢失</a> <a href="#s7-4">四个状态字段</a></li>
+        <li><a href="#s8">和 Backend 怎样接</a></li>
+        <li><a href="#s9">和 Lifecycle 的关系</a></li>
+        <li><a href="#s10">架构视角：对照 three.js r177</a></li>
+        <li><a href="#s11">审查视角</a></li>
+        <li><a href="#s12">检查题</a></li>
+        <li><a href="#s13">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 原始输入：一代里有什么</h2>
+    <h3 id="s1-1">1.1 Backend 在哪里用到它</h3>
+    <p>Backend 每建「一代」（第 13 课），就新建一个 ResourceManager；之后 draw、丢失、关闭都经过它（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:259">WebGL1Backend.ts:259–305</a>）：</p>
+    <pre><code>// WebGL1Backend.ts（节选，注释是课程加的；工作区版本）
+// :259–305 建一代：能力快照、State、ResourceManager……
+private createGeneration(): Generation {
+  const capabilities = detectWebGL1Capabilities(this.gl) // 这一代的能力
+  const state = new WebGL1State(this.gl)
+
+  // 六个 Manager 由它一次建好；三样东西都属于这一代
+  const resources = new WebGL1ResourceManager(this.gl, capabilities, {
+    invalidateState: () =&gt; {
+      state.invalidate() // 任何 Manager 直接动了 GL，都让这一代的 State 忘掉缓存
+    }
+  })
+  // …
+  const uniforms = new WebGL1Uniforms(
+    this.gl,
+    capabilities.maxTextureUnits,
+    (texture) =&gt; resources.cubeTextures.get(texture),       // 每次都经过 getter
+    (source, uniformName) =&gt; {
+      if (source instanceof Texture2D) return resources.textures2D.get(source).handle
+      // …
+      return resources.renderTargets.resolveSampledColor(source)
+    }
+  )
+  // …
+}
+
+// :208–217 每次 draw：从它借出 Manager
+const program = generation.resources.programs.get(material.shaderModule)
+const buffers = generation.resources.geometries.get(geometry)
+// …
+generation.resources.vertexInputs.bind(geometry, buffers, program)
+
+// :331–336 context 丢了：整代作废
+private invalidateGeneration(): void {
+  this.epoch = {}
+  this.generation.valid = false
+  this.generation.state.invalidate()
+  this.generation.resources.invalidateForContextLoss()
+}
+
+// :242–256 Backend 关闭
+dispose(): void {
+  // …
+  this.generation.resources.dispose()
+  this.cleanupComplete = true
+}</code></pre>
+    <p>四个用法对应 ResourceManager 的四件事：<strong>构造</strong>（建六个 Manager 并接线）、<strong>借出</strong>（六个 getter）、<strong>通知丢失</strong>（invalidateForContextLoss）、<strong>关闭</strong>（dispose）。</p>
+
+    <h3 id="s1-2">1.2 一代里到底有哪些 GPU 对象</h3>
+    <p>先看实物。下面这张卡片在你的浏览器里建一代，给 gl 套一层记账的代理，数一数「刚建好时」和「用过一次以后」各有哪些 GPU 对象；用过一次是指：取一个 program、一个三角形的 buffer、配一次顶点输入、一张 1 × 1 的颜色贴图、一个 4 × 4 的离屏目标。最后关闭，看删除的顺序。</p>
+    <div id="lab-assemble"></div>
+    <p>我在 Chrome 里跑的结果是：</p>
+    <pre><code>刚建好：create 0 次
+用过一次：create shader#1、shader#2、program#1，
+          delete shader#1、shader#2（第 15 课：链接后只留 program），
+          create buffer#1、vao#1、texture#1（颜色贴图），
+          create framebuffer#1、texture#2（离屏目标的颜色附件）
+关闭：delete vao#1 → framebuffer#1 → texture#2 → texture#1 → buffer#1 → program#1</code></pre>
+    <p>把这些对象按「谁拥有、谁借用」排一排：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Manager</th><th>拥有（负责删）</th><th>借用别人的</th><th>讲过的课</th></tr></thead>
+      <tbody>
+        <tr><td>ProgramManager</td><td>program#1</td><td>—</td><td>第 15 课</td></tr>
+        <tr><td>GeometryManager</td><td>buffer#1（顶点、索引）</td><td>—</td><td>第 16 课</td></tr>
+        <tr><td>Texture2DManager</td><td>texture#1</td><td>—</td><td>第 29 课</td></tr>
+        <tr><td>CubeTextureManager</td><td>cubemap 纹理（这张卡片没用到）</td><td>—</td><td>第 17 课</td></tr>
+        <tr><td>RenderTargetManager</td><td>framebuffer#1、texture#2（以及深度 renderbuffer）</td><td>—</td><td>第 27 课</td></tr>
+        <tr><td>VertexInputManager（OES 策略）</td><td>vao#1</td><td><strong>vao#1 里记着 buffer#1；它的配置按 program#1 的 location 来</strong></td><td>第 16 课</td></tr>
+      </tbody>
+    </table></div>
+    <p>六个 Manager 里，只有顶点输入借用别人的东西。整个 ResourceManager 的设计，有一半是围绕这一条借用关系展开的。</p>
+
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 350" role="img" aria-label="Backend 只持有 ResourceManager。ResourceManager 建六个 Manager。顶点输入借用 GeometryManager 的 buffer 和 ProgramManager 的 program；Geometry 与 Program 两个 Manager 删除前通过 beforeDelete 钩子通知顶点输入。六个 Manager 共用一个 invalidateState 回调，指向这一代的 State。">
+          <defs>
+            <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+            <marker id="f1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <rect x="300" y="14" width="160" height="34" rx="5" class="box" />
+          <text x="380" y="36" text-anchor="middle" class="title">WebGL1Backend</text>
+          <path d="M380 48 L380 74" class="line" marker-end="url(#f1a)" />
+          <text x="388" y="66" class="small">每代建一个</text>
+          <rect x="250" y="76" width="260" height="40" rx="5" class="box hl" />
+          <text x="380" y="94" text-anchor="middle" class="title">WebGL1ResourceManager</text>
+          <text x="380" y="109" text-anchor="middle" class="small">建、接线、借出、通知、关闭</text>
+          <path d="M380 116 L380 140" class="line" />
+          <path d="M70 140 L690 140" class="line" />
+          <path d="M70 140 L70 158" class="line" marker-end="url(#f1a)" />
+          <path d="M194 140 L194 158" class="line" marker-end="url(#f1a)" />
+          <path d="M318 140 L318 158" class="line" marker-end="url(#f1a)" />
+          <path d="M442 140 L442 158" class="line" marker-end="url(#f1a)" />
+          <path d="M566 140 L566 158" class="line" marker-end="url(#f1a)" />
+          <path d="M690 140 L690 158" class="line" marker-end="url(#f1a)" />
+          <rect x="16" y="160" width="108" height="44" rx="5" class="box" />
+          <text x="70" y="179" text-anchor="middle">Program</text>
+          <text x="70" y="195" text-anchor="middle" class="small">program</text>
+          <rect x="140" y="160" width="108" height="44" rx="5" class="box" />
+          <text x="194" y="179" text-anchor="middle">Geometry</text>
+          <text x="194" y="195" text-anchor="middle" class="small">buffer</text>
+          <rect x="264" y="160" width="108" height="44" rx="5" class="box" />
+          <text x="318" y="179" text-anchor="middle">Texture2D</text>
+          <text x="318" y="195" text-anchor="middle" class="small">二维纹理</text>
+          <rect x="388" y="160" width="108" height="44" rx="5" class="box" />
+          <text x="442" y="179" text-anchor="middle">CubeTexture</text>
+          <text x="442" y="195" text-anchor="middle" class="small">cubemap</text>
+          <rect x="512" y="160" width="108" height="44" rx="5" class="box" />
+          <text x="566" y="179" text-anchor="middle">RenderTarget</text>
+          <text x="566" y="195" text-anchor="middle" class="small">FBO + 附件</text>
+          <rect x="636" y="160" width="108" height="44" rx="5" class="box hl" />
+          <text x="690" y="179" text-anchor="middle">VertexInput</text>
+          <text x="690" y="195" text-anchor="middle" class="small">VAO</text>
+          <path d="M676 204 L676 236 L180 236 L180 208" class="line dash" marker-end="url(#f1a)" />
+          <path d="M180 236 L56 236 L56 208" class="line dash" marker-end="url(#f1a)" />
+          <text x="430" y="228" text-anchor="middle" class="small">VAO 借用：记着 buffer，按 program 的 location 配置</text>
+          <path d="M84 204 L84 286 L716 286 L716 208" class="line accent" marker-end="url(#f1b)" />
+          <path d="M208 204 L208 286" class="line accent" />
+          <text x="400" y="304" text-anchor="middle" class="small accent">beforeDelete：删 buffer / program 之前，先请顶点输入放掉 VAO</text>
+          <text x="380" y="336" text-anchor="middle" class="small">另外，六个 Manager 拿到同一个 invalidateState，指向这一代的 State</text>
+        </svg>
+      </div>
+      <figcaption>图 1　一代的组成。实线是「建」，虚线是借用，蓝线是钩子。只有 ResourceManager 认识全部六个 Manager；Backend 只认识 ResourceManager。</figcaption>
+    </figure>
+
+    <h2 id="s2">2. 需求</h2>
+    <div class="table-scroll"><table>
+      <thead><tr><th>#</th><th>需求</th><th>具体场景</th></tr></thead>
+      <tbody>
+        <tr><td>①</td><td>六个 Manager 一起建：同一个 gl、同一份能力快照、同一个 invalidateState；建的时候不碰 GPU</td><td>Backend 每代建一次；恢复时要很快建出新的一代（第 13 课）</td></tr>
+        <tr><td>②</td><td>接线：删 buffer、program 之前，先删掉借用它们的 VAO；但 GeometryManager、ProgramManager 不应该认识顶点输入</td><td>调试时换 shader，旧 program 被删（第 15 课 2.6 节）</td></tr>
+        <tr><td>③</td><td>借出：Backend 每次 draw 都要拿 Manager；关闭以后、丢失以后不能再拿到</td><td>退出 HW2 后，残留的回调又去要 program</td></tr>
+        <tr><td>④</td><td>丢失：六个 Manager 都要「只忘不删」，一个都不能漏</td><td>第 27 课的卡片：没收到通知的 RenderTargetManager 恢复后交出一个已经失效的 FBO</td></tr>
+        <tr><td>⑤</td><td>关闭：按「先借用方、后所有者」的顺序删；某一步失败就停下、报错，之后可以重试，重试不重复已经做完的步骤</td><td>Engine 退出 HW2（第 30 课 8.2 节：Renderer 先关 Pipeline，再关 Backend）</td></tr>
+        <tr><td>⑥</td><td>关闭途中 context 丢了：剩下的步骤改成只忘不删</td><td>关页面、显卡驱动重置恰好发生在清理中途</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="s3">3. 第 1 版：Backend 自己拿着六个 Manager</h2>
+    <p>最直接的写法：六个 Manager 是公开字段，各建各的；关闭时挨个 dispose。<strong>这段是课程写的，项目里没有</strong>，下面的卡片跑的就是它：</p>
+    <pre><code>// 课程写的第 1 版（assets/build/resource-course.ts）
+export class ManagersV1 {
+  readonly programs: WebGL1ProgramManager
+  readonly geometries: WebGL1GeometryManager
+  readonly textures2D: WebGL1Texture2DManager
+  readonly cubeTextures: WebGL1CubeTextureManager
+  readonly renderTargets: WebGL1RenderTargetManager
+  readonly vertexInputs: WebGL1VertexInputManager
+
+  constructor(
+    gl: WebGLRenderingContext,
+    capabilities: WebGL1Capabilities,
+    hooks: ManagersV1Hooks
+  ) {
+    // 没有 beforeDelete：删 program、删 buffer 之前，没人通知顶点输入
+    this.programs = new WebGL1ProgramManager(gl, { invalidateState: hooks.invalidateState })
+    this.geometries = new WebGL1GeometryManager(gl, capabilities, {
+      invalidateState: hooks.invalidateState
+    })
+    this.textures2D = new WebGL1Texture2DManager(gl, capabilities, hooks)
+    this.cubeTextures = new WebGL1CubeTextureManager(gl, capabilities, hooks)
+    this.renderTargets = new WebGL1RenderTargetManager(gl, capabilities, hooks)
+    this.vertexInputs = createWebGL1VertexInputManager(gl, capabilities, hooks)
+  }
+
+  /** context 丢了：逐个通知。前提是调用者记得调用它。 */
+  invalidateForContextLoss(): void {
+    for (const manager of this.all()) manager.invalidateForContextLoss()
+  }
+
+  /** 尽力而为：一个失败了，接着清理下一个，最后把第一个错误抛出去。 */
+  dispose(): void {
+    let firstError: unknown = null
+    for (const manager of this.all()) {
+      try {
+        manager.dispose()
+      } catch (error) {
+        firstError ??= error
+      }
+    }
+    if (firstError !== null) throw firstError
+  }
+
+  /** 声明顺序：借用 buffer 和 program 的顶点输入排在最后。 */
+  private all() {
+    return [
+      this.programs,
+      this.geometries,
+      this.textures2D,
+      this.cubeTextures,
+      this.renderTargets,
+      this.vertexInputs
+    ]
+  }
+}</code></pre>
+    <p>看起来没毛病，而且每个子 Manager 自己都很严谨。先看第一处：</p>
+    <div id="lab-v1"></div>
+    <p>第 1 版一共有四处问题，后面几节逐个对上真实代码：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>第 1 版</th><th>后果</th><th>真实代码在哪里补</th></tr></thead>
+      <tbody>
+        <tr><td>Manager 之间没接线</td><td>删 program 时 VAO 没人删，一直占着（卡片）</td><td>构造时接 beforeDelete（第 4 节）</td></tr>
+        <tr><td>字段公开，谁都能一直拿着用</td><td>关闭后、丢失后照样能拿到 Manager；物理丢失只有被访问的那一个 Manager 自己发现</td><td>六个 getter + assertAvailable（第 5 节）</td></tr>
+        <tr><td>丢失通知靠调用者记得逐个调用</td><td>漏一个，恢复后它交出失效的 handle</td><td>invalidateForContextLoss 一次通知六个，而且是永久的（第 6 节）</td></tr>
+        <tr><td>关闭「尽力而为」，借用方排在最后</td><td>顶点输入清理失败时，buffer 和 program 已经被删了，VAO 还拿着它们</td><td>先借用方的固定顺序、失败停在原地、游标重试（第 7 节）</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="s4">4. 真实代码 ①：构造——组合根</h2>
+    <h3 id="s4-1">4.1 代码</h3>
+    <pre><code>// WebGL1ResourceManager.ts:74–120（注释是课程加的）
+constructor(
+  gl: WebGLRenderingContext,
+  capabilities: WebGL1Capabilities, // 这一代的能力快照，六个 Manager 共用
+  hooks: WebGL1ResourceManagerHooks // { invalidateState }，接到这一代的 State
+) {
+  // 已经丢失的 context 上不组装：建出来也只能立刻作废
+  if (gl.isContextLost()) throw new WebGLContextLostError('create resource manager')
+
+  this.gl = gl
+
+  // 顶点输入：按能力二选一（有 OES 扩展用 VAO，没有就手动接线，第 16 课）
+  this.vertexInputsValue = createWebGL1VertexInputManager(gl, capabilities, hooks)
+
+  // 接线：GeometryManager 删 buffer 之前，先请顶点输入放掉这个 Geometry 的 VAO
+  this.geometriesValue = new WebGL1GeometryManager(gl, capabilities, {
+    invalidateState: hooks.invalidateState,
+    beforeDelete: (geometry) =&gt; {
+      this.vertexInputsValue.releaseGeometry(geometry)
+    }
+  })
+
+  // 接线：ProgramManager 删 program 之前，先请顶点输入放掉按它配置的 VAO
+  this.programsValue = new WebGL1ProgramManager(gl, {
+    invalidateState: hooks.invalidateState,
+    beforeDelete: (program) =&gt; {
+      this.vertexInputsValue.releaseProgram(program)
+    }
+  })
+
+  // 三个纹理类 Manager 不借用任何人，只拿 invalidateState
+  this.textures2DValue = new WebGL1Texture2DManager(gl, capabilities, hooks)
+  this.cubeTexturesValue = new WebGL1CubeTextureManager(gl, capabilities, hooks)
+  this.renderTargetsValue = new WebGL1RenderTargetManager(gl, capabilities, hooks)
+
+  // 先结束借用方，再结束被借用的 GPU 资源所有者（第 7 节）
+  this.disposalOrder = Object.freeze([
+    this.vertexInputsValue,
+    this.renderTargetsValue,
+    this.textures2DValue,
+    this.cubeTexturesValue,
+    this.geometriesValue,
+    this.programsValue
+  ])
+}</code></pre>
+    <ul>
+      <li><strong>构造时不碰 GPU。</strong>六个 Manager 的构造函数都不创建 GPU 对象，program、buffer、纹理、FBO、VAO 都是第一次 get 时才建（1.2 节的卡片：建好时 create 0 次）。所以恢复时建一代很快，也不会在构造中途失败、留下一半 GPU 对象。</li>
+      <li><strong>为什么先建顶点输入？</strong>两个钩子是闭包，里面写的是 <code>this.vertexInputsValue</code>，要到真正删除时才读这个字段。严格说先建谁都行，只要构造过程中不发生删除；先建它，读代码的人一眼看出「后面两个 Manager 依赖它」。</li>
+      <li><strong>disposalOrder 用 Object.freeze 冻结。</strong>顺序是这个类最重要的约定之一，冻结以后谁也不能在运行时往里插、改顺序。</li>
+    </ul>
+
+    <h3 id="s4-2">4.2 谁 import 谁：为什么需要「组合根」</h3>
+    <p>我逐个看了 webgl1 目录下这几个文件顶部的 import（只看它们之间的）：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>文件</th><th>import 了哪些 Manager</th></tr></thead>
+      <tbody>
+        <tr><td>WebGL1GeometryManager.ts</td><td>无</td></tr>
+        <tr><td>WebGL1ProgramManager.ts</td><td>无</td></tr>
+        <tr><td>WebGL1Texture2DManager.ts、CubeTextureManager.ts、RenderTargetManager.ts</td><td>无（只用共享的 TextureUploadSupport）</td></tr>
+        <tr><td>WebGL1OESVertexInputManager.ts、ManualVertexInputManager.ts</td><td>只 <code>import type</code> 了 Geometry、Program 两个 Manager 交出来的<strong>结果类型</strong>，不引用它们的类</td></tr>
+        <tr><td><strong>WebGL1ResourceManager.ts</strong></td><td><strong>全部六个</strong></td></tr>
+        <tr><td>WebGL1Backend.ts</td><td>只有 ResourceManager（外加 State、Uniforms、SurfaceScope、Lifecycle）</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      这种「只有一个地方认识所有零件，并负责把它们装起来、接好线」的写法叫<strong>组合根 (composition root)</strong>。零件只声明自己需要什么（GeometryManager 说「删除之前，我会调用 beforeDelete，如果有人给了的话」），不去 import 别的零件。好处是：
+    </p>
+    <ul>
+      <li>GeometryManager 可以单独测试、单独使用（它的单元测试就不带顶点输入，beforeDelete 是可选的 <code>?</code>，<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:50">GeometryManager.ts:50</a>）。</li>
+      <li>换掉顶点输入的实现（OES 或手动，甚至以后的 WebGL2 VAO），只改组合根一处。</li>
+      <li>依赖关系全写在一个构造函数里：想知道「删 buffer 前会发生什么」，看 ResourceManager 的第 93–98 行就够了，不用在六个文件之间来回找。</li>
+    </ul>
+
+    <h3 id="s4-3">4.3 两种钩子，两种规矩</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th></th><th>invalidateState</th><th>beforeDelete</th></tr></thead>
+      <tbody>
+        <tr><td>给谁</td><td>六个 Manager 都给，同一个函数</td><td>只给 GeometryManager、ProgramManager</td></tr>
+        <tr><td>做什么</td><td>让这一代的 State 忘掉缓存（第 14 课），因为 Manager 直接动了 GL 绑定</td><td>真正的清理：请顶点输入删掉相关 VAO</td></tr>
+        <tr><td>能不能抛错</td><td>不能（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:14">ResourceManager.ts:14–22</a> 的注释：只改 CPU 缓存标记，不发 GL 命令、不抛错）。它常在 finally 里调用，抛错会盖住原来的异常</td><td>可以。抛错就是「屏障」：调用方停下，不删 buffer / program，保留记录供重试（第 15 课 2.6 节）</td></tr>
+        <tr><td>为什么写成闭包</td><td colspan="2">类型要求返回 <code>undefined</code>（块体 <code>{ … }</code> 不返回值）；直接传 <code>this.vertexInputsValue.releaseGeometry</code> 会丢掉 this</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="s5">5. 真实代码 ②：借出——六个 getter</h2>
+    <pre><code>// WebGL1ResourceManager.ts:122–159、:217–227（节选，注释是课程加的）
+get programs(): WebGL1ProgramManager {
+  this.assertAvailable() // 每次借出之前都检查
+  return this.programsValue
+}
+// … geometries、textures2D、cubeTextures、renderTargets、vertexInputs 写法相同
+
+private assertAvailable(): void {
+  // 关闭已经开始（哪怕清理失败了）：不许开始新工作
+  if (this.closing) {
+    throw new WebGLBackendDisposedError('access resource manager')
+  }
+
+  // 这一代已经作废，或者 context 物理上已经丢了（可能比 DOM 事件早）
+  if (this.lost || this.gl.isContextLost()) {
+    this.invalidateForContextLoss() // 一个入口发现，六个全部作废
+    throw new WebGLContextLostError('access resource manager')
+  }
+}</code></pre>
+    <ul>
+      <li><strong>为什么不直接公开字段？</strong>公开字段谁都能一直拿着用；getter 让「借出」变成一个动作，每次都能检查这一代还能不能用。Backend 的解析闭包也是每次 draw 都写 <code>resources.cubeTextures.get(…)</code>，不把子 Manager 存在自己的变量里（1.1 节），所以每次 draw 都经过这道检查。</li>
+      <li><strong>物理丢失：一个入口发现，六个全部作废。</strong>context 可能已经丢了，但 webglcontextlost 事件还没派发（第 13 课）。这时 Backend 无论访问哪个 getter，都会先把六个 Manager 一起作废。第 1 版只能靠每个 Manager 在自己的 get 里各自发现，没被访问的那几个就不知道（第 9 节的卡片对比了这两种情况）。</li>
+      <li><strong>它收不回已经借出去的引用。</strong>注释写得很清楚（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:40">:40–42</a>）：「Getter 不是 JavaScript 引用撤销机制」。如果有人提前把 <code>resources.geometries</code> 存进变量，之后 getter 再拒绝也管不到它；好在每个子 Manager 自己也会检查 disposed 和 lost，这是第二道防线。</li>
+    </ul>
+    <div id="lab-getters"></div>
+
+    <h2 id="s6">6. 真实代码 ③：丢失——一次通知六个</h2>
+    <pre><code>// WebGL1ResourceManager.ts:171–179（注释是课程加的）
+invalidateForContextLoss(): void {
+  if (this.lost) return // 只做一次；后面再调用直接返回
+
+  this.lost = true // 永久：恢复事件不会把它改回 false
+
+  // 按关闭的顺序逐个通知；每个子 Manager 只丢记录、退订，不发 GL 命令
+  for (const manager of this.disposalOrder) {
+    manager.invalidateForContextLoss()
+  }
+}</code></pre>
+    <ul>
+      <li><strong>只忘不删。</strong>旧 context 上的 handle 已经全部作废，对它们调用 delete 没有意义；子 Manager 只清空自己的表、取消对 CPU 资源的订阅（不然 Geometry 释放时还会回调一个已经作废的 Manager）。</li>
+      <li><strong>永久。</strong>恢复以后 <code>gl.isContextLost()</code> 又是 false，但这一代不复活，Backend 会新建一代（第 9 节）。这和每个子 Manager 的 lost 标记是同一个规矩。</li>
+      <li><strong>谁调用它。</strong>两个入口：Lifecycle 收到 lost 事件后经 Backend.invalidateGeneration 调用；或者 assertAvailable、dispose 自己发现物理丢失时调用。</li>
+    </ul>
+
+    <h2 id="s7">7. 真实代码 ④：关闭</h2>
+    <pre><code>// WebGL1ResourceManager.ts:197–215（注释是课程加的）
+dispose(): void {
+  // 正在关闭（同步重入）或者已经全部做完：直接返回
+  if (this.disposing || this.disposalIndex === this.disposalOrder.length) return
+
+  this.closing = true   // 第一次调用就置上：从此不再借出 Manager，失败了也不恢复
+  this.disposing = true
+
+  try {
+    while (this.disposalIndex &lt; this.disposalOrder.length) {
+      // 每一步之前都看一眼：context 中途丢了，剩下的改成只忘不删
+      if (this.gl.isContextLost()) this.invalidateForContextLoss()
+
+      const manager = this.disposalOrder[this.disposalIndex]!
+      manager.dispose()        // 抛错：下一行不执行，游标停在这一步，错误原样往外传
+      this.disposalIndex += 1  // 只有这一步成功了才前进
+    }
+  } finally {
+    this.disposing = false     // 出错也复位，调用者处理完异常可以再调一次
+  }
+}</code></pre>
+
+    <h3 id="s7-1">7.1 顺序怎么定</h3>
+    <p>顺序是 vertexInputs → renderTargets → textures2D → cubeTextures → geometries → programs。先列出六个 Manager 之间真正的借用关系：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>谁</th><th>引用了谁的 GPU 对象</th><th>对顺序的要求</th></tr></thead>
+      <tbody>
+        <tr><td>vertexInputs 的 VAO</td><td>geometries 的 buffer、programs 的 program（配置按它的 location）</td><td><strong>必须在 geometries、programs 之前</strong></td></tr>
+        <tr><td>renderTargets 的 FBO</td><td>只引用自己建的附件纹理、renderbuffer</td><td>自己内部先删 FBO 再删附件；对别人没有要求</td></tr>
+        <tr><td>textures2D、cubeTextures</td><td>谁都不引用</td><td>没有要求</td></tr>
+      </tbody>
+    </table></div>
+    <p>所以硬性的只有一条：顶点输入在 buffer 和 program 之前。三个纹理类排在中间，彼此的先后只是约定。</p>
+    <p>
+      <strong>已经有 beforeDelete 了，为什么还要排顺序？</strong>确实，就算把顺序反过来，GeometryManager 删每个 buffer 之前也会通过 beforeDelete 先删掉相关 VAO。固定「借用方在前」仍然有三个好处：
+    </p>
+    <ol>
+      <li><strong>一次删完，钩子变成空操作。</strong>vertexInputs.dispose 一次删掉全部 VAO；之后 geometries、programs 的 beforeDelete 再调用 releaseGeometry / releaseProgram 时，顶点输入已经关闭，直接返回（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:163">OESVertexInputManager.ts:163–164</a>）。</li>
+      <li><strong>不依赖一个可选的钩子。</strong>beforeDelete 是可选的；关闭的正确性不该建立在「别人记得传了这个函数」上。</li>
+      <li><strong>失败时有屏障。</strong>借用方的清理失败了，就停下来，不去删它还引用着的东西。这一条最重要，下一节用卡片看。</li>
+    </ol>
+    <p>同一条规则「先放手，再删除」在三个粒度上都出现：ResourceManager 的 disposalOrder（Manager 之间）、beforeDelete（单个 Geometry 或 program）、RenderTargetManager 内部先删 FBO 再删附件（单个目标）。</p>
+
+    <h3 id="s7-2">7.2 屏障与重试</h3>
+    <p>
+      先说明一点：真实的 <code>gl.deleteBuffer</code> 这类调用不会抛错。会让某一步清理失败的，是钩子、退订 CPU 资源时的监听器、Manager 自己的代码缺陷，或者手动顶点输入策略在 unbind 里读到别人留下的 GL 错误码。下面的卡片用注入错误来模拟「顶点输入这一步失败了」。
+    </p>
+    <div id="lab-barrier"></div>
+    <p>
+      第 1 版这里的问题不是「最后清理不干净」：重试一次，它也能把 VAO 删掉。问题在<strong>失败和重试之间</strong>：GeometryManager 以为 buffer 已经删了，<code>isBuffer</code> 也说 false，可 VAO 还拿着它，显存没有释放，用这个 VAO 照样画得出图（卡片里画出了紫色）。如果调用者没有重试，这块显存就一直被一个「已经删除」的 buffer 占着，任何记账都看不到它。真实代码停在第一步，所有对象都还活着、记录都还对得上，重试时从顶点输入接着做，每个对象只删一次。
+    </p>
+    <p>
+      游标 <code>disposalIndex</code> 只在某一步正常返回后才加一，所以重试不会重复已经成功的步骤。第 30 课的 RenderPipeline.dispose 用的是同一个思路（成功一个 shift 一个）；Renderer、Backend、ResourceManager、各个子 Manager 一层套一层，每一层都把「做到哪了」记在自己身上，上一层只要再调一次 dispose。
+    </p>
+
+    <h3 id="s7-3">7.3 关闭途中 context 丢了</h3>
+    <p>每一步之前都检查一次 <code>gl.isContextLost()</code>：丢了就先 invalidateForContextLoss（六个全部只忘不删），再继续走完剩下的 dispose。子 Manager 的 dispose 看到自己已经 lost，就不发 delete 命令（比如 <a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:388">RenderTargetManager.ts:388–402</a>）。</p>
+    <div id="lab-lost-dispose"></div>
+
+    <h3 id="s7-4">7.4 四个状态字段</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>字段</th><th>什么时候变</th><th>表示什么</th><th>不表示什么</th></tr></thead>
+      <tbody>
+        <tr><td><code>closing</code></td><td>第一次 dispose 时置 true，永不复原</td><td>不再借出 Manager</td><td>不表示清理已经成功</td></tr>
+        <tr><td><code>lost</code></td><td>第一次 invalidateForContextLoss 时置 true，永不复原</td><td>这一代的 GPU 记录全部作废</td><td>不表示 context 现在还丢着（可能已经恢复）</td></tr>
+        <tr><td><code>disposing</code></td><td>dispose 执行期间为 true，finally 复位</td><td>拒绝同步重入（比如某个子 Manager 的 dispose 里又调了 ResourceManager.dispose，测试 <a data-src="tests/unit/rendering/backend/webgl1/WebGL1ResourceManager.test.ts:355">ResourceManager.test.ts:355</a>）</td><td>不是跨线程的锁</td></tr>
+        <tr><td><code>disposalIndex</code></td><td>每一步成功后加一</td><td>下一个还没做完的步骤</td><td>等于 6 时表示全部做完，dispose 直接返回</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="s8">8. 和 Backend 怎样接</h2>
+    <p>回头看 1.1 节的四个调用点，再补上恢复的那一处：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Backend 的时刻</th><th>对 ResourceManager 做什么</th><th>位置</th></tr></thead>
+      <tbody>
+        <tr><td>构造、恢复：建一代</td><td>new，传入这一代的能力和 State 的 invalidate</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:263">Backend.ts:263–267</a></td></tr>
+        <tr><td>每次 draw</td><td>经 getter 借出 programs、geometries、vertexInputs，Uniforms 的闭包经 getter 借出纹理类 Manager</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:208">:208–217</a>、<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:292">:292–302</a></td></tr>
+        <tr><td>lost 事件</td><td>invalidateForContextLoss</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:331">:331–336</a></td></tr>
+        <tr><td>恢复时发现自己已经被 dispose，或又丢了</td><td>刚建好的候选一代：先 invalidateForContextLoss，再 dispose，然后丢掉</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:83">:83–95</a></td></tr>
+        <tr><td>Backend.dispose</td><td>dispose；它抛错时 <code>cleanupComplete</code> 保持 false，Backend 下次 dispose 再调一次，ResourceManager 从失败那一步接着做</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:242">:242–256</a></td></tr>
+      </tbody>
+    </table></div>
+    <p>State 和 ResourceManager 同属一代、同时创建，invalidateState 只指向这一代的 State，所以旧一代的 Manager 就算还在执行清理，也不会去打扰新一代的缓存。</p>
+
+    <h2 id="s9">9. 和 Lifecycle 的关系</h2>
+    <p>第 13 课讲过 WebGLContextLifecycle 的两件事：丢失时作废一代，恢复时建新一代。落到 ResourceManager 上：</p>
+    <pre><code>丢失：canvas 的 webglcontextlost
+      → Lifecycle.onLost → Backend.invalidateGeneration()
+      → resources.invalidateForContextLoss()          （第 6 节）
+      → 六个子 Manager 各自 invalidateForContextLoss：清表、退订，不 delete
+
+恢复：canvas 的 webglcontextrestored
+      → Lifecycle 调用 restore → Backend.createGeneration()
+      → 重新探测能力 → new WebGL1ResourceManager(…)   （新的一代，表全是空的）
+      → 下一次 draw：按 CPU 对象身份懒创建，从仍然活着的 Geometry、Texture 等重新上传
+         离屏目标只能新建空存储，内容要由生产者重画（第 27 课）</code></pre>
+    <p>下面这张卡片把三件事放在一起：丢失以后访问一次 getter；恢复以后，提前拿到手的子 Manager 还会不会复活；一个没交给 ResourceManager、也没人通知的 RenderTargetManager 会怎样；最后新一代能不能从同一个 CPU 对象重建。</p>
+    <div id="lab-lifecycle"></div>
+
+    <h2 id="s10">10. 架构视角：对照 three.js r177</h2>
+    <p>
+      旧的 WebGLRenderer 在 <code>initGLContext()</code> 里一次建出二十来个模块（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:401">WebGLRenderer.js:401–440</a>），作用和本项目的 createGeneration 加 ResourceManager 相同。恢复时它直接再调用一次 initGLContext（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1023">:1023–1035</a>），旧的模块整套丢掉，也是「新的一代」的思路。
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>问题</th><th>three.js r177</th><th>本项目</th></tr></thead>
+      <tbody>
+        <tr><td>模块之间怎样认识</td><td>直接把依赖传进构造函数：WebGLGeometries 拿到 bindingStates（:424–425），删除时直接调用它</td><td>子 Manager 互不认识，由组合根用钩子接线</td></tr>
+        <tr><td>删 buffer 与删 VAO 的先后</td><td>先删 buffer，再 <code>bindingStates.releaseStatesOfGeometry</code>（<a data-src="node_modules/three/src/renderers/webgl/WebGLGeometries.js:9">WebGLGeometries.js:9–38</a>）</td><td>先删 VAO，再删 buffer（beforeDelete）</td></tr>
+        <tr><td>丢失时</td><td>只置一个 <code>_isContextLost</code> 标记（:1013–1021），恢复时整套重建</td><td>丢失时就把六个 Manager 的记录作废、退订；恢复时整套重建</td></tr>
+        <tr><td>renderer.dispose 删什么</td><td>只删 VAO（<a data-src="node_modules/three/src/renderers/webgl/WebGLBindingStates.js:474">WebGLBindingStates.js:474</a>）；properties.dispose 只是换一个新的 WeakMap（<a data-src="node_modules/three/src/renderers/webgl/WebGLProperties.js:38">WebGLProperties.js:38–42</a>），GPU 上的 buffer、纹理、program 不删，要用户逐个调用 geometry、texture、material 的 dispose</td><td>Backend.dispose 删掉这一代建过的全部 GPU 对象，按固定顺序，失败可续做；CPU 资源仍归用户</td></tr>
+        <tr><td>关闭失败</td><td>没有特别处理</td><td>停在失败的那一步，重试接着做</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      three.js 先删 buffer、后删 VAO 也能工作：它在每帧结束时把绑定记录重置，删 VAO 紧跟在删 buffer 后面，中间不会有 draw，buffer 成为「僵尸」的时间极短（课程备忘里实测过僵尸 buffer 的现象）。本项目选「先放手、再删除」，是为了让每一步失败时都有一个干净的停顿点，而不是依赖「两步之间没人用它」这个时间上的巧合。
+    </p>
+
+    <h2 id="s11">11. 审查视角</h2>
+    <h3 id="s11-1">11.1 重试只和每一步一样可靠</h3>
+    <p>
+      ResourceManager 的注释把「当前步骤内部的部分清理和重试安全」交给各个 Manager（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:189">:189–191</a>）。可六个子 Manager 的 dispose 写法并不一样：GeometryManager、ProgramManager、Texture2DManager 的 dispose 没有「调过一次就直接返回」的开关，某个条目清理失败就留在表里，下次 dispose 接着处理；CubeTextureManager 和 RenderTargetManager 一进来就置 <code>disposed</code>、先把表清空再逐个删，删到一半抛错，剩下的对象就没人记得了（找茬题 19，第 29 课 12.1 节、第 27 课第 7 节讨论过）。放到 ResourceManager 里看，后果更隐蔽：
+    </p>
+    <div id="lab-retry"></div>
+    <p>重试时 RenderTargetManager.dispose 看到 <code>disposed</code> 已经是 true，直接返回；ResourceManager 以为这一步成功了，游标前进，最后报告「全部完成」，FBO 和它的颜色附件却永远留在 GPU 上。修法是让这两个 Manager 也改成 Texture2DManager 那样：用 closing 标记拒绝新工作，dispose 不早退，删成功的才移出表。</p>
+
+    <h3 id="s11-2">11.2 通知丢失时，前提是没有一个会抛错</h3>
+    <p>
+      invalidateForContextLoss 先置 <code>lost = true</code>，再逐个通知。如果第 2 个子 Manager 的 invalidateForContextLoss 抛了错，后面四个就收不到通知；而第二次调用会因为 <code>lost</code> 已经是 true 直接返回，再也补不上。现在六个子 Manager 的这个方法都不发 GL 命令、只调用不许抛错的 invalidateState，所以契约上成立；但这个前提只写在注释里（:168），没有代码兜底。
+    </p>
+
+    <h3 id="s11-3">11.3 想一想（直接在对话里回答）</h3>
+    <ol>
+      <li>11.2 的情况，如果要用代码兜底，你会怎么改 invalidateForContextLoss？（提示：可以学 dispose 的写法，也可以「全部通知完再把第一个错误抛出去」。两种各有什么代价？）</li>
+      <li>HW1 要加一个 ShadowMapPass，它自己拥有一个 RenderTarget。Engine 退出 HW1 时，这个 RenderTarget 的 FBO 是由谁、在什么时候删掉的？把调用链从 Renderer.dispose 一路写到 RenderTargetManager。（提示：第 30 课 8.2 节、第 27 课 3.6 节。）</li>
+      <li>如果以后加一个 Manager，它的 FBO 要借用 Texture2DManager 的纹理（比如渲染到一张已有的二维纹理上），disposalOrder 应该怎么排？除了顺序，还要接什么线？</li>
+    </ol>
+
+    <h2 id="s12">12. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0018"></div>
+
+    <h2 id="s13">13. 延伸阅读</h2>
+    <ul>
+      <li><a href="https://blog.ploeh.dk/2011/07/28/CompositionRoot/">Mark Seemann：Composition Root</a>：组合根这个说法的来源，讲为什么「只在一个地方组装对象」。</li>
+      <li><a href="https://threejs.org/manual/#en/how-to-dispose-of-objects">three.js 手册：How to dispose of objects</a>：three.js 要求用户逐个 dispose 的理由和写法，可以和第 10 节对照。</li>
+      <li><a href="https://registry.khronos.org/webgl/specs/latest/1.0/">WebGL 1.0 规范</a>：各个 create、delete 函数的说明，可以和 7.2 节卡片里「isBuffer 是 false 却照样画得出图」对照着看。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：实验卡片和检查题各错了哪几题；第 11 节的三个想一想，直接在对话里回答。哪一步还接不上，把那几行贴给我。
+    </aside>
+
+    <div class="nav">
+      <a href="0030-frame-orchestration.html">← 第 30 课：帧编排</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0031-frame-overview.html">第 31 课：一帧的全局图 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 18 课 · 2026-10-14</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        const R = window.RTeachResource
+
+        // ---------------- 课程写的小工具 ----------------
+        const HELPER_NOTE =
+          '课程写的部分：instrument（给 gl 套一层代理，记下 create/delete 了哪些 GPU 对象并编号；VAO 通过包装 OES 扩展对象来记；可以让某个 delete 抛一次错）、cpu（一组 CPU 资源：全屏三角形 Geometry、单色 ShaderModule、1 × 1 的 DataTexture2D、4 × 4 的 RenderTarget）、populate（照 Backend.draw 的顺序取 program、buffer、绑一次顶点输入，再取二维纹理和离屏目标）。ResourceManager 和六个子 Manager 都是项目代码（工作区版本）。'
+        const V1_NOTE = ' ManagersV1 是课程写的第 1 版（第 3 节的代码）。'
+        const INJECT_NOTE = ' 真实的 gl.delete* 不会抛错；卡片里的错误是课程注入的，模拟这一步的清理代码出错。'
+
+        const err = (e) => (e && e.name ? e.name : 'Error') + '：' + (e && e.message ? e.message : String(e))
+        const hooks = { invalidateState: () => undefined }
+
+        function instrument(realGL) {
+          const log = []
+          const names = new WeakMap()
+          const counters = {}
+          const objects = {}
+          const failOnce = new Set()
+          let wrappedExtension = null
+          const label = (kind, object) => {
+            if (!names.has(object)) {
+              counters[kind] = (counters[kind] || 0) + 1
+              const name = kind + '#' + counters[kind]
+              names.set(object, name)
+              objects[name] = object
+            }
+            return names.get(object)
+          }
+          const wrapExtension = (real) =>
+            new Proxy(real, {
+              get(target, property) {
+                const value = target[property]
+                if (typeof value !== 'function') return value
+                return (...args) => {
+                  if (property === 'createVertexArrayOES') {
+                    const vao = value.apply(target, args)
+                    log.push('create ' + label('vao', vao))
+                    return vao
+                  }
+                  if (property === 'deleteVertexArrayOES') log.push('delete ' + (args[0] ? label('vao', args[0]) : 'null'))
+                  return value.apply(target, args)
+                }
+              }
+            })
+          const gl = new Proxy(realGL, {
+            get(target, property) {
+              const value = target[property]
+              if (typeof value !== 'function') return value
+              return (...args) => {
+                const match = /^(create|delete)(Buffer|Program|Shader|Texture|Framebuffer|Renderbuffer)$/.exec(property)
+                if (match && match[1] === 'create') {
+                  const object = value.apply(target, args)
+                  log.push('create ' + label(match[2].toLowerCase(), object))
+                  return object
+                }
+                if (match && match[1] === 'delete') {
+                  if (failOnce.has(property)) {
+                    failOnce.delete(property)
+                    log.push(property + ' 抛错（课程注入）')
+                    throw new Error(property + ' 失败（课程注入）')
+                  }
+                  log.push('delete ' + (args[0] ? label(match[2].toLowerCase(), args[0]) : 'null'))
+                  return value.apply(target, args)
+                }
+                if (property === 'getExtension') {
+                  const extension = value.apply(target, args)
+                  if (extension && args[0] === 'OES_vertex_array_object') {
+                    wrappedExtension = wrappedExtension || wrapExtension(extension)
+                    return wrappedExtension
+                  }
+                  return extension
+                }
+                return value.apply(target, args)
+              }
+            }
+          })
+          return { gl, log, objects, failOnce }
+        }
+
+        function freshContext(inDom = false) {
+          const canvas = document.createElement('canvas')
+          canvas.width = 4
+          canvas.height = 4
+          if (inDom) {
+            canvas.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none'
+            document.body.appendChild(canvas)
+          }
+          canvas.addEventListener('webglcontextlost', (event) => event.preventDefault())
+          const gl = canvas.getContext('webgl')
+          if (!gl) throw new Error('这个浏览器拿不到 WebGL context')
+          const lose = gl.getExtension('WEBGL_lose_context')
+          return {
+            gl,
+            lose,
+            release: () => {
+              if (lose && !gl.isContextLost()) lose.loseContext()
+              canvas.remove()
+            }
+          }
+        }
+        async function withGL(body, inDom = false) {
+          const context = freshContext(inDom)
+          const lines = []
+          try {
+            await body(context.gl, lines, context.lose)
+          } catch (error) {
+            lines.push({ text: '实验里抛出了没有预料到的错误：' + err(error), kind: 'late' })
+          } finally {
+            context.release()
+          }
+          return { lines }
+        }
+
+        function cpu() {
+          const geometry = new R.Geometry({
+            attributes: {
+              [R.VertexAttributeSemantic.Position]: new R.VertexAttribute({
+                data: new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]),
+                itemSize: 3
+              })
+            }
+          })
+          const shader = new R.ShaderModule({
+            name: 'lesson18/flat',
+            language: 'glsl-es-100',
+            vertexSource: 'attribute vec3 position;\nvoid main() { gl_Position = vec4(position, 1.0); }',
+            fragmentSource: 'precision mediump float;\nvoid main() { gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0); }'
+          })
+          const texture = new R.DataTexture2D({
+            label: 'albedo',
+            storage: { format: 'rgba', type: 'uint8' },
+            colorSpace: 'linear',
+            sampler: { minFilter: 'nearest', magFilter: 'nearest' },
+            source: { width: 1, height: 1, data: new Uint8Array([255, 255, 255, 255]) }
+          })
+          const target = new R.RenderTarget({ width: 4, height: 4, colors: [{ format: 'rgba8' }] }, { label: 'shadow/main' })
+          return { geometry, shader, texture, target }
+        }
+        function populate(managers, c) {
+          const program = managers.programs.get(c.shader)
+          const buffers = managers.geometries.get(c.geometry)
+          managers.vertexInputs.bind(c.geometry, buffers, program)
+          managers.vertexInputs.unbind()
+          managers.textures2D.get(c.texture)
+          managers.renderTargets.get(c.target)
+        }
+        const joined = (log) => (log.length === 0 ? '（没有任何 create/delete）' : log.join('，'))
+        const hasVAO = (gl) => gl.getExtension('OES_vertex_array_object') !== null
+        const NO_VAO = { text: '这个浏览器没有 OES_vertex_array_object，项目会用手动顶点输入，没有 VAO 可看；这张卡片停在这里。', kind: 'late' }
+
+        /** 用一个新 program（position 固定在 location 0）去画留下的 VAO，读中间的像素。 */
+        function drawWithVAO(gl, vao) {
+          const make = (type, source) => {
+            const shader = gl.createShader(type)
+            gl.shaderSource(shader, source)
+            gl.compileShader(shader)
+            return shader
+          }
+          const program = gl.createProgram()
+          gl.attachShader(program, make(gl.VERTEX_SHADER, 'attribute vec3 position; void main(){ gl_Position = vec4(position, 1.0); }'))
+          gl.attachShader(program, make(gl.FRAGMENT_SHADER, 'precision mediump float; void main(){ gl_FragColor = vec4(1.0, 0.0, 1.0, 1.0); }'))
+          gl.bindAttribLocation(program, 0, 'position')
+          gl.linkProgram(program)
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+          gl.viewport(0, 0, 4, 4)
+          gl.clearColor(0, 0, 0, 1)
+          gl.clear(gl.COLOR_BUFFER_BIT)
+          gl.useProgram(program)
+          const extension = gl.getExtension('OES_vertex_array_object')
+          extension.bindVertexArrayOES(vao)
+          gl.drawArrays(gl.TRIANGLES, 0, 3)
+          extension.bindVertexArrayOES(null)
+          const pixel = new Uint8Array(4)
+          gl.readPixels(2, 2, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel)
+          return '(' + Array.from(pixel).join(', ') + ')，getError ' + gl.getError()
+        }
+
+        // ---------------- 1.2 一代里有什么 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-assemble'),
+          storageKey: 'lesson-0018-assemble',
+          cards: [
+            {
+              title: '建一代、用一次、关掉',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '给 gl 套上记账代理，new WebGL1ResourceManager；然后取 program、buffer、绑一次顶点输入、取一张 1 × 1 纹理和一个 4 × 4 离屏目标；最后 dispose。',
+              note: HELPER_NOTE,
+              question: '刚建好的一代里，有几个 GPU 对象？',
+              choices: ['0 个：六个 Manager 都等第一次 get 才建', '6 个：每个 Manager 先建一个空对象占位', '1 个：顶点输入先建一个默认 VAO'],
+              answer: 0,
+              explain:
+                '构造只是把六个 Manager 建出来、接好线，它们的构造函数都不创建 GPU 对象。第一次 get 时才编译、上传、组装 FBO；顶点输入第一次 bind 时才建 VAO。关闭时删除的顺序和 disposalOrder 一致：先 VAO（顶点输入），再 FBO 和它的附件（离屏目标），再颜色贴图，最后 buffer 和 program。cubemap 这一步没有东西可删。',
+              run: () =>
+                withGL(async (realGL, lines) => {
+                  const t = instrument(realGL)
+                  const resources = new R.WebGL1ResourceManager(t.gl, R.detectWebGL1Capabilities(t.gl), hooks)
+                  lines.push({ t: '建好', text: 'create 次数：' + t.log.length, kind: 'user' })
+                  populate(resources, cpu())
+                  lines.push({ t: '用一次', text: joined(t.log), kind: 'server' })
+                  t.log.length = 0
+                  resources.dispose()
+                  lines.push({ t: '结果', text: '关闭：' + joined(t.log), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3 第 1 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v1'),
+          storageKey: 'lesson-0018-v1',
+          cards: [
+            {
+              title: '换 shader：释放 ShaderModule 以后，VAO 还在吗',
+              tags: ['真实 WebGL', '课程版 + 项目代码'],
+              desc: '同样填一次，然后调用 shader.dispose()（比如调试时换掉了 shader）。先用第 1 版跑，再用真实的 ResourceManager 跑，看各自删了什么、vao#1 还在不在。',
+              note: HELPER_NOTE + V1_NOTE,
+              question: '第 1 版里，vao#1 还在吗？',
+              choices: ['还在：program 删了，按它配置的 VAO 没人删', '不在：删 program 时 GPU 自动删掉引用它的 VAO', '不在：顶点输入自己订阅了 ShaderModule 的释放'],
+              answer: 0,
+              explain:
+                'ShaderModule 释放时，ProgramManager 的订阅收到通知，删掉 program（第 15 课）。第 1 版没给 ProgramManager 接 beforeDelete，顶点输入根本不知道这件事：它的表里还有一条「这个 Geometry、这个 program → vao#1」，以后没人会拿一个已经删掉的 program 来查这一条，VAO 就一直占着（第 16 课 4.4 节）。GPU 不会替你删 VAO。真实代码在构造时接好了线：删 program 之前先 releaseProgram，所以先 delete vao#1、再 delete program#1。',
+              run: () =>
+                withGL(async (realGL, lines) => {
+                  if (!hasVAO(realGL)) {
+                    lines.push(NO_VAO)
+                    return
+                  }
+                  for (const [label, make] of [
+                    ['第 1 版', (gl, caps) => new R.course.ManagersV1(gl, caps, hooks)],
+                    ['真实', (gl, caps) => new R.WebGL1ResourceManager(gl, caps, hooks)]
+                  ]) {
+                    const t = instrument(realGL)
+                    const managers = make(t.gl, R.detectWebGL1Capabilities(t.gl))
+                    const c = cpu()
+                    populate(managers, c)
+                    t.log.length = 0
+                    c.shader.dispose()
+                    const alive = realGL.getExtension('OES_vertex_array_object').isVertexArrayOES(t.objects['vao#1'])
+                    lines.push({ t: label, text: 'shader.dispose() 之后：' + joined(t.log) + '；vao#1 还活着 → ' + alive, kind: label === '真实' ? 'result' : 'late' })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 5 getter ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-getters'),
+          storageKey: 'lesson-0018-getters',
+          cards: [
+            {
+              title: '关闭以后再借 Manager',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '先提前存下一份 resources.geometries 的引用（saved），然后 dispose。之后分别访问 resources.geometries，以及用 saved 去 get 一个新的 Geometry。',
+              note: HELPER_NOTE,
+              question: 'dispose 以后访问 resources.geometries 会怎样？',
+              choices: ['抛 WebGLBackendDisposedError', '返回 null', '返回一个新建的 GeometryManager'],
+              answer: 0,
+              explain:
+                'dispose 第一行就把 closing 置成 true，之后每个 getter 的 assertAvailable 都拒绝。提前存下的 saved 绕开了 getter（getter 收不回已经借出的引用，注释 :40–42），但 GeometryManager 自己的 dispose 也把 disposed 置上了，它的 get 照样拒绝：这是第二道防线。',
+              run: () =>
+                withGL(async (realGL, lines) => {
+                  const resources = new R.WebGL1ResourceManager(realGL, R.detectWebGL1Capabilities(realGL), hooks)
+                  const saved = resources.geometries
+                  resources.dispose()
+                  try {
+                    resources.geometries
+                    lines.push({ text: 'resources.geometries → 成功', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ t: 'getter', text: 'resources.geometries → ' + err(error), kind: 'abort' })
+                  }
+                  try {
+                    saved.get(cpu().geometry)
+                    lines.push({ text: 'saved.get → 成功', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ t: '结果', text: '提前存下的 saved.get(新 Geometry) → ' + err(error), kind: 'result' })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 7.2 屏障与重试 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-barrier'),
+          storageKey: 'lesson-0018-barrier',
+          cards: [
+            {
+              title: '顶点输入的清理第一次失败',
+              tags: ['真实 WebGL', '课程版 + 项目代码', '注入错误'],
+              desc: '填一次，然后让 vertexInputs.dispose 第一次调用时抛错。先用第 1 版（尽力而为、顶点输入排最后）dispose，再看 buffer#1、program#1、vao#1 的状态，并用 vao#1 画一次；然后重试 dispose。再用真实的 ResourceManager 做一遍。',
+              note: HELPER_NOTE + V1_NOTE + INJECT_NOTE + ' 「用 vao#1 画一次」是课程写的：新建一个 position 固定在 location 0 的 program，绑定 vao#1，画一个全屏三角形，读中间像素。',
+              question: '第 1 版第一次 dispose 失败以后，用留下的 vao#1 还能画出图吗？',
+              choices: ['能：buffer 被「删」了，可 VAO 还拿着它，显存没有放', '不能：buffer 已经删了，draw 报 INVALID_OPERATION', '不能：VAO 也跟着 buffer 一起被删了'],
+              answer: 0,
+              explain:
+                '第 1 版按声明顺序走：program、buffer、两张纹理、FBO 都删了，轮到顶点输入才抛错。这时 isBuffer(buffer#1) 已经是 false，可 vao#1 还活着，还引用着那块 buffer 的存储，用它画照样画出紫色：GeometryManager 以为删干净了，显存其实没放。真实代码把顶点输入放在第一步，它一失败就停下，buffer、program 都还活着（画出紫色是因为 buffer 本来就在），记录都对得上；重试时从顶点输入接着做，六类对象各删一次。',
+              run: () =>
+                withGL(async (realGL, lines) => {
+                  if (!hasVAO(realGL)) {
+                    lines.push(NO_VAO)
+                    return
+                  }
+                  const extension = realGL.getExtension('OES_vertex_array_object')
+                  for (const [label, make] of [
+                    ['第 1 版', (gl, caps) => new R.course.ManagersV1(gl, caps, hooks)],
+                    ['真实', (gl, caps) => new R.WebGL1ResourceManager(gl, caps, hooks)]
+                  ]) {
+                    const t = instrument(realGL)
+                    const managers = make(t.gl, R.detectWebGL1Capabilities(t.gl))
+                    populate(managers, cpu())
+                    t.log.length = 0
+                    const vertexInputs = managers.vertexInputs
+                    const original = vertexInputs.dispose.bind(vertexInputs)
+                    let fail = true
+                    vertexInputs.dispose = () => {
+                      if (fail) {
+                        fail = false
+                        t.log.push('vertexInputs.dispose 抛错（课程注入）')
+                        throw new Error('顶点输入清理失败（课程注入）')
+                      }
+                      original()
+                    }
+                    try {
+                      managers.dispose()
+                    } catch (error) {
+                      t.log.push('dispose 抛出 ' + err(error))
+                    }
+                    lines.push({ t: label, text: '第 1 次 dispose：' + joined(t.log), kind: 'user' })
+                    lines.push({
+                      text:
+                        'isBuffer(buffer#1) ' + realGL.isBuffer(t.objects['buffer#1']) +
+                        '，isProgram(program#1) ' + realGL.isProgram(t.objects['program#1']) +
+                        '，vao#1 活着 ' + extension.isVertexArrayOES(t.objects['vao#1']) +
+                        '；用 vao#1 画一次 → ' + drawWithVAO(realGL, t.objects['vao#1']),
+                      kind: label === '真实' ? 'server' : 'late'
+                    })
+                    t.log.length = 0
+                    try {
+                      managers.dispose()
+                    } catch (error) {
+                      t.log.push('抛出 ' + err(error))
+                    }
+                    lines.push({ t: label, text: '重试：' + joined(t.log), kind: 'result' })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 7.3 关闭途中丢失 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-lost-dispose'),
+          storageKey: 'lesson-0018-lost-dispose',
+          cards: [
+            {
+              title: '关到第 3 步，context 丢了',
+              tags: ['真实 WebGL', '项目代码（工作区版本）', '真的丢一次 context'],
+              desc: '填一次，然后 dispose。课程在第 3 步（textures2D）做完以后用 WEBGL_lose_context 让 context 丢失，看后面几步还会不会发 delete。',
+              note: HELPER_NOTE + ' 「第 3 步之后丢失」是课程包了一层 textures2D.dispose 做到的。',
+              question: '后面几步（cubeTextures、geometries、programs）还会发 delete 吗？',
+              choices: ['不会：每一步之前检查到丢失，六个全部改成只忘不删', '会：关闭已经开始，照原计划删完', '不会：抛 WebGLContextLostError，停在第 4 步'],
+              answer: 0,
+              explain:
+                'dispose 每走一步前都问一次 gl.isContextLost()（:205）。第 4 步之前发现丢了，就调用 invalidateForContextLoss：六个子 Manager 清表、退订；之后它们的 dispose 看到自己已经 lost，不发 delete。整个 dispose 正常返回，没有抛错：丢失以后 GPU 那边的对象已经全部作废，「删不了」不算清理失败。buffer#1 和 program#1 没有被 delete，但它们属于已经丢失的 context，不占用新 context 的任何东西。',
+              run: () =>
+                withGL(async (realGL, lines, lose) => {
+                  if (!lose) {
+                    lines.push({ text: '这个浏览器没有 WEBGL_lose_context', kind: 'late' })
+                    return
+                  }
+                  const t = instrument(realGL)
+                  const resources = new R.WebGL1ResourceManager(t.gl, R.detectWebGL1Capabilities(t.gl), hooks)
+                  populate(resources, cpu())
+                  t.log.length = 0
+                  const textures2D = resources.textures2D
+                  const original = textures2D.dispose.bind(textures2D)
+                  textures2D.dispose = () => {
+                    original()
+                    lose.loseContext()
+                    t.log.push('（第 3 步做完，context 丢了）')
+                  }
+                  let outcome = '正常返回'
+                  try {
+                    resources.dispose()
+                  } catch (error) {
+                    outcome = '抛出 ' + err(error)
+                  }
+                  lines.push({ text: joined(t.log), kind: 'server' })
+                  lines.push({ t: '结果', text: 'dispose ' + outcome, kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 9 Lifecycle ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-lifecycle'),
+          storageKey: 'lesson-0018-lifecycle',
+          cards: [
+            {
+              title: '丢失、恢复、新一代',
+              tags: ['真实 WebGL', '项目代码（工作区版本）', '真的丢一次 context'],
+              desc: '同一个 context 上：ResourceManager A 借出 renderTargets（提前存成 savedRT）并 get 一个 RenderTarget；另外单独建一个没交给任何协调器的 RenderTargetManager（lone），也 get 同一个目标。然后丢失 context（不调用任何通知），访问一次 A.programs；再恢复，分别用 savedRT、lone 去 get；最后新建 ResourceManager B，get 同一个 RenderTarget。',
+              note: HELPER_NOTE + ' 丢失、恢复用 WEBGL_lose_context；canvas 临时挂进页面（不挂的话，有的浏览器不发恢复事件），用完移除。lone 是课程为了对比单独建的。',
+              question: '恢复以后，提前存下的 savedRT.get 会怎样？',
+              choices: ['抛 WebGLContextLostError：那一代已经被整体作废', '成功：context 已经恢复，照常交回 FBO', '交回丢失前的旧 FBO'],
+              answer: 0,
+              explain:
+                '丢失后访问 A.programs，assertAvailable 发现物理丢失，调用 invalidateForContextLoss，六个子 Manager（包括 savedRT 指向的那个）全部记下 lost。lost 是永久的，恢复以后 isContextLost 又是 false，savedRT 照样拒绝。lone 没人通知，丢失期间也没人访问它，所以它不知道发生过丢失：恢复后缓存命中，交回丢失前那个 FBO，isFramebuffer 是 false（第 27 课第 5 节同样的现象）。新一代 B 的表是空的，按同一个 RenderTarget 对象新建了一个可用的 FBO。',
+              run: () =>
+                withGL(async (realGL, lines, lose) => {
+                  if (!lose) {
+                    lines.push({ text: '这个浏览器没有 WEBGL_lose_context', kind: 'late' })
+                    return
+                  }
+                  const capabilities = R.detectWebGL1Capabilities(realGL)
+                  const a = new R.WebGL1ResourceManager(realGL, capabilities, hooks)
+                  const lone = new R.WebGL1RenderTargetManager(realGL, capabilities, hooks)
+                  const c = cpu()
+                  const savedRT = a.renderTargets
+                  const oldA = savedRT.get(c.target).framebuffer
+                  const oldLone = lone.get(c.target).framebuffer
+                  lose.loseContext()
+                  await new Promise((resolve) => setTimeout(resolve, 50))
+                  try {
+                    a.programs
+                  } catch (error) {
+                    lines.push({ t: '丢失后', text: 'A.programs → ' + err(error), kind: 'abort' })
+                  }
+                  const restored = new Promise((resolve) => realGL.canvas.addEventListener('webglcontextrestored', resolve, { once: true }))
+                  lose.restoreContext()
+                  const outcome = await Promise.race([restored.then(() => 'restored'), new Promise((resolve) => setTimeout(() => resolve('timeout'), 3000))])
+                  if (outcome !== 'restored') {
+                    lines.push({ text: '3 秒内没等到恢复事件，实验停在这里', kind: 'late' })
+                    return
+                  }
+                  lines.push({ t: '恢复后', text: 'isContextLost → ' + realGL.isContextLost(), kind: 'muted' })
+                  try {
+                    savedRT.get(c.target)
+                    lines.push({ text: 'savedRT.get → 成功', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: '提前存下的 savedRT.get → ' + err(error), kind: 'server' })
+                  }
+                  try {
+                    const framebuffer = lone.get(c.target).framebuffer
+                    lines.push({ text: '没人通知的 lone.get → 成功；交回旧 FBO → ' + (framebuffer === oldLone) + '，isFramebuffer → ' + realGL.isFramebuffer(framebuffer), kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: 'lone.get → ' + err(error), kind: 'server' })
+                  }
+                  const b = new R.WebGL1ResourceManager(realGL, R.detectWebGL1Capabilities(realGL), hooks)
+                  const fresh = b.renderTargets.get(c.target).framebuffer
+                  lines.push({ t: '结果', text: '新一代 B：新 FBO → ' + (fresh !== oldA) + '，isFramebuffer → ' + realGL.isFramebuffer(fresh), kind: 'result' })
+                }, true)
+            }
+          ]
+        })
+
+        // ---------------- 11.1 审查：重试只和每一步一样可靠 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-retry'),
+          storageKey: 'lesson-0018-retry',
+          cards: [
+            {
+              title: '子 Manager 删到一半抛错，重试以后',
+              tags: ['真实 WebGL', '项目代码（工作区版本）', '注入错误'],
+              desc: '两次实验。第一次：让 RenderTargetManager 删 FBO 时抛一次错。第二次：让 Texture2DManager 删颜色贴图时抛一次错。两次都在抛错后重试一次 ResourceManager.dispose，最后检查 FBO、附件纹理、颜色贴图还在不在。',
+              note: HELPER_NOTE + INJECT_NOTE,
+              question: '第一次实验：重试 dispose 以后，那个 FBO 删掉了吗？',
+              choices: ['没有：重试时它的 dispose 直接返回，ResourceManager 以为这一步成功了', '删掉了：重试从这一步接着做', '没有：ResourceManager 停在这一步，重试也一直报错'],
+              answer: 0,
+              explain:
+                'RenderTargetManager.dispose 一进来就置 disposed、把表清空，再逐个删（WebGL1RenderTargetManager.ts:388–402）。删 FBO 时抛错，ResourceManager 停在这一步，没问题；可重试时 RenderTargetManager 看到 disposed 已经是 true，直接返回，ResourceManager 的游标前进，后面几步照常做完，没有任何报错，FBO 和它的附件纹理却永远留在 GPU 上（isFramebuffer、isTexture 都是 true）。Texture2DManager 的 dispose 没有早退，失败的条目留在表里，重试时删掉了。',
+              run: () =>
+                withGL(async (realGL, lines) => {
+                  for (const which of ['renderTargets', 'textures2D']) {
+                    const t = instrument(realGL)
+                    const resources = new R.WebGL1ResourceManager(t.gl, R.detectWebGL1Capabilities(t.gl), hooks)
+                    populate(resources, cpu())
+                    t.log.length = 0
+                    if (which === 'renderTargets') {
+                      t.failOnce.add('deleteFramebuffer')
+                    } else {
+                      const textures2D = resources.textures2D
+                      const original = textures2D.dispose.bind(textures2D)
+                      let first = true
+                      textures2D.dispose = () => {
+                        if (first) {
+                          first = false
+                          t.failOnce.add('deleteTexture')
+                        }
+                        original()
+                      }
+                    }
+                    try {
+                      resources.dispose()
+                    } catch (error) {
+                      t.log.push('抛出 ' + err(error))
+                    }
+                    lines.push({ t: which, text: '第 1 次：' + joined(t.log), kind: 'user' })
+                    t.log.length = 0
+                    try {
+                      resources.dispose()
+                    } catch (error) {
+                      t.log.push('抛出 ' + err(error))
+                    }
+                    lines.push({ t: which, text: '重试：' + joined(t.log), kind: 'server' })
+                    lines.push({
+                      t: '结果',
+                      text:
+                        'isFramebuffer(framebuffer#1) ' + realGL.isFramebuffer(t.objects['framebuffer#1']) +
+                        '，isTexture(texture#2 附件) ' + realGL.isTexture(t.objects['texture#2']) +
+                        '，isTexture(texture#1 颜色贴图) ' + realGL.isTexture(t.objects['texture#1']),
+                      kind: which === 'renderTargets' ? 'late' : 'result'
+                    })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0018"]'), [
+          {
+            q: 'WebGL1ResourceManager 自己拥有哪些 GPU 对象？',
+            opts: ['一个都没有：GPU 对象都由六个子 Manager 拥有，它只负责组装、接线、借出、通知丢失和按顺序关闭', '它拥有全部 GPU 对象，子 Manager 只是帮它创建', '它只拥有 VAO，因为 VAO 引用了别人的对象'],
+            answer: 0,
+            why: '类注释写明「不拥有 CPU Resource，不执行 draw，不上传 uniform，不创建另一套资源缓存」（:36–37）；1.2 节的表。'
+          },
+          {
+            q: 'GeometryManager 删 buffer 之前要先让顶点输入删 VAO，为什么不让 GeometryManager 直接 import 顶点输入并调用它？',
+            opts: ['依赖方向：GeometryManager 应该能单独使用和测试；它只声明一个可选的 beforeDelete，由组合根把顶点输入接上', '因为 TypeScript 不允许两个文件互相 import', '因为顶点输入只有在有 OES 扩展时才存在'],
+            answer: 0,
+            why: '4.2 节：只有 ResourceManager 认识全部六个 Manager；换顶点输入的实现只改组合根一处。'
+          },
+          {
+            q: 'context 物理上已经丢了，但 webglcontextlost 事件还没派发。这时 Backend 访问 resources.programs，会发生什么？',
+            opts: ['六个子 Manager 全部作废，然后抛 WebGLContextLostError', '只有 ProgramManager 作废，其余五个不受影响', '正常返回 ProgramManager，等事件到了再作废'],
+            answer: 0,
+            why: 'assertAvailable 发现 isContextLost 就调用 invalidateForContextLoss（:223–226）；第 9 节卡片里提前存下的 savedRT 也被作废了。'
+          },
+          {
+            q: '已经有 beforeDelete 了，为什么关闭时还要把顶点输入放在第一步？',
+            opts: ['一次删完全部 VAO、之后的钩子变成空操作；不依赖可选的钩子；顶点输入清理失败时可以停在屏障前，不删它还引用着的 buffer 和 program', '因为 beforeDelete 在关闭时不会被调用', '因为删 VAO 最快，放前面能缩短关闭时间'],
+            answer: 0,
+            why: '7.1 节三个理由；7.2 节卡片：第 1 版把顶点输入排在最后，失败时 buffer 已被「删」，VAO 却还拿着它。'
+          },
+          {
+            q: 'dispose 在第 2 步（renderTargets）抛错。调用者处理完异常再调一次 dispose，从哪一步开始？',
+            opts: ['从第 2 步：disposalIndex 只在一步成功后才加一', '从第 1 步：每次 dispose 都从头来', '不会再做：closing 已经是 true，dispose 直接返回'],
+            answer: 0,
+            why: ':204–210 的循环；第一次调用置的 closing 只拦 getter，不拦 dispose 的重试。'
+          },
+          {
+            q: '第一次 dispose 失败了，还能继续用这一代画图吗？',
+            opts: ['不能：closing 在第一次调用时就置上，getter 一律拒绝，只能重试 dispose', '能：dispose 失败等于没关', '能，但只能画不需要纹理的物体'],
+            answer: 0,
+            why: ':193 的注释「closing 在首次调用时即置 true，即使清理失败也不能恢复绘制」；7.4 节的表。'
+          },
+          {
+            q: 'context 恢复以后，旧的 ResourceManager 会怎样？',
+            opts: ['永久作废；Backend 新建一代 ResourceManager，从仍然活着的 CPU 资源懒上传', '自动复活，重新上传所有资源', '把旧 handle 交给新 context 继续用'],
+            answer: 0,
+            why: 'lost 是永久标记（:58、:174）；恢复走 Backend.createGeneration（第 9 节）。'
+          },
+          {
+            q: '关闭途中 context 丢了，剩下的步骤会怎样？',
+            opts: ['先 invalidateForContextLoss，剩下的子 Manager 只忘不删，dispose 正常返回', '照常发 delete 命令', 'dispose 抛 WebGLContextLostError，停在原地等重试'],
+            answer: 0,
+            why: ':205 每一步之前检查；7.3 节卡片。'
+          },
+          {
+            q: '7.2 节说「重试从失败那一步接着做」，可 11.1 节的卡片里，重试后 FBO 还是没删。原因是？',
+            opts: ['RenderTargetManager 的 dispose 一进来就置 disposed、先清空表，重试时直接返回；ResourceManager 只能看到「这一步没抛错」', 'ResourceManager 的游标写错了，跳过了这一步', 'FBO 在 WebGL 里不能删除'],
+            answer: 0,
+            why: 'ResourceManager 把步骤内部的续做交给各个子 Manager（:189–191）；Cube 和 RenderTarget 两个 Manager 的 dispose 不可续做（找茬题 19）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

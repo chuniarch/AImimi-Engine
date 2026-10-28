@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 2 课 · GL 怎样告诉你失败了</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/gl-sandbox.js"></script>
+    <script src="../assets/predict.js"></script>
+  </head>
+  <body>
+    <p class="kicker">选修动手课 2 · 约 25 分钟 · 精读主线从 <a href="0003-architecture-overview.html">第 3 课</a> 开始</p>
+    <h1>GL 怎样告诉你失败了：五条失败通道</h1>
+    <p class="lede">
+      第 1 课的三道故障题只是三个例子。这一课把 WebGL 报告失败的所有方式归成<strong>五条通道</strong>：每条通道「GL 怎么说、你怎么问、项目在哪拦」。然后你亲手写出项目里那几个校验原语——<code>requireNonNull</code>、<code>checkError</code>、状态检查——沙盒会像项目的单元测试一样，用真实的、已丢失的和伪造的 context 去测它们。
+    </p>
+
+    <div class="mission">
+      <strong>和你的任务的关系</strong> —— Task 15 的 <code>draw()</code> 要在十几个 GL 调用之间决定「在哪查、查什么」。查多了会拖慢每一帧（<code>getError</code> 会同步等待 GPU），查少了错误就会在别处以奇怪的样子冒出来。这一课给你一张地图；你说自己「校验考虑不全」，这张地图就是用来补这一块的。
+    </div>
+
+    <h2>0. 热身：上一课还记得吗</h2>
+    <p>不要翻回去，凭记忆答。隔一段时间再回忆一次，比当时多读一遍记得更牢。</p>
+    <div class="quiz" data-quiz="lesson-0002-warmup"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0002-warmup"]'), [
+        {
+          q: 'getAttribLocation 找不到 attribute 时返回什么？',
+          opts: ['返回 -1', '返回 null', '返回 0'],
+          answer: 0,
+          why: '失败值是 -1；0 是合法的 location。所以要写 <code>location &lt; 0</code>。'
+        },
+        {
+          q: 'shader 编译失败时，compileShader 会怎样？',
+          opts: ['照常返回，要自己去查 COMPILE_STATUS', '直接抛出一个带编译日志的 JS 异常', '返回 false，同时记下 INVALID_OPERATION'],
+          answer: 0,
+          why: 'compileShader 不返回结果、不抛异常，<code>getError</code> 也还是 NO_ERROR（下面第 4 节会亲眼看到）。只有主动查 COMPILE_STATUS 才知道。'
+        },
+        {
+          q: '在项目里，谁负责把 buffer 接到 shader 的 attribute 上？',
+          opts: ['VertexInputManager 的 bind', 'GeometryManager 的 get', 'ProgramManager 的 get'],
+          answer: 0,
+          why: 'GeometryManager 只上传 buffer，ProgramManager 只编译并反射出 location；两者在 <a data-src="src/rendering/backend/webgl1/WebGL1VertexInputManager.ts:21">VertexInputManager.bind</a> 里相遇。'
+        }
+      ])
+    </script>
+
+    <h2>1. 一张地图：五条通道</h2>
+    <p>WebGL 几乎从不抛 JavaScript 异常。能抛的只有参数<strong>类型</strong>错误（例如 <code>bindBuffer</code> 收到的不是 WebGLBuffer，会抛 TypeError）。其余所有失败，都从下面五条通道之一报出来：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>通道</th><th>GL 怎么说</th><th>你怎么问</th><th>项目里的原语</th></tr>
+        <tr><td><strong>① 特殊返回值</strong></td><td>返回 <code>null</code> 或 <code>-1</code>：<code>createShader</code>、<code>getAttribLocation</code>、<code>getUniformLocation</code>、<code>getExtension</code></td><td>判 <code>=== null</code>、<code>&lt; 0</code>，不用真假值</td><td><a data-src="src/rendering/core/requireNonNull.ts:15">requireNonNull</a></td></tr>
+        <tr><td><strong>② 状态查询</strong></td><td>什么都不说，把结果存在对象的状态里：COMPILE_STATUS、LINK_STATUS、framebuffer 完整性</td><td>主动查，不查就永远不知道</td><td><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:310">compile</a> 与 link 检查、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:327">checkFramebufferStatus</a></td></tr>
+        <tr><td><strong>③ 错误标志</strong></td><td>参数取值或当前状态不合法：把 INVALID_ENUM、INVALID_VALUE、INVALID_OPERATION、OUT_OF_MEMORY 记进错误标志 (error flag)</td><td><code>getError()</code>，只在冷路径调用</td><td><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:354">checkError</a>、<a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:21">assertTextureOperation</a></td></tr>
+        <tr><td><strong>④ context 丢失</strong></td><td>任何时刻都可能发生：之后所有调用变成空操作，返回默认值</td><td><code>isContextLost()</code>；入口查一次，跨过查询、创建或回调之后再查一次</td><td><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:385">assertAvailable</a></td></tr>
+        <tr><td><strong>⑤ 静默失败</strong></td><td>什么都不报，只是结果不对：纹理不完整采样出黑色、attribute 没 enable、uniform 名字拼错</td><td>只能靠事前校验和最终的像素验收</td><td><a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:203">validateStorage</a>、<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:80">resolve</a></td></tr>
+      </table>
+    </div>
+    <p>于是，每写下一个 GL 调用，都可以按顺序问自己四个问题。这就是「校验考虑全面」的具体做法：</p>
+    <ol class="steps">
+      <li>它的<strong>返回值</strong>能不能是失败值（null、-1）？能就判 <code>=== null</code> 或 <code>&lt; 0</code>。</li>
+      <li>它有没有对应的<strong>状态</strong>可查（编译、链接、framebuffer）？有就主动查。</li>
+      <li>它会不会把错误记进<strong>错误标志</strong>？会的话，在这一段冷路径结束时 <code>checkError</code>。</li>
+      <li><strong>context 还活着吗？</strong>入口查一次；跨过一次 GL 查询、创建或外部回调之后再查一次。</li>
+    </ol>
+    <p>四个问题都答完了还是可能出错——那就是第 ⑤ 条通道。它没有「查询」可用，只能在调用之前把参数组合校验好，在调用之后用像素去验收。</p>
+
+    <h2>2. 语法：先读懂项目里的四个原语</h2>
+    <p>下面每段都是项目的原样代码，注释是我逐行加的。先读懂，第 3 节你要自己写出同样职责的版本。</p>
+
+    <h3>2.1 <code>getError</code>：每次只取出一个标志</h3>
+    <p>规则（ES 2.0 参考页，并在 Chromium 152 里实测过）：</p>
+    <ul>
+      <li><strong>每一种错误各有一个标志</strong>；同一种错误重复发生，只记一次。</li>
+      <li>每调用一次 <code>getError</code>，<strong>取出并清除其中一个</strong>。同时有好几个时，返回哪一个不保证——实测我依次制造了 ENUM、VALUE、OPERATION，取出的顺序却是 ENUM、OPERATION、VALUE。要全部取干净，只能<strong>循环调用直到 NO_ERROR</strong>。</li>
+      <li>context 丢失后，第一次调用返回 <code>CONTEXT_LOST_WEBGL</code>，之后一直是 NO_ERROR；丢失之前还没取走的错误被一并丢弃。</li>
+      <li>它会<strong>同步等待 GPU</strong>（MDN：一次 flush 加一次到 GPU 进程的往返）。所以只放在创建、上传这种只发生一次的冷路径 (cold path) 上，不放进每帧的热路径 (hot path)。</li>
+      <li>错误会<strong>一直攒着</strong>，直到有人来取。所以在做一件事之前先取一次，叫 preflight：把前面别人留下的错误先报出来，免得算到自己头上。</li>
+    </ul>
+    <pre><code>// WebGL1ProgramManager.ts 的 checkError：10 月 12 日之前的版本（提交 137d9de 的 :323-334），
+// 现在的写法见本节末尾的更新
+/** 错误检查仅出现在创建冷路径；cache hit 不执行 getError。 */
+private checkError(operation: string, label: string): void {
+  this.assertAvailable(operation)     // ① 先确认 context 活着：丢失后 getError 会返回 CONTEXT_LOST_WEBGL，不能当普通错误
+  const code = this.gl.getError()     // ② 取出一个标志（同步等待 GPU）
+  this.assertAvailable(operation)     // ③ 查询期间可能刚好丢失：结果不可信时，按丢失处理
+  if (code !== this.gl.NO_ERROR) {    // ④ 有错：包成带 operation 和 label 的领域错误，调用方知道是哪一步、哪个资源
+    throw new WebGLOperationError(operation, label, `GL error ${code}`)
+  }
+}</code></pre>
+    <p>
+      调用点：<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:99">ProgramManager.ts:99</a>（preflight：「发现既有 GL 错误时停止，不把它伪装成本次编译产生的错误」）、<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:318">:318</a>（每个 shader 编译后）、<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:139">:139</a>（链接后）；GeometryManager 的 <a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:124">:124</a>（preflight）和 <a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:333">:333</a>（每次上传后）。
+    </p>
+    <aside class="note">
+      项目的每个检查点只取一次，没有循环排空。只取一次，足以回答「现在干不干净」：只有所有标志都清空时，getError 才返回 NO_ERROR，所以没有错误时，一次调用就能确认。它做不到的是「有错时一次取完」：同时有两种错误时，只报出其中一种，另一种留给下一个检查点——通常是下一个操作开头的 preflight，于是一个无辜的操作也跟着失败，而第一份报告里只看得到一种错误。循环排空并不更贵：没有错误时，它同样只调用一次；多出来的调用只发生在已经出错的冷路径上。所以改成循环，是一个值得在 code review 里提出的改进——本课沙盒的选做题就是它。
+    </aside>
+    <aside class="note">
+      <strong>10 月 12 日更新</strong>：你已经在工作区把 ProgramManager 和 GeometryManager 的 checkError 改成了循环（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:354">WebGL1ProgramManager.ts:354–382</a>、<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:416">WebGL1GeometryManager.ts:416–444</a>）。和选做题的「排空」相比多了两样：读的次数有上限，32 次还没见到 NO_ERROR 就报「收集未完成」，免得一个坏掉的 context 让循环停不下来；每读一次，前后都检查 context 有没有丢。信息里列出全部错误码，例如「GL errors: 1280, 1281」。顶点输入（<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:168">WebGL1VertexInputSupport.ts:168</a>）和纹理上传（<a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:27">WebGL1TextureUploadSupport.ts:27</a>）的检查还是只读一次。
+    </aside>
+    <pre><code>// src/rendering/backend/webgl1/WebGL1ProgramManager.ts:354–382（工作区版本）
+// 原注释块在 :323–353，这里换成了课程的注释
+private checkError(operation: string, label: string): void {
+  const maxErrorReads = 32            // 上限：包括最后那次用来确认的 NO_ERROR
+  const errorCodes: number[] = []
+
+  for (let readIndex = 0; readIndex &lt; maxErrorReads; readIndex += 1) {
+    this.assertAvailable(operation)   // 读之前：context 还活着
+    const code = this.gl.getError()
+    this.assertAvailable(operation)   // 读之后：读的期间没有丢
+
+    if (code === this.gl.NO_ERROR) {
+      if (errorCodes.length === 0) {
+        return                        // 一个错误都没有：和旧版一样，只读了一次
+      }
+      throw new WebGLOperationError(operation, label, `GL errors: ${errorCodes.join(', ')}`)
+    }
+
+    errorCodes.push(code)             // 记下来，接着读
+  }
+
+  // 读满 32 次还没见到 NO_ERROR：不假装已经读干净
+  throw new WebGLOperationError(
+    operation,
+    label,
+    `GL error collection incomplete after ${maxErrorReads} reads: …`
+  )
+}</code></pre>
+
+    <h3>2.2 状态查询：先排除丢失，再解读结果</h3>
+    <pre><code>// src/rendering/backend/webgl1/WebGL1ProgramManager.ts:307-318（compile 的后半段）
+gl.shaderSource(compiled, stage === 'vertex' ? source.vertexSource : source.fragmentSource)
+gl.compileShader(compiled)                        // 不返回结果、不抛异常，getError 也还是 NO_ERROR
+const success: unknown = gl.getShaderParameter(compiled, gl.COMPILE_STATUS)
+                                                  // 返回类型是 any：先收进 unknown，逼自己在下面做判断
+this.assertAvailable('compile shader')            // 丢失时 success 是 null——那不是编译失败，必须先排除
+if (success !== true) {                           // 用 !== true，不用 !success：只有明确的 true 才算成功
+  throw new ShaderCompilationError(source.name, stage, gl.getShaderInfoLog(compiled) ?? '')
+}                                                 // 错误对象里带上 stage 和 info log，失败时知道是哪个 shader、第几行
+this.checkError('compile shader', source.name)    // 顺手把这一段的错误标志也清一遍</code></pre>
+    <p>
+      顺序是关键：<strong>查询 → 确认 context 还活着 → 才解读结果</strong>。反过来写，丢失时的 <code>null</code> 就会被当成「编译失败」，报出一个误导人的 ShaderCompilationError。链接用 LINK_STATUS 和 <code>getProgramInfoLog</code>，写法一样（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:120">:120–125</a>）。
+    </p>
+
+    <h3>2.3 <code>requireNonNull</code>：只判 null，而且拦不住丢失</h3>
+    <pre><code>// src/rendering/core/requireNonNull.ts:15-21
+export function requireNonNull&lt;T&gt;(value: T | null, errorFactory: () =&gt; Error): T {
+  if (value === null) {      // 只判 null：0、false、'' 都是合法值，不能用 !value
+    throw errorFactory()     // 惰性工厂：只有真的失败时才构造错误对象，成功路径零开销
+  }
+  return value               // 原样返回，TypeScript 把类型从 T | null 收窄成 T
+}</code></pre>
+    <p>
+      第 1 课备课时我实测发现：现行规范里，<code>createBuffer</code>、<code>createProgram</code>、<code>createTexture</code> 等<strong>不再返回 null</strong>（TypeScript 5.8 的类型也是非 null），context 丢失时返回的是一个<strong>已经作废的对象</strong>；只有 <code>createShader</code> 的签名还是 <code>WebGLShader | null</code>。所以光判 null 拦不住丢失。项目的写法是三步连用：
+    </p>
+    <pre><code>// src/rendering/backend/webgl1/WebGL1ProgramManager.ts:296-305
+const candidate = gl.createShader(type)       // ① 创建
+this.assertAvailable('create shader')         // ② 先查丢失：作废对象判 null 判不出来，要靠 isContextLost
+const compiled = requireNonNull(candidate, () =&gt; new WebGLResourceCreationError('shader', `${source.name}:${stage}`))
+                                              // ③ 再判 null：旧实现、测试替身，以及规范仍允许的 createShader 失败
+owned.push(compiled)                          // ④ 立刻登记，后面任何一步失败都能找到它、把它删掉</code></pre>
+
+    <h3>2.4 <code>assertAvailable</code>：入口查一次，跨过查询之后再查一次</h3>
+    <pre><code>// src/rendering/backend/webgl1/WebGL1ProgramManager.ts:384-392
+/** 物理 lost 可以早于 DOM 事件，因此不能只依赖 onLost 回调。 */
+private assertAvailable(operation: string): void {
+  if (this.disposedValue) throw new WebGLBackendDisposedError(operation)   // 我们自己关掉的：生命周期错误
+  if (this.lostValue || this.gl.isContextLost()) {                        // 之前记下的丢失，或者浏览器此刻报告丢失
+    this.invalidateForContextLoss()                                        // 整批丢弃这一代的记录（不对失效的 context 发 delete）
+    throw new WebGLContextLostError(operation)
+  }
+}</code></pre>
+    <p>
+      为什么不能只靠 <code>webglcontextlost</code> 事件？事件是异步派发的：GPU 已经丢了，事件可能还没到，这期间 <code>isContextLost()</code> 已经返回 true。所以每个入口直接问浏览器。「跨过一次查询之后再查一次」的例子：<a data-src="src/rendering/backend/webgl1/WebGL1Capabilities.ts:41">Capabilities.ts:41</a> 和 <a data-src="src/rendering/backend/webgl1/WebGL1Capabilities.ts:53">:53</a> 在探测前后各查一次，避免把丢失期间 <code>getExtension</code> 返回的 null 误判成「不支持」。
+    </p>
+
+    <h2>3. 动手：写出你自己的校验原语</h2>
+    <p>
+      模板里给了四种错误类型（对应项目的错误类）。你要补完五个函数。这一课不画图，沙盒会像单元测试一样调用你的函数：有时传真实的 context，有时传已经丢失的 context，有时传一个在 <code>getError</code> 之后才「丢失」的伪造 context。<strong>第一次运行全红是正常的</strong>——先红后绿，和项目的 TDD 流程一样。
+    </p>
+
+    <div id="sandbox-0002"></div>
+
+    <script type="text/plain" id="template-0002">// 这一课不画图：你要写的是五个校验函数。沙盒会像单元测试一样，
+// 用真实的 context、已经丢失的 context 和伪造的 context 去测它们。
+// ⌘/Ctrl + Enter 运行。第一次运行全红是正常的。
+
+// ===== 本课提供：错误类型（对应项目里的 RenderingError 家族）=====
+class NullHandleError extends Error {}    // ↔ WebGLResourceCreationError：create* 返回了 null
+class ContextLostError extends Error {}   // ↔ WebGLContextLostError：context 已丢失
+class GLCallError extends Error {}        // ↔ WebGLOperationError：getError 报出的错误
+class CompileError extends Error {}       // ↔ ShaderCompilationError / ProgramLinkError
+
+const ERROR_NAMES = {
+  0x0500: 'INVALID_ENUM',
+  0x0501: 'INVALID_VALUE',
+  0x0502: 'INVALID_OPERATION',
+  0x0505: 'OUT_OF_MEMORY',
+  0x0506: 'INVALID_FRAMEBUFFER_OPERATION'
+}
+
+// ① 特殊返回值：只有 null 算失败（抛 NullHandleError）；成功时原样返回 value
+function requireNonNull(value, what) {
+
+}
+
+// ④ context 丢失：丢失了就抛 ContextLostError
+function assertAlive(gl, operation) {
+
+}
+
+// ③ 错误标志：查丢失 → getError → 再查丢失 → 有错就抛 GLCallError（信息里写出错误名）
+function checkError(gl, operation) {
+
+}
+
+// ② 状态查询：问 COMPILE_STATUS；失败就抛 CompileError，信息里带上 info log
+//    提醒：context 丢失时，这个查询返回 null——那不是编译失败
+function checkCompiled(gl, shader, stage) {
+
+}
+
+// ② 状态查询：问 LINK_STATUS；失败就抛 CompileError，信息里带上链接日志
+function checkLinked(gl, program) {
+
+}
+
+// 别删这一行：沙盒靠它拿到你写的函数
+return {
+  requireNonNull, assertAlive, checkError, checkCompiled, checkLinked,
+  errors: { NullHandleError, ContextLostError, GLCallError, CompileError }
+}
+</script>
+
+    <script>
+      ;(function () {
+        const G = RTeach.gl
+        const esc = G.escape
+
+        function helpers(c) {
+          const h = c.returned
+          if (c.threw) throw new Error('代码运行时抛了错：' + c.describeThrow())
+          if (!h || typeof h !== 'object' || !h.errors) {
+            throw new Error('模板最后的 return 被删掉或改掉了，沙盒拿不到你写的函数')
+          }
+          return h
+        }
+
+        function said(result) {
+          if (!result.error) return '没有抛错'
+          const name = result.error.constructor && result.error.constructor.name ? result.error.constructor.name : 'Error'
+          return name + '「' + esc(result.error.message) + '」'
+        }
+
+        function compileSource(gl, type, source) {
+          const shader = gl.createShader(type)
+          gl.shaderSource(shader, source)
+          gl.compileShader(shader)
+          return shader
+        }
+
+        const GOOD_VS = 'attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }'
+        const GOOD_FS = 'precision mediump float; void main() { gl_FragColor = vec4(1.0); }'
+        const BAD_VS = 'void main() { gl_Positon = vec4(0.0); }'
+        const MISMATCH_FS = 'precision mediump float; varying vec3 vColor; void main() { gl_FragColor = vec4(vColor, 1.0); }'
+
+        RTeach.sandbox({
+          mount: document.getElementById('sandbox-0002'),
+          storageKey: 'lesson-0002',
+          canvas: false,
+          template: document.getElementById('template-0002').textContent,
+          checks: [
+            {
+              label: 'requireNonNull(null) 抛出 NullHandleError',
+              test(c) {
+                const h = helpers(c)
+                const r = G.attempt(() => h.requireNonNull(null, 'createShader'))
+                return r.error instanceof h.errors.NullHandleError || '得到：' + said(r)
+              }
+            },
+            {
+              label: 'requireNonNull 把 0、false、"" 原样返回',
+              test(c) {
+                const h = helpers(c)
+                for (const value of [0, false, '']) {
+                  const r = G.attempt(() => h.requireNonNull(value, 'x'))
+                  if (r.error) return '传入 ' + esc(JSON.stringify(value)) + ' 时抛了错：只有 null 才是失败值，不能用真假值判断'
+                  if (!Object.is(r.value, value)) return '传入 ' + esc(JSON.stringify(value)) + ' 却返回了 ' + esc(String(r.value)) + '：要原样返回'
+                }
+                return true
+              }
+            },
+            {
+              label: 'assertAlive：context 活着时不抛，丢失后抛 ContextLostError',
+              test(c) {
+                const h = helpers(c)
+                const gl = G.freshContext()
+                const alive = G.attempt(() => h.assertAlive(gl, 'x'))
+                if (alive.error) return 'context 活着却抛了：' + said(alive)
+                G.lose(gl)
+                const lost = G.attempt(() => h.assertAlive(gl, 'x'))
+                return lost.error instanceof h.errors.ContextLostError || '丢失后得到：' + said(lost) + '（用 gl.isContextLost()）'
+              }
+            },
+            {
+              label: 'checkError：没有错误时不抛',
+              test(c) {
+                const h = helpers(c)
+                const gl = G.freshContext()
+                const r = G.attempt(() => h.checkError(gl, 'x'))
+                return !r.error || '得到：' + said(r)
+              }
+            },
+            {
+              label: 'checkError：有 INVALID_ENUM 时抛 GLCallError，信息里写出错误名',
+              test(c) {
+                const h = helpers(c)
+                const gl = G.freshContext()
+                gl.enable(0x1234)
+                const r = G.attempt(() => h.checkError(gl, 'enable'))
+                if (!(r.error instanceof h.errors.GLCallError)) return '得到：' + said(r)
+                return /INVALID_ENUM/.test(r.error.message) || '信息里没有写出 INVALID_ENUM：「' + esc(r.error.message) + '」。可以用模板里的 ERROR_NAMES 把数字翻译成名字'
+              }
+            },
+            {
+              label: 'checkError：抛过之后错误标志已被清空（紧接着再查不再抛）',
+              test(c) {
+                const h = helpers(c)
+                const gl = G.freshContext()
+                gl.enable(0x1234)
+                const first = G.attempt(() => h.checkError(gl, 'first'))
+                if (!(first.error instanceof h.errors.GLCallError)) {
+                  return '第一次检查就应该抛 GLCallError（先让上一条通过），这里得到：' + said(first)
+                }
+                const second = G.attempt(() => h.checkError(gl, 'second'))
+                return !second.error || '第二次又抛了：' + said(second) + '。getError 取出一个标志的同时就把它清掉了；如果第一次没有调用 getError，标志就还留着'
+              }
+            },
+            {
+              label: 'checkError：context 已丢失时抛 ContextLostError，而不是把 CONTEXT_LOST_WEBGL 当普通错误',
+              test(c) {
+                const h = helpers(c)
+                const gl = G.freshContext()
+                G.lose(gl)
+                const r = G.attempt(() => h.checkError(gl, 'x'))
+                if (r.error instanceof h.errors.ContextLostError) return true
+                if (r.error instanceof h.errors.GLCallError) {
+                  return '抛的是 GLCallError（' + esc(r.error.message) + '）：丢失后第一次 getError 会返回 CONTEXT_LOST_WEBGL（0x9242），要先用 isContextLost 排除'
+                }
+                return '得到：' + said(r)
+              }
+            },
+            {
+              label: 'checkError：getError 之后才发现丢失（伪造 context）也按丢失处理',
+              test(c) {
+                const h = helpers(c)
+                let asked = 0
+                const fake = {
+                  NO_ERROR: 0,
+                  isContextLost() {
+                    asked += 1
+                    return asked > 1
+                  },
+                  getError() {
+                    return 0x0502
+                  }
+                }
+                const r = G.attempt(() => h.checkError(fake, 'x'))
+                if (r.error instanceof h.errors.ContextLostError) return true
+                return (
+                  '这个伪造的 context 第一次说「活着」，第二次起说「丢失」，而 getError 返回 INVALID_OPERATION。' +
+                  '你的 checkError 一共查了 ' + asked + ' 次 isContextLost，结果是 ' + said(r) + '。' +
+                  'getError 之后要再查一次：丢失时 getError 的结果不可信，应该抛 ContextLostError'
+                )
+              }
+            },
+            {
+              label: 'checkCompiled：编译失败时抛 CompileError，信息里带 info log',
+              test(c) {
+                const h = helpers(c)
+                const gl = G.freshContext()
+                const shader = compileSource(gl, gl.VERTEX_SHADER, BAD_VS)
+                const r = G.attempt(() => h.checkCompiled(gl, shader, 'vertex'))
+                if (!(r.error instanceof h.errors.CompileError)) return '得到：' + said(r)
+                return /gl_Positon/.test(r.error.message) || '信息里没有 info log（getShaderInfoLog 的内容，里面会提到 gl_Positon）：「' + esc(r.error.message) + '」'
+              }
+            },
+            {
+              label: 'checkCompiled：context 丢失时（查询返回 null）抛 ContextLostError，不是 CompileError',
+              test(c) {
+                const h = helpers(c)
+                const gl = G.freshContext()
+                const shader = compileSource(gl, gl.VERTEX_SHADER, GOOD_VS)
+                G.lose(gl)
+                const r = G.attempt(() => h.checkCompiled(gl, shader, 'vertex'))
+                if (r.error instanceof h.errors.ContextLostError) return true
+                if (r.error instanceof h.errors.CompileError) {
+                  return '抛的是 CompileError：丢失时 getShaderParameter 返回 null，看起来像编译失败，其实不是。先排除丢失，再解读结果'
+                }
+                return '得到：' + said(r)
+              }
+            },
+            {
+              label: 'checkCompiled、checkLinked：正常的 shader 和 program 都不抛',
+              test(c) {
+                const h = helpers(c)
+                const gl = G.freshContext()
+                const vs = compileSource(gl, gl.VERTEX_SHADER, GOOD_VS)
+                const fs = compileSource(gl, gl.FRAGMENT_SHADER, GOOD_FS)
+                const v = G.attempt(() => h.checkCompiled(gl, vs, 'vertex'))
+                if (v.error) return '正常的 vertex shader 抛了：' + said(v)
+                const f = G.attempt(() => h.checkCompiled(gl, fs, 'fragment'))
+                if (f.error) return '正常的 fragment shader 抛了：' + said(f)
+                const program = gl.createProgram()
+                gl.attachShader(program, vs)
+                gl.attachShader(program, fs)
+                gl.linkProgram(program)
+                const p = G.attempt(() => h.checkLinked(gl, program))
+                return !p.error || '正常的 program 抛了：' + said(p)
+              }
+            },
+            {
+              label: 'checkLinked：varying 对不上时抛 CompileError，信息里带链接日志',
+              test(c) {
+                const h = helpers(c)
+                const gl = G.freshContext()
+                const vs = compileSource(gl, gl.VERTEX_SHADER, GOOD_VS)
+                const fs = compileSource(gl, gl.FRAGMENT_SHADER, MISMATCH_FS)
+                const program = gl.createProgram()
+                gl.attachShader(program, vs)
+                gl.attachShader(program, fs)
+                gl.linkProgram(program)
+                const r = G.attempt(() => h.checkLinked(gl, program))
+                if (!(r.error instanceof h.errors.CompileError)) return '得到：' + said(r) + '。两个 shader 都能编译通过，只有 LINK_STATUS 能发现这个问题'
+                return /vColor/.test(r.error.message) || '信息里没有链接日志（getProgramInfoLog 的内容，里面会提到 vColor）：「' + esc(r.error.message) + '」'
+              }
+            },
+            {
+              label: 'checkError 一次排空所有错误标志，信息里列出全部错误名',
+              optional: true,
+              test(c) {
+                const h = helpers(c)
+                const gl = G.freshContext()
+                gl.enable(0x1234)
+                gl.viewport(0, 0, -1, 1)
+                const r = G.attempt(() => h.checkError(gl, 'x'))
+                if (!(r.error instanceof h.errors.GLCallError)) return '得到：' + said(r)
+                const both = /INVALID_ENUM/.test(r.error.message) && /INVALID_VALUE/.test(r.error.message)
+                const drained = gl.getError() === gl.NO_ERROR
+                if (both && drained) return true
+                return '这里同时挂着 INVALID_ENUM 和 INVALID_VALUE，你的信息是「' + esc(r.error.message) + '」' + (drained ? '' : '，而且检查完还有标志没被取走') + '。提示：循环调用 getError 直到 NO_ERROR（每一轮也要留意 context 是否丢失）'
+              }
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <details>
+      <summary>我写完了（或者真的卡住了）：参考答案</summary>
+      <pre><code>function requireNonNull(value, what) {
+  if (value === null) throw new NullHandleError(`${what} 返回了 null`)
+  return value
+}
+
+function assertAlive(gl, operation) {
+  if (gl.isContextLost()) throw new ContextLostError(`${operation}：context 已丢失`)
+}
+
+function checkError(gl, operation) {
+  assertAlive(gl, operation)            // 丢失后 getError 会返回 CONTEXT_LOST_WEBGL，不能当普通错误
+  const code = gl.getError()
+  assertAlive(gl, operation)            // 查询期间可能刚好丢失：先确认结果还可信
+  if (code !== gl.NO_ERROR) {
+    throw new GLCallError(`${operation}：${ERROR_NAMES[code] ?? '0x' + code.toString(16)}`)
+  }
+}
+
+function checkCompiled(gl, shader, stage) {
+  const ok = gl.getShaderParameter(shader, gl.COMPILE_STATUS)
+  assertAlive(gl, `compile ${stage}`)   // 丢失时 ok 是 null，不是编译失败
+  if (ok !== true) {
+    throw new CompileError(`${stage} shader 编译失败：${gl.getShaderInfoLog(shader) ?? ''}`)
+  }
+}
+
+function checkLinked(gl, program) {
+  const ok = gl.getProgramParameter(program, gl.LINK_STATUS)
+  assertAlive(gl, 'link program')
+  if (ok !== true) {
+    throw new CompileError(`链接失败：${gl.getProgramInfoLog(program) ?? ''}`)
+  }
+}
+
+// 选做：一次排空所有错误标志
+function checkErrorDrained(gl, operation) {
+  const names = []
+  for (let guard = 0; guard &lt; 16; guard++) {   // 上限防止实现异常时死循环
+    assertAlive(gl, operation)
+    const code = gl.getError()
+    assertAlive(gl, operation)
+    if (code === gl.NO_ERROR) break
+    names.push(ERROR_NAMES[code] ?? '0x' + code.toString(16))
+  }
+  if (names.length &gt; 0) throw new GLCallError(`${operation}：${names.join(', ')}`)
+}</code></pre>
+      <p>选做题要让沙盒测到它，把 <code>checkErrorDrained</code> 的函数体直接写进 <code>checkError</code>（或者在 return 里写 <code>checkError: checkErrorDrained</code>）。</p>
+    </details>
+
+    <h2>4. 预测：这次会从哪条通道报出来？</h2>
+    <p>
+      每段代码都会先跑一段公共的前置代码（编译好一个 program、创建一个还没绑定的 buffer、清屏成深灰；fragment shader 用 <code>uniform vec4 uColor</code> 着色，<code>useProgramWithColor()</code> 会把它设成橙色）。<strong>先选你的预测，再看运行结果</strong>——先让脑子里的模型说话，再让证据来纠正它。
+    </p>
+    <details>
+      <summary>前置代码（每段之前都会先跑一遍）</summary>
+      <pre><code id="prelude-0002">const VS = 'attribute vec2 position; void main() { gl_Position = vec4(position, 0.0, 1.0); }'
+const FS = 'precision mediump float; uniform vec4 uColor; void main() { gl_FragColor = uColor; }'
+const name = (code) =&gt; ({ 0: 'NO_ERROR', 0x500: 'INVALID_ENUM', 0x501: 'INVALID_VALUE',
+  0x502: 'INVALID_OPERATION', 0x9242: 'CONTEXT_LOST_WEBGL' })[code] ?? code
+const program = gl.createProgram()
+for (const [type, source] of [[gl.VERTEX_SHADER, VS], [gl.FRAGMENT_SHADER, FS]]) {
+  const shader = gl.createShader(type)
+  gl.shaderSource(shader, source)
+  gl.compileShader(shader)
+  gl.attachShader(program, shader)
+}
+gl.linkProgram(program)
+const buffer = gl.createBuffer()
+const TRIANGLE = new Float32Array([0, 0.8, -0.8, -0.8, 0.8, -0.8])
+function useProgramWithColor() {
+  gl.useProgram(program)
+  gl.uniform4f(gl.getUniformLocation(program, 'uColor'), 1, 0.4, 0.1, 1)
+}
+gl.clearColor(0.1, 0.1, 0.12, 1)
+gl.clear(gl.COLOR_BUFFER_BIT)</code></pre>
+    </details>
+
+    <div id="predict-0002"></div>
+    <script>
+      RTeach.predict({
+        mount: document.getElementById('predict-0002'),
+        storageKey: 'lesson-0002',
+        choices: ['① 特殊返回值', '② 状态查询', '③ 错误标志', '④ context 丢失', '⑤ 静默失败'],
+        prelude: document.getElementById('prelude-0002').textContent,
+        items: [
+          {
+            title: 'A · 向一个不存在的扩展要能力',
+            code: "const extension = gl.getExtension('WEBGL_not_a_real_extension')\nlog('getExtension →', extension)\nlog('getError →', name(gl.getError()))",
+            answer: 0,
+            explain: '返回 <code>null</code>，而且<strong>不算错误</strong>：错误标志里什么都没有。「设备没有这个能力」是正常结果，不是 bug。所以 <a data-src="src/rendering/backend/webgl1/WebGL1Capabilities.ts:43">Capabilities</a> 把 null 原样存进快照，交给用到它的 Manager 决定是降级还是报错（第 4 课）。'
+          },
+          {
+            title: 'B · GLSL 里拼错一个字',
+            code: "const shader = gl.createShader(gl.VERTEX_SHADER)\ngl.shaderSource(shader, 'void main() { gl_Positon = vec4(0.0); }')\ngl.compileShader(shader)\nlog('getError →', name(gl.getError()))\nlog('COMPILE_STATUS →', gl.getShaderParameter(shader, gl.COMPILE_STATUS))\nlog(gl.getShaderInfoLog(shader))",
+            answer: 1,
+            explain: '<code>getError</code> 是 NO_ERROR——编译失败<strong>不进错误标志</strong>。只有 COMPILE_STATUS 是 false，原因写在 info log 里。如果你的代码只靠 <code>checkError</code> 兜底，这种错误会一路漏到 draw 才以别的样子冒出来。'
+          },
+          {
+            title: 'C · 先 vertexAttribPointer，后 bindBuffer',
+            code: "const location = gl.getAttribLocation(program, 'position')\ngl.vertexAttribPointer(location, 2, gl.FLOAT, false, 0, 0)  // 此刻 ARRAY_BUFFER 上还是 null\ngl.enableVertexAttribArray(location)\ngl.bindBuffer(gl.ARRAY_BUFFER, buffer)\ngl.bufferData(gl.ARRAY_BUFFER, TRIANGLE, gl.STATIC_DRAW)\nuseProgramWithColor()\ngl.drawArrays(gl.TRIANGLES, 0, 3)",
+            answer: 2,
+            explain: '错误出现在<strong>第 9 个调用 drawArrays</strong> 上，可犯错的是<strong>第 2 个调用</strong>：pointer 调用时 ARRAY_BUFFER 是 null，offset 又是 0，所以它安静地记下了 null（offset ≠ 0 才会当场报错）。等到 draw 发现「这个 location 启用了却没有 buffer」，才记下 INVALID_OPERATION。<strong>报错的地方不一定是犯错的地方</strong>：顺着调用日志往前找最后一次动过相关状态的调用。'
+          },
+          {
+            title: 'D · context 丢失之后再创建资源',
+            code: "gl.getExtension('WEBGL_lose_context').loseContext()\nconst buffer2 = gl.createBuffer()\nlog('createBuffer →', buffer2)\nlog('isBuffer →', gl.isBuffer(buffer2))\nlog('getError →', name(gl.getError()))\nlog('getError（第二次）→', name(gl.getError()))",
+            answer: 3,
+            explain: '<code>createBuffer</code> 返回的是<strong>对象，不是 null</strong>，只是已经作废（<code>isBuffer</code> 是 false）；<code>getError</code> 只在第一次返回 CONTEXT_LOST_WEBGL，之后又是 NO_ERROR——要是第一次的结果被别处取走了，就只剩 <code>isContextLost()</code> 能告诉你。这就是 2.3 节「create → assertAvailable → requireNonNull」的顺序为什么不能省。'
+          },
+          {
+            title: 'E · 忘了 enableVertexAttribArray',
+            code: "gl.bindBuffer(gl.ARRAY_BUFFER, buffer)\ngl.bufferData(gl.ARRAY_BUFFER, TRIANGLE, gl.STATIC_DRAW)\nconst location = gl.getAttribLocation(program, 'position')\ngl.vertexAttribPointer(location, 2, gl.FLOAT, false, 0, 0)\n// 忘了 gl.enableVertexAttribArray(location)\nuseProgramWithColor()\ngl.drawArrays(gl.TRIANGLES, 0, 3)",
+            answer: 4,
+            explain: '没有任何 GL 错误，画面上也什么都没有。没 enable 的 location 读的是常量 (0, 0, 0, 1)，三个顶点全落在原点，三角形面积为 0。这种错误<strong>没有任何查询能发现</strong>，只能靠像素验收——这也是为什么 Task 15 的验收标准是「真实浏览器里 readPixels 读到三角形」，而不只是单元测试通过。'
+          },
+          {
+            title: 'F · uniform 名字拼错',
+            code: "gl.bindBuffer(gl.ARRAY_BUFFER, buffer)\ngl.bufferData(gl.ARRAY_BUFFER, TRIANGLE, gl.STATIC_DRAW)\nconst location = gl.getAttribLocation(program, 'position')\ngl.vertexAttribPointer(location, 2, gl.FLOAT, false, 0, 0)\ngl.enableVertexAttribArray(location)\ngl.useProgram(program)\ngl.uniform4f(gl.getUniformLocation(program, 'uColour'), 1, 0.4, 0.1, 1)  // 拼错了\ngl.drawArrays(gl.TRIANGLES, 0, 3)",
+            answer: 4,
+            explain: '拼错的名字查到 <code>null</code>，而 WebGL 规定 <code>uniform4f(null, …)</code> 是合法的空操作，于是 uColor 保持默认值 (0, 0, 0, 0)：三角形画了，但画成了<strong>透明的黑色</strong>（中心像素的 alpha 是 0）。Task 15 上传材质参数时一定会遇到它；项目把「材质给了参数、shader 里却没有对应 uniform」的检查列为 <a data-src="src/rendering/resources/Material.ts:178">TODO(material-uniform-reflection)</a>。'
+          }
+        ]
+      })
+    </script>
+    <aside class="note">
+      调试小技巧：打开浏览器开发者工具的 Console。Chromium 会把每个 GL 错误的<strong>原因</strong>打印出来，例如 <code>WebGL: INVALID_OPERATION: drawArrays: no valid shader program in use</code>，比错误码本身好懂得多（报满一定数量后会停止打印）。它只对通道 ③ 有用：编译失败、静默失败都不会出现在这里。
+    </aside>
+
+    <h2>5. 在项目里：通道 → 错误类型 → 上层怎么处理</h2>
+    <p>项目为每种失败准备了不同的错误类（都继承自 <a data-src="src/rendering/core/errors/RenderingError.ts:24">RenderingError</a>）。分这么多类，不是为了好看，而是让上层可以<strong>分别处理</strong>：有的该报告给开发者，有的该暂停绘制等待恢复，有的该换一种方案重试。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>通道</th><th>项目原语</th><th>抛出的错误类</th><th>上层该怎么办</th></tr>
+        <tr><td>① null / -1</td><td>requireNonNull、<code>location &lt; 0</code></td><td>WebGLResourceCreationError、WebGLOperationError</td><td>中止这次构建，清理已经创建的对象</td></tr>
+        <tr><td>② 编译、链接</td><td>compile 与 link 的状态检查</td><td>ShaderCompilationError、ProgramLinkError（带 infoLog）</td><td>报告给开发者：这是 shader 写错了，重试没有用</td></tr>
+        <tr><td>② framebuffer</td><td>checkFramebufferStatus</td><td>IncompleteFramebufferError</td><td>换一种附件格式，或者关掉这个功能</td></tr>
+        <tr><td>③ 错误标志</td><td>checkError、assertTextureOperation</td><td>WebGLOperationError</td><td>INVALID_* 是代码 bug，要修；OUT_OF_MEMORY 可以考虑降低分辨率</td></tr>
+        <tr><td>④ 丢失</td><td>assertAvailable</td><td>WebGLContextLostError</td><td>停止绘制，等 restored 事件后重建（第 5 课）</td></tr>
+        <tr><td>⑤ 静默</td><td>validateStorage、resolve 等事前校验</td><td>UnsupportedRenderFeatureError、InvalidTextureSourceError</td><td>在上传之前就拒绝，并说明原因</td></tr>
+      </table>
+    </div>
+    <p>另外还有一类不是 GL 给的失败：<strong>我们自己的生命周期</strong>。Manager 已经 dispose 之后又被调用，抛 WebGLBackendDisposedError；CPU 资源已经释放之后又被使用，抛 ResourceDisposedError。它们和 context 丢失是两回事：前者是调用方的 bug，后者是设备那边发生的事。</p>
+
+    <h2>6. 检查题</h2>
+    <p>凭记忆作答。</p>
+    <div class="quiz" data-quiz="lesson-0002"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0002"]'), [
+        {
+          q: 'context 丢失之后调用 gl.createBuffer()，现在的 Chromium 返回什么？',
+          opts: ['一个已经作废的 WebGLBuffer 对象', '返回 null，所以 requireNonNull 能拦住', '直接抛出 WebGLContextLostError'],
+          answer: 0,
+          why: '现行规范里 createBuffer 的返回类型是非 null 的 WebGLBuffer，丢失时返回作废对象（对它调用 isBuffer 得到 false）。所以只判 null 拦不住丢失，项目在 create* 之后紧跟一次 isContextLost（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:298">ProgramManager.ts:298</a>）。「直接抛出 WebGLContextLostError」不对：GL 从不抛领域错误，WebGLContextLostError 是项目自己定义的类。'
+        },
+        {
+          q: '一次操作里先后产生了 INVALID_ENUM 和 INVALID_VALUE，然后调用一次 getError，会怎样？',
+          opts: ['只取出其中一个，另一个还留在标志里', '两个一起取出，拼成一个组合错误码', '只保留最后一个，前面那个被覆盖了'],
+          answer: 0,
+          why: '每种错误各有一个标志，每次 getError 取出并清除其中一个，返回哪个不保证。要取干净只能循环调用到 NO_ERROR；只取一次，剩下的会被算到下一次检查头上。'
+        },
+        {
+          q: '为什么 ProgramManager.get 在编译之前，先 checkError(\'preflight\')？',
+          opts: ['先把别人留下的旧错误报出来，别算到编译头上', '先预热一下 GPU 管线，让后面的编译更快一些', '先确认 context 创建成功，再开始后面的编译'],
+          answer: 0,
+          why: '错误标志会一直攒着，直到有人调用 getError。如果之前某段代码留下了 INVALID_ENUM，而 ProgramManager 编译完才第一次去查，就会把它当成编译引起的错误。preflight 让「是谁的错」变得清楚。只调一次也够用：只有所有标志都清空，getError 才返回 NO_ERROR，所以一次调用就能判断「干不干净」；干净，后面查到的错就都是这次编译自己的。取不干净的只是「已经有错时剩下的那些」——那时编译根本不会开始（剩下的会留给下一个检查点，这是可以改进的地方，见 2.1 节末尾）。'
+        },
+        {
+          q: '把 uniform 的名字拼错了，上传时会发生什么？',
+          opts: ['location 是 null，上传被悄悄忽略', 'uniform4f 记下 INVALID_OPERATION', 'linkProgram 失败，LINK_STATUS 变 false'],
+          answer: 0,
+          why: '这是第 ⑤ 条通道：拼错的名字查不到 location，而把 null 传给 uniform* 是合法的空操作。只能靠事前核对（shader 反射出的 uniform 表 vs 材质参数），或者像素验收。'
+        },
+        {
+          q: '为什么不在每一次 draw 之后都 checkError？',
+          opts: ['getError 会同步等待 GPU，每帧几百次会卡', 'draw 调用不会产生任何 GL 错误，没必要查', 'getError 只在创建资源的阶段调用才有效'],
+          answer: 0,
+          why: 'MDN best practices：getError 会触发一次 flush 和到 GPU 进程的往返。放在只发生一次的冷路径上没问题；放进每帧的热路径，等于在每个 draw 后面插一次同步等待。draw 当然会产生错误（第 1 课的越界检查就是），开发期可以靠 Console 里的 WebGL 警告和像素验收来发现。'
+        }
+      ])
+    </script>
+
+    <h2>7. 延伸阅读</h2>
+    <p>
+      <strong>首选：</strong><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices">MDN · WebGL best practices</a> 里的两节：「Avoid blocking API calls in production」（为什么 getError、getParameter 慢）和「Don't check shader compile status unless linking fails」（和项目逐个检查编译状态的做法正好相反——第 6 课我们会讨论这个取舍）。大约 10 分钟。
+    </p>
+    <p>
+      补充：<a href="https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glGetError.xml">ES 2.0 · glGetError 参考页</a>（多个错误标志的规则，一页纸）；本课程的 <a href="../reference/webgl1-api.html#channels">API 速查 · 五种失败通道</a> 和 <a href="../reference/webgl1-api.html#measured">实测清单</a>。
+    </p>
+
+    <aside class="ask">
+      有任何没讲清楚的地方，直接在对话里问我。做完之后告诉我：热身题和检查题各错了哪题、沙盒里哪几项一直过不了、六道预测猜对了几道。第 1 课的结果也可以一起告诉我——我用这些来调整后面的课。
+    </aside>
+
+    <div class="nav">
+      <a href="0001-one-draw-four-stages.html">← 第 1 课：一次 draw 的四段调用</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0003-architecture-overview.html">精读主线 · 第 3 课：src/rendering 全景 →</a>
+    </div>
+    <footer>WebGL1 后端课程 · 第 2 课 · 2026-09-23</footer>
+  </body>
+</html>

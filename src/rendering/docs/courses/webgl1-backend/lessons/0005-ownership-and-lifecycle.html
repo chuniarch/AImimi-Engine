@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 5 课 · 所有权与生命周期</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/gl-sandbox.js"></script>
+    <script src="../assets/predict.js"></script>
+    <script src="../assets/rendering-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 架构篇 3/4 · 约 25 分钟</p>
+    <h1>架构决策二：谁拥有，谁借用，谁负责释放</h1>
+    <p class="lede">
+      上一课讲的是 GPU 表示归谁（每个 context 的 Manager）。这一课往上走一层：CPU 资源本身归谁？一个 Geometry 被两个 Mesh、两个 Scene 共用时，该由谁、在什么时候释放它？读完你应该能区分「挂在树上」「借用」「拥有」三种关系，说出 Resource 的三个释放出口各用在什么场合，并能解释 Scene 账本里三处顺序各自挡住了什么反例。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 第 4 课的 Manager 何时删除 GPU 对象，取决于这一课的 CPU 资源何时释放。HW2 切换预设时新旧两个 Scene 怎样交接资源，靠的也是这一课的机制；写 Task 15 和审查 HW2 的场景工厂时都会用到。
+    </div>
+
+    <h2>1. 设计问题：共享的资源该由谁释放？</h2>
+    <p>
+      一个具体场景：HW2 切换预设时，<code>Engine.setScene()</code>「先完成新 scene/camera 的原子替换，再 dispose 旧 Scene」（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1713">HW2 设计 §26</a>）。假设新旧两个 Scene 共用同一个背景立方体 Geometry 和同一个 cubemap。四种分配释放责任的方案：
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 22%">方案</th><th style="width: 30%">谁负责释放</th><th>在这个场景里会怎样</th></tr>
+        <tr><td>Mesh 拥有资源</td><td>每个 Mesh 释放自己的 Geometry</td><td>两个 Mesh 共用一个 Geometry，先走的那个把另一个的也释放了。Mesh 还能摘下再挂回去，摘下时根本不知道该不该释放。</td></tr>
+        <tr><td>Scene 独占（设计文档最初的 <code>own()</code>）</td><td><code>Scene.dispose()</code> 直接 dispose 它登记过的每个资源（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:624">§9.3 末尾的修订说明</a>）</td><td>旧 Scene 一 dispose，就把新 Scene 正在用的背景和 cubemap 一起释放了。</td></tr>
+        <tr><td>不管（three.js 的做法）</td><td>应用自己记账，手动 dispose</td><td>能做对，但每一个共享点都要自己数。忘了就泄漏，数错就提前释放。</td></tr>
+        <tr><td><strong>Scene 级引用计数（本项目）</strong></td><td>每个 Scene 对一个资源最多贡献一份引用；最后一份交还时自动释放</td><td>旧 Scene 交还后，还剩新 Scene 那一份，资源继续活着。新 Scene 将来释放时，它才真正被释放。</td></tr>
+      </table>
+    </div>
+    <p>设计文档最初写的是第二种，实现改成了第四种（设计文档已在 2026-09-24 按实现修订；第 8.2 节讲这次改动当时留下的旧说法）。</p>
+
+    <h2>2. 三种关系要分开：挂在树上、借用、拥有</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 16%">关系</th><th style="width: 32%">API</th><th style="width: 22%">谁对谁</th><th>影响资源寿命吗</th></tr>
+        <tr><td>挂在树上</td><td><code>scene.add(mesh)</code>、<code>mesh.removeFromParent()</code></td><td>Scene → 节点</td><td>不影响。节点可以摘下来再挂回去。</td></tr>
+        <tr><td>借用</td><td><code>new Mesh(geometry, material)</code>；Material 的 shaderModule 与纹理参数；RenderItem</td><td>Mesh → Geometry、Material；Material → ShaderModule、纹理</td><td>不影响。借用方在<strong>使用时</strong>检查对方是否已经释放。</td></tr>
+        <tr><td>拥有</td><td><code>scene.retain(r)</code>、<code>scene.release(r)</code>、<code>scene.dispose()</code></td><td>Scene → 资源</td><td>影响。引用数归零，资源自动释放。</td></tr>
+      </table>
+    </div>
+    <p>
+      Mesh 的类注释把前两种分得很清楚：「Scene.add(mesh) 只登记父子关系；资源存活由 Scene.retain(resource) 单独登记」（<a data-src="src/rendering/scene/Mesh.ts:13">Mesh.ts:13</a>）。所以正确的建场景写法是：每创建一个资源就立刻 retain，再把节点挂上树。<code>retain</code> 原样返回传入的资源，正好可以写成一行（<a data-src="src/rendering/scene/Scene.ts:72">Scene.ts:72–75</a> 的示例）：
+    </p>
+    <pre><code>const scene = new Scene()
+const shader = scene.retain(new ShaderModule({ … }))
+const material = scene.retain(new Material({ shaderModule: shader }))   // Material 借用 shader，但 shader 也要 retain
+const geometry = scene.retain(new Geometry({ … }))
+scene.add(new Mesh(geometry, material), new Mesh(geometry, material))   // 两个 Mesh 借用同一份资源</code></pre>
+    <p>
+      还有两种所有权不经过 Scene：RenderTarget 归创建它的 Pass 或功能模块，由它直接 dispose（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:261">HW2 设计 §6 核心规则</a>）；GPU 对象归每个 context 的 Manager（第 4 课）。
+    </p>
+
+    <h2>3. 精读 ①：Resource 的计数与三个释放出口</h2>
+    <pre><code>// src/rendering/core/Resource.ts:124-190（节选，行尾注释是我加的）
+retainSceneReference(): void {
+  this.assertUsable()                       // ① 已释放的资源不能复活
+  this.sceneReferenceCountValue += 1
+}
+releaseSceneReference(): void {
+  if (this.sceneReferenceCountValue === 0)  // ② 先验证，再修改：不能先减成 -1 再补救
+    throw new ResourceSceneReferenceUnderflowError(this.resourceType)
+  this.sceneReferenceCountValue -= 1
+  if (this.sceneReferenceCountValue === 0) this.finalizeDisposal()   // ③ 最后一份交还：自动真正释放
+}
+tryDispose(): boolean {
+  if (this.disposedValue) return true
+  if (this.sceneReferenceCountValue &gt; 0) return false   // ④ 还有人持有：返回 false，什么都不改
+  this.finalizeDisposal()
+  return true
+}
+dispose(): void {
+  if (this.disposedValue) return
+  if (this.sceneReferenceCountValue &gt; 0) {              // ⑤ 还有人持有：抛错，什么都不改
+    throw new ResourceHasSceneReferencesError(this.resourceType, this.sceneReferenceCountValue)
+  }
+  this.finalizeDisposal()
+}</code></pre>
+    <p>
+      <strong>计的是 Scene 的个数</strong>，不是 JavaScript 引用数，也不统计 Mesh 或 context（<a data-src="src/rendering/core/Resource.ts:31">Resource.ts:31–38</a>）。不数 Mesh，是因为 Mesh 会摘下又挂回，按它来数，资源会在节点暂时摘下时被误释放；不数 JavaScript 引用，是因为根本数不到（JS 没有析构函数，垃圾回收的时机也不可预测）。
+    </p>
+    <p><strong>三个出口，各用在一种场合：</strong></p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 24%">出口</th><th>什么时候用</th><th style="width: 30%">还有 Scene 持有时</th></tr>
+        <tr><td><code>scene.release(r)</code> / <code>scene.dispose()</code></td><td>正常路径：所有者交还自己那一份，最后一份交还时自动清理</td><td>只减一份，资源继续活着</td></tr>
+        <tr><td><code>r.tryDispose()</code></td><td>「没人用了就释放」：资源可能仍被共享，这是正常分支</td><td>返回 false，状态不变</td></tr>
+        <tr><td><code>r.dispose()</code></td><td>断言「我确定没人持有它」。断言错了就是 bug，要大声失败，不能悄悄弄坏另一个 Scene</td><td>抛 ResourceHasSceneReferencesError，状态不变</td></tr>
+      </table>
+    </div>
+    <p>
+      错误类的注释写明了这条分工：对于「资源可能仍在使用」的正常分支，应该调用 <code>tryDispose()</code>，「而不是依赖异常控制流程」（<a data-src="src/rendering/core/errors/RenderingError.ts:58">RenderingError.ts:58–65</a>）。②④⑤ 有同一个模式：<strong>先验证，验证失败就什么都不改</strong>——测试逐一守着这一点（<a data-src="tests/unit/rendering/core/Resource.test.ts:149">Resource.test.ts:149</a>、<a data-src="tests/unit/rendering/core/Resource.test.ts:166">:166</a>、<a data-src="tests/unit/rendering/core/Resource.test.ts:215">:215</a>）。
+    </p>
+
+    <h2>4. 精读 ②：Scene 的账本，三处顺序</h2>
+    <p>Scene 有两项职责：作为 Group 保存节点树，以及为每个 retain 过的资源持有一份引用（<a data-src="src/rendering/scene/Scene.ts:11">Scene.ts:11–14</a>）。账本是一个 <code>Set&lt;Resource&gt;</code>（<a data-src="src/rendering/scene/Scene.ts:38">:38</a>），同一个 Scene 对同一个资源最多记一次。难点全在顺序上：</p>
+    <pre><code>// src/rendering/scene/Scene.ts:77-86、102-110、131-143（行尾注释是我加的）
+retain&lt;T extends Resource&gt;(resource: T): T {
+  if (this.disposedValue) throw new ResourceDisposedError('Scene')
+  if (this.retainedResources.has(resource)) return resource   // 已记过：不重复加引用
+  resource.retainSceneReference()                             // ① 先让资源同意（已释放的会在这里抛错）
+  this.retainedResources.add(resource)                        //    再记账
+  return resource
+}
+release(resource: Resource): boolean {
+  if (this.disposedValue) return false                        // ③ 释放期间不接受单独的 release
+  if (!this.retainedResources.delete(resource)) return false  // ② 先销账
+  resource.releaseSceneReference()                            //    再交还（可能触发同步的监听器）
+  return true
+}
+dispose(): void {
+  if (this.disposedValue) return
+  this.disposedValue = true                                   // ③ 先标记
+  this.removeAllChildren()                                    //    断开整棵树
+  for (const resource of this.retainedResources) {
+    resource.releaseSceneReference()                          //    逐个交还，不是 dispose
+  }
+  this.retainedResources.clear()
+}</code></pre>
+    <ol class="steps">
+      <li><strong>retain：先让资源同意，再记账。</strong>资源已经释放时，<code>retainSceneReference</code> 会抛错；这时 Set 里还什么都没记，账本不会留下一条假记录（<a data-src="src/rendering/scene/Scene.ts:69">:69–70</a>）。</li>
+      <li><strong>release：先销账，再交还。</strong>交还最后一份引用会同步触发监听器。如果某个监听器又回过头来调用 <code>scene.release(同一个资源)</code>——这叫重入 (re-entrancy)——它会发现账已经销了，直接返回 false，不会把引用数减成负数（测试 <a data-src="tests/unit/rendering/scene/Scene.test.ts:331">Scene.test.ts:331</a>）。通用规则：<strong>先改好自己的账，再通知别人。</strong></li>
+      <li><strong>dispose：先标记，而且标记之后 release 一律返回 false。</strong>标记在前，监听器里看到的 <code>scene.disposed</code> 已经是 true，这时再想 retain 新资源会被拒绝（<a data-src="tests/unit/rendering/scene/Scene.test.ts:208">:208</a>）。release 返回 false，是防止一个资源的监听器把另一个资源从这一轮里「截走」：那个资源会留下一份永远不会被交还的引用（<a data-src="tests/unit/rendering/scene/Scene.test.ts:242">:242</a>）。</li>
+    </ol>
+    <p>
+      注意 dispose 里调用的是 <code>releaseSceneReference()</code>，不是 <code>resource.dispose()</code>：「如果其他 Scene 仍持有同一 Resource，引用数只会减少」（<a data-src="src/rendering/scene/Scene.ts:125">:125–126</a>）。这正是第 1 节里新旧 Scene 能安全交接的原因。
+    </p>
+
+    <h2>5. 精读 ③：借用方不拥有，但在使用时检查</h2>
+    <p>借用方不 retain，也不订阅释放事件。它们在<strong>每次使用</strong>时检查对方是否还活着：</p>
+    <ul>
+      <li><strong>Mesh：</strong>构造时拒绝已释放的依赖（<a data-src="src/rendering/scene/Mesh.ts:40">Mesh.ts:40–41</a>）；每次读 <code>geometry</code>、<code>material</code> 都再检查一次（<a data-src="src/rendering/scene/Mesh.ts:56">:56–59</a>、<a data-src="src/rendering/scene/Mesh.ts:66">:66–69</a>），因为「构造完成后外部仍可能释放依赖」（<a data-src="src/rendering/scene/docs/mesh-and-camera.zh-CN.md:19">mesh-and-camera.zh-CN.md:19</a>）。</li>
+      <li><strong>Material：</strong>构造时检查 shader，读取纹理参数时检查纹理（cubemap 见 <a data-src="src/rendering/resources/materialParameters.ts:118">materialParameters.ts:118–129</a> 的 <code>requireCubeTexture</code>，二维纹理和附件见 <a data-src="src/rendering/resources/Texture2DSamplingSource.ts:53">Texture2DSamplingSource.ts:53</a>；10 月 10 日起，两处都调用资源自己的 <code>assertUsable()</code>，原来的 <code>requireAlive</code> 已删）；「替换纹理参数不负责释放旧纹理，也不负责登记新纹理的 Scene 引用」（<a data-src="src/rendering/resources/Material.ts:340">Material.ts:340</a>）；Material 自己释放时，只断开引用（<a data-src="src/rendering/resources/Material.ts:351">:351–357</a>）。</li>
+      <li><strong>参数块（10 月 19 日新增）：</strong>借用链多了一环。Material 借用 ParameterBlock，块再借用纹理或 RenderTarget 附件，两层都不 retain、不级联释放（<a data-src="src/rendering/resources/ParameterBlock.ts:132">ParameterBlock.ts:132–141</a>），都在用的时候查：Material 每次读 <code>blocks</code> 都查每个块还活着（<a data-src="src/rendering/resources/Material.ts:286">Material.ts:286–290</a>），块读到纹理项时查那张纹理还活着（<a data-src="src/rendering/resources/ParameterBlock.ts:80">ParameterBlock.ts:80–91</a>）。所以建场景时，块和它借的阴影图也要各自 retain（第 45 课）。</li>
+    </ul>
+    <p>
+      <strong>为什么借用方不订阅释放事件？</strong>它们没有东西要删：Mesh 和 Material 手里只有一个引用，发现对方死了，报错就够了。订阅反而有害：Mesh 远比资源多，每个 Mesh 挂一个监听器，Mesh 被丢弃时又没有 dispose 可以退订，监听器就会一直堆在资源身上。只有 Manager 订阅，因为它手里有必须及时删除的 GPU 副本（第 4 课）。
+    </p>
+    <p>
+      代价是：用了已经释放的资源，要到<strong>下一次使用</strong>才会发现，但那时一定会明确地抛出 ResourceDisposedError，而不是变成 GL 错误或者悄悄画错（卡片 E）。对建场景的人来说，规则只有一条：「Scene 必须分别 retain 每个实际需要的资源」（<a data-src="src/rendering/resources/Material.ts:172">Material.ts:172</a>）。漏掉一个会怎样，见卡片 F。
+    </p>
+
+    <h2>6. 先预测、再运行：跑真实的项目代码</h2>
+    <p>和第 4 课一样，卡片运行的是打包进来的真实项目代码。只有卡片 A 用到了 GL（它借 GeometryManager 看 GPU 对象什么时候被删），其余几张只动 CPU 对象，调用日志是空的。</p>
+    <details>
+      <summary>每张卡片之前都会先运行的准备代码</summary>
+      <pre><code id="prelude-view"></code></pre>
+    </details>
+    <div id="predict-0005"></div>
+    <script>
+      ;(function () {
+        // 只为课程演示：SceneNode 用 crypto.randomUUID 生成 UUID，它要求安全上下文。
+        // 个别浏览器在 file:// 下没有这个函数，这里用 getRandomValues 补一个同格式的实现。
+        if (window.crypto && typeof window.crypto.randomUUID !== 'function') {
+          Object.defineProperty(window.crypto, 'randomUUID', {
+            configurable: true,
+            value: function randomUUID() {
+              const bytes = window.crypto.getRandomValues(new Uint8Array(16))
+              bytes[6] = (bytes[6] & 0x0f) | 0x40
+              bytes[8] = (bytes[8] & 0x3f) | 0x80
+              const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+              return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20)
+            }
+          })
+        }
+
+        const prelude = [
+          'const R = window.RTeachRendering                      // 打包进来的真实项目代码',
+          'const hooks = { invalidateState: () => undefined }',
+          "const shader = new R.ShaderModule({ name: 'unlit', language: 'glsl-es-100', vertexSource: 'attribute vec3 position; void main() { gl_Position = vec4(position, 1.0); }', fragmentSource: 'precision mediump float; void main() { gl_FragColor = vec4(1.0); }' })",
+          'const material = new R.Material({ shaderModule: shader })',
+          'const geometry = new R.Geometry({ attributes: { position: new R.VertexAttribute({ data: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), itemSize: 3 }) } })'
+        ].join('\n')
+        document.getElementById('prelude-view').textContent = prelude
+
+        if (!window.RTeachRendering) {
+          document.getElementById('predict-0005').textContent =
+            '没有加载到 assets/rendering-bundle.js，卡片无法运行。按 MAINTENANCE.md「真实代码打包」重新构建一次。'
+          return
+        }
+
+        RTeach.predict({
+          mount: document.getElementById('predict-0005'),
+          storageKey: 'lesson-0005',
+          canvas: false,
+          prelude,
+          items: [
+            {
+              title: 'A · 两个 Scene 共用一个 Geometry：A 先 dispose，它还能用吗？',
+              code: "const geometries = new R.WebGL1GeometryManager(gl, { elementIndexUint: null }, hooks)\nconst sceneA = new R.Scene()\nconst sceneB = new R.Scene()\nsceneA.retain(geometry)\nsceneB.retain(geometry)\ngeometries.get(geometry)             // 上传到这个 context\nsceneA.dispose()                     // 旧场景先走\nlog('A 释放后：disposed =', geometry.disposed, '，引用数 =', geometry.sceneReferenceCount)\nsceneB.dispose()\nlog('B 释放后：disposed =', geometry.disposed, '，引用数 =', geometry.sceneReferenceCount)",
+              choices: ['还能用：B 还持有一份引用', '不能用：A 释放时连它一起释放', '还能用：Scene 从来不释放资源'],
+              answer: 0,
+              explain: '第一条 log：A 交还之后引用数从 2 变 1，Geometry 没有释放。第二条：B 交还最后一份，引用数归零，Geometry 自动真正释放。再看调用日志：唯一的 <code>deleteBuffer</code> 出现在最末尾——GeometryManager 是在 <code>sceneB.dispose()</code> 时才收到释放事件的。这就是 HW2 切换预设时新旧 Scene 能安全交接的原因。「Scene 从来不释放资源」不对：它交还引用，最后一份交还时资源就被释放了。'
+            },
+            {
+              title: 'B · 一个 Scene、两个 Mesh 共用 Geometry，retain 两次：引用数是几？',
+              code: "const scene = new R.Scene()\nscene.add(new R.Mesh(geometry, material), new R.Mesh(geometry, material))\nscene.retain(geometry)\nscene.retain(geometry)               // 同一个 Scene 再登记一次\nlog('引用数 =', geometry.sceneReferenceCount)",
+              choices: ['1：计的是 Scene 的个数', '2：retain 被调用了两次', '4：两个 Mesh 加两次 retain'],
+              answer: 0,
+              explain: 'Mesh 只借用，不增加引用（<a data-src="src/rendering/scene/Mesh.ts:12">Mesh.ts:12</a>）；同一个 Scene 重复 retain，Set 里已经有了，直接返回（<a data-src="src/rendering/scene/Scene.ts:80">Scene.ts:80</a>）。所以引用数是 1。这让「一个 Scene 交还一次」总能把它自己那一份交干净，不会因为多调了几次 retain，就留下一份永远没人交还的引用。'
+            },
+            {
+              title: 'C · 把 Mesh 从场景里摘下来：它借用的 Geometry 会被释放吗？',
+              code: "const scene = new R.Scene()\nconst mesh = new R.Mesh(geometry, material)\nscene.add(mesh)\nscene.retain(geometry)\nmesh.removeFromParent()\nlog('disposed =', geometry.disposed, '，引用数 =', geometry.sceneReferenceCount)\nscene.add(mesh)                      // 还能挂回去\nlog('挂回去了吗？', mesh.parent === scene)",
+              choices: ['不会：摘下节点不碰资源寿命', '会：没有节点再用它就释放', '会：removeFromParent 会释放'],
+              answer: 0,
+              explain: '挂在树上和拥有是两回事：removeFromParent 只改父子关系，引用数还是 1，Mesh 也可以原样挂回去（测试 <a data-src="tests/unit/rendering/scene/Mesh.test.ts:125">Mesh.test.ts:125</a>）。如果「没有节点在用就释放」，把一个物体暂时藏起来（摘下再挂回），它的资源就会在中间被误删。'
+            },
+            {
+              title: 'D · 还有 Scene 持有时调用 geometry.dispose()：会怎样？',
+              code: "const scene = new R.Scene()\nscene.retain(geometry)\nlog('tryDispose →', geometry.tryDispose())\nlog('引用数 =', geometry.sceneReferenceCount, '，disposed =', geometry.disposed)\ngeometry.dispose()                   // 严格释放",
+              choices: ['抛错：还有 Scene 持有它', '立即释放：dispose 总会生效', '静默返回：什么也不做'],
+              answer: 0,
+              explain: '<code>tryDispose()</code> 返回 false，状态不变；<code>dispose()</code> 是断言「没人持有它」，断言不成立就抛 ResourceHasSceneReferencesError，同样什么都不改。看异常那一行：错误信息里带着还剩几份引用，方便定位是哪个 Scene 还拿着它。选错的话，想想第 1 节：如果这里悄悄释放，另一个 Scene 下一帧就会用到一个已经死掉的资源。'
+            },
+            {
+              title: 'E · 所有者交还了最后一份引用，Mesh 还借着它：读 mesh.geometry 会怎样？',
+              code: "const scene = new R.Scene()\nconst mesh = new R.Mesh(geometry, material)\nscene.add(mesh)\nscene.retain(geometry)\nscene.release(geometry)              // 最后一份引用：自动释放\nlog('disposed =', geometry.disposed)\nconst borrowed = mesh.geometry       // 借用方来取\nlog('取到了：', borrowed === geometry)",
+              choices: ['抛出 ResourceDisposedError', '返回它，draw 时再出错', '返回 null，跳过这个 Mesh'],
+              answer: 0,
+              explain: 'release 把引用数减到 0，Geometry 立即释放（第一条 log）。Mesh 还在树上、还拿着引用，但它的 getter 每次都检查（<a data-src="src/rendering/scene/Mesh.ts:56">Mesh.ts:56–59</a>），于是在<strong>第一次使用</strong>时明确抛错，第二条 log 根本没有执行。将来的 RenderListBuilder 读 <code>mesh.geometry</code> 时，就会在这里停下，而不是把一个死掉的资源交给后端。'
+            },
+            {
+              title: 'F · Scene 只 retain 了 geometry 和 material：dispose 之后，shader 怎样？',
+              code: "const scene = new R.Scene()\nscene.retain(geometry)\nscene.retain(material)               // material 借用 shader，但 scene 没有 retain shader\nscene.dispose()\nlog('geometry:', geometry.disposed, '；material:', material.disposed, '；shader:', shader.disposed)\nlog('shader 的引用数 =', shader.sceneReferenceCount)",
+              choices: ['还活着：Material 只借用它', '被释放：Material 会级联释放', '抛错：它不属于任何 Scene'],
+              answer: 0,
+              explain: 'Material 释放时只断开自己的引用，不级联释放 shader（<a data-src="src/rendering/resources/Material.ts:351">Material.ts:351–357</a>）。于是 shader 活着，引用数是 0：<strong>现在没有任何人负责释放它</strong>。除非创建它的代码记得自己调用 tryDispose，否则它（以及每个 context 里为它编译的 program）会一直留到 Backend 关闭。所以规则是每个资源都要 retain，包括只被别的资源借用的那些（第 2 节的写法）。'
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <h2>7. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0005"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0005"]'), [
+        {
+          q: '一个 Scene 里 3 个 Mesh 共用一个 Geometry，这个 Scene 对它 retain 了两次。引用数是几？',
+          opts: ['1：计的是持有它的 Scene 个数', '2：retain 一共被调用了两次', '5：三个 Mesh 再加两次 retain'],
+          answer: 0,
+          why: 'Mesh 只借用，不计数；同一个 Scene 重复 retain 会被 Set 去重（<a data-src="src/rendering/scene/Scene.ts:80">Scene.ts:80</a>）。计数的单位是「持有它的 Scene」（<a data-src="src/rendering/core/Resource.ts:31">Resource.ts:31–38</a>）。'
+        },
+        {
+          q: 'tryDispose() 和 dispose() 该怎样选？',
+          opts: ['资源可能仍被共享时用 tryDispose', '想强制立即释放时用 tryDispose', '两者完全等价，只是名字不同'],
+          answer: 0,
+          why: 'tryDispose 用于「资源可能仍被共享」的正常分支，被持有时返回 false；dispose 是断言「没人持有」，断言错了就抛错。两者都不会强制释放一个仍被 Scene 持有的资源。'
+        },
+        {
+          q: 'Scene.release 为什么先从 Set 里删除，再调用 releaseSceneReference？',
+          opts: ['防止监听器重入时把引用减成负数', '从 Set 删除元素比修改计数更快', '让 Set 保持元素原来的插入顺序'],
+          answer: 0,
+          why: '交还最后一份引用会同步触发监听器；监听器如果重入调用 <code>scene.release(同一个资源)</code>，会看到账已经销了，返回 false（<a data-src="tests/unit/rendering/scene/Scene.test.ts:331">Scene.test.ts:331</a>）。顺序反过来，就会第二次减引用，触发下溢错误。'
+        },
+        {
+          q: 'mesh.removeFromParent() 之后，它借用的 Geometry 会怎样？',
+          opts: ['不变：寿命只由 Scene 的引用决定', '释放：没有节点再使用它了', '引用数减一：Mesh 交还了一份'],
+          answer: 0,
+          why: '挂在树上不等于拥有。Mesh 从不增加引用，所以也没有可交还的；节点摘下后还能挂回去（<a data-src="tests/unit/rendering/scene/Mesh.test.ts:125">Mesh.test.ts:125</a>）。'
+        },
+        {
+          q: 'Material 为什么不在构造时 retain 它的 ShaderModule？',
+          opts: ['借用不改变寿命，拥有统一交给 Scene', 'Material 自己不是 Resource 的子类', 'ShaderModule 不允许被任何对象 retain'],
+          answer: 0,
+          why: 'Material 本身就是 Resource（<a data-src="src/rendering/resources/Material.ts:181">Material.ts:181</a>），ShaderModule 也可以被 Scene retain。不让 Material 计数，是为了让「谁负责释放」只有一个答案：Scene 的账本。同一个 shader 被多个 Material、多个 Scene 共用时，只看 Scene 的引用数就够了。'
+        },
+        {
+          q: '新旧两个 Scene 共用一个 CubeTexture。Engine 先换上新 Scene，再 dispose 旧 Scene。结果是？',
+          opts: ['纹理继续活着，引用数从 2 变成 1', '纹理被释放，新 Scene 下一帧出错', '抛错：纹理还被另一个 Scene 持有'],
+          answer: 0,
+          why: 'Scene.dispose 对每个资源调用的是 releaseSceneReference，不是 dispose（<a data-src="src/rendering/scene/Scene.ts:125">Scene.ts:125–126</a>），所以既不会误释放，也不会因为「还有人持有」而抛错。'
+        }
+      ])
+    </script>
+
+    <h2>8. 架构视角</h2>
+    <h3>8.1 对照 three.js：它的 dispose 释放的是 GPU 副本</h3>
+    <ul>
+      <li><strong>CPU 侧没有所有权模型。</strong>three.js 的 Object3D 和 Scene 都没有 dispose；<code>scene.remove(mesh)</code> 不释放任何东西；<code>geometry.dispose()</code> 只是派发一个 <code>'dispose'</code> 事件（<a data-src="node_modules/three/src/core/BufferGeometry.js:1438">BufferGeometry.js:1438–1442</a>），Material、Texture 也一样（<a data-src="node_modules/three/src/materials/Material.js:974">Material.js:974</a>、<a data-src="node_modules/three/src/textures/Texture.js:635">Texture.js:635</a>）。共享多少、什么时候释放，都由应用自己记。</li>
+      <li><strong>dispose 的含义不同。</strong>three.js 的 dispose 释放的是 <strong>GPU 副本</strong>，CPU 对象仍然有效：渲染器删掉自己的记录（<a data-src="node_modules/three/src/renderers/webgl/WebGLGeometries.js:27">WebGLGeometries.js:27</a>），下次再画它时重新登记、重新上传（<a data-src="node_modules/three/src/renderers/webgl/WebGLGeometries.js:52">:52–58</a>；纹理见 <a data-src="node_modules/three/src/renderers/webgl/WebGLTextures.js:363">WebGLTextures.js:363</a> 与 <a data-src="node_modules/three/src/renderers/webgl/WebGLTextures.js:666">:666–670</a>）。本项目的 dispose 结束的是<strong>逻辑资源本身</strong>：CPU 数据被丢掉，之后再用就抛 ResourceDisposedError。</li>
+      <li><strong>three.js 也有引用计数，但在 GPU 侧。</strong>多个材质共用一个 program（<a data-src="node_modules/three/src/renderers/webgl/WebGLPrograms.js:591">WebGLPrograms.js:591</a> 的 usedTimes）、多个 Texture 共用同一份图像源时共用一个 GPU 纹理（<a data-src="node_modules/three/src/renderers/webgl/WebGLTextures.js:700">WebGLTextures.js:700–723</a>），都靠计数决定何时删除。本项目的计数在 CPU 侧、按 Scene 计；它的 GPU 侧是「一个 CPU 对象在每个 context 里一份表示」，没有跨对象共享，也就不需要 GPU 侧的计数。</li>
+    </ul>
+    <p>
+      取舍：three.js 的模型对不跨场景共享的应用更省心，「dispose 之后还能再用」也很宽容；代价是共享要应用自己数，而且用了已经 dispose 的对象不会报错，只会悄悄地重新上传一次。本项目要多学几个概念（retain、release、tryDispose 与 dispose），换来的是所有权只有一个答案，出错时大声失败。
+    </p>
+
+    <h3>8.2 审查视角：设计改了，旧说法还留着</h3>
+    <p>
+      设计文档原来的方案是 Scene 独占：<code>Scene.own()</code> 登记，<code>Scene.dispose()</code> 直接 dispose 每个资源（§9.3）；所有权矩阵（§6）里也写着「<code>Scene.own()</code> 登记」。实现改成了引用计数，<code>Resource.dispose()</code> 也从「总是释放」变成了「还有人持有就抛错」。备课时有两处没跟着改：
+    </p>
+    <ul>
+      <li><a data-src="src/rendering/scene/Group.ts:12">Group.ts:12–13</a> 的注释写着「资源的显式所有权由 Scene.own() 管理」——Scene 已经没有 own() 了。</li>
+      <li>HW2 设计文档的 §6、§9.3，以及 §27.3 的时间线（原来写的是「Scene.dispose Geometry」），都还是独占模型。</li>
+    </ul>
+    <p>
+      照着旧文档写代码的人，会以为 <code>Scene.dispose()</code> 一定会释放资源，或者在另一个 Scene 还持有时直接调用 <code>resource.dispose()</code>（现在会抛错）。<strong>想一想（不用写代码）：</strong>Group.ts 这句注释你会怎样改？设计文档除了改成新 API，要不要再记下<em>为什么</em>把 own 换成了引用计数？记下改动的理由，正是架构决策记录 (Architecture Decision Record, ADR) 的用处。
+    </p>
+    <aside class="note">
+      <strong>2026-09-25 更新：</strong>这两处都已按实现改好。设计文档在 2026-09-24 修订了 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:245">§6</a>、<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:566">§9.3</a>、<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1805">§27.3</a> 等节，并在 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:624">9.3 节末尾</a>记下了为什么把 own 换成引用计数；<a data-src="src/rendering/scene/Group.ts:13">Group.ts:13</a> 和实施计划在 2026-09-25 同步。可以拿它们对照你对上面两个问题的答案：注释改成了什么？9.3 节末尾那段说明算不算一条 ADR？对照 ADR 常见的几个部分（背景、决策、后果、状态），它写了哪些、缺了哪些？
+    </aside>
+
+    <h2>9. 延伸阅读</h2>
+    <p>
+      <strong>首选（一手来源，约 10 分钟）：</strong>项目自己的 <a data-src="src/rendering/core/docs/resource-lifecycle-and-errors.zh-CN.md:5">Resource 生命周期与错误设计</a> 的前两节（从「两个 Scene 共享 Geometry」的计数过程讲起），以及 <a data-src="src/rendering/scene/docs/mesh-and-camera.zh-CN.md:5">Mesh 与 Camera</a> 的 Mesh 一节。
+    </p>
+    <p>
+      补充：HW2 设计的 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:245">§6 所有权矩阵</a>，以及 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1697">§26</a> 里 Engine.setScene、场景工厂和 Controller 怎样处理加载失败与过期结果——每一处 <code>scene.dispose()</code> 都依赖这一课的交接语义。
+    </p>
+
+    <aside class="ask">
+      有任何没讲清楚的地方，直接在对话里问我（我会在对话里回答，不另写页面）。做完告诉我：检查题错了哪几题、六张卡片猜对了几张。第 6 课是架构篇的最后一课：边界与失败——RenderBackend 接口、值快照、surface 作用域、错误分类，以及 context 丢失时整代作废。
+    </aside>
+
+    <div class="nav">
+      <a href="0004-cpu-resource-gpu-representation.html">← 第 4 课：CPU 资源与 GPU 表示</a>
+      <a href="../index.html">课程首页</a>
+      <span style="color: var(--muted)">第 6 课（待发）→</span>
+    </div>
+    <footer>src/rendering 精读课 · 第 5 课 · 2026-09-24</footer>
+  </body>
+</html>

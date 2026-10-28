@@ -1,0 +1,644 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 8 课 · Transform 与 SceneNode</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/gl-sandbox.js"></script>
+    <script src="../assets/predict.js"></script>
+    <script src="../assets/rendering-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 详细设计篇 2/12 · 约 40 分钟</p>
+    <h1>scene ①：Transform 与 SceneNode——一个矩阵什么时候该重算</h1>
+    <p class="lede">
+      每个物体画出来之前，都要先知道它的世界矩阵：把它从自己的坐标系搬到世界坐标系的那个 4×4 矩阵。这一课逐个函数读 <code>Transform</code>（保存局部的平移、旋转、缩放）和 <code>SceneNode</code>（把祖先的变换逐层组合起来），看它们怎样做到「不每帧全部重算，却永远不读到过期的矩阵」，以及树结构怎样保证「要么全改，要么不改」。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 将来的 RenderListBuilder（Task 16）会对每个 Mesh 调用 <code>copyWorldMatrixTo</code>，拿到的就是 DrawSubmission 里的 <code>worldMatrix</code>，也就是第 19 课 WebGL1Uniforms 上传的 uModel。这一课讲清这个矩阵从哪来、什么时候重算、为什么一定是最新的。
+    </div>
+
+    <h2>0. 热身：前几课还记得吗</h2>
+    <div class="quiz" data-quiz="lesson-0008-warmup"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0008-warmup"]'), [
+        {
+          q: 'Resource 的 finalizeDisposal 为什么先把 disposed 设成 true，再通知 listener？',
+          opts: ['listener 里重入 dispose 或再订阅时，能看出资源已在释放', '为了让 listener 读到最新的 CPU 数据', 'Set 只能在 disposed 为 true 时遍历'],
+          answer: 0,
+          why: '第 7 课第 3.2 节：重入的 dispose 直接返回，onDispose 拒绝新订阅。这一课的 updateWorldMatrix 也会用到同样的思路：先弄清楚状态，再决定做不做事。'
+        },
+        {
+          q: 'WebGL1Backend.draw 里，哪一对步骤绝对不能调换？',
+          opts: ['useProgram 和 upload：uniform 的 location 只对当前 program 有效', '解析资源和设置深度状态：换了一定画错', 'applyDrawState 和顶点输入绑定'],
+          answer: 0,
+          why: '第 19 课第 4 节、卡片 G。「先解析资源、后设状态」只是软约束，换了也能画对。这一课会反复问同一个问题：两个步骤能不能调换，调换了具体坏在哪里。'
+        },
+        {
+          q: 'Scene.dispose() 之后，场景里的 Mesh 会怎样？',
+          opts: ['被断开，parent 变回 null，可以挂到别的 Scene 下', '跟着被 dispose，不能再用', '仍然挂在已经释放的 Scene 下，不能移动'],
+          answer: 0,
+          why: 'Scene.dispose 先 removeAllChildren（第 5 课、第 7 课卡片 C）。这一课第 4.3 节精读 removeAllChildren 本身。'
+        }
+      ])
+    </script>
+
+    <h2>1. 设计问题：世界矩阵依赖三样东西</h2>
+    <p>
+      一个节点的世界矩阵 = 父节点的世界矩阵 × 自己的局部矩阵。所以它依赖三样东西：<strong>自己的平移、旋转、缩放（TRS）</strong>、<strong>父节点的世界矩阵</strong>、<strong>自己挂在谁下面</strong>。任何一样变了，缓存的世界矩阵就过期了。
+    </p>
+    <p>
+      最省事的做法是每帧把所有节点全部重算一遍——three.js 默认就是这样（第 8.1 节）。本项目选了另一条路：<strong>谁被读，就只检查谁；三样东西都没变，就直接用缓存</strong>。要做到这一点，每样东西都得有一个「变了没有」的记录：
+    </p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 720 270" role="img" aria-label="本节点的世界矩阵由 local 矩阵和父节点的世界矩阵相乘得到；自己的 TRS 变化由 Transform.version 发现，父节点变化由 worldVersion 发现，结构变化由 dirty 发现">
+          <defs>
+            <marker id="f1-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+            <marker id="f1-tip-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip accent" /></marker>
+          </defs>
+          <text x="135" y="22" text-anchor="middle" class="small">setPosition / setRotation / setScale</text>
+          <line x1="135" y1="30" x2="135" y2="58" class="line" marker-end="url(#f1-tip)" />
+          <text x="145" y="49" class="small halo">version + 1</text>
+          <rect x="20" y="60" width="230" height="64" rx="6" class="box" />
+          <text x="135" y="86" text-anchor="middle" class="title">Transform（本节点）</text>
+          <text x="135" y="107" text-anchor="middle" class="small">TRS → local 矩阵（懒计算）</text>
+          <rect x="20" y="170" width="230" height="64" rx="6" class="box" />
+          <text x="135" y="196" text-anchor="middle" class="title">父节点</text>
+          <text x="135" y="217" text-anchor="middle" class="small">它自己的世界矩阵缓存</text>
+          <text x="135" y="258" text-anchor="middle" class="small">父节点重算一次 → worldVersion + 1</text>
+          <rect x="440" y="112" width="260" height="72" rx="6" class="box hl" />
+          <text x="570" y="140" text-anchor="middle" class="title">本节点的世界矩阵缓存</text>
+          <text x="570" y="163" text-anchor="middle">= parent world × local</text>
+          <line x1="250" y1="92" x2="436" y2="136" class="line" marker-end="url(#f1-tip)" />
+          <text x="343" y="108" text-anchor="middle" class="small halo">local（比较 version）</text>
+          <line x1="250" y1="202" x2="436" y2="162" class="line" marker-end="url(#f1-tip)" />
+          <text x="343" y="188" text-anchor="middle" class="small halo">parent world（比较 worldVersion）</text>
+          <text x="570" y="38" text-anchor="middle" class="small">add / remove / removeAllChildren</text>
+          <line x1="570" y1="46" x2="570" y2="108" class="line accent" marker-end="url(#f1-tip-a)" />
+          <text x="562" y="84" text-anchor="end" class="small accent">worldMatrixDirty = true</text>
+        </svg>
+      </div>
+      <figcaption>图 1 · 三样依赖，三个记录。自己的 TRS 变了，Transform.version 加一；父节点的矩阵重算了，父节点的 worldVersion 加一；挂到别的父节点下了，本节点的 worldMatrixDirty 变成 true。读矩阵时比较这三个记录，全都没变才用缓存。</figcaption>
+    </figure>
+
+    <h2>2. Transform：保存局部 TRS，懒计算局部矩阵</h2>
+    <h3>2.1 字段一览</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 30%">字段</th><th style="width: 30%">是什么</th><th>谁会改它</th></tr>
+        <tr><td><code>positionValue</code>、<code>rotationValue</code>、<code>scaleValue</code>（<a data-src="src/rendering/scene/Transform.ts:106">:106–112</a>）</td><td>三个 gl-matrix 的 vec3，Float32 存储；旋转单位是弧度</td><td>只有三个 setter</td></tr>
+        <tr><td><code>localMatrixValue</code>（:115）</td><td>按当前 TRS 算出来的局部矩阵缓存</td><td>只有 updateLocalMatrixIfNeeded</td></tr>
+        <tr><td><code>localMatrixDirty</code>（<a data-src="src/rendering/scene/Transform.ts:126">:126</a>）</td><td>缓存是不是落后于 TRS</td><td>setter 设成 true；重算后变回 false</td></tr>
+        <tr><td><code>versionValue</code>（<a data-src="src/rendering/scene/Transform.ts:141">:141</a>）</td><td>TRS 每真正变化一次就加一，只增不减</td><td>只有 invalidateLocalMatrix</td></tr>
+      </table>
+    </div>
+
+    <h3>2.2 三个 setter：先量化，再比较，真变了才记账</h3>
+    <pre><code>setPosition(position: Vec3Tuple): void {                             // Transform.ts:186–192
+  if (!setFloat32ComponentsIfChanged(this.positionValue, position)) {
+    return                                         // 存储值没变：不动 dirty，也不加 version
+  }
+  this.invalidateLocalMatrix()                     // 真变了：记一次账
+}
+
+function setFloat32ComponentsIfChanged(current: vec3, next: Vec3Tuple): boolean {   // :36–50
+  const nextX = Math.fround(next[0])               // ① 先按 Float32 量化：0.1 → 0.10000000149011612
+  const nextY = Math.fround(next[1])
+  const nextZ = Math.fround(next[2])
+  const unchanged =                                // ② 再和已经存着的 Float32 值精确比较
+    Object.is(current[0], nextX) &amp;&amp; Object.is(current[1], nextY) &amp;&amp; Object.is(current[2], nextZ)
+  if (unchanged) return false
+  vec3.set(current, nextX, nextY, nextZ)           // ③ 写入的正是刚才比较用的那组量化值
+  return true
+}
+
+private invalidateLocalMatrix(): void {            // :241–244
+  this.localMatrixDirty = true                     // 缓存过期
+  this.versionValue += 1                           // 发生了一次真实变化
+}</code></pre>
+    <div class="table-scroll">
+      <table class="fn">
+        <tr><th>作用</th><td>修改局部 TRS；只有存储值真正变化时，才让局部矩阵失效、让 version 加一。</td></tr>
+        <tr><th>所在层</th><td>第一层 scene（纯 CPU，不知道 GL）。调用者是应用代码或将来的动画系统。</td></tr>
+        <tr><th>为什么这样设计</th><td>version 是给 SceneNode 用的「变了没有」的信号。如果「设了一个一模一样的值」也加一，子孙节点就会白白重算。量化必须在比较之前：内部存的是 Float32，拿 JavaScript 的 0.1（binary64）直接和存着的 0.10000000149011612 比，永远不相等，每次都会误报变化（注释在 <a data-src="src/rendering/scene/Transform.ts:15">:15–35</a>）。</td></tr>
+        <tr><th>校验</th><td><strong>没有运行时校验。</strong>只靠 TypeScript 类型保证是三个数；NaN、Infinity、长度不对的数组都会被存进去（第 8.2 节的审查发现）。</td></tr>
+        <tr><th>状态变化</th><td>真变化时：对应的 vec3、<code>localMatrixDirty = true</code>、<code>version + 1</code>。没变化时：什么都不改。</td></tr>
+        <tr><th>生命周期</th><td>无。Transform 是 SceneNode 独占的组成部分（第 5 课答疑：真正的组合），随节点一起被回收。</td></tr>
+        <tr><th>顺序能不能换</th><td>「量化 → 比较 → 写入」不能换：先写入再比较，就永远是「没变化」；比较用原值、写入用量化值，比较语义和存储语义就分家了（<a data-src="src/rendering/scene/Transform.ts:30">:30–31</a> 的注释）。</td></tr>
+      </table>
+    </div>
+    <p><code>Object.is</code> 而不是 <code>===</code>：它把两个 NaN 看成相同，又区分 +0 和 -0，这样「重复设 NaN」不会反复加 version，「0 改成 -0」也算一次真实变化（<a data-src="src/rendering/scene/Transform.ts:33">:33–34</a>）。</p>
+
+    <h3>2.3 三个 getter：返回新的数组，不交出内部的 vec3</h3>
+    <p>
+      <code>position</code> 每次都 new 一个 <code>[x, y, z]</code>（<a data-src="src/rendering/scene/Transform.ts:148">:148–150</a>）。调用者拿到的只是一份拷贝，改它不会绕过 setter、不会漏掉 version。读回来的值是 Float32 量化之后的：设 0.1，读到 0.10000000149011612（类注释 <a data-src="src/rendering/scene/Transform.ts:65">:65–67</a>）。
+    </p>
+
+    <h3>2.4 copyLocalMatrixTo：懒计算，只在需要时重算</h3>
+    <pre><code>copyLocalMatrixTo(out: mat4): void {               // Transform.ts:229–232
+  this.updateLocalMatrixIfNeeded()                 // 过期了才算
+  mat4.copy(out, this.localMatrixValue)            // 交出去的是拷贝
+}
+
+private updateLocalMatrixIfNeeded(): void {        // :253–274
+  if (!this.localMatrixDirty) return               // 没过期：一次矩阵运算都不做
+  const rotationQuaternion = quat.create()
+  quat.fromEuler(rotationQuaternion,               // gl-matrix 要角度，这里存的是弧度
+    this.rotationValue[0] * RADIANS_TO_DEGREES, …)
+  mat4.fromRotationTranslationScale(this.localMatrixValue, rotationQuaternion,
+    this.positionValue, this.scaleValue)           // local = T · R · S
+  this.localMatrixDirty = false                    // 只清 dirty，不动 version
+}</code></pre>
+    <p>
+      记号：T、R、S 分别是平移、旋转、缩放矩阵，作用在列向量上，所以 <code>local = T · R · S</code> 的意思是<strong>先缩放、再旋转、最后平移</strong>。R 本身由三个欧拉角组成。R<sub>x</sub>(θ) 表示绕 x 轴转 θ 弧度（右手系），R<sub>y</sub>、R<sub>z</sub> 同理。gl-matrix 3.4 的 <code>fromEuler</code> 没有「顺序」参数，按它的公式展开是
+    </p>
+    <pre><code>R = Rz(z) · Ry(y) · Rx(x)        先绕 x 轴，再绕 y 轴，最后绕 z 轴（都是固定的坐标轴）</code></pre>
+    <p>
+      例：rotation = [90°, 90°, 0]。原来的 x 轴 (1, 0, 0)：Rx 不动它，Ry(90°) 把它转到 (0, 0, −1)，Rz = 单位矩阵。所以矩阵的第 0 列是 (0, 0, −1)（卡片 F）。three.js 默认的 'XYZ' 顺序是 R = Rx · Ry · Rz，同样三个数会得到 (0, 1, 0)——第 8.1 节再说这对搬场景数据意味着什么。
+    </p>
+
+    <h3>2.5 dirty 与 version：为什么是两个字段，而不是一个</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 34%">操作</th><th>localMatrixDirty</th><th>version</th><th>这一步算不算矩阵</th></tr>
+        <tr><td>新建 Transform</td><td>true</td><td>0</td><td>不算</td></tr>
+        <tr><td>第一次 copyLocalMatrixTo</td><td>true → false</td><td>0</td><td>算一次（单位矩阵）</td></tr>
+        <tr><td>setPosition、setRotation、setScale 各一次</td><td>true</td><td>1 → 2 → 3</td><td>一次都不算</td></tr>
+        <tr><td>再 copyLocalMatrixTo</td><td>true → false</td><td>3</td><td>三次修改合并成一次重算</td></tr>
+        <tr><td>再 copyLocalMatrixTo</td><td>false</td><td>3</td><td>不算，直接复制</td></tr>
+      </table>
+    </div>
+    <p>
+      这张表来自 Transform 的类注释（<a data-src="src/rendering/scene/Transform.ts:78">:78–95</a>）。关键在最后一句：<strong>dirty 会被任何一个读矩阵的人清掉，version 不会</strong>（:97–98）。假设有两个子系统都关心这个 Transform：A 读了矩阵，dirty 变回 false；B 再来看 dirty，就会以为什么都没变。所以 SceneNode 不能看 dirty，只能记下「上次看到的 version」，下次比较——version 只增不减，谁读都不影响它。dirty 是 Transform 自己的缓存开关，version 是给外面看的变化通知。
+    </p>
+
+    <h2>3. SceneNode 的世界矩阵：拉取式更新</h2>
+    <h3>3.1 四个缓存字段</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 32%">字段</th><th style="width: 36%">记的是什么</th><th>用来发现</th></tr>
+        <tr><td><code>worldMatrixValue</code>（<a data-src="src/rendering/scene/SceneNode.ts:86">:86</a>）</td><td>上次算好的世界矩阵</td><td>——</td></tr>
+        <tr><td><code>observedTransformVersion</code>（<a data-src="src/rendering/scene/SceneNode.ts:95">:95</a>）</td><td>上次算的时候，自己 Transform 的 version；初始 −1</td><td>自己的 TRS 变了</td></tr>
+        <tr><td><code>observedParentWorldVersion</code>（<a data-src="src/rendering/scene/SceneNode.ts:104">:104</a>）</td><td>上次算的时候，父节点的 worldVersion；没有父节点记 −1</td><td>父节点的矩阵变了</td></tr>
+        <tr><td><code>worldMatrixDirty</code>（<a data-src="src/rendering/scene/SceneNode.ts:63">:63</a>）</td><td>结构有没有变过；初始 true</td><td>换了父节点、被摘下</td></tr>
+        <tr><td><code>worldVersionValue</code>（<a data-src="src/rendering/scene/SceneNode.ts:119">:119</a>）</td><td>自己真正重算的次数</td><td>给子节点当「父节点变了没有」的信号</td></tr>
+      </table>
+    </div>
+    <p>初始值是故意选的：Transform 的 version 从 0 开始，observed 从 −1 开始，第一次比较必然不相等，所以第一次读一定会算。</p>
+
+    <h3>3.2 updateWorldMatrix：先更新父节点，再比较三个记录</h3>
+    <pre><code>updateWorldMatrix(): void {                                        // SceneNode.ts:353–381
+  let parentWorldVersion = -1
+  if (this.parentValue !== null) {
+    this.parentValue.updateWorldMatrix()          // ① 先让父节点（递归到根）变成最新
+    parentWorldVersion = this.parentValue.worldVersionValue   // ② 再读它的版本
+  }
+  const transformVersion = this.transform.version
+  const cacheIsCurrent =                          // ③ 三个记录都没变？
+    !this.worldMatrixDirty &amp;&amp;
+    this.observedTransformVersion === transformVersion &amp;&amp;
+    this.observedParentWorldVersion === parentWorldVersion
+  if (cacheIsCurrent) return                      //    是：直接用缓存，worldVersion 不变
+
+  this.transform.copyLocalMatrixTo(this.worldMatrixValue)          // ④ out = local
+  if (this.parentValue !== null) {
+    mat4.multiply(this.worldMatrixValue, this.parentValue.worldMatrixValue, this.worldMatrixValue)
+  }                                               // ⑤ out = parent world × out（原地）
+  this.observedTransformVersion = transformVersion                 // ⑥ 记下这次看到的
+  this.observedParentWorldVersion = parentWorldVersion
+  this.worldMatrixDirty = false
+  this.worldVersionValue += 1                     // ⑦ 对子节点宣布：我变了
+}</code></pre>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 720 230" role="img" aria-label="读 node 的矩阵时，先沿父链一路调用到根，再从根往回逐个比较、必要时重算">
+          <defs>
+            <marker id="f2-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+            <marker id="f2-tip-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip accent" /></marker>
+          </defs>
+          <rect x="20" y="85" width="180" height="60" rx="6" class="box" />
+          <text x="110" y="111" text-anchor="middle" class="title">root</text>
+          <text x="110" y="131" text-anchor="middle" class="small">没有父节点，记 −1</text>
+          <rect x="270" y="85" width="180" height="60" rx="6" class="box" />
+          <text x="360" y="111" text-anchor="middle" class="title">parent</text>
+          <text x="360" y="131" text-anchor="middle" class="small">parent world × local</text>
+          <rect x="520" y="85" width="180" height="60" rx="6" class="box hl" />
+          <text x="610" y="111" text-anchor="middle" class="title">node（被读的那个）</text>
+          <text x="610" y="131" text-anchor="middle" class="small">copyWorldMatrixTo(out)</text>
+          <line x1="520" y1="72" x2="452" y2="72" class="line" marker-end="url(#f2-tip)" />
+          <text x="486" y="60" text-anchor="middle" class="small">① 调用</text>
+          <line x1="270" y1="72" x2="202" y2="72" class="line" marker-end="url(#f2-tip)" />
+          <text x="236" y="60" text-anchor="middle" class="small">② 调用</text>
+          <text x="360" y="30" text-anchor="middle" class="small">往上：先保证父节点是最新的</text>
+          <line x1="200" y1="160" x2="268" y2="160" class="line accent" marker-end="url(#f2-tip-a)" />
+          <text x="234" y="178" text-anchor="middle" class="small accent">③ 返回</text>
+          <line x1="450" y1="160" x2="518" y2="160" class="line accent" marker-end="url(#f2-tip-a)" />
+          <text x="484" y="178" text-anchor="middle" class="small accent">④ 返回</text>
+          <text x="360" y="210" text-anchor="middle" class="small">往下：每一层比较三个记录，变了才重算、worldVersion + 1</text>
+        </svg>
+      </div>
+      <figcaption>图 2 · 拉取式更新。读 node 时，调用先沿父链一路走到根（①②），然后每一层在返回途中各自比较三个记录（③④）。父节点重算了，它的 worldVersion 加一，子节点在自己这一层的比较中就会发现。</figcaption>
+    </figure>
+    <div class="table-scroll">
+      <table class="fn">
+        <tr><th>作用</th><td>保证 worldMatrixValue 反映最新的祖先链和局部 TRS；没变化时什么都不做。</td></tr>
+        <tr><th>所在层</th><td>第一层 scene。调用者：copyWorldMatrixTo（本节点或子孙节点读矩阵时），以及递归中的子节点。</td></tr>
+        <tr><th>为什么这样设计</th><td>谁被读就只更新谁的祖先链，不读的子树不花任何代价；三个记录都没变就立即返回，读多少次都只算一次。</td></tr>
+        <tr><th>校验</th><td>不做数值校验（输入早就由 Transform 存好）。它只判断「缓存还有没有效」。</td></tr>
+        <tr><th>状态变化</th><td>重算时：worldMatrixValue、三个 observed 记录、<code>worldMatrixDirty = false</code>、<code>worldVersion + 1</code>；递归中祖先也可能各自重算。没变化时：什么都不改。</td></tr>
+        <tr><th>和谁有关</th><td>读 Transform 的 version 和 local 矩阵（Transform 被 SceneNode 独占）；读父节点的 worldVersion 和 worldMatrixValue（父子之间只通过这两个值联系）。</td></tr>
+      </table>
+    </div>
+    <p><strong>顺序约束——每一条都能换吗？</strong></p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 34%">约束</th><th>如果调换</th></tr>
+        <tr><td>① 先更新父节点，再读父节点的 worldVersion</td><td>读到的是父节点<em>更新前</em>的版本：父节点这一刻才重算、版本刚加一，而子节点比较的还是旧值，结论是「没变」，于是用了过期的矩阵。</td></tr>
+        <tr><td>④ 先复制 local，再乘父矩阵</td><td>乘法要的就是 parent × local，out 里必须先放好 local。gl-matrix 的 multiply 允许输出和右操作数是同一个数组（覆盖前先缓存一整列），所以不用给每个节点多留一个 mat4（注释 <a data-src="src/rendering/scene/SceneNode.ts:339">:339–351</a>）。</td></tr>
+        <tr><td>⑤ 乘法顺序 parent × local</td><td>列向量约定下，先施加 local 再施加父节点的变换。换成 local × parent，只要父节点有旋转或缩放，结果就错了（:350–351）。</td></tr>
+        <tr><td>⑥⑦ 先记下观察值，最后 worldVersion + 1</td><td>这两步之间没有别的代码会读它们，可以对调。但它们必须都放在矩阵算完之后：记录是「矩阵已经反映了这些版本」的声明，先写记录、后算矩阵，一旦将来中间加了可能抛错的步骤，就会留下「记录说是最新、矩阵却没算完」的状态——先做事、再记账。</td></tr>
+      </table>
+    </div>
+
+    <h3>3.3 已经有两个版本号，为什么还要 worldMatrixDirty</h3>
+    <p>
+      版本号只能说明「同一个对象变没变」。换了父节点，比较的就是<strong>另一个对象</strong>的版本号，数字可能恰好一样（注释 <a data-src="src/rendering/scene/SceneNode.ts:336">:336–337</a>）：
+    </p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 720 250" role="img" aria-label="P1 和 P2 的 worldVersion 都是 1；child 从 P1 移到 P2 后，只比版本号会误以为没变，加上 dirty 才会重算">
+          <defs>
+            <marker id="f3-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+            <marker id="f3-tip-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip accent" /></marker>
+          </defs>
+          <rect x="20" y="30" width="200" height="58" rx="6" class="box" />
+          <text x="120" y="54" text-anchor="middle" class="title">P1：位置 (10, 0, 0)</text>
+          <text x="120" y="75" text-anchor="middle" class="small">worldVersion = 1</text>
+          <rect x="20" y="162" width="200" height="58" rx="6" class="box" />
+          <text x="120" y="186" text-anchor="middle" class="title">P2：位置 (0, 5, 0)</text>
+          <text x="120" y="207" text-anchor="middle" class="small">worldVersion = 1</text>
+          <rect x="280" y="96" width="200" height="60" rx="6" class="box hl" />
+          <text x="380" y="120" text-anchor="middle" class="title">child</text>
+          <text x="380" y="142" text-anchor="middle" class="small">记下的父节点版本 = 1</text>
+          <line x1="220" y1="59" x2="278" y2="112" class="line dash" />
+          <text x="262" y="70" class="small halo">原来的父节点</text>
+          <line x1="220" y1="191" x2="278" y2="140" class="line accent" marker-end="url(#f3-tip-a)" />
+          <text x="258" y="192" class="small accent halo">P2.add(child)</text>
+          <rect x="520" y="30" width="180" height="70" rx="6" class="box bad" />
+          <text x="610" y="54" text-anchor="middle" class="title bad">只比版本号</text>
+          <text x="610" y="73" text-anchor="middle" class="small">1 === 1，以为没变</text>
+          <text x="610" y="90" text-anchor="middle" class="small">读到 (10, 0, 0) ✗</text>
+          <rect x="520" y="150" width="180" height="70" rx="6" class="box ok" />
+          <text x="610" y="174" text-anchor="middle" class="title ok">加上 dirty</text>
+          <text x="610" y="193" text-anchor="middle" class="small">add 设了 dirty，强制重算</text>
+          <text x="610" y="210" text-anchor="middle" class="small">读到 (0, 5, 0) ✓</text>
+          <line x1="480" y1="116" x2="518" y2="74" class="line" marker-end="url(#f3-tip)" />
+          <line x1="480" y1="136" x2="518" y2="178" class="line" marker-end="url(#f3-tip)" />
+        </svg>
+      </div>
+      <figcaption>图 3 · 两个父节点的 worldVersion 恰好都是 1。child 换到 P2 下之后，它比较的是 P2 的版本 1，和记下的 1 相等；只靠版本号，就会继续用 P1 下算出的旧矩阵。结构变化必须显式失效——这就是 worldMatrixDirty 存在的理由（卡片 C）。</figcaption>
+    </figure>
+
+    <h3>3.4 copyWorldMatrixTo：唯一的读取入口</h3>
+    <p>
+      <a data-src="src/rendering/scene/SceneNode.ts:391">copyWorldMatrixTo</a> 只有两行：先 updateWorldMatrix，再复制给调用者。没有「直接拿到内部矩阵」的 getter，所以不存在「绕过更新、读到旧矩阵」的路径，调用者也改不了内部缓存。这和 Transform 的 getter 返回拷贝是同一条规矩。
+    </p>
+
+    <h2>4. SceneNode 的树结构：要么全改，要么不改</h2>
+    <h3>4.1 add：先全部验证，再全部提交</h3>
+    <pre><code>add(...nodes: SceneNode[]): this {                                 // SceneNode.ts:208–228
+  const seen = new Set&lt;SceneNode&gt;()
+  for (const node of nodes) {                      // —— 验证阶段：一个都不改 ——
+    if (seen.has(node)) throw new DuplicateSceneNodeError(node.debugLabel)   // 同一次调用里重复
+    seen.add(node)
+    this.assertCanAdopt(node)                      // 会不会成环
+  }
+  for (const node of nodes) {                      // —— 提交阶段：全部验证通过才进来 ——
+    node.removeFromParent()                        // ① 先从旧父节点摘下
+    node.parentValue = this                        // ② 再认新父节点
+    this.childrenValue.push(node)                  // ③ 加进自己的子节点列表
+    node.markWorldMatrixDirtyRecursively()         // ④ 世界矩阵失效（等下次读时再算）
+  }
+  return this
+}</code></pre>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 720 220" role="img" aria-label="add 先在验证阶段检查所有节点，全部通过才进入提交阶段；任何一个失败就抛错，树完全不变">
+          <defs>
+            <marker id="f4-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+            <marker id="f4-tip-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip bad" /></marker>
+          </defs>
+          <rect x="20" y="20" width="300" height="110" rx="6" class="box" />
+          <text x="170" y="44" text-anchor="middle" class="title">验证阶段（一个都不改）</text>
+          <text x="36" y="70" class="small">对每个 node：</text>
+          <text x="36" y="91" class="small">· 这次调用里出现过？→ Duplicate…Error</text>
+          <text x="36" y="112" class="small">· 从 this 往上碰到 node？→ Cycle…Error</text>
+          <rect x="400" y="20" width="300" height="110" rx="6" class="box hl" />
+          <text x="550" y="44" text-anchor="middle" class="title">提交阶段（逐个）</text>
+          <text x="416" y="67" class="small">① node.removeFromParent()</text>
+          <text x="416" y="85" class="small">② node.parentValue = this</text>
+          <text x="416" y="103" class="small">③ this.childrenValue.push(node)</text>
+          <text x="416" y="121" class="small">④ 子树标记 dirty</text>
+          <line x1="320" y1="75" x2="398" y2="75" class="line" marker-end="url(#f4-tip)" />
+          <text x="359" y="66" text-anchor="middle" class="small">全部通过</text>
+          <line x1="170" y1="130" x2="170" y2="178" class="line bad" marker-end="url(#f4-tip-b)" />
+          <text x="170" y="200" text-anchor="middle" class="small bad">任何一个失败：抛错，树完全不变</text>
+        </svg>
+      </div>
+      <figcaption>图 4 · add 的两个阶段。验证阶段只读不写，所以抛错时树是原样；提交阶段只有在所有节点都通过之后才开始（卡片 D）。</figcaption>
+    </figure>
+    <div class="table-scroll">
+      <table class="fn">
+        <tr><th>作用</th><td>把一个或多个节点接到当前节点下面，保持参数顺序。</td></tr>
+        <tr><th>为什么这样设计</th><td>批量操作最怕做到一半失败：前面几个已经接上、后面的没接上，调用者既不知道哪些成功了，也没法撤销。两阶段让它变成「要么全成，要么全不变」——和 Scene.retain「先让资源同意再记账」、Material「先验证再写 Map」是同一条规矩。</td></tr>
+        <tr><th>校验</th><td>① 同一次调用里的重复节点；② 成环（包括 add 自己）。<strong>不校验</strong>节点是不是已经是 this 的子节点：再 add 一次，它会被挪到最后（先摘下、再追加）。</td></tr>
+        <tr><th>状态变化</th><td>旧父节点的 children 少一个；node.parent；this.children 多一个；node 的整棵子树 <code>worldMatrixDirty = true</code>。不重算任何矩阵，也不改 worldVersion。</td></tr>
+        <tr><th>生命周期</th><td>不涉及。树结构不决定任何资源的寿命（第 5 课「挂在树上 ≠ 拥有」），add 不会 retain 任何东西。</td></tr>
+      </table>
+    </div>
+    <p><strong>提交阶段的顺序能不能换？</strong>① 和 ② 不能换。如果先写 <code>node.parentValue = this</code> 再调 <code>removeFromParent()</code>，removeFromParent 会去「新父节点」this 的列表里找它——找不到，什么也不做（remove 是幂等的）。结果旧父节点的 children 里还留着它，它同时出现在两个父节点的列表里：遍历时被访问两次，双向关系就破了。③ 和 ① 对调其实也能得到正确结果：先 push 再摘，remove 用 indexOf 删掉的是第一次出现的位置，也就是旧位置，新追加的那一份留了下来。但这要靠 remove 恰好删第一个——哪天有人把它改成 lastIndexOf，这里就坏了。保持「先摘下、再挂上」，每一步都不依赖这种细节。</p>
+
+    <h3>4.2 assertCanAdopt：只查祖先链</h3>
+    <pre><code>private assertCanAdopt(node: SceneNode): void {                   // SceneNode.ts:406–410
+  for (let current = this as SceneNode | null; current !== null; current = current.parentValue) {
+    if (current === node) throw new SceneGraphCycleError(this.debugLabel, node.debugLabel)
+  }
+}</code></pre>
+    <p>
+      新加的边是 this → node。什么时候会成环？只有 node 已经在 this 的祖先链上（包括 this 自己）。所以从 this 沿 parent 往上走一遍就够了：时间和树高成正比，不需要额外空间，也不用遍历 node 的整棵子树（注释 <a data-src="src/rendering/scene/SceneNode.ts:402">:402–404</a>）。
+    </p>
+
+    <h3>4.3 remove、removeFromParent、removeAllChildren</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 22%">方法</th><th style="width: 30%">做什么</th><th style="width: 24%">不是子节点时</th><th>状态变化</th></tr>
+        <tr><td><a data-src="src/rendering/scene/SceneNode.ts:239">remove(node)</a></td><td>从自己的列表里删掉 node，断开它的 parent</td><td>什么都不做，不抛错（幂等）</td><td>children、node.parent、node 子树 dirty</td></tr>
+        <tr><td><a data-src="src/rendering/scene/SceneNode.ts:258">removeFromParent()</a></td><td>让父节点 remove 自己</td><td>没有父节点就什么都不做</td><td>同上</td></tr>
+        <tr><td><a data-src="src/rendering/scene/SceneNode.ts:271">removeAllChildren()</a></td><td>断开全部直接子节点</td><td>——</td><td>每个子节点的 parent、子树 dirty；列表清空</td></tr>
+      </table>
+    </div>
+    <p>三个方法都是「两边一起改」：父节点的列表和子节点的 parent 永远一致。<code>children</code> getter 返回拷贝（<a data-src="src/rendering/scene/SceneNode.ts:176">:176–178</a>），外面没法绕过这几个方法去改列表。</p>
+
+    <h3>4.4 traverse 与 traverseVisible</h3>
+    <p>
+      两个都是先父后子的深度优先遍历（<a data-src="src/rendering/scene/SceneNode.ts:287">:287–313</a>）。<code>traverseVisible</code> 遇到 <code>visible === false</code> 立即返回：不访问这个节点，也不访问它的任何后代——隐藏一个 Group 就隐藏了整棵子树。注意：它直接遍历内部的 <code>childrenValue</code>，不是拷贝。visitor 里如果改了树，就会出问题（卡片 E，第 8.2 节）。
+    </p>
+
+    <h2>5. 身份：uuid、name 与 debugLabel</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 18%">字段</th><th style="width: 38%">是什么</th><th>能拿来做什么</th></tr>
+        <tr><td><code>uuid</code></td><td>构造时 <code>crypto.randomUUID()</code> 生成的完整 UUID v4，只有 getter（<a data-src="src/rendering/scene/SceneNode.ts:71">:71</a>）</td><td>机器身份：将来序列化、去重用</td></tr>
+        <tr><td><code>name</code></td><td>随便改、可以重复的可读标签</td><td>只给人看，不能当 key</td></tr>
+        <tr><td><code>debugLabel</code></td><td><code>name 或 debugType</code> + <code>#</code> + UUID 前 8 位（<a data-src="src/rendering/scene/SceneNode.ts:158">:158–161</a>）</td><td>日志和错误消息。不用 constructor.name，压缩也不会变（第 7 课 9.2 节的反面）</td></tr>
+      </table>
+    </div>
+
+    <h2>6. 先预测、再运行：跑真实的项目代码</h2>
+    <p>准备代码里的 <code>out</code>、<code>world</code> 是课程写的小工具，项目里没有它们；Transform、SceneNode 是真实的项目类。这些卡片不用 GL。</p>
+    <details>
+      <summary>每张卡片之前都会先运行的准备代码</summary>
+      <pre><code id="prelude-view"></code></pre>
+    </details>
+    <div id="predict-0008"></div>
+    <script>
+      ;(function () {
+        // 只为课程演示：SceneNode 用 crypto.randomUUID 生成 UUID，它要求安全上下文。
+        // 个别浏览器在 file:// 下没有这个函数，这里用 getRandomValues 补一个同格式的实现。
+        if (window.crypto && typeof window.crypto.randomUUID !== 'function') {
+          Object.defineProperty(window.crypto, 'randomUUID', {
+            configurable: true,
+            value: function randomUUID() {
+              const bytes = window.crypto.getRandomValues(new Uint8Array(16))
+              bytes[6] = (bytes[6] & 0x0f) | 0x40
+              bytes[8] = (bytes[8] & 0x3f) | 0x80
+              const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+              return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20)
+            }
+          })
+        }
+
+        const prelude = [
+          'const R = window.RTeachRendering                      // 打包进来的真实项目代码',
+          '// 以下两个是课程写的小工具',
+          'const out = new Float32Array(16)                      // 接收矩阵拷贝',
+          'const world = (node) => { node.copyWorldMatrixTo(out); return [out[12], out[13], out[14]].map((v) => Number(v.toFixed(3))).join(\', \') }   // 世界矩阵的平移部分'
+        ].join('\n')
+        document.getElementById('prelude-view').textContent = prelude
+
+        if (!window.RTeachRendering) {
+          document.getElementById('predict-0008').textContent =
+            '没有加载到 assets/rendering-bundle.js，卡片无法运行。按 MAINTENANCE.md「真实代码打包」重新构建一次。'
+          return
+        }
+
+        RTeach.predict({
+          mount: document.getElementById('predict-0008'),
+          storageKey: 'lesson-0008',
+          canvas: false,
+          prelude,
+          items: [
+            {
+              title: 'A · 设两次同样的 0.1、再读两次矩阵：version 最后是多少？',
+              code: [
+                'const t = new R.Transform()',
+                "log('初始 version =', t.version)",
+                't.setPosition([0.1, 0, 0])',
+                "log('设成 0.1 之后 version =', t.version, '；读回来的 x =', t.position[0].toPrecision(17))",
+                't.setPosition([0.1, 0, 0])                // 同一个值再设一次',
+                'const m = new Float32Array(16)',
+                't.copyLocalMatrixTo(m)                    // 读矩阵：会触发一次懒计算',
+                't.copyLocalMatrixTo(m)',
+                "log('再设一次 0.1、读两次矩阵之后 version =', t.version)"
+              ].join('\n'),
+              choices: ['1：只有真实的修改才加一，读矩阵不算', '2：每次调用 setter 都加一', '4：每次读矩阵也算一次变化'],
+              answer: 0,
+              explain: '第二次设 0.1 时，量化后的 0.10000000149011612 和存着的值相同，setFloat32ComponentsIfChanged 返回 false，setter 直接返回（<a data-src="src/rendering/scene/Transform.ts:186">Transform.ts:186–192</a>）。读矩阵只清 dirty、不动 version（:253–274）。读回来的 x 是 Float32 量化后的值，这正是比较之前必须先量化的原因。'
+            },
+            {
+              title: 'B · 父节点刚移动、还没人读矩阵：child.worldVersion 变了吗？',
+              code: [
+                'const parent = new R.SceneNode()',
+                'const child = new R.SceneNode()',
+                'parent.add(child)',
+                "log('第一次读：child 的世界位置 =', world(child), '；child.worldVersion =', child.worldVersion)",
+                'parent.transform.setPosition([5, 0, 0])',
+                "log('父节点刚移动：child.worldVersion =', child.worldVersion)",
+                "log('再读一次：child 的世界位置 =', world(child), '；child.worldVersion =', child.worldVersion)"
+              ].join('\n'),
+              choices: ['没变：要等有人读矩阵时才重算', '变了：setPosition 会立刻通知所有子节点', '变成 0：缓存被清空了'],
+              answer: 0,
+              explain: 'setPosition 只让父节点 Transform 的 version 加一，不通知任何人。直到 world(child) 调用 copyWorldMatrixTo，updateWorldMatrix 才沿父链往上：父节点发现自己的 Transform 变了，重算、worldVersion 加一；child 在自己这一层发现父节点的版本变了，也重算（图 2）。这就是「拉取式」：谁被读，才算谁。'
+            },
+            {
+              title: 'C · P1、P2 的 worldVersion 都是 1：child 从 P1 移到 P2 之后，读到的世界位置是？',
+              code: [
+                'const P1 = new R.SceneNode()',
+                'P1.transform.setPosition([10, 0, 0])',
+                'const P2 = new R.SceneNode()',
+                'P2.transform.setPosition([0, 5, 0])',
+                'const child = new R.SceneNode()',
+                'P1.add(child)',
+                "log('child 在 P1 下：', world(child))",
+                'world(P2)                                   // 让 P2 也算一次',
+                "log('P1.worldVersion =', P1.worldVersion, '，P2.worldVersion =', P2.worldVersion)",
+                'P2.add(child)                               // 移到 P2 下',
+                "log('child 移到 P2 下：', world(child))"
+              ].join('\n'),
+              choices: ['0, 5, 0：add 设了 dirty，强制重算', '10, 0, 0：版本号相同，还是旧矩阵', '10, 5, 0：两个父节点的位移叠加了'],
+              answer: 0,
+              explain: '两个父节点的 worldVersion 恰好都是 1，child 记下的 observedParentWorldVersion 也是 1——只看版本号就会判定「没变」（图 3）。add 在提交阶段把 child 的子树标成 dirty（<a data-src="src/rendering/scene/SceneNode.ts:224">SceneNode.ts:224</a>），updateWorldMatrix 看到 dirty 就不会走缓存（:362–365）。'
+            },
+            {
+              title: 'D · q.add(k, p) 的第二个参数会成环：第一个参数 k 被接上了吗？',
+              code: [
+                "const p = new R.SceneNode(); p.name = 'p'",
+                "const q = new R.SceneNode(); q.name = 'q'",
+                "const k = new R.SceneNode(); k.name = 'k'",
+                'p.add(q)                                     // p → q',
+                "try { q.add(k, p) } catch (error) { log('q.add(k, p) 抛出：', error.name) }   // p 是 q 的父节点",
+                "log('k.parent =', k.parent, '；q 的子节点数 =', q.children.length)"
+              ].join('\n'),
+              choices: ['没有：先全部验证，一个失败就什么都不改', '接上了：k 排在前面，已经处理完', '接上了一半：k.parent 指向 q，但 q 的列表里没有 k'],
+              answer: 0,
+              explain: '验证阶段对 k 检查通过，对 p 检查时 assertCanAdopt 从 q 往上走，碰到了 p，抛 SceneGraphCycleError（<a data-src="src/rendering/scene/SceneNode.ts:406">SceneNode.ts:406–410</a>）。这时提交阶段还没开始，k 和 q 都保持原样（图 4）。'
+            },
+            {
+              title: 'E · visitor 在访问 a 时把 a 摘掉：b 还会被访问到吗？',
+              code: [
+                "const root = new R.SceneNode(); root.name = 'root'",
+                "const a = new R.SceneNode(); a.name = 'a'",
+                "const b = new R.SceneNode(); b.name = 'b'",
+                "const c = new R.SceneNode(); c.name = 'c'",
+                'root.add(a, b, c)',
+                'const visited = []',
+                'root.traverse((node) => {',
+                '  visited.push(node.name)',
+                '  if (node === a) a.removeFromParent()      // 在 visitor 里把自己摘掉',
+                '})',
+                "log('访问顺序：', visited.join(' → '))",
+                "log('root 现在的子节点：', root.children.map((n) => n.name).join(', '))"
+              ].join('\n'),
+              choices: ['不会：列表左移了一格，b 被跳过', '会：traverse 遍历的是一份拷贝', '会，而且 a 会被再访问一次'],
+              answer: 0,
+              explain: 'traverse 用 for-of 直接遍历 childrenValue（<a data-src="src/rendering/scene/SceneNode.ts:290">SceneNode.ts:290–292</a>）。访问 a 时 a 被 splice 掉，b、c 左移一格；迭代器的下一个下标指向的已经是 c，b 被跳过了。第 8.2 节讨论该怎样定这条规矩。'
+            },
+            {
+              title: 'F · rotation = [90°, 90°, 0]：原来的 x 轴 (1, 0, 0) 转到了哪里？',
+              code: [
+                'const node = new R.SceneNode()',
+                'node.transform.setRotation([Math.PI / 2, Math.PI / 2, 0])   // 绕 x 90°、绕 y 90°（弧度）',
+                'node.copyWorldMatrixTo(out)',
+                "log('矩阵第 0 列（x 轴转到了哪里）：', [out[0], out[1], out[2]].map((v) => Number(v.toFixed(3))).join(', '))"
+              ].join('\n'),
+              choices: ['(0, 0, −1)：先绕 x 再绕 y，R = Rz·Ry·Rx', '(0, 1, 0)：先绕 z、再 y、再 x，three.js 默认的 XYZ', '(1, 0, 0)：两次 90° 互相抵消了'],
+              answer: 0,
+              explain: 'gl-matrix 3.4 的 fromEuler 等价于 R = Rz · Ry · Rx（第 2.4 节）。x 轴先经过 Rx，不动；再经过 Ry(90°)，转到 (0, 0, −1)。three.js 的 XYZ 是 R = Rx · Ry · Rz：同样先 Ry 得到 (0, 0, −1)，再经过 Rx(90°) 转到 (0, 1, 0)。只转一个轴时两种约定没有区别，同时转两个以上就不一样了。'
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <h2>7. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0008"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0008"]'), [
+        {
+          q: 'Transform 的 dirty 和 version 为什么不能合并成一个？',
+          opts: ['dirty 读完矩阵就变回 false，version 不会；外面的人只能靠不会被读复位的 version', 'version 只在构造时使用一次', '合并之后会多占内存'],
+          answer: 0,
+          why: '第 2.5 节。一个人读了矩阵，dirty 就清掉了，另一个人再看 dirty 会以为什么都没变。'
+        },
+        {
+          q: '设置 0.1 时为什么要先 Math.fround 再比较？',
+          opts: ['内部存的是 Float32，拿 JavaScript 的 0.1 直接比较永远不相等，会误报变化', 'Math.fround 比 === 更快', '为了把 0.1 四舍五入成 0'],
+          answer: 0,
+          why: '<a data-src="src/rendering/scene/Transform.ts:15">Transform.ts:15–35</a>，卡片 A。'
+        },
+        {
+          q: 'updateWorldMatrix 为什么先更新父节点，再读父节点的 worldVersion？',
+          opts: ['父节点可能正是这一刻才重算，先读就会拿到旧版本、误判为没变', '为了让根节点最后更新', '子节点的 Transform 依赖父节点的 Transform'],
+          answer: 0,
+          why: '第 3.2 节的顺序约束表第一行。'
+        },
+        {
+          q: '已经有两个版本号，为什么还需要 worldMatrixDirty？',
+          opts: ['换了父节点后比较的是另一个对象，版本号可能恰好相同', '版本号迟早会溢出', 'dirty 比比较版本号更快'],
+          answer: 0,
+          why: '图 3、卡片 C。'
+        },
+        {
+          q: 'add 为什么分成两个循环？',
+          opts: ['先全部验证、再全部提交：任何一个失败，树都保持原样', '第一个循环排序，第二个循环插入', '两个循环分别处理 Group 和 Mesh'],
+          answer: 0,
+          why: '图 4、卡片 D。'
+        },
+        {
+          q: '提交阶段为什么必须先 removeFromParent，再写 parentValue？',
+          opts: ['先写的话，removeFromParent 会去新父节点里找它，旧父节点的列表里就留下了它', '为了让旧父节点先更新世界矩阵', '没有区别，顺序可以随便换'],
+          answer: 0,
+          why: '第 4.1 节末尾：remove 是幂等的，在新父节点里找不到就什么也不做，结果这个节点同时出现在两个父节点的列表里。'
+        }
+      ])
+    </script>
+
+    <h2>8. 架构视角</h2>
+    <h3>8.1 对照 three.js 的 Object3D</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 18%">方面</th><th style="width: 41%">本项目</th><th>three.js r177</th></tr>
+        <tr><td>世界矩阵怎样更新</td><td>拉取式：读谁就沿祖先链更新到谁；三个记录都没变就直接返回</td><td>推送式：每帧从根调用 updateMatrixWorld，一路 <code>force = true</code> 传给所有子节点（<a data-src="node_modules/three/src/core/Object3D.js:1126">Object3D.js:1126–1150</a>）</td></tr>
+        <tr><td>局部矩阵</td><td>有 dirty，只在 TRS 真正变化之后重算</td><td>matrixAutoUpdate 默认为 true（<a data-src="node_modules/three/src/core/Object3D.js:1606">:1606</a>），每次 updateMatrixWorld 都重新 compose（:1107–1112）</td></tr>
+        <tr><td>add 的成环检查</td><td>沿祖先链向上查，成环就抛错，树不变</td><td>只拒绝 add 自己（<a data-src="node_modules/three/src/core/Object3D.js:734">:734</a>，console.error）；把祖先加进来会悄悄形成环</td></tr>
+        <tr><td>遍历中改树</td><td>会跳过兄弟节点（卡片 E）</td><td>同样的问题；文档写着「不建议在回调里修改场景图」（<a data-src="node_modules/three/src/core/Object3D.js:1040">:1040</a>），而且遍历前缓存了长度，删掉节点后可能访问到 undefined 而报错</td></tr>
+        <tr><td>欧拉角</td><td>R = Rz · Ry · Rx（gl-matrix 3.4 的 fromEuler）</td><td>默认 'XYZ'：R = Rx · Ry · Rz（<a data-src="node_modules/three/src/math/Matrix4.js:327">Matrix4.js:327</a> 开始的分支）</td></tr>
+      </table>
+    </div>
+    <p>
+      取舍：three.js 每帧全部重算，代码简单，每帧的代价与节点数成正比，不用担心缓存失效；本项目只算被读的，代价与「被读的节点数 × 树高」成正比，而且多了三个记录要维护。欧拉角那一行对搬场景数据很重要：从 three.js 拿来的旋转角，直接填进这里的 Transform，两个以上的轴非零时方向就不对了。好在旧引擎的 Mesh 也用同一个 <code>quat.fromEuler</code>（<a data-src="src/objects/Mesh.ts:480">src/objects/Mesh.ts:480</a>），HW2 从旧引擎迁过来的预设数据不受影响。
+    </p>
+
+    <h3>8.2 审查视角：三处值得讨论的地方</h3>
+    <ol>
+      <li>
+        <strong>Transform 的 setter 不做运行时校验。</strong>我实测了：<code>setPosition([NaN, 0, 0])</code> 会把 NaN 存进去；<code>setPosition([1, 2])</code> 的第三个分量变成 NaN；<code>setPosition([1e39, 0, 0])</code> 量化成 Float32 之后是 Infinity。之后整个局部矩阵、所有子孙的世界矩阵都是 NaN，画面上物体消失，却没有任何报错。Material 的参数、第 19 课的 Uniforms 都会检查「有限数」，唯独这里没有。<strong>想一想：</strong>该不该在 setFloat32ComponentsIfChanged 里加检查？检查放在量化之前还是之后（提示：1e39 本身是有限数）？
+      </li>
+      <li>
+        <strong>遍历中改树的规矩没写下来。</strong>卡片 E 里 b 被跳过了。可以选的做法：遍历一份拷贝（每个节点多一次数组复制）；或者在注释里明确「visitor 不能修改树」，像 three.js 那样。<strong>想一想：</strong>将来 RenderListBuilder 会在 traverseVisible 里做什么？它需要改树吗？
+      </li>
+      <li>
+        <strong>递归标脏是不是必要的？</strong>add、remove 会把被移动节点的<em>整棵子树</em>都标成 dirty（<a data-src="src/rendering/scene/SceneNode.ts:419">:419–425</a>），代价与子树大小成正比。<strong>想一想：</strong>如果只标记被移动的那个节点，它的子孙还能算对吗？（提示：子孙比较的是哪个版本号？它是谁的？）
+        <details>
+          <summary>想好了再展开</summary>
+          <p>能算对。孙节点比较的是自己父节点（被移动节点的子节点）的 worldVersion，而那个子节点比较的是被移动节点的 worldVersion。被移动节点因为 dirty 会重算，worldVersion 加一；这个变化沿版本链一层层传下去，每一层都会重算。我把 markWorldMatrixDirtyRecursively 临时改成只标记自己，做了实验：把一个三层的子树从 A 挪到 B 下面，孙节点的世界坐标照样正确。所以递归标脏对正确性不是必需的，它是一份保险——也是一份和子树大小成正比的开销。要不要去掉，取决于你更看重「少一种依赖版本链的推理」还是「reparent 更便宜」。</p>
+        </details>
+      </li>
+    </ol>
+
+    <h2>9. 延伸阅读</h2>
+    <p>
+      <strong>首选（一手来源，约 10 分钟）：</strong>项目文档 <a data-src="src/rendering/scene/docs/transforms-and-scene-graph.zh-CN.md:5">Transform 与场景树的职责</a> 的前三节（一个具体的父子关系、Transform 的参数与派生矩阵、SceneNode）。
+    </p>
+    <p>
+      补充：HW2 设计的 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:400">§8 Transform</a> 和 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:470">§9 SceneNode</a>（§9.2 专门讲防止祖先循环）；两个测试文件的用例标题——<a data-src="tests/unit/rendering/scene/Transform.test.ts:21">Transform.test.ts</a>、<a data-src="tests/unit/rendering/scene/SceneNode.test.ts:163">SceneNode.test.ts</a>。
+    </p>
+
+    <aside class="ask">
+      做完告诉我：热身题和检查题各错了哪几题、六张卡片猜对了几张；8.2 的三个问题可以直接在对话里回答。第 9 课读 Group、Scene、Mesh、Camera 和 PerspectiveCamera。
+    </aside>
+
+    <div class="nav">
+      <a href="0019-task15-backend-orchestration.html">← 第 19 课（提前）：Task 15 编排</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0009-group-scene-mesh-camera.html">第 9 课：Group、Scene、Mesh 与 Camera →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 8 课 · 2026-09-27</footer>
+  </body>
+</html>

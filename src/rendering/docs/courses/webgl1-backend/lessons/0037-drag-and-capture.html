@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 37 课 · 拖动与指针捕获</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/event-lab.js"></script>
+  </head>
+  <body>
+    <p class="kicker">零基础重写 · 浏览器事件 2/3 · 约 25 分钟</p>
+    <h1>拖动：把一串事件变成「挪了多少」，以及指针捕获</h1>
+    <p class="lede">
+      上一课看到，一次拖动是一串事件：pointerdown、很多个 pointermove、pointerup。这一课用它们拖动一个方块。第 1 版十几行就能拖，但有个 bug：拖出舞台再松手，方块会一直粘在手上。修它要用到「指针捕获」。然后再把「拖动可能怎样结束」列全，最后对照项目的轨道控制，看它的每一行对应这里的哪一步。
+    </p>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：第 36 课（addEventListener、事件对象、clientX、button、buttons）。<br />
+      <strong>这一课讲的</strong>：为什么要在函数外面记状态；增量 dx；指针编号 pointerId；setPointerCapture；拖动的五种结束方式和一个统一的出口；项目代码对照。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">第 1 版：记住「在不在拖」和「上一次在哪」</a></li>
+        <li><a href="#s2">第 1 版的 bug：拖出舞台再松手</a></li>
+        <li><a href="#s3">第 2 版：指针捕获</a></li>
+        <li><a href="#s4">第 3 版：拖动还可能怎样结束</a></li>
+        <li><a href="#s5">对照项目代码</a></li>
+        <li><a href="#s6">检查题</a></li>
+        <li><a href="#s7">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 第 1 版：记住「在不在拖」和「上一次在哪」</h2>
+    <p>每个事件都是浏览器对监听函数的一次新调用。函数里的局部变量，调用结束就没了。可拖动需要跨事件记住两件事：</p>
+    <ul>
+      <li><strong>现在是不是在拖。</strong>鼠标只是划过时也有 pointermove，它们不该挪方块。</li>
+      <li><strong>上一个事件时指针在哪。</strong>这一次的位置减去上一次的位置，就是这一次挪了多少，记作 dx、dy。</li>
+    </ul>
+    <p>所以把它们放在监听函数<strong>外面</strong>的变量里。这种跨事件保存的变量叫<strong>状态 (state)</strong>。实验台这次多给了一个方块 <code>box</code>（舞台里那个红色方块），代码改它的 <code>style.left</code>、<code>style.top</code>（CSS 规则让方块中心对准这个点）：</p>
+    <div id="lab1"></div>
+    <p>在舞台上按住拖：方块跟着挪。看记录里每次 move 的 dx、dy：一般只有几个像素，加起来才是总的拖动距离。为什么每次都用「这次减上次」（增量），而不是「这次减按下时」（总量）？两种都能拖方块。轨道控制用的是增量（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:268">mountOrbitCameraInput.ts:268–271</a>）：第 33 课平移公式里的 dx，就是这一次 pointermove 的增量。</p>
+
+    <h2 id="s2">2. 第 1 版的 bug：拖出舞台再松手</h2>
+    <p>用上面的第 1 版做这个实验：</p>
+    <ol>
+      <li>在舞台上按住左键；</li>
+      <li>一直按着，把鼠标拖出舞台（拖到上面的代码区就行）；</li>
+      <li>在舞台外面松开；</li>
+      <li>不按任何键，把鼠标移回舞台里，晃一晃。</li>
+    </ol>
+    <p>方块还跟着鼠标走，记录里只有 down、一串 move，没有 up。原因：</p>
+    <ul>
+      <li>事件只交给「指针下面那个元素」。你在舞台外面松开，pointerup 发给了外面的元素，舞台上登记的函数根本没被调用。</li>
+      <li>所以 <code>dragging</code> 一直是 true。鼠标回到舞台上，即使没按键，pointermove 也会来，第 1 版照样挪方块。</li>
+    </ul>
+    <p>这时点一下舞台，就会收到一个 pointerup，结束这次「拖动」。可用户不该需要这样做。</p>
+    <p>你做完以后，可以对照我在无界面 Chrome 里用 DevTools 协议发真实鼠标事件录下的同一个操作：</p>
+    <div id="rec-v1"></div>
+    <p>第 2 个 move 的 dy 是 +40：它不是从舞台外面回来的那一步，而是从「拖出去之前最后一个舞台里的位置」直接跳到「移回来的位置」。舞台外面那一段，舞台一个事件都没收到；松手的那一下也没收到。</p>
+
+    <h2 id="s3">3. 第 2 版：指针捕获</h2>
+    <p>浏览器提供了正好用于拖动的功能：<strong>指针捕获 (pointer capture)</strong>。在 pointerdown 里调用</p>
+<pre>stage.setPointerCapture(event.pointerId)</pre>
+    <p>意思是：<strong>这个指针以后的事件，不管它跑到哪里，都送到 stage。</strong>直到松开（pointerup）或者被取消（pointercancel），浏览器自动解除捕获（<a href="https://developer.mozilla.org/en-US/docs/Web/API/Pointer_events#pointer_capture">MDN：Pointer capture</a>）。</p>
+    <p>参数 <code>event.pointerId</code> 是<strong>指针编号</strong>：每个指针一个。鼠标通常一直是同一个编号；触摸屏上每根手指各有一个，所以要告诉浏览器「捕获的是哪一个」。</p>
+    <p>第 2 版只比第 1 版多一行（标了「新增」）：</p>
+    <div id="lab2"></div>
+    <p>再做一遍第 2 节的实验：拖出舞台、在外面松开。这次记录里有 up，方块不再粘在手上。按着拖出舞台时，pointermove 也照样送来，方块会一直跟到舞台边缘以外（被舞台裁掉看不见）。</p>
+    <p>记录里 up 后面还多了一行 lostpointercapture：解除捕获时，浏览器会发这个事件，告诉 stage「捕获没了」。下一节会用到它。同一个操作，我录下的记录：</p>
+    <div id="rec-v2"></div>
+    <p>和第 1 版对比：舞台外面那一步（dy = −90，方块到了 y = −30，在舞台外面）送来了，松手的 up 也送来了。之后鼠标移回舞台，不再有 move 被当成拖动。</p>
+
+    <h2 id="s4">4. 第 3 版：拖动还可能怎样结束</h2>
+    <p>正常结束是 pointerup。可拖动还可能这样结束，一个都不能漏，否则就会出现第 2 节那种「粘在手上」：</p>
+    <ul>
+      <li><strong>pointercancel</strong>：浏览器认定这个指针不会再发事件了。比如触摸时，浏览器决定把这次滑动拿去滚动页面（第 38 课实测），或者设备断开（<a href="https://developer.mozilla.org/en-US/docs/Web/API/Pointer_events">MDN</a>）。</li>
+      <li><strong>lostpointercapture</strong>：捕获没了。pointerup、pointercancel 之后浏览器都会自动发它；别的代码调用 releasePointerCapture、舞台被移出页面时也会发。</li>
+      <li><strong>窗口失去焦点 (blur)</strong>：按着键用快捷键切到别的窗口，松手发生在别的窗口里，这一页可能收不到 pointerup。</li>
+      <li><strong>开始拖动的键不按着了</strong>：第 36 课第 6 节，组合键时左键松开不发 pointerup。第 38 课处理。</li>
+    </ul>
+    <p>这些情况都走同一个出口 <code>end</code>。另外第 3 版改用「正在拖的指针编号」<code>dragId</code> 代替 true/false：只有编号对得上的事件才算数，这样第二根手指、第二个指针的事件不会干扰正在进行的拖动。</p>
+    <div id="lab3"></div>
+    <p>试试：正常拖一次，记录里依次是 pointerup「结束拖动」、lostpointercapture「已经结束，不再处理」。<code>end</code> 先看编号对不对得上，第二次来时 <code>dragId</code> 已经是 null，就什么也不做。一个结束动作只执行一次，不管有几个事件来报告它。</p>
+    <p>再试 blur：按住拖动的同时，用快捷键切到别的窗口（比如 macOS 的 ⌘ + Tab），再切回来。记录里会有「窗口失去焦点：结束拖动」。</p>
+
+    <h2 id="s5">5. 对照项目代码</h2>
+    <p>项目的轨道控制（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:233">mountOrbitCameraInput.ts:233–285</a>）就是第 3 版，加上「左键旋转、右键平移」两种模式。逐段对照：</p>
+<pre>// 状态
+第 3 版：let dragId = null
+项目：  let drag = null    // 不是 null 时是 { pointerId, camera, mode, x, y }
+
+// pointerdown
+第 3 版：if (dragId !== null) return
+项目：  if (closed || drag !== null || !event.isPrimary) return
+        // isPrimary：只认第一根手指（第 38 课）
+第 3 版：dragId = event.pointerId；lastX = event.clientX；lastY = …
+项目：  drag = { pointerId: event.pointerId, …, x: event.clientX, y: … }
+第 3 版：stage.setPointerCapture(event.pointerId)
+项目：  canvas.setPointerCapture(event.pointerId)
+
+// pointermove
+第 3 版：if (event.pointerId !== dragId) return
+项目：  if (closed || event.pointerId !== drag?.pointerId) return
+第 3 版：const dx = event.clientX - lastX；lastX = event.clientX
+项目：  const dx = event.clientX - drag.x；drag.x = event.clientX
+        // 然后 applyPan（第 33 课）或 applyOrbit（第 35 课）
+
+// 结束
+第 3 版：pointerup、pointercancel、lostpointercapture → end；window 的 blur → end
+项目：  这三个事件 → onPointerEnd；hostWindow 的 blur → endDrag</pre>
+    <p>（登记那几行在 <a data-src="src/rendering/controls/mountOrbitCameraInput.ts:309">:309–318</a>。）项目比第 3 版多了三件事：</p>
+    <ul>
+      <li>setPointerCapture 包在 try 里：元素已经不在页面上时它会抛错，这时干脆不开始拖动（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:245">:245–250</a>）。</li>
+      <li>endDrag 先把 drag 设成 null，再释放捕获（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:108">:108–118</a>）。释放捕获会引出一个 lostpointercapture，它再进 onPointerEnd 时，drag 已经是 null，什么都不做。这和第 3 版 end 先查编号是同一个道理。</li>
+      <li>pointermove 里检查「开始拖动的键还按着吗」（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:260">:260–266</a>），下一课讲。</li>
+    </ul>
+
+    <h2 id="s6">6. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0037"></div>
+
+    <h2 id="s7">7. 延伸阅读</h2>
+    <ul>
+      <li>速查：<a href="../reference/pointer-events.html">指针事件</a>（第 36–38 课的字段、骨架和实测现象）。</li>
+      <li>首选：<a href="https://developer.mozilla.org/en-US/docs/Web/API/Element/setPointerCapture">MDN：Element.setPointerCapture()</a>。页面上的例子就是一个可拖动的滑块，和这一课的第 2 版几乎一样。</li>
+      <li><a href="https://www.w3.org/TR/pointerevents3/#pointer-capture">W3C Pointer Events：Pointer capture</a>：捕获只在指针「按着」的时候才生效；解除以后先发 lostpointercapture，再发这个指针后面的事件。</li>
+    </ul>
+
+    <aside class="note">
+      哪一行代码看不懂，直接在对话里问我。做完告诉我检查题错了哪几题。
+    </aside>
+
+    <div class="nav">
+      <a href="0036-events-from-zero.html">← 第 36 课：浏览器事件从零开始</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0038-buttons-wheel-two-fingers.html">第 38 课：右键、滚轮、两根手指 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 37 课 · 2026-10-15</footer>
+
+    <script>
+      // 2026-10-15 在无界面 Chrome 155 里用 DevTools 协议（Input.dispatchMouseEvent / dispatchTouchEvent）发真实输入、从实验台读回的记录
+      window.RECORDED_V1 = "   0 ms  down：开始拖\n  10 ms  move：dx = 20，dy = -40，方块到 (170, 60)\n  43 ms  move：dx = 40，dy = 40，方块到 (210, 100)\n  60 ms  move：dx = 20，dy = 20，方块到 (230, 120)"
+      window.RECORDED_V2 = "   0 ms  down：开始拖，捕获了指针 1\n  16 ms  move：dx = 20，dy = -40，方块到 (170, 60)\n  32 ms  move：dx = 20，dy = -90，方块到 (190, -30)\n  34 ms  up：结束\n  34 ms  lostpointercapture：捕获解除了"
+    </script>
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        // ================= 第 1 版 =================
+        function v1(stage, box, print) {
+          // 状态：放在监听函数外面，事件和事件之间一直保留
+          let boxX = 150 // 方块中心在舞台里的位置（CSS 像素）
+          let boxY = 100
+          let dragging = false // 现在是不是在拖
+          let lastX = 0 // 上一个事件时指针的位置（clientX、clientY）
+          let lastY = 0
+
+          // 把方块画到 (boxX, boxY)：改它的 CSS left、top
+          function draw() {
+            box.style.left = boxX + 'px'
+            box.style.top = boxY + 'px'
+          }
+          draw()
+
+          stage.addEventListener('pointerdown', (event) => {
+            dragging = true
+            lastX = event.clientX
+            lastY = event.clientY
+            print('down：开始拖')
+          })
+          stage.addEventListener('pointermove', (event) => {
+            if (!dragging) return // 没在拖：只是划过，不管
+            // 这一次比上一次挪了多少（增量）
+            const dx = event.clientX - lastX
+            const dy = event.clientY - lastY
+            boxX += dx
+            boxY += dy
+            // 记下这一次的位置，下一次 move 再和它比
+            lastX = event.clientX
+            lastY = event.clientY
+            draw()
+            print('move：dx = ' + dx + '，dy = ' + dy +
+              '，方块到 (' + boxX + ', ' + boxY + ')')
+          })
+          stage.addEventListener('pointerup', () => {
+            dragging = false
+            print('up：结束')
+          })
+        }
+
+        // ================= 第 2 版 =================
+        function v2(stage, box, print) {
+          let boxX = 150
+          let boxY = 100
+          let dragging = false
+          let lastX = 0
+          let lastY = 0
+          function draw() {
+            box.style.left = boxX + 'px'
+            box.style.top = boxY + 'px'
+          }
+          draw()
+
+          stage.addEventListener('pointerdown', (event) => {
+            dragging = true
+            lastX = event.clientX
+            lastY = event.clientY
+            // 新增：这个指针以后的事件，不管它跑到哪里，都送到 stage
+            stage.setPointerCapture(event.pointerId)
+            print('down：开始拖，捕获了指针 ' + event.pointerId)
+          })
+          stage.addEventListener('pointermove', (event) => {
+            if (!dragging) return
+            const dx = event.clientX - lastX
+            const dy = event.clientY - lastY
+            boxX += dx
+            boxY += dy
+            lastX = event.clientX
+            lastY = event.clientY
+            draw()
+            print('move：dx = ' + dx + '，dy = ' + dy +
+              '，方块到 (' + boxX + ', ' + boxY + ')')
+          })
+          stage.addEventListener('pointerup', () => {
+            dragging = false
+            print('up：结束')
+          })
+          // 只是为了让你看到它：解除捕获时浏览器发的事件
+          stage.addEventListener('lostpointercapture', () => {
+            print('lostpointercapture：捕获解除了')
+          })
+        }
+
+        // ================= 第 3 版 =================
+        function v3(stage, box, print) {
+          let boxX = 150
+          let boxY = 100
+          let dragId = null // 正在拖的指针编号；null 表示没在拖
+          let lastX = 0
+          let lastY = 0
+          function draw() {
+            box.style.left = boxX + 'px'
+            box.style.top = boxY + 'px'
+          }
+          draw()
+
+          stage.addEventListener('pointerdown', (event) => {
+            if (dragId !== null) return // 已经在拖了：别的指针按下，不管
+            dragId = event.pointerId
+            lastX = event.clientX
+            lastY = event.clientY
+            stage.setPointerCapture(event.pointerId)
+            print('down：开始拖，指针 ' + dragId)
+          })
+          stage.addEventListener('pointermove', (event) => {
+            if (event.pointerId !== dragId) return // 不是正在拖的那个指针
+            const dx = event.clientX - lastX
+            const dy = event.clientY - lastY
+            boxX += dx
+            boxY += dy
+            lastX = event.clientX
+            lastY = event.clientY
+            draw()
+            print('move：dx = ' + dx + '，dy = ' + dy)
+          })
+
+          // 唯一的出口：不管是哪种结束，都只在这里把状态清掉
+          function end(event) {
+            if (event.pointerId !== dragId) {
+              // 已经结束过了（比如 pointerup 之后的 lostpointercapture）
+              print(event.type + '：已经结束，不再处理')
+              return
+            }
+            dragId = null
+            print(event.type + '：结束拖动')
+          }
+          stage.addEventListener('pointerup', end)
+          stage.addEventListener('pointercancel', end)
+          stage.addEventListener('lostpointercapture', end)
+          // 窗口失去焦点：可能再也收不到 pointerup
+          window.addEventListener('blur', () => {
+            if (dragId === null) return
+            dragId = null
+            print('窗口失去焦点：结束拖动')
+          })
+        }
+
+        const E = RTeach.eventLab
+        E.run({ mount: document.getElementById('lab1'), fn: v1, box: true, height: 220, hint: '按住拖动；再试试拖出舞台松手' })
+        E.run({ mount: document.getElementById('lab2'), fn: v2, box: true, height: 220, hint: '拖出舞台再松手' })
+        E.run({ mount: document.getElementById('lab3'), fn: v3, box: true, height: 220, hint: '正常拖一次；按着拖时切换窗口' })
+        const how = '无界面 Chrome 155，DevTools 协议发真实鼠标事件：在舞台里按下 → 舞台里挪一下 → 拖到舞台上方 30 px 处 → 在那里松开 → 不按键移回舞台 → 再挪一下'
+        E.recorded(document.getElementById('rec-v1'), how + '（第 1 版）', window.RECORDED_V1 || '（记录还没生成）')
+        E.recorded(document.getElementById('rec-v2'), how + '（第 2 版）', window.RECORDED_V2 || '（记录还没生成）')
+
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0037"]'), [
+          {
+            q: '为什么 dragging、lastX 要放在监听函数外面？',
+            opts: ['每个事件是一次新调用，要跨事件记住', '放在外面，浏览器调用得更快一些', '监听函数里面不允许声明任何变量'],
+            answer: 0,
+            why: '第 1 节：局部变量在一次调用结束时就没了。拖动要从 pointerdown 一直记到 pointerup，只能放在外面。'
+          },
+          {
+            q: '第 1 版里，拖出舞台、在外面松开，然后鼠标移回舞台。会怎样？',
+            opts: ['方块继续跟着鼠标走', '方块回到按下时的位置', '浏览器自动补发 pointerup'],
+            answer: 0,
+            why: '第 2 节：pointerup 发给了舞台外面的元素，舞台收不到，dragging 一直是 true。'
+          },
+          {
+            q: 'stage.setPointerCapture(event.pointerId) 的作用是？',
+            opts: ['这个指针以后的事件都送到 stage', '把指针的位置固定在 stage 里', '让 stage 收到所有指针的事件'],
+            answer: 0,
+            why: '第 3 节：只捕获这一个编号的指针，直到松开或取消。它不限制指针的位置，也不影响别的指针。'
+          },
+          {
+            q: '正常拖动一次，第 3 版的 end 会被调用几次？',
+            opts: ['两次：pointerup 和 lostpointercapture', '一次：只有 pointerup', '三次：再加上 pointercancel'],
+            answer: 0,
+            why: '第 4 节：松开时先是 pointerup，捕获自动解除，又来一个 lostpointercapture。第二次进 end 时编号对不上，什么都不做。'
+          },
+          {
+            q: '项目的 endDrag 为什么先写 drag = null，再释放捕获？',
+            opts: ['释放会引出 lostpointercapture，那时要已经结束', '释放捕获之后 drag 就不能再修改了', '先写 null 才能让浏览器发出 pointerup'],
+            answer: 0,
+            why: '第 5 节：lostpointercapture 进 onPointerEnd 时，drag 已经是 null，就不会重复结束。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

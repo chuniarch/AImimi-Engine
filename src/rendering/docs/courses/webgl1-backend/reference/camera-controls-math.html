@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>相机控制的数学：速查</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+  </head>
+  <body>
+    <p class="kicker">速查 · 来自第 32–35 课</p>
+    <h1>相机控制的数学：速查</h1>
+    <p class="lede">一条公式（点落在哪个像素），推出平移、滚轮缩放、歪头三件事。数字都按 HW2 的相机：在 (0, 20, 50) 看 (0, 10, 0)，fovY = 45°，画布 900 × 600。</p>
+
+    <h2>用词</h2>
+    <ul>
+      <li><strong>世界坐标</strong>：整个场景共用、不随相机动的坐标。</li>
+      <li><strong>相机坐标</strong>：以相机为原点；x 指画面右，y 指画面上，相机看 −z。</li>
+      <li><strong>深度 D</strong>：点在相机正前方多远 = −(相机坐标的 z)。不是世界 z，也不是直线距离。算法：D = (P − 相机位置) · f，f 是看的方向（长度 1）。</li>
+      <li><strong>相机的三根轴</strong>：右 r、上 u、后 b，就是相机 world 矩阵的前三列；看的方向 f = −b。</li>
+    </ul>
+
+    <h2>★ 点落在哪个像素（第 32 课）</h2>
+<pre>h(D) = 2 × D × tan(fovY/2)          深度 D 处画面能装下的高度
+px   = W/2 + x × H / h(D)           x、y 是相机坐标
+py   = H/2 − y × H / h(D)           屏幕的行号向下增大，所以是减号</pre>
+    <ul>
+      <li>D = 50.99：h = 42.24，1 px = 0.0704 个单位；(5, 10, 0) 画在第 521.02 列。</li>
+      <li>横向也用 h/H：aspect = W/H 时 w/W = h/H（像素是正方形的）。只有画面被拉伸时才不同。</li>
+      <li>同样长的东西，占的像素和 D 成反比（近大远小）。</li>
+    </ul>
+
+    <h2>平移（第 33 课）</h2>
+<pre>相机向左挪 s ⟺ 每个点的相机坐标 x 增加 s，深度不变
+深度 D 的点在屏幕上挪：  Δpx = s × H / h(D)
+让目标点（深度 d）跟手挪 dx：  s = dx × h(d) / H
+其他点挪：  Δpx = dx × d / D            （视差）</pre>
+    <p>HW2：拖 100 px，相机挪 7.04（panSpeed 0.8 时 5.63）；近点（D = 19.61）挪 260 px，远点（D = 101.98）挪 50 px。代码：<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:184">applyPan</a>，target 和相机挪同样的距离。</p>
+
+    <h2>滚轮缩放（第 34 课）</h2>
+<pre>要求一：每格放大同样的比例   ⟹  r' = r ÷ k（乘法）
+要求二：g(a + b) = g(a) × g(b)  ⟹  g(Δ) = q^Δ = e^(c × Δ)
+项目：r' = r × e^(0.001 × deltaY)，再限制在 [1, 300]</pre>
+    <p>deltaY = −100：r × 0.90484，画面放大 1.10517 倍。10 次 deltaY = 10 和 1 次 100 完全一样。three.js：<code>Math.pow(0.95, zoomSpeed × |deltaY × 0.01|)</code>，同一个形式。代码：<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:296">onWheel</a>。</p>
+
+    <h2>歪头（第 35 课）</h2>
+<pre>歪头 (roll) = 绕视线转；方位角 (yaw) = 绕世界竖轴；仰角 (pitch) = 抬头低头
+没歪 ⟺ r 的 y 分量 = 0
+歪头角 ρ = atan2(r 的 y 分量, u 的 y 分量)
+轨道控制：R = R_y(az) × R_x(−el)，r = (cos az, 0, −sin az)，永远不歪
+arcball：屏幕点 → 球面 (x, y, √(1 − x² − y²))；转角 acos(a · b)，转轴 a × b（相机自己的坐标系）</pre>
+    <ul>
+      <li>arcball 一次拖 100 px（半径 300）：从中心 19.47°，从 200 px 拖到 300 px 48.19°。</li>
+      <li>arcball 拖一个闭合正方形：位置回到 (0, 20, 50)，头还歪着 6.76°。原因：转轴在相机坐标系里，相机低头时它是斜的；绕不同轴的旋转不能交换顺序，累积起来不等于没转。</li>
+      <li>轨道控制只记两个角、每次重建朝向，拖回原处就回到原样。</li>
+    </ul>
+
+    <h2>数学工具</h2>
+<pre>tan θ = 对边 ÷ 邻边；atan2(a, b) 反过来求角
+点积  a · b = a_x b_x + a_y b_y + a_z b_z     两个单位向量：= cos(夹角)
+叉积  a × b = (a_y b_z − a_z b_y, a_z b_x − a_x b_z, a_x b_y − a_y b_x)   同时垂直于 a、b
+矩阵 × (1, 0, 0) = 矩阵的第一列</pre>
+    <p class="nav"><a href="../index.html">课程首页</a></p>
+    <script>if (RTeach.linkSources) RTeach.linkSources(document.body)</script>
+  </body>
+</html>

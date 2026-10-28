@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 6 课 · 边界与失败</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/gl-sandbox.js"></script>
+    <script src="../assets/predict.js"></script>
+    <script src="../assets/rendering-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 架构篇 4/4 · 约 25 分钟</p>
+    <h1>架构决策三：边界上传什么，失败怎样跨过边界</h1>
+    <p class="lede">
+      前三课讲了分层、GPU 表示、所有权。这一课看第二层和第三层之间那条边界：上面交给后端的是什么，后端怎样保证「临时改的绑定一定改回来」，出了错怎样告诉上面，以及 context 丢失为什么不按「一次调用失败」来处理。读完你应该能说出 RenderBackend 每个成员背后的约束，并能判断一次失败之后哪些状态保持、哪些回滚、哪些整代作废。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— Task 15 要实现的正是这条边界：<code>withRenderSurface</code>、<code>clear</code>（Task 15 已把它并入 withRenderSurface，见第 2 节的更新说明）、<code>draw</code>、<code>ready</code>。这一课是它的「验收标准」；详细设计篇（第 7–18 课）之后，第 19 课再回来讲编排。
+    </div>
+
+    <h2>0. 热身：前几课还记得吗</h2>
+    <div class="quiz" data-quiz="lesson-0006-warmup"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0006-warmup"]'), [
+        {
+          q: 'backend 的 GeometryManager import 了 resources/Geometry。这是哪种方向、合不合法？',
+          opts: ['知识方向：机器读数据，合法', '调用方向：向上调用，不合法', '知识方向：数据读机器，不合法'],
+          answer: 0,
+          why: '第 3 课的更正：import 类型属于知识方向。处理数据的机器可以读数据，数据不能知道机器。Geometry 从不 import 任何 Manager。'
+        },
+        {
+          q: '只调用一次 getError，能可靠地回答哪一个问题？',
+          opts: ['此刻是否还有任何错误标志', '之前一共发生了哪几种错误', '最早发生的是哪一种错误'],
+          answer: 0,
+          why: '只有全部标志都清空时才返回 NO_ERROR，所以一次调用足以判断「干不干净」；要知道有哪几种，得循环取到 NO_ERROR；取出的顺序不保证，也就说不出哪个最早。'
+        },
+        {
+          q: 'context 丢失时，Manager 为什么要退订全部释放事件？',
+          opts: ['让作废的这一代和资源断开', '让浏览器更快地恢复 context', '让 CPU 资源能立即被回收'],
+          answer: 0,
+          why: '第 4 课：CPU 资源比这一代 Manager 活得久。不退订，资源的监听器集合就一直拽着作废的 Manager，等资源释放时还会调进它。'
+        }
+      ])
+    </script>
+
+    <h2>1. 设计问题：边界上该传什么？</h2>
+    <p>
+      后端画一个物体，需要几何体、材质、模型矩阵、视图和投影矩阵、相机位置。最省事的办法是把 Mesh 和 Camera 直接交给后端。本项目偏不这样做，<code>draw</code> 只收一个 <a data-src="src/rendering/backend/RenderBackend.ts:6">DrawSubmission</a>：<code>{ item: RenderItem, view: ViewState }</code>。原因有三条：
+    </p>
+    <ol class="steps">
+      <li><strong>后端不能知道场景。</strong>收 Mesh、Camera，后端就得 import scene，违反「Backend 不知道 Scene」（第 3 课）。</li>
+      <li><strong>同一批 draw 要看到同一帧。</strong>提取阶段把可变的场景读一次，复制成值：RenderItem 带着 worldMatrix 的副本（<a data-src="src/rendering/frame/RenderItem.ts:11">RenderItem.ts:11</a>），ViewState 带着相机矩阵的副本。「Backend 不接收 Camera，因此不能在同一批 draw 中重新读取可变相机状态」（<a data-src="src/rendering/frame/ViewState.ts:11">ViewState.ts:11</a>）。否则，两次 draw 之间有人动了相机，同一帧就会一半用旧矩阵、一半用新矩阵。</li>
+      <li><strong>类型把边界钉死。</strong><a data-src="tests/unit/rendering/backend/RenderBackend.test.ts:41">RenderBackend.test.ts:41–44</a> 用 <code>@ts-expect-error</code> 证明：draw 不接受零散的 geometry、material 字段，Mat4Tuple 少一个数都编译不过。</li>
+    </ol>
+    <p>
+      快照有一个诚实的缺口：RenderItem 复制了矩阵，Geometry、Material 却只是借用身份。Geometry 不可变，没问题；Material 可以 <code>setParameter</code>，而源码写明了它的读取结果「不是整帧快照协议；后续帧提取若要求参数在一帧内固定，需要在那里显式捕获」（<a data-src="src/rendering/resources/Material.ts:175">Material.ts:175–176</a>）。这是留给 Task 16 的决定。
+    </p>
+
+    <h2>2. 精读 ①：RenderBackend 的六个成员（Task 15 后是五个），每个都是「意图」</h2>
+    <pre><code>// src/rendering/backend/RenderBackend.ts（Task 15 改动之前的版本，节选，注释是我加的）
+export interface RenderBackend {
+  readonly ready: boolean                                             // 设备现在能不能画（未丢失、未关闭）
+  resizeDrawingBuffer(cssWidth: number, cssHeight: number, pixelRatio: number): void
+  withRenderSurface(surface: RenderSurface, callback: () =&gt; undefined): void   // 在某个输出目标上执行一段同步代码
+  clear(descriptor: ClearDescriptor): void                            // 清除当前目标的哪些缓冲
+  draw(submission: DrawSubmission): void                              // 画一个物体
+  dispose(): void
+}</code></pre>
+    <aside class="note">
+      <strong>2026-09-26 更新：</strong>Task 15 改了这份契约，现在是五个成员。独立的 <code>clear()</code> 取消了，清除变成进入作用域时的一项描述：<code>withRenderSurface</code> 的第一个参数是 <code>{ surface, clear? }</code>（<a data-src="src/rendering/backend/RenderSurface.ts:37">RenderSurface.ts:37–40</a>），绑定目标之后、执行回调之前清除一次；嵌套作用域退出时只恢复外层的绑定，不会再清一次外层（<a data-src="src/rendering/backend/RenderSurface.ts:28">:28–36</a>）。形状上和 WebGPU 的 render pass 一样：清除是「开始画这个目标」时的一个选项，而不是随时可以插进来的命令。上面的节选保留改动前的样子，读新代码以 <a data-src="src/rendering/backend/RenderBackend.ts:18">RenderBackend.ts:18–44</a> 为准；正式实现在 <a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:191">WebGL1SurfaceScope.ts:191–244</a>。
+    </aside>
+    <p>
+      对照重构方案的三条接口规则（<a data-main="claude-workspace/threejs-refactor/PLAN.md:521">PLAN.md §5.8</a>）：① 方法名表达意图，不用 GL 术语——这里没有 <code>bindFramebuffer</code>、<code>useProgram</code>，只有「在哪画、清什么、画什么」；③ 签名里不出现任何 GL 类型——只有逻辑资源和值类型。第 ② 条（能力差异走 <code>hasFeature</code>）目前还没有对应的成员：只有一个后端时用不上，接 WebGL2 时要补上。
+    </p>
+    <p>
+      这条边界还有两条「反向」的约束：Pass 不能自己调用 <code>gl.clear</code>、<code>gl.useProgram</code> 或 <code>gl.draw*</code>（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1187">HW2 设计 §18</a>）；后端独占它的 context，任何外部代码都不能直接改同一个 context 的状态（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1191">:1191</a>）。后一条正是 State 缓存可信的前提——上次答疑讲 invalidateState 时说的就是它。
+    </p>
+
+    <h2>3. 精读 ②：输出目标用「作用域」，不用全局开关</h2>
+    <p>一次离屏绘制要临时绑定另一个 framebuffer 和 viewport，画完必须改回去。改回去有两种写法：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 18%"></th><th>全局开关（three.js 的 <code>setRenderTarget</code>）</th><th>作用域（本项目的 <code>withRenderSurface</code>）</th></tr>
+        <tr><td>写法</td><td><code>setRenderTarget(rt)</code> → 画 → <code>setRenderTarget(旧的)</code></td><td><code>withRenderSurface(surface, () =&gt; { 画 })</code></td></tr>
+        <tr><td>谁负责改回去</td><td>每个调用者自己记住</td><td>后端在 <code>finally</code> 里改回去</td></tr>
+        <tr><td>中途抛错</td><td>改回去的那一行被跳过，之后的绘制都画进了离屏目标</td><td>照样恢复</td></tr>
+        <tr><td>嵌套</td><td>调用者得自己保存每一层的旧值</td><td>每一层都恢复到自己进入之前的样子</td></tr>
+      </table>
+    </div>
+    <p>
+      契约写在 <a data-src="src/rendering/backend/RenderBackend.ts:25">RenderBackend.ts:25–37</a>：先捕获<strong>真实的</strong> FRAMEBUFFER_BINDING 和 VIEWPORT，再在 try 里解析并绑定目标、执行回调，最后在 finally 里恢复。捕获真实值而不是假设「进来之前是画布」，是因为外层可能本身就是另一个离屏目标（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:228">WebGL1State.ts:228</a>）。三块零件已经在 State 里：<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:180">captureSurfaceState</a>、<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:207">bindSurface</a>、<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:255">restoreSurfaceState</a>；把它们组装成作用域，是 Task 15 的事（卡片 D 演示了这个骨架）。
+    </p>
+    <p><strong>两处细节：</strong></p>
+    <ul>
+      <li><strong>目的地是显式的联合类型。</strong><a data-src="src/rendering/backend/RenderSurface.ts:10">RenderSurface</a> 只有 <code>default-framebuffer</code> 和 <code>render-target</code> 两种，不允许用 null 表示画布。设计文档说明了原因：「不能把 disposed RenderTarget 的 null framebuffer 静默当作默认 framebuffer，否则像素会写进 canvas」（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1876">§28</a>）。</li>
+      <li><strong>回调必须同步，而且类型只挡得住一半。</strong>回调类型是 <code>() =&gt; undefined</code>——和上次答疑讲的 hook 是同一个手法，async 函数和 <code>() =&gt; 1</code> 都编译不过（<a data-src="tests/unit/rendering/backend/RenderBackend.test.ts:35">RenderBackend.test.ts:35–38</a>）。但它挡不住回调<em>内部</em>启动一个不等待的异步任务，比如 <code>() =&gt; { void loadAndDraw() }</code>：那个任务会在 finally 恢复之后才去画，画到错误的目标上。所以契约写明「禁止跨 await 或启动稍后再次 draw 的任务」，这部分要靠 lint 和审查（<a data-src="src/rendering/backend/RenderBackend.ts:34">:34</a>）。</li>
+    </ul>
+
+    <h2>4. 精读 ③：失败怎样跨过边界——分类，要么完整、要么不变</h2>
+    <p>
+      第 2 课按「GL 从哪条通道报错」分过类；这里换一个角度：<strong>上层拿到错误之后该做什么</strong>。设计文档说得很直白：窄错误的意义不是增加类的数量，而是让调用者区分这几种情况（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1865">§28</a>）：
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 16%">情况</th><th style="width: 42%">错误类（都继承 RenderingError）</th><th>上层该怎么办</th></tr>
+        <tr><td>数据非法</td><td>Invalid*Error（Geometry、Material、RenderTarget……）、SceneGraphCycleError</td><td>修调用方的数据或代码；重试没有用</td></tr>
+        <tr><td>对象已释放 / 记账错误</td><td>ResourceDisposedError、ResourceHasSceneReferencesError、WebGLBackendDisposedError</td><td>调用方的 bug：用了已经释放的东西（第 5 课）</td></tr>
+        <tr><td>功能不支持</td><td>UnsupportedRenderFeatureError、UnsupportedShaderLanguageError、UnsupportedIndexTypeError</td><td>换一种方案，或者关掉这个功能</td></tr>
+        <tr><td>构建失败</td><td>ShaderCompilationError、ProgramLinkError（带 infoLog）、IncompleteFramebufferError</td><td>shader 写错了就报告开发者；FBO 不完整就换附件格式</td></tr>
+        <tr><td>设备暂时不可用</td><td>WebGLContextLostError</td><td>暂停绘制，等恢复（第 5 节）</td></tr>
+        <tr><td>GL 操作失败</td><td>WebGLOperationError、WebGLResourceCreationError</td><td>多半是代码 bug；OUT_OF_MEMORY 可以试着降低分辨率</td></tr>
+      </table>
+    </div>
+    <p>
+      「功能不支持」的检查放在<strong>创建任何 GPU 对象之前</strong>：「能力检查必须先于任何 create*，避免已知不支持的请求产生半成品」（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:190">RenderTargetManager.ts:190</a>）；ProgramManager 也是先看 shader 语言，再碰 GL（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:92">ProgramManager.ts:92–94</a>，卡片 B）。
+    </p>
+    <p>
+      而一旦开始创建，失败时就要做到<strong>要么完整成功，要么什么都没变</strong>。这句话在三个粒度上各执行一次：
+    </p>
+    <ul>
+      <li><strong>CPU 资源：先验证，再提交。</strong>Material.setParameter 验证失败时旧值不变（<a data-src="src/rendering/resources/Material.ts:337">Material.ts:337–349</a>）；RenderTarget.resize「先验证两个尺寸，再准备完整新快照，最后提交」（<a data-src="src/rendering/resources/RenderTarget.ts:465">RenderTarget.ts:465–470</a>）；Scene 的账本（第 5 课）。</li>
+      <li><strong>GPU 资源：事务式发布 (transactional publish)。</strong>全部成功才放进缓存；失败只删这一次新建的对象（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:341">RenderTargetManager.ts:341–347</a>），缓存里不留半成品，下次 get 会从头再来（卡片 A）。</li>
+      <li><strong>作用域：恢复绑定。</strong>finally 恢复的是 framebuffer 和 viewport。它不回滚已经写进附件的像素，也不恢复 program、深度状态（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:229">WebGL1State.ts:229–230</a>）。「原子」指的是状态，不是已经发生的效果。</li>
+    </ul>
+
+    <h2>5. 精读 ④：context 丢失是一个状态，不是一次调用的失败</h2>
+    <p>
+      context 可能在任意两个 GL 调用之间丢失。如果把它当成「某次调用失败」，就得在每个 <code>gl.*</code> 外面包 try/catch。设计文档明确拒绝了这种做法：「不需要在每个 gl.* 周围 try/catch。Renderer 在帧入口检查 backend.ready；Backend 公开方法仍执行 assertReady() 作为误用防线」（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1303">§20</a>）。
+    </p>
+    <pre><code>ready ──webglcontextlost──→ lost ──webglcontextrestored──→ restoring ──成功──→ ready
+                                                               └──失败──→ restore-failed
+任何状态 ──dispose()──→ disposed                         （WebGLContextLifecycle.ts:2）</code></pre>
+    <ul>
+      <li><strong>丢失时：</strong>状态先变成 lost（所以回调里看到的 isReady 已经是 false），再通知后端让这一代的缓存整体作废（第 4 课）。浏览器的 DOM 事件回调里「所有业务回调异常均不逃出 DOM listener」（<a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:70">Lifecycle.ts:70</a>）：失败记进 <code>lastFailure</code>，不往浏览器里抛。</li>
+      <li><strong>恢复时：</strong>重新探测能力、重新组装 State 和 Manager，最后才变回 ready；之后第一次 draw 从 CPU 资源懒上传。</li>
+      <li><strong>边界上：</strong>第二层只看一个布尔值 <code>ready</code>（<a data-src="src/rendering/backend/RenderBackend.ts:20">RenderBackend.ts:20</a>）。实施计划里 Renderer 的测试要求：「backend not ready 时 Builder/Pipeline 都不调用」。</li>
+    </ul>
+    <p>生命周期里还有一个 <code>transitionVersion</code>，用来防止旧的回调覆盖新的状态。它是第 13 课的主题，这里先知道它存在就行。</p>
+
+    <h2>6. 先预测、再运行：跑真实的项目代码</h2>
+    <p>卡片 A 用了<strong>故障注入</strong>：把 <code>checkFramebufferStatus</code> 的返回值换成「不完整」，模拟一块不支持这种附件组合的设备。卡片上会标明注入了什么。</p>
+    <details>
+      <summary>每张卡片之前都会先运行的准备代码</summary>
+      <pre><code id="prelude-view"></code></pre>
+    </details>
+    <div id="predict-0006"></div>
+    <script>
+      ;(function () {
+        const prelude = [
+          'const R = window.RTeachRendering                      // 打包进来的真实项目代码',
+          'const hooks = { invalidateState: () => undefined }',
+          'const geometries = new R.WebGL1GeometryManager(gl, { elementIndexUint: null }, hooks)',
+          'const programs = new R.WebGL1ProgramManager(gl, hooks)',
+          "const targets = new R.WebGL1RenderTargetManager(gl, { drawBuffers: gl.getExtension('WEBGL_draw_buffers') }, hooks)",
+          'const state = new R.WebGL1State(gl)',
+          'const makeGeometry = () => new R.Geometry({ attributes: { position: new R.VertexAttribute({ data: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), itemSize: 3 }) } })',
+          "const FS = 'precision mediump float; void main() { gl_FragColor = vec4(1.0); }'"
+        ].join('\n')
+        document.getElementById('prelude-view').textContent = prelude
+
+        if (!window.RTeachRendering) {
+          document.getElementById('predict-0006').textContent =
+            '没有加载到 assets/rendering-bundle.js，卡片无法运行。按 MAINTENANCE.md「真实代码打包」重新构建一次。'
+          return
+        }
+
+        RTeach.predict({
+          mount: document.getElementById('predict-0006'),
+          storageKey: 'lesson-0006',
+          canvas: false,
+          prelude,
+          items: [
+            {
+              title: 'A · FBO 不完整，get 抛错之后：Manager 的缓存里留下了什么？',
+              code: "const target = new R.RenderTarget({ width: 64, height: 64, colors: [{ format: 'rgba8' }] })\ntry { targets.get(target) } catch (error) { log('第一次 get →', error.name) }\ntry { targets.get(target) } catch (error) { log('第二次 get →', error.name) }",
+              overrides: {
+                checkFramebufferStatus: function (args, callReal, real) {
+                  return real.FRAMEBUFFER_INCOMPLETE_ATTACHMENT
+                }
+              },
+              choices: ['什么都没留：下次从头再建', '留下半成品：下次直接返回', '留下失败标记：下次直接拒绝'],
+              answer: 0,
+              explain: '两次都是 IncompleteFramebufferError——「构建失败」这一类，而不是笼统的 GL 错误。在调用日志里找这几行：<code>createFramebuffer() → WebGLFramebuffer#1</code>、<code>checkFramebufferStatus → FRAMEBUFFER_INCOMPLETE_ATTACHMENT</code>，然后是 <code>deleteFramebuffer(WebGLFramebuffer#1)</code>、<code>deleteTexture(WebGLTexture#1)</code>：失败时删掉的正是这一次新建的对象（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:341">RenderTargetManager.ts:341–347</a>）。第二次 get 又建了 <code>WebGLFramebuffer#2</code>，说明缓存里什么都没留。如果留下半成品，调用者会拿到一个画不上去的 FBO；如果留下失败标记，设备条件变了（比如换了附件格式）也没法重试。'
+            },
+            {
+              title: 'B · 一个拼错的 shader、一个 WebGL1 不支持的 shader：各抛什么错？',
+              code: "const typo = new R.ShaderModule({ name: 'typo', language: 'glsl-es-100', vertexSource: 'void main() { gl_Positon = vec4(0.0); }', fragmentSource: FS })\nconst es300 = new R.ShaderModule({ name: 'es300', language: 'glsl-es-300', vertexSource: '#version 300 es\\nvoid main() { gl_Position = vec4(0.0); }', fragmentSource: '#version 300 es\\nprecision mediump float;\\nout vec4 color;\\nvoid main() { color = vec4(1.0); }' })\nfor (const shader of [typo, es300]) {\n  try { programs.get(shader) } catch (error) { log(shader.name, '→', error.name) }\n}",
+              choices: ['两个不同的类：构建失败、功能不支持', '同一个类：都是 WebGLOperationError', '同一个类：都是 InvalidShaderModuleError'],
+              answer: 0,
+              explain: 'typo 是 ShaderCompilationError：错误里带着 infoLog，上层应该把它报告给开发者，重试没用。es300 是 UnsupportedShaderLanguageError：WebGL1 只能编译 GLSL ES 1.00，上层应该换一个用 GLSL ES 1.00 写的 ShaderModule。再看调用日志：typo 走完了 createShader → compileShader → <code>COMPILE_STATUS → false</code> → deleteShader（失败也清理）；es300 <strong>一个创建调用都没有</strong>——语言检查排在任何 GL 调用之前（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:92">ProgramManager.ts:92–94</a>）。「InvalidShaderModuleError」不对：两个 ShaderModule 本身都是合法的 CPU 资源，构造时就验证过了。'
+            },
+            {
+              title: 'C · resize 之前拿到的 descriptor 快照：resize 之后，它的 width 是多少？',
+              code: "const target = new R.RenderTarget({ width: 64, height: 64, colors: [{ format: 'rgba8' }] })\nconst before = target.descriptor\ntarget.resize(128, 128)\nlog('旧快照 width =', before.width, '；新快照 width =', target.descriptor.width)\nlog('旧快照冻结了吗？', Object.isFrozen(before))",
+              choices: ['64：快照不跟着改变', '128：同一个对象被改了', '报错：旧快照已经作废'],
+              answer: 0,
+              explain: 'descriptor 返回的是深层冻结的快照（<a data-src="src/rendering/resources/RenderTarget.ts:449">RenderTarget.ts:449</a>：「调用者缓存旧快照不会跟随 resize 改变」）。resize 造一份新快照、revision 加一，旧的原样留着。这就是「值当边界」：拿到值的人不用担心它在自己手里被别人改掉。第 4 课的 RenderTargetManager 就是靠比较 revision，而不是比较快照内容，来判断要不要重建的。'
+            },
+            {
+              title: 'D · 嵌套作用域里 inner 抛错：捕获之后，当前绑定的是哪个 framebuffer？',
+              code: "const outer = targets.get(new R.RenderTarget({ width: 64, height: 64, colors: [{ format: 'rgba8' }] }))\nconst inner = targets.get(new R.RenderTarget({ width: 16, height: 16, colors: [{ format: 'rgba8' }] }))\nconst scope = (resource, callback) => {    // withRenderSurface 的骨架：Task 15 要写的就是它\n  const snapshot = state.captureSurfaceState()\n  try {\n    state.bindSurface(resource)\n    callback()\n  } finally {\n    state.restoreSurfaceState(snapshot)\n  }\n}\nscope(outer, () => {\n  try {\n    scope(inner, () => { throw new Error('inner 里 draw 失败') })\n  } catch (error) {\n    log('捕获：', error.message)\n  }\n  log('现在绑定的是 outer 吗？', gl.getParameter(gl.FRAMEBUFFER_BINDING) === outer.framebuffer)\n  log('viewport =', Array.from(gl.getParameter(gl.VIEWPORT)).join(', '))\n})\nlog('最后回到画布了吗？', gl.getParameter(gl.FRAMEBUFFER_BINDING) === null, '；viewport =', Array.from(gl.getParameter(gl.VIEWPORT)).join(', '))",
+              note: '这张卡片里的 scope 是本课写的教学骨架（写于 Task 15 之前），不是项目代码；它调用的 targets.get() 和 state 的三个方法是真实代码。项目后来的正式实现是 WebGL1SurfaceScope.run，见解析末尾。',
+              choices: ['outer：恢复到 inner 进入之前', '画布：一律恢复成默认目标', 'inner：抛错跳过了恢复'],
+              answer: 0,
+              explain: 'inner 进入时捕获的真实状态是「outer + 64×64」，finally 就恢复成这个样子；outer 结束时再恢复成「画布 + 160×100」。这就是「每一层恢复到自己进入之前」，也是为什么要捕获真实状态，而不是一律绑回画布——一律绑回画布的话，outer 剩下的绘制就画错了地方。three.js 的 setRenderTarget 没有这层保护：它自己的 PMREMGenerator 也是先保存旧目标（<a data-src="node_modules/three/src/extras/PMREMGenerator.js:127">PMREMGenerator.js:127</a>），最后再手动设回去（<a data-src="node_modules/three/src/extras/PMREMGenerator.js:253">:253</a>），中间抛错就恢复不了。<br><br>这段代码你在源码里找不到：<code>scope</code> 是本课为了演示写的，模仿 Task 15 的 <code>withRenderSurface</code>（契约见 <a data-src="src/rendering/backend/RenderBackend.ts:25">RenderBackend.ts:25–37</a>）。它调用的三个方法是真实代码：<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:180">captureSurfaceState</a>、<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:207">bindSurface</a>、<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:255">restoreSurfaceState</a>。2026-09-26 起项目里有了正式实现 <a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:191">WebGL1SurfaceScope.run</a>：骨架和这里一样（先捕获、try 里绑定并执行、finally 恢复），另外多做了三件事——绑定之后执行一次入口清除；用一个栈检查嵌套作用域里的目标有没有被改尺寸或释放；恢复本身也失败时，用 AggregateError 同时保留两个错误。'
+            },
+            {
+              title: 'E · context 丢失之后：GPU 一侧的入口和 CPU 资源分别怎样？',
+              code: "const geometry = makeGeometry()\ngeometries.get(geometry)\nRTeach.gl.lose(gl)                        // 模拟 GPU 重置\ntry { geometries.get(makeGeometry()) } catch (error) { log('GeometryManager →', error.name) }\ntry { state.useProgram(null) } catch (error) { log('State →', error.name) }\nlog('CPU 的 geometry.disposed =', geometry.disposed)",
+              choices: ['入口都抛 ContextLost，CPU 资源不受影响', 'CPU 资源也跟着被标记为 disposed', '入口静默返回，等恢复后自动补上'],
+              answer: 0,
+              explain: 'Manager 和 State 的入口都会检查 context（assertAvailable / assertContextAvailable），发现丢失就抛 WebGLContextLostError——「设备暂时不可用」这一类。CPU 的 Geometry 一点没动：它是下一代重建 GPU 表示的唯一来源（第 4 课）。「静默返回」不对：如果入口什么也不说，上层会以为画成功了。正常情况下，上层根本走不到这里——它每帧先看 <code>backend.ready</code>，不 ready 就不画；入口的检查是误用防线。（loseContext 那一行标着的 CONTEXT_LOST_WEBGL，第 4 课卡片 C 解释过。）'
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <h2>7. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0006"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0006"]'), [
+        {
+          q: 'draw 为什么收 RenderItem + ViewState 的值，而不是直接收 Mesh 和 Camera？',
+          opts: ['让同一批 draw 看到同一帧的值', 'Mesh 和 Camera 的字段都是私有的', '传值比传对象引用更加节省内存'],
+          answer: 0,
+          why: '值快照在提取时读一次场景，之后后端看到的都是冻结的值；后端也因此不必知道 Scene（<a data-src="src/rendering/frame/ViewState.ts:11">ViewState.ts:11</a>）。复制矩阵反而多占一点内存，换来的是一致性和解耦。'
+        },
+        {
+          q: 'withRenderSurface 为什么把恢复放在 finally 里？',
+          opts: ['回调抛错时也必须恢复绑定', 'finally 里的代码执行得更快', 'TypeScript 要求回调包在 finally 里'],
+          answer: 0,
+          why: '恢复写在回调后面，抛错时就会被跳过，之后的绘制全画进离屏目标。放进 finally，正常、异常、嵌套三种情况都会恢复到进入之前（卡片 D）。'
+        },
+        {
+          q: '回调类型写成 () => undefined，挡不住下面哪一种？',
+          opts: ['回调里启动一个不等待的异步任务', '直接传进来一个 async 函数', '回调最后 return 一个数字'],
+          answer: 0,
+          why: 'async 函数返回 Promise，<code>() =&gt; 1</code> 返回数字，都不能赋给 <code>() =&gt; undefined</code>（<a data-src="tests/unit/rendering/backend/RenderBackend.test.ts:35">RenderBackend.test.ts:35–38</a>）。但 <code>() =&gt; { void loadAndDraw() }</code> 返回的仍是 undefined，类型挡不住，要靠 lint 和审查（<a data-src="src/rendering/backend/RenderBackend.ts:34">RenderBackend.ts:34</a>）。'
+        },
+        {
+          q: '设备不支持多个颜色附件时，请求一个 MRT 目标，应该收到什么？',
+          opts: ['UnsupportedRenderFeatureError', 'IncompleteFramebufferError', 'WebGLOperationError'],
+          answer: 0,
+          why: '能力检查排在任何 create* 之前（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:190">RenderTargetManager.ts:190</a>），已知不支持的请求直接被拒绝，归入「功能不支持」，上层可以换方案。IncompleteFramebufferError 是「建了但不完整」，WebGLOperationError 是笼统的 GL 失败，都会让上层分不清该做什么。'
+        },
+        {
+          q: 'FBO 创建到一半失败了，Manager 会怎样？',
+          opts: ['删掉这次新建的对象，缓存不变', '把半成品放进缓存，下次再补齐', '清空缓存里所有 FBO，从头再来'],
+          answer: 0,
+          why: '事务式发布：只清理这一次的 owned 对象，旧的缓存条目不受影响，下次 get 从头再建（卡片 A）。清空所有 FBO 会误伤正在使用的目标。'
+        },
+        {
+          q: 'context 丢失后，上层怎样知道这一帧不该画？',
+          opts: ['每帧开头检查 backend.ready', '每个 gl 调用外面包 try/catch', '等 draw 抛出 WebGLOperationError'],
+          answer: 0,
+          why: '丢失是整个设备的一种状态，不是某次调用的失败：Renderer 在帧入口看 ready，Backend 的入口检查只是误用防线（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1303">HW2 设计 §20</a>）。'
+        }
+      ])
+    </script>
+
+    <h2>8. 架构视角</h2>
+    <h3>8.1 对照 three.js：它选择「软失败」</h3>
+    <ul>
+      <li><strong>边界上传的是活对象。</strong>新渲染器的 <a data-src="node_modules/three/src/renderers/common/Backend.js:156">Backend.draw(renderObject, info)</a> 收到的 RenderObject 直接引用 object、material、scene、camera（<a data-src="node_modules/three/src/renderers/common/RenderObject.js:105">RenderObject.js:105–126</a>），没有值快照这一层；它靠版本号和缓存来判断哪些东西变了。</li>
+      <li><strong>输出目标是全局开关。</strong><a data-src="node_modules/three/src/renderers/WebGLRenderer.js:2683">setRenderTarget</a> 直接改渲染器的当前目标（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:2685">:2685</a>），恢复靠调用者自觉（卡片 D 的解析里有它自己的例子）。</li>
+      <li><strong>出错不抛异常。</strong>shader 编译、链接失败时，它调用 <code>debug.onShaderError</code> 或者在控制台打印错误，然后继续运行（<a data-src="node_modules/three/src/renderers/webgl/WebGLProgram.js:919">WebGLProgram.js:919–950</a>）；context 丢失时，<code>render()</code> 开头直接返回（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1533">WebGLRenderer.js:1533</a>）。</li>
+    </ul>
+    <p>
+      取舍：three.js 面向的是终端用户的页面，一个 shader 写错不该让整页崩掉，所以它选「软失败、继续跑」。本项目是要反复重构、要教学、要逐像素对比两个后端的代码库，更需要「在哪一步、因为什么失败」一目了然，所以选「大声失败、按类型分类」。代价是应用边界上必须有人接住这些异常，并决定报告、暂停还是降级——分好类的错误，正是让这个决定能做出来的前提。
+    </p>
+
+    <h3>8.2 审查视角：一个会误导人的字段</h3>
+    <p>
+      所有渲染错误都继承自 RenderingError，而 RenderingError 把基类 EngineError 的 <code>recoverable</code> 一律写死为 false（<a data-src="src/rendering/core/errors/RenderingError.ts:40">RenderingError.ts:40</a>）——连 WebGLContextLostError 也是，可它明明有恢复路径。旧引擎的做法恰好相反：<a data-src="src/errors/EngineError/MeshError/MeshVBOCreationError.ts:23">MeshVBOCreationError.ts:23</a> 因为「可能是 WebGL 上下文丢失」而标了 <code>recoverable: true</code>。目前没有任何代码读取这个字段（只在序列化时输出，<a data-src="src/errors/EngineError/BaseError.ts:98">BaseError.ts:98</a>），所以它暂时无害；但只要将来有人写一个「recoverable 为 false 就弹出致命错误」的全局处理器，context 丢失就会被当成致命错误。
+    </p>
+    <p>
+      <strong>想一想（不用写代码）：</strong>两种约定——「按错误类判断」和「按 recoverable 字段判断」——应该留哪一种？如果留字段，WebGLContextLostError 该怎样设置；如果不留，要不要在 RenderingError 的注释里写明「不要用 recoverable 判断能否恢复」？一个会误导人的字段，往往比没有这个字段更糟。
+    </p>
+
+    <h2>9. 延伸阅读</h2>
+    <p>
+      <strong>首选（一手来源，约 10 分钟）：</strong>HW2 设计的 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1093">§17.2–§18</a>（RenderSurface、clear 描述、绑定与恢复、RenderBackend 公开能力）和 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1842">§28 自定义错误</a>。读 §17.4 时，对照卡片 D 的骨架。
+    </p>
+    <p>
+      补充：<a data-src="src/rendering/backend/RenderBackend.ts:11">RenderBackend.ts</a> 的完整注释（每个成员都写了「不做什么」）；类型契约测试 <a data-src="tests/unit/rendering/backend/RenderBackend.test.ts:10">RenderBackend.test.ts</a>，看它怎样只用 <code>@ts-expect-error</code> 就把边界钉住；生命周期的时间线见 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1248">§20</a>。
+    </p>
+
+    <aside class="ask">
+      架构篇到这里就讲完了。有任何没讲清楚的地方，直接在对话里问我（我会在对话里回答，不另写页面）。做完告诉我：热身题和检查题各错了哪几题、五张卡片猜对了几张；8.2 的思考题也可以直接回答我。第 7 课进入详细设计篇，从 core 开始：Resource、错误体系和 requireNonNull 逐行精读。
+    </aside>
+
+    <div class="nav">
+      <a href="0005-ownership-and-lifecycle.html">← 第 5 课：所有权与生命周期</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0007-core-resource-errors.html">第 7 课：core 精读 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 6 课 · 2026-09-24</footer>
+  </body>
+</html>

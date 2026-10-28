@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 24 课 · 一次请求在网络上怎么走</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <style>pre.raw .anno { color: var(--accent); font-style: italic; }</style>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 答疑专题 · 约 25 分钟</p>
+    <h1>一次请求在网络上怎么走：为什么响应头能先到</h1>
+    <p class="lede">
+      第 23 课的实验台里写着「服务器 100 ms 回响应头，正文再传 100 ms」。你问：服务器不是一次性把响应头和响应体一起发出来吗，怎么能单独先回响应头？这一课用真实抓下来的字节回答。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 第 23 课有一个设计决定：「超时只管响应头」。要判断这个决定对不对，得先知道响应头和正文在网络上是怎样到达的。HW2 读的 transport 文件有 2.6 MB，正好是「正文要传很久」的那种情况。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：fetch、await、response.text()（第 20 课第 9 节）；第 23 课的实验台。<br />
+      <strong>本课的数据从哪来</strong>：我在本机起了一个小服务器，中间夹一个能记录原始字节的代理，再让无界面 Chrome 154 真的去请求。下面引用的报文、字节数和毫秒数都是那次抓到的。不是项目的 dev server，所以响应头比 Vite 回的少几行。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol start="0">
+        <li><a href="#s0">先给结论</a></li>
+        <li><a href="#s1">浏览器发出去的 621 个字节</a></li>
+        <li><a href="#s2">服务器回来的 1761 个字节</a></li>
+        <li><a href="#s3">这些字节在网络上怎么走</a></li>
+        <li><a href="#s4">服务器怎样「先回响应头」</a></li>
+        <li><a href="#s5">实测：三种文件的到达时间</a></li>
+        <li><a href="#s6">fetch 怎样把这两段交给你</a></li>
+        <li><a href="#s7">「一块」到底有多大</a></li>
+        <li><a href="#s8">回到第 23 课</a></li>
+        <li><a href="#s9">检查题</a></li>
+        <li><a href="#s10">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s0">0. 先给结论</h2>
+    <ul>
+      <li>
+        <strong>一次响应不是一个整体包裹，而是一串字节。</strong>响应头排在前面，正文排在后面，两者之间隔着一个空行。接收方从前往后读，读到那个空行，就知道响应头读完了，不必等正文。
+      </li>
+      <li>
+        <strong>文件小的时候，两者几乎同时到。</strong>实测 1.5 KB 的 shader：响应头和正文在同一次读取里一起到达，3 ms。
+      </li>
+      <li>
+        <strong>文件大、网络慢的时候，差别就很明显。</strong>实测 2.6 MB 的 transport 文件（限速约 2.5 MB/s）：响应头 3 ms 就到了，正文传了 1 秒多。
+      </li>
+      <li>
+        <strong>fetch 正是按这两段交给你的。</strong>收到响应头时 <code>await fetch()</code> 就结束了；<code>response.text()</code> 要等正文全部到齐，所以它也是异步的；<code>response.body</code> 是一个流 (stream)，可以到一块处理一块。
+      </li>
+      <li>
+        <strong>你拿到的「一块」不是 HTTP 规定的单位。</strong>它是浏览器那一刻手里攒了多少字节，就交给你多少。实测多是 64 KiB 或 128 KiB，但不固定。
+      </li>
+    </ul>
+
+    <h2 id="s1">1. 浏览器发出去的 621 个字节</h2>
+    <p>
+      页面里执行 <code>fetch('/shaders/prt/sphericalHarmonics/order2/vertex.vert')</code>，Chrome 往连接里写了下面这些字节。每一行末尾都是两个看不见的字节 <code>\r\n</code>（回车、换行）。蓝色斜体、以「↑」开头的行是我加的说明，不是报文的一部分：
+    </p>
+    <pre class="raw"><code>GET /shaders/prt/sphericalHarmonics/order2/vertex.vert HTTP/1.1
+<span class="anno">  ↑ 请求行：方法、路径、协议版本</span>
+Host: 127.0.0.1:60322
+<span class="anno">  ↑ 从这一行起是请求头，每行「名字: 值」</span>
+Connection: keep-alive
+<span class="anno">  ↑ 用完别断开，这条连接留着发下一个请求</span>
+Pragma: no-cache
+Cache-Control: no-cache
+<span class="anno">  ↑ 这两行来自页面里的 cache: 'no-store'</span>
+sec-ch-ua-platform: "macOS"
+User-Agent: Mozilla/5.0 (Macintosh; …) HeadlessChrome/154.0.0.0 Safari/537.36
+sec-ch-ua: "Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99"
+sec-ch-ua-mobile: ?0
+Accept: */*
+<span class="anno">  ↑ 什么类型的内容都接受</span>
+Sec-Fetch-Site: same-origin
+<span class="anno">  ↑ 这是同一个网站发出的请求</span>
+Sec-Fetch-Mode: cors
+Sec-Fetch-Dest: empty
+Referer: http://127.0.0.1:60322/
+Accept-Encoding: gzip, deflate, br, zstd
+<span class="anno">  ↑ 能解哪些压缩格式</span>
+Accept-Language: zh-CN,zh;q=0.9
+
+<span class="anno">  ↑ 上面这一行是空行：请求头到此结束。GET 没有请求体，空行之后什么也没有</span></code></pre>
+    <p>
+      这就是 HTTP/1.1 报文的全部结构：起始行、若干行头部、一个空行、可选的正文。MDN 的说法是四部分：起始行 (start-line)、头部 (headers)、空行、正文 (body)。见第 10 节的首选读物。
+    </p>
+
+    <h2 id="s2">2. 服务器回来的 1761 个字节</h2>
+    <pre><code>HTTP/1.1 200 OK                                  ← 状态行：协议版本、状态码、原因短语
+Content-Type: text/plain; charset=utf-8          ← 正文是什么：纯文本，UTF-8 编码
+Content-Length: 1524                             ← 正文有多少「字节」：读到第 1524 个字节就是读完了
+Last-Modified: Sun, 04 Oct 2026 17:30:20 GMT
+Cache-Control: no-cache
+Date: Mon, 05 Oct 2026 19:36:07 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+                                                 ← 空行：响应头到此结束（以上共 237 个字节）
+#ifdef GL_ES                                     ← 从这里起就是正文，也就是 vertex.vert 文件本身
+precision highp float;
+#endif
+
+/**
+ * PRT 模型位置输入，与 Geometry 的位置语义名称一致。
+ …（一共 1524 个字节）</code></pre>
+    <p>
+      注意 <code>Content-Length: 1524</code> 数的是<strong>字节</strong>。这个文件里有中文注释，UTF-8 里一个汉字占 3 个字节；Chrome 解码以后，<code>response.text()</code> 得到的字符串长度是 1428。接收方靠这个数字判断正文什么时候结束；没有它的情况见第 4 节。
+    </p>
+
+    <h2 id="s3">3. 这些字节在网络上怎么走</h2>
+    <p>把上面两段拼起来看，一次请求大致是这样：</p>
+    <ol class="steps">
+      <li><strong>建立连接。</strong>浏览器和服务器之间先建立一条 TCP 连接，加密网站还要再做一次 TLS 握手。这条连接用 <code>Connection: keep-alive</code> 留着，后面的请求可以接着用。</li>
+      <li><strong>发请求。</strong>浏览器把第 1 节那 621 个字节写进连接。</li>
+      <li><strong>服务器处理。</strong>服务器读到请求头末尾的空行，知道请求完整了，开始准备响应。</li>
+      <li><strong>回响应。</strong>服务器把响应的字节按顺序写进连接：先是响应头，后是正文。</li>
+      <li><strong>浏览器边收边解析。</strong>TCP 保证字节按顺序、不丢失地到达，但它不知道「消息」在哪里开始、在哪里结束，它只负责一串字节。浏览器的 HTTP 解析器从这串字节里找那个空行：找到了，响应头就完整了；再按 <code>Content-Length</code> 数够字节，正文就完整了。</li>
+    </ol>
+    <p>
+      字节在线路上不是一个一个走的，而是切成一个个包。一个包能装多少，取决于网卡的 MTU（最大传输单元）。你这台 Mac 上，Wi-Fi/以太网接口 en0 的 MTU 是 1500 字节，扣掉 IPv4 头和 TCP 头各 20 字节，每个包最多装 1460 字节的数据；本机回环接口 lo0 的 MTU 是 16384（用 <code>ifconfig</code> 查的）。所以一个 2.6 MB 的文件，走真实网络要切成大约 1800 个包。
+    </p>
+    <p>
+      对小文件，这些都发生得太快，看起来就像「一次性」。实测：shader 的整条响应在<strong>同一次读取</strong>里到达，237 字节的头加 1524 字节的正文，一共 1761 字节，3 ms。你说的「一次性响应」，在这里没错。
+    </p>
+
+    <h2 id="s4">4. 服务器怎样「先回响应头」</h2>
+    <p>
+      服务器写响应，也是往连接里写字节，想分几次写就分几次写。实验服务器（Node）的三个接口，就是三种写法：
+    </p>
+    <pre><code>// 写法一：头和正文一次写完（第 2 节的 shader 就是这样）
+res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Length': body.length })
+res.end(body)
+
+// 写法二：先把头写出去，正文以后慢慢写（模拟慢网络下的大文件）
+res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Length': body.length })
+res.flushHeaders()                // 立刻把响应头送进连接，不等正文
+// 之后每 50 ms 写 128 KiB，约 2.5 MB/s
+let off = 0
+const step = () =&gt; {
+  res.write(body.subarray(off, off + 131072))   // 写 128 KiB 正文
+  off += 131072
+  if (off &lt; body.length) setTimeout(step, 50) // 50 ms 后再写下一段
+  else res.end()                               // 写完了
+}
+setTimeout(step, 50)
+
+// 写法三：正文是边算边发的，开始时连多长都不知道
+res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })   // 没有 Content-Length
+res.flushHeaders()
+// 之后每 200 ms 算出一行，就写一行
+res.write('第 1 行，服务器在 200 ms 时才算出来\n')</code></pre>
+    <p>
+      真实的静态文件服务器（Vite、nginx）走的是写法二：先查文件大小，写出带 <code>Content-Length</code> 的响应头，再从磁盘一块一块读文件、一块一块往连接里写。即使服务器写得很快，网络也会让正文慢慢到：每个包只装 1460 字节，网速就那么快。
+    </p>
+    <p>
+      写法三没有 <code>Content-Length</code>，接收方怎么知道正文何时结束？HTTP/1.1 的办法叫分块传输编码 (chunked transfer coding)：响应头里写 <code>Transfer-Encoding: chunked</code>，正文切成一段一段，每段前面用十六进制写出这一段的字节数，最后用一个长度为 0 的段表示结束。代理抓到的原始字节（第 3 行和结尾同一次到达）：
+    </p>
+    <pre><code>HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Transfer-Encoding: chunked                       ← 没有 Content-Length，改用分块
+                                                 ← 空行：响应头结束（1 ms 就到了）
+30                                               ← 十六进制 0x30 = 48：下一段有 48 个字节（203 ms 到）
+第 1 行，服务器在 200 ms 时才算出来
+30                                               ← 又是 48 个字节（403 ms 到）
+第 2 行，服务器在 400 ms 时才算出来
+30                                               ← （605 ms 到）
+第 3 行，服务器在 600 ms 时才算出来
+0                                                ← 长度为 0 的段：正文结束
+</code></pre>
+    <p>「第 1 行，服务器在 200 ms 时才算出来」加上末尾的换行，正好 48 个字节：12 个汉字和中文标点，每个 3 字节，共 36 字节；11 个空格、数字和字母，每个 1 字节；再加 1 个换行。</p>
+
+    <h2 id="s5">5. 实测：三种文件的到达时间</h2>
+    <p>同一个页面里，Chrome 依次请求三个地址。下面的时间都从调用 fetch 开始算，由页面里的 <code>performance.now()</code> 测得：</p>
+    <pre><code>// shader，1524 字节，一次写完
+fetch() 交回 Response：    6 ms   ← 响应头到了
+response.text() 完成：     7 ms   ← 正文也到齐了（同一次就到了）
+
+// transport_mary_shadowed.txt，2,649,685 字节，限速约 2.5 MB/s
+fetch() 交回 Response：    3 ms   ← 响应头 3 ms 就到了
+正文陆续到达：从 52 ms 起，大约每 50 ms 一批
+正文全部到齐：          1077 ms   ← 一共分 34 块交给页面
+
+// 边算边发的三行字
+fetch() 交回 Response：    2 ms
+三行字分别在 204 ms、404 ms、606 ms 交给页面</code></pre>
+    <p>
+      代理那一侧看到的是同样的情况：限速那次，服务器发来的第一批只有 169 个字节，全是响应头，在第 2 ms 到达；正文从第 52 ms 才开始。
+    </p>
+
+    <h2 id="s6">6. fetch 怎样把这两段交给你</h2>
+    <p>
+      MDN 写得很明白：浏览器一收到状态行和响应头，<code>fetch()</code> 返回的 Promise 就兑现成一个 Response，这时正文可能还没到；请求体和响应体都是 ReadableStream，读它们就是在读流（<a href="https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch">MDN · Using the Fetch API</a>）。所以有两种读法：
+    </p>
+    <pre><code>const response = await fetch(url)   // 只等到响应头：状态码、Content-Type 这时已经能看了
+console.log(response.status)        // 200 —— 正文可能一个字节都还没到
+
+// 读法一：等正文全部到齐，一次拿到整个字符串
+const text = await response.text()  // 这就是为什么 text() 也要 await：它在等后面的字节
+
+// 读法二：到一块，处理一块（和读法一二选一，正文只能读一次）
+const reader = response.body.getReader()
+for (;;) {
+  const { value, done } = await reader.read() // value 是一个 Uint8Array：这一次交过来的字节
+  if (done) break                             // 正文读完了
+  console.log(value.byteLength)               // 实测（限速那次）：81660、49412、65328、49204、16540、130864……
+}</code></pre>
+    <p>
+      第 23 课的实验台把这两段画成「100 ms 回响应头，正文再传 100 ms」，就是为了把这两个时刻分开给你看。真实的小文件两段几乎同时，大文件两段相差很大。
+    </p>
+
+    <h2 id="s7">7. 「一块」到底有多大</h2>
+    <p>把那 2,649,685 字节的正文，从你的代码往下一层层拆开看：</p>
+    <ol class="steps">
+      <li><strong>你的代码拿到的块</strong>（<code>reader.read()</code> 的 value）：不固定。全速那次是 41 块，其中 31 块是 65,536 字节，可第一块有 262,144，还有 48,996、16,540 这样的零头；限速那次是 34 块，从 208 字节到 131,072 字节都有。同一个文件跑两次，切法也不一样：限速那次的第一块，第一回是 65,536 字节，第二回是 81,660 字节。这是浏览器把收到的数据转给页面时，手里攒了多少就交多少，规范没有规定它的大小。</li>
+      <li><strong>HTTP/1.1 这一层</strong>：用 <code>Content-Length</code> 时，正文就是空行后面连续的 2,649,685 个字节，没有再分块。用 chunked 时，块的大小由服务器每次写多少决定，比如第 4 节的 48 字节。浏览器会把块的格式（长度那一行）拆掉再交给你。</li>
+      <li><strong>HTTP/2 这一层</strong>（https 网站通常是 HTTP/2 或 HTTP/3）：响应头放在 HEADERS 帧里，正文放在 DATA 帧里。每个帧的默认上限是 16,384 字节（2<sup>14</sup>），对方可以协商得更大（<a href="https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2">RFC 9113 §4.2</a>）。</li>
+      <li><strong>TLS 这一层</strong>（https 的加密）：每条记录的明文最多 16,384 字节（RFC 8446 §5.1）。</li>
+      <li><strong>TCP 这一层</strong>：只是一串有序的字节，没有「消息」的边界。每个包能装多少，由网卡的 MTU 决定：en0 每包最多 1460 字节，本机回环 lo0 大约 16 KB（第 3 节）。</li>
+    </ol>
+    <p>
+      所以「一块」不是 HTTP 正文的某个固定单位，也不是一个网络包，而是好几层各自切分、浏览器又重新攒起来以后的结果。
+    </p>
+    <p>
+      这对解析有一个实际影响：<strong>块的边界可能落在任何地方。</strong>第一回实测时第一块正好是 65,536 字节，它在 transport 文件第 991 行的中间断开，把数字 <code>0.0478074</code> 劈成了两半：
+    </p>
+    <pre><code>第一块的末尾：  … 0.120322 0.124826 0.0
+第二块的开头：  478074 0.000143491</code></pre>
+    <p>第二回实测时，第一块是 81,660 字节，断在第 1177 行的中间：前一块以 <code>0.238651 0.043</code> 结尾，后一块以 <code>2773 0.273961</code> 开头。</p>
+    <p>
+      所以拿到一块就按行切、马上转数字，会把 <code>0.0</code> 和 <code>478074</code> 当成两个数。边收边解析时，要把最后那半行留着，和下一块拼起来再处理。中文字符也可能被劈开，UTF-8 的一个汉字有 3 个字节，所以解码要用流式的 <code>TextDecoderStream</code>。这正是「大文本加载」那个对话会讲的内容。
+    </p>
+
+    <h2 id="s8">8. 回到第 23 课：「超时只管响应头」</h2>
+    <ul>
+      <li>
+        <strong>对下载来说这个决定合理。</strong>响应头到达的时刻反映「服务器有没有在回应」：服务器挂了、卡住了，响应头就迟迟不来。正文传多久主要取决于文件大小和网速：2.6 MB 在 2.5 MB/s 下要 1 秒多，在更慢的网络上可能要十几秒，但服务器一直在正常工作。
+      </li>
+      <li>
+        <strong>对上传就不一样了。</strong>服务器通常要把整个请求体收完，才回响应头。这时「等响应头」就包含了整个上传时间，一个大文件会被超时误杀。上传该怎么定超时，我已经转给「大文本加载」那个对话专门讲。
+      </li>
+    </ul>
+
+    <h2 id="s9">9. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0024"></div>
+
+    <h2 id="s10">10. 延伸阅读</h2>
+    <p>
+      <strong>首选（约 10 分钟）：</strong><a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Messages">MDN · HTTP messages</a>。它讲请求和响应的四部分结构，以及 HTTP/2 怎样把报文拆成 HEADERS 帧和 DATA 帧。
+    </p>
+    <p>补充：</p>
+    <ul>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch">MDN · Using the Fetch API</a> 的「Handling the response」和「Streaming the response body」两节：fetch 何时兑现，怎样逐块读。</li>
+      <li><a href="https://www.rfc-editor.org/rfc/rfc9112.html">RFC 9112（HTTP/1.1）</a>：报文格式，以及 §7.1 的分块传输编码。</li>
+      <li><a href="https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2">RFC 9113 §4.2</a>：HTTP/2 帧大小。</li>
+    </ul>
+
+    <aside class="ask">
+      做完告诉我检查题错了哪几题。哪一层还是想不明白（TCP、TLS、HTTP/2），直接问；想看 HTTP/2 或 https 下的实测，也可以告诉我，我再抓一次。
+    </aside>
+
+    <div class="nav">
+      <a href="0023-designing-fetch-with-timeout.html">← 第 23 课：从零设计 fetchWithTimeout</a>
+      <a href="../index.html">课程首页</a>
+      <span style="color: var(--muted)">（答疑专题，没有下一课）</span>
+    </div>
+    <footer>src/rendering 精读课 · 第 24 课 · 2026-10-06</footer>
+
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0024"]'), [
+        {
+          q: '在连接里，一次响应的响应头和正文是什么关系？',
+          opts: ['同一条字节流里，头在前、正文在后', '两个独立的包裹，各自单独发送出去', '正文排在最前面，响应头附在最末尾'],
+          answer: 0,
+          why: '响应就是一串字节：状态行、响应头、一个空行、正文（第 2 节）。'
+        },
+        {
+          q: '浏览器怎么知道响应头已经收完了？',
+          opts: ['读到响应头后面那个空行', '等整条响应全部收完以后', '服务器另发一个结束信号'],
+          answer: 0,
+          why: '空行就是响应头的结束标记，读到它就能开始用响应头，不必等正文（第 3 节）。'
+        },
+        {
+          q: 'await fetch(url) 什么时候结束？',
+          opts: ['收到状态行和响应头的时候', '整个正文全部下载完的时候', '请求刚从浏览器发出的时候'],
+          answer: 0,
+          why: 'MDN 写明 fetch 在收到状态和响应头时就兑现，正文可能还没到；要等正文，得再 await response.text()（第 6 节）。'
+        },
+        {
+          q: '响应头写着 Content-Length: 1524，response.text() 得到的字符串长度却是 1428，为什么？',
+          opts: ['长度按字节算，一个汉字占三个字节', '有九十六个字节在传输的途中丢掉了', '响应头本身的长度也被一起算进这个数'],
+          answer: 0,
+          why: 'Content-Length 数的是正文的字节数；文件里的中文在 UTF-8 里每个字 3 字节，解码成字符串以后就变短了（第 2 节）。'
+        },
+        {
+          q: 'response.body.getReader() 每次 read() 拿到的一块有多大？',
+          opts: ['不固定，看浏览器那时攒了多少', '固定等于一个 HTTP/2 帧的大小', '固定等于一个 TCP 包里的数据'],
+          answer: 0,
+          why: '实测有 65,536、131,072，也有 208 这样的零头。它是浏览器重新攒起来的，不对应任何一层的单位（第 7 节）。'
+        },
+        {
+          q: '逐块解析 transport 文件时，为什么不能拿到一块就马上按行切？',
+          opts: ['块的边界可能落在一行的中间', '每一块里面都只会有一行数据', '浏览器会把每行拆成单独一块'],
+          answer: 0,
+          why: '第一回实测时，第一块在第 991 行中间断开，把 0.0478074 劈成了 0.0 和 478074（第 7 节）。'
+        }
+      ])
+    </script>
+  </body>
+</html>

@@ -1,0 +1,1078 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 39 课 · FFT 为什么频繁查询</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/query-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">插课 · 接在第 30 课之后 · 约 30 分钟</p>
+    <h1>FFT 海面为什么每帧要问 GL 近 600 次</h1>
+    <p class="lede">
+      FFT 迁移计划里有一句话：新架构下 FFT 海面每帧约有 592 次状态查询，旧代码只有 7 次。这一课把这句话拆成四个问题，一节回答一个。每一个数都用项目真实的 Renderer、RenderPipeline、WebGL1Backend 当场跑出来：你点一下卡片，就能看到这一帧里浏览器实际收到了哪些查询。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— FFT 海面是新架构要接的第二个场景。迁移计划的决定 4 问的就是：这 592 次查询要不要省、怎么省。读完这一课，你应该能自己数出任何一个 Pass 每帧的查询次数，并判断这个数值不值得改代码。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 第 30 课：Pass 拿到的只有 <code>context</code>（frame、view、renderList、backend）；要往一个地方画，只能写 <code>backend.withRenderSurface(目的地, () =&gt; { backend.draw(…) })</code>；ForwardPass 在一个 withRenderSurface 里画完所有物体。② 第 27 课：RenderTarget 是一块离屏画布（GPU 里叫 FBO）；不能读正在写的那块画布。如果其中哪一条其实没懂，告诉我，我先补那一块。<strong>不需要懂 FFT 的数学</strong>，用到的部分这一课从头讲。<br />
+      <strong>这一课讲的</strong>：命令和查询；withRenderSurface 在哪几处查询、为什么；GPU 怎样「算」一张图；FFT 为什么要分很多轮、每轮换一块画布；74、296、592 是怎么乘出来的；旧代码为什么只问 7 次；问得多是不是就慢；三种省法和各自的代价。<br />
+      <strong>页面会用到你的显卡</strong>：卡片会建真实的 WebGL context，画布都很小（最大 8 × 8 像素）。<br />
+      <strong>版本</strong>：src/rendering 按 2026-10-15 的工作区讲（含未提交的改动）。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">要解释的那句话</a></li>
+        <li><a href="#s2">命令和查询</a></li>
+        <li><a href="#s3">在哪里问：进门的时候</a>：<a href="#s3-1">进门问两件事</a> <a href="#s3-2">为什么不自己记</a> <a href="#s3-3">清屏再问五项</a> <a href="#s3-4">规律</a></li>
+        <li><a href="#s4">FFT 为什么每次 draw 都要进一次门</a>：<a href="#s4-1">GPU 怎样算一张图</a> <a href="#s4-2">为什么分很多轮</a> <a href="#s4-3">为什么来回换画布</a></li>
+        <li><a href="#s5">数到 592</a></li>
+        <li><a href="#s6">旧代码为什么只问 7 次</a></li>
+        <li><a href="#s7">问得多就慢吗</a></li>
+        <li><a href="#s8">如果要省：三种办法</a></li>
+        <li><a href="#s9">检查题</a></li>
+        <li><a href="#s10">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 要解释的那句话</h2>
+    <p>迁移计划（<code>claude-workspace/fft-ocean-migration/2026-10-02-fft-ocean-migration-plan.zh-CN.md</code>）决定 4 的原文：</p>
+    <blockquote>
+      FFT 每次 draw 都换目标，所以每个 draw 要单独开一个 scope。默认配置下（4 层，N = 512，log₂N = 9）：每层每帧 74 次 draw：频谱 1 次、IFFT 4 × 2 × 9 = 72 次、assembly 1 次；4 层共 296 个 scope，每帧约 592 次状态查询；旧 v3 只在 pass 入口查 7 次。
+    </blockquote>
+    <p>这句话里藏着四个问题：</p>
+    <ol>
+      <li>「查询」是什么，和别的 GL 调用有什么不同？（第 2 节）</li>
+      <li>为什么「开一个 scope」就要查询？一次查几项？（第 3 节）</li>
+      <li>为什么 FFT「每次 draw 都换目标」，于是每次 draw 都要开一个 scope？（第 4 节）</li>
+      <li>74、296、592 怎么来的？旧代码为什么只要 7 次？（第 5、6 节）</li>
+    </ol>
+    <p>先说两个用词。<strong>scope</strong> 就是一次 <code>backend.withRenderSurface(…)</code>：从进入到退出这一段，画出来的东西都落在同一个目的地上。这一课把「进入 scope」叫<strong>进门</strong>，「退出 scope」叫<strong>出门</strong>。<strong>目标 (target)</strong> 就是目的地：屏幕，或者一块 RenderTarget。</p>
+
+    <h2 id="s2">2. 命令和查询</h2>
+    <p>JavaScript 调用的 WebGL 方法分两种：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th></th><th>命令 (command)</th><th>查询 (query)</th></tr>
+        <tr><td>做什么</td><td>让 GL 去做一件事</td><td>问 GL 一件事</td></tr>
+        <tr><td>返回值</td><td>没有</td><td>有：一个答案</td></tr>
+        <tr><td>例子</td><td><code>bindFramebuffer</code>、<code>viewport</code>、<code>uniform1f</code>、<code>drawArrays</code></td><td><code>getParameter</code>、<code>isEnabled</code>、<code>isFramebuffer</code>、<code>getError</code></td></tr>
+        <tr><td>JavaScript 要不要等</td><td>不用：交出去就往下走</td><td>要：拿到答案才能往下走</td></tr>
+      </table>
+    </div>
+    <p>为什么「等不等」要紧？Chrome 等浏览器把 WebGL 放在一个单独的 <strong>GPU 进程 (GPU process)</strong> 里执行，你的 JavaScript 在另一个进程里。命令可以先排在队里，攒一批再送过去，JavaScript 不用停。查询不一样：代码要用答案，浏览器如果自己答不上来，就只能把问题送到 GPU 进程，<strong>停下来等它回话</strong>（往返一次，round trip）。MDN 的 WebGL 最佳实践因此建议生产环境少用这类同步调用（见延伸阅读）。</p>
+
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 236" role="img" aria-label="上面一行是 JavaScript，下面一行是 GPU 进程。bindFramebuffer、viewport、drawArrays 三条命令交出去就排进队里，JavaScript 接着往下走。getParameter 是查询：问题送到 GPU 进程，JavaScript 停下来等，答案回来后才继续。">
+          <defs>
+            <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+            <marker id="f1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <text x="16" y="56" class="small">你的 JavaScript</text>
+          <text x="16" y="186" class="small">GPU 进程</text>
+          <path d="M120 52 L744 52" class="line dash" />
+          <rect x="130" y="34" width="112" height="34" rx="5" class="box" />
+          <text x="186" y="56" text-anchor="middle">bindFramebuffer</text>
+          <rect x="250" y="34" width="76" height="34" rx="5" class="box" />
+          <text x="288" y="56" text-anchor="middle">viewport</text>
+          <rect x="334" y="34" width="92" height="34" rx="5" class="box" />
+          <text x="380" y="56" text-anchor="middle">drawArrays</text>
+          <rect x="130" y="166" width="296" height="34" rx="5" class="box" />
+          <text x="278" y="188" text-anchor="middle">排在队里，稍后成批执行</text>
+          <path d="M186 70 L186 162" class="line" marker-end="url(#f1a)" />
+          <path d="M288 70 L288 162" class="line" marker-end="url(#f1a)" />
+          <path d="M380 70 L380 162" class="line" marker-end="url(#f1a)" />
+          <text x="196" y="122" class="small">交出去就走</text>
+
+          <rect x="446" y="34" width="104" height="34" rx="5" class="box hl" />
+          <text x="498" y="56" text-anchor="middle">getParameter</text>
+          <rect x="558" y="34" width="110" height="34" rx="5" class="box bad" />
+          <text x="613" y="56" text-anchor="middle">停下来等答案</text>
+          <rect x="676" y="34" width="68" height="34" rx="5" class="box" />
+          <text x="710" y="56" text-anchor="middle">继续</text>
+          <path d="M498 70 L560 162" class="line accent" marker-end="url(#f1b)" />
+          <path d="M620 162 L670 72" class="line accent" marker-end="url(#f1b)" />
+          <rect x="520" y="166" width="140" height="34" rx="5" class="box hl" />
+          <text x="590" y="188" text-anchor="middle">查出答案</text>
+          <text x="508" y="122" class="small accent">问</text>
+          <text x="660" y="122" class="small accent">答</text>
+          <text x="446" y="226" class="small">浏览器能在本地答的查询，不用往返；答不了的才要等</text>
+        </svg>
+      </div>
+      <figcaption>图 1　命令交出去就走，查询要等答案。哪些查询要往返，取决于浏览器和问的是哪一项：第 14 课实测，Chrome 回答 FRAMEBUFFER_BINDING、VIEWPORT 两项每次只要 0.2–0.6 μs，看起来是在本进程就答了；getError 每次要 37–62 μs。</figcaption>
+    </figure>
+
+    <p>还有一个方法叫 <code>isContextLost</code>，项目几乎每一步都要调用它（下面的卡片里每进一次门、画一次，约 46 次）。它也有返回值，但按 WebGL 规范，它只返回 context 对象上的一个标志（context lost flag），不需要问 GPU 那边。所以这一课不把它算作查询，卡片里单独列出。</p>
+    <p>下面这张卡片画一帧 HW2 那样的画面：ForwardPass，一个绿色三角形。课程写了一个计数器 <code>countGL</code>，给 context 上的每个方法套一层，先记账再调用原来的方法；查询按「方法（问的是哪一项）」分类，命令只数总数。</p>
+    <div id="lab-a"></div>
+    <p>第 1 帧多出来的 30 次查询，是第一次用到 shader、几何体时的「建」：编译完问编译结果（getShaderParameter）、问 program 里有哪些 attribute 和 uniform、建 VAO 前后用 getError 检查。这些只在第一次发生，以后从缓存里取。<strong>每一帧都会发生的，只有 7 次。</strong>下一节看这 7 次是谁问的。</p>
+
+    <h2 id="s3">3. 在哪里问：进门的时候</h2>
+    <h3 id="s3-1">3.1 进门问两件事，出门绑回去</h3>
+    <p>withRenderSurface 交给 <a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:191">WebGL1SurfaceScope.run</a> 去做。去掉检查和异常处理，剩下五步：</p>
+<pre><code>// WebGL1SurfaceScope.ts:191–243（节选，注释是课程加的）
+run(descriptor: RenderSurfaceScopeDescriptor, callback: () =&gt; undefined): void {
+  // …（省略：检查 context、复制描述、记下目标的尺寸版本）
+  // ① 进门：问 GL 现在绑着哪块画布、viewport 是多少，记下来
+  const previous = this.state.captureSurfaceState()
+  // …
+  try {
+    // 第一次用到这块 RenderTarget 时，这里才真正建 FBO
+    const resource = target === null ? null : this.hooks.resolveTarget(target)
+    // …
+    this.state.bindSurface(resource)  // ② 绑上目的地、设 viewport：两条命令
+    this.clearAttachments(next.clear) // ③ 要清屏的话：清（清屏前还要再问几项）
+    // …
+    const result: unknown = callback() // ④ 你的 draw 都在这里面
+    // …
+  } catch (error: unknown) {
+    // …
+  } finally {
+    // …
+      this.restoreEntry(previous)     // ⑤ 出门：绑回 ① 记下的画布和 viewport
+    // …
+  }
+  // …
+}</code></pre>
+    <p>第 ① 步就是 <a data-src="src/rendering/backend/webgl1/WebGL1State.ts:180">WebGL1State.captureSurfaceState</a>：</p>
+<pre><code>// WebGL1State.ts:180–197（节选，注释是课程加的）
+captureSurfaceState(): SurfaceStateSnapshot {
+  this.assertContextAvailable('capture surface')
+  // 查询 1：现在绑着哪个 framebuffer（null 表示屏幕）
+  const framebuffer = this.gl.getParameter(
+    this.gl.FRAMEBUFFER_BINDING
+  ) as WebGLFramebuffer | null
+  // 查询 2：现在的 viewport [x, y, 宽, 高]
+  const viewport = this.gl.getParameter(this.gl.VIEWPORT) as Int32Array
+  this.assertContextAvailable('capture surface')
+  // …（省略：把 viewport 抄成冻结的四元组 copiedViewport）
+  return Object.freeze({ framebuffer, viewport: copiedViewport })
+}</code></pre>
+    <p>第 ⑤ 步 <a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:294">restoreEntry</a> 一般只发两条命令（bindFramebuffer、viewport）。只有一种情况它也要问：进门时绑着的是一块离屏画布（也就是这个 scope 套在另一个 scope 里），它先用 <code>isFramebuffer</code> 确认那块画布还在（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:302">:302</a>），再绑回去。这一课的 FFT 不套 scope，所以用不到这一次。</p>
+
+    <h3 id="s3-2">3.2 为什么不自己记</h3>
+    <p>「进门前绑的是什么」，为什么不让 State 自己记住，非要问 GL？因为进门前的那个状态，不一定是 State 自己设的：</p>
+    <ul>
+      <li><strong>进门前不一定是屏幕。</strong>阴影 Pass 可能套在别的 scope 里，进门前绑着的是外层那块画布。出门一律绑回屏幕，外层剩下的 draw 就画错了地方（第 27 课的嵌套卡片）。</li>
+      <li><strong>有人不经过 State 改了绑定。</strong>RenderTargetManager 第一次建 FBO 时，自己调用 bindFramebuffer 把新的 FBO 绑上去挂附件，挂完再绑回原来那个（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:288">WebGL1RenderTargetManager.ts:288</a>、<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:392">:392</a>）。迁移期同一个 context 上还跑着旧引擎的代码，它们直接调用 gl，State 一概不知道。</li>
+    </ul>
+    <p>所以设计选了最稳的办法：每次进门都问真实值。State 的注释写明了这是有意的，和每次 draw 设深度状态时「信自己的缓存」不是同一种频率和职责（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:112">WebGL1State.ts:112–114</a>）。代价是：<strong>每进一次门，问 2 次。</strong></p>
+
+    <h3 id="s3-3">3.3 清屏再问五项</h3>
+    <p>ForwardPass 进门时要清屏：颜色清成黑、深度清成 1。WebGL 的 clear 会受写掩码 (write mask) 和裁剪 (scissor) 影响：如果之前有人关掉了颜色写入，clear 就清不掉颜色。所以 <a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:348">clearAttachments</a> 先问出这几项，临时打开写入、关掉 scissor 和 dithering，清完再按问到的值恢复：</p>
+    <ul>
+      <li><code>getParameter(DEPTH_BITS)</code>：这块画布到底有没有深度附件，没有就不能清深度；</li>
+      <li><code>getParameter(COLOR_WRITEMASK)</code>、<code>getParameter(DEPTH_WRITEMASK)</code>：清完要恢复的写掩码；</li>
+      <li><code>isEnabled(SCISSOR_TEST)</code>、<code>isEnabled(DITHER)</code>：清完要不要重新打开。</li>
+    </ul>
+    <p>2 + 5 = 7，就是卡片 A 里第 2 帧的那 7 次。FFT 的每一轮都把整块画布重写一遍，不需要清屏，所以 FFT 的每次进门只有 2 次。</p>
+
+    <h3 id="s3-4">3.4 规律：查询跟着进门的次数走</h3>
+    <p>把上面合起来，一帧的查询次数是：</p>
+<pre>每帧查询 = 把每次进门的「2 + 清屏要问的 + 出门要问的」加起来
+HW2：     进门 1 次 × (2 + 5 + 0) = 7</pre>
+    <p>公式里没有 draw 的次数。下面这张卡片验证这一点：同一个 ForwardPass，场景里放 2 个物体和 200 个物体。</p>
+    <div id="lab-b"></div>
+    <p>这就是「HW2 每帧只问 7 次」的原因：它不管画多少东西，都在<strong>同一个</strong> scope 里画，只进一次门。一帧要问多少次，问题变成了：<strong>一帧要进几次门？</strong></p>
+
+    <h2 id="s4">4. FFT 为什么每次 draw 都要进一次门</h2>
+    <h3 id="s4-1">4.1 GPU 怎样「算」一张图</h3>
+    <p>FFT 海面每一帧要算出每一层海浪在这个时刻的样子：一张 512 × 512 的图，每个像素存这一点的高度和水平位移。它从一张「频谱 (spectrum)」算出来，算法叫逆快速傅里叶变换 (inverse FFT，IFFT)。这一课不需要它的数学，只需要知道 <strong>GPU 怎样算一张图</strong>：</p>
+    <ol>
+      <li>把一块 RenderTarget 当作输出，在上面画一个盖满整块画布的矩形。</li>
+      <li>fragment shader 对这块画布的<strong>每一个像素各运行一次</strong>，算出这个像素的结果，写进去。</li>
+      <li>需要的输入（比如上一步的结果）放在纹理里，shader 用 <code>texture2D</code> 去读。</li>
+    </ol>
+    <p>所以「一次 draw」= 把整张图的每一格各算一遍，而且是<strong>同时</strong>算的：GPU 不保证哪个像素先算，一个像素也读不到同一次 draw 里别的像素刚算出来的值。它只能读 draw 开始之前就已经写好的纹理。</p>
+
+    <h3 id="s4-2">4.2 为什么分很多轮</h3>
+    <p>IFFT 不能一次 draw 算完。以一行 N = 8 个数为例，它分 log₂8 = 3 轮；每一轮里，第 i 格的结果由<strong>上一轮的两格</strong>算出来（旧 shader 的公式，<a data-src="src/shaders/water/fftOcean/compute/fftStockham/FFTStockham2D.frag:103">FFTStockham2D.frag:103–108</a>）：</p>
+<pre>第 s 轮（s = 1, 2, 3），sub = 2^s：
+  even = ⌊i / sub⌋ × (sub/2) + (i mod (sub/2))
+  odd  = even + N/2
+  这一轮的[i] = 上一轮的[even] + W × 上一轮的[odd]      （W 是一个按 i 算的复数系数）</pre>
+    <p>代进去算一格：第 3 轮（sub = 8）第 5 格，even = ⌊5/8⌋ × 4 + (5 mod 4) = 1，odd = 1 + 4 = 5，所以它读第 2 轮的第 1、5 格。图 2 把每一格读哪两格都画出来，蓝色是从第 3 轮第 5 格往回追的路线：</p>
+
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 352" role="img" aria-label="N 等于 8 时 FFT 的三轮。每一轮的每一格都读上一轮的两格，例如第 3 轮第 5 格读第 2 轮的第 1 格和第 5 格。往回追，第 3 轮的一格最终用到了输入的全部 8 格，所以后一轮必须等前一轮整张写完。每一轮写进 ping 和 pong 中的一个，轮流交替。">
+        <defs><marker id="f2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker></defs>
+        <text x="102.0" y="30" text-anchor="middle" class="small">输入（频谱）</text>
+        <text x="302.0" y="30" text-anchor="middle" class="small">第 1 轮 → ping</text>
+        <text x="502.0" y="30" text-anchor="middle" class="small">第 2 轮 → pong</text>
+        <text x="702.0" y="30" text-anchor="middle" class="small">第 3 轮 → ping</text>
+        <path d="M270 74.0 L134 74.0" class="line" opacity="0.2" />
+        <path d="M270 74.0 L134 210.0" class="line" opacity="0.2" />
+        <path d="M270 142.0 L134 108.0" class="line" opacity="0.2" />
+        <path d="M270 142.0 L134 244.0" class="line" opacity="0.2" />
+        <path d="M270 210.0 L134 142.0" class="line" opacity="0.2" />
+        <path d="M270 210.0 L134 278.0" class="line" opacity="0.2" />
+        <path d="M270 278.0 L134 176.0" class="line" opacity="0.2" />
+        <path d="M270 278.0 L134 312.0" class="line" opacity="0.2" />
+        <path d="M470 74.0 L334 74.0" class="line" opacity="0.2" />
+        <path d="M470 74.0 L334 210.0" class="line" opacity="0.2" />
+        <path d="M470 142.0 L334 74.0" class="line" opacity="0.2" />
+        <path d="M470 142.0 L334 210.0" class="line" opacity="0.2" />
+        <path d="M470 176.0 L334 108.0" class="line" opacity="0.2" />
+        <path d="M470 176.0 L334 244.0" class="line" opacity="0.2" />
+        <path d="M470 210.0 L334 142.0" class="line" opacity="0.2" />
+        <path d="M470 210.0 L334 278.0" class="line" opacity="0.2" />
+        <path d="M470 278.0 L334 142.0" class="line" opacity="0.2" />
+        <path d="M470 278.0 L334 278.0" class="line" opacity="0.2" />
+        <path d="M470 312.0 L334 176.0" class="line" opacity="0.2" />
+        <path d="M470 312.0 L334 312.0" class="line" opacity="0.2" />
+        <path d="M670 74.0 L534 74.0" class="line" opacity="0.2" />
+        <path d="M670 74.0 L534 210.0" class="line" opacity="0.2" />
+        <path d="M670 108.0 L534 108.0" class="line" opacity="0.2" />
+        <path d="M670 108.0 L534 244.0" class="line" opacity="0.2" />
+        <path d="M670 142.0 L534 142.0" class="line" opacity="0.2" />
+        <path d="M670 142.0 L534 278.0" class="line" opacity="0.2" />
+        <path d="M670 176.0 L534 176.0" class="line" opacity="0.2" />
+        <path d="M670 176.0 L534 312.0" class="line" opacity="0.2" />
+        <path d="M670 210.0 L534 74.0" class="line" opacity="0.2" />
+        <path d="M670 210.0 L534 210.0" class="line" opacity="0.2" />
+        <path d="M670 278.0 L534 142.0" class="line" opacity="0.2" />
+        <path d="M670 278.0 L534 278.0" class="line" opacity="0.2" />
+        <path d="M670 312.0 L534 176.0" class="line" opacity="0.2" />
+        <path d="M670 312.0 L534 312.0" class="line" opacity="0.2" />
+        <path d="M270 108.0 L137 74.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M270 108.0 L137 210.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M270 176.0 L137 108.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M270 176.0 L137 244.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M270 244.0 L137 142.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M270 244.0 L137 278.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M270 312.0 L137 176.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M270 312.0 L137 312.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M470 108.0 L337 108.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M470 108.0 L337 244.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M470 244.0 L337 176.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M470 244.0 L337 312.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M670 244.0 L537 108.0" class="line accent" marker-end="url(#f2a)" />
+        <path d="M670 244.0 L537 244.0" class="line accent" marker-end="url(#f2a)" />
+        <rect x="70" y="62" width="64" height="24" rx="4" class="box hl" />
+        <text x="102.0" y="78" text-anchor="middle">0</text>
+        <rect x="70" y="96" width="64" height="24" rx="4" class="box hl" />
+        <text x="102.0" y="112" text-anchor="middle">1</text>
+        <rect x="70" y="130" width="64" height="24" rx="4" class="box hl" />
+        <text x="102.0" y="146" text-anchor="middle">2</text>
+        <rect x="70" y="164" width="64" height="24" rx="4" class="box hl" />
+        <text x="102.0" y="180" text-anchor="middle">3</text>
+        <rect x="70" y="198" width="64" height="24" rx="4" class="box hl" />
+        <text x="102.0" y="214" text-anchor="middle">4</text>
+        <rect x="70" y="232" width="64" height="24" rx="4" class="box hl" />
+        <text x="102.0" y="248" text-anchor="middle">5</text>
+        <rect x="70" y="266" width="64" height="24" rx="4" class="box hl" />
+        <text x="102.0" y="282" text-anchor="middle">6</text>
+        <rect x="70" y="300" width="64" height="24" rx="4" class="box hl" />
+        <text x="102.0" y="316" text-anchor="middle">7</text>
+        <rect x="270" y="62" width="64" height="24" rx="4" class="box" />
+        <text x="302.0" y="78" text-anchor="middle">0</text>
+        <rect x="270" y="96" width="64" height="24" rx="4" class="box hl" />
+        <text x="302.0" y="112" text-anchor="middle">1</text>
+        <rect x="270" y="130" width="64" height="24" rx="4" class="box" />
+        <text x="302.0" y="146" text-anchor="middle">2</text>
+        <rect x="270" y="164" width="64" height="24" rx="4" class="box hl" />
+        <text x="302.0" y="180" text-anchor="middle">3</text>
+        <rect x="270" y="198" width="64" height="24" rx="4" class="box" />
+        <text x="302.0" y="214" text-anchor="middle">4</text>
+        <rect x="270" y="232" width="64" height="24" rx="4" class="box hl" />
+        <text x="302.0" y="248" text-anchor="middle">5</text>
+        <rect x="270" y="266" width="64" height="24" rx="4" class="box" />
+        <text x="302.0" y="282" text-anchor="middle">6</text>
+        <rect x="270" y="300" width="64" height="24" rx="4" class="box hl" />
+        <text x="302.0" y="316" text-anchor="middle">7</text>
+        <rect x="470" y="62" width="64" height="24" rx="4" class="box" />
+        <text x="502.0" y="78" text-anchor="middle">0</text>
+        <rect x="470" y="96" width="64" height="24" rx="4" class="box hl" />
+        <text x="502.0" y="112" text-anchor="middle">1</text>
+        <rect x="470" y="130" width="64" height="24" rx="4" class="box" />
+        <text x="502.0" y="146" text-anchor="middle">2</text>
+        <rect x="470" y="164" width="64" height="24" rx="4" class="box" />
+        <text x="502.0" y="180" text-anchor="middle">3</text>
+        <rect x="470" y="198" width="64" height="24" rx="4" class="box" />
+        <text x="502.0" y="214" text-anchor="middle">4</text>
+        <rect x="470" y="232" width="64" height="24" rx="4" class="box hl" />
+        <text x="502.0" y="248" text-anchor="middle">5</text>
+        <rect x="470" y="266" width="64" height="24" rx="4" class="box" />
+        <text x="502.0" y="282" text-anchor="middle">6</text>
+        <rect x="470" y="300" width="64" height="24" rx="4" class="box" />
+        <text x="502.0" y="316" text-anchor="middle">7</text>
+        <rect x="670" y="62" width="64" height="24" rx="4" class="box" />
+        <text x="702.0" y="78" text-anchor="middle">0</text>
+        <rect x="670" y="96" width="64" height="24" rx="4" class="box" />
+        <text x="702.0" y="112" text-anchor="middle">1</text>
+        <rect x="670" y="130" width="64" height="24" rx="4" class="box" />
+        <text x="702.0" y="146" text-anchor="middle">2</text>
+        <rect x="670" y="164" width="64" height="24" rx="4" class="box" />
+        <text x="702.0" y="180" text-anchor="middle">3</text>
+        <rect x="670" y="198" width="64" height="24" rx="4" class="box" />
+        <text x="702.0" y="214" text-anchor="middle">4</text>
+        <rect x="670" y="232" width="64" height="24" rx="4" class="box hl" />
+        <text x="702.0" y="248" text-anchor="middle">5</text>
+        <rect x="670" y="266" width="64" height="24" rx="4" class="box" />
+        <text x="702.0" y="282" text-anchor="middle">6</text>
+        <rect x="670" y="300" width="64" height="24" rx="4" class="box" />
+        <text x="702.0" y="316" text-anchor="middle">7</text>
+        </svg>
+      </div>
+      <figcaption>图 2　N = 8 时 IFFT 的三轮（一行）。每一轮的每一格读上一轮的两格。第 3 轮的第 5 格往回追：第 2 轮用到 2 格，第 1 轮用到 4 格，输入的 8 格全部用到。所以第 3 轮必须等第 2 轮<strong>整张</strong>写完才能开始：每一轮是一次单独的 draw。</figcaption>
+    </figure>
+
+    <p>能不能一次 draw 算完？能，但要让每个像素直接读输入的全部 N 格（直接按定义算 DFT）。比一比每个像素要读多少次纹理（2D 图要先对每一行做、再对每一列做，所以乘 2）：</p>
+<pre>              一行 N = 8          一行 N = 512
+一次算完：    每格读 8 次          每格读 512 次 × 2 个方向 = 1024 次
+分轮算：      3 轮 × 2 次 = 6 次   9 轮 × 2 次 × 2 个方向 = 36 次</pre>
+    <p>N = 512 时，分轮算每个像素少读约 28 倍。<strong>分很多轮，是用「多几次 draw」换「少很多读取」</strong>，这正是快速傅里叶变换「快」的地方。</p>
+
+    <h3 id="s4-3">4.3 为什么来回换画布</h3>
+    <p>每一轮要读上一轮的结果、写这一轮的结果。能不能读写同一块画布？不能：同一次 draw 里边读边写同一块纹理，叫<strong>反馈环 (feedback loop)</strong>，WebGL 规范规定这时 draw 报 INVALID_OPERATION；项目在 draw 之前就检查并抛错（第 27 课的 <a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:276">assertCanSample</a>）。</p>
+    <p>所以要准备两块画布 ping 和 pong，轮流写：第 1 轮读输入写 ping，第 2 轮读 ping 写 pong，第 3 轮读 pong 写 ping……这叫 <strong>ping-pong</strong>。结果是：<strong>每一次 draw 写的画布，都和上一次 draw 不同。</strong></p>
+    <p>而一个 scope 只对应一个目的地：withRenderSurface 进门时就定好了画到哪（<a data-src="src/rendering/backend/RenderSurface.ts:38">RenderSurface.ts:38</a>），里面不能换。要换画布，只能出门、再进另一扇门。合起来就是迁移计划那句话的前半句：<strong>FFT 每次 draw 都换目标，所以每个 draw 都要单独开一个 scope。</strong></p>
+    <p>下面用项目真实的 Renderer、Pipeline、Backend 跑一个课程写的 Pass，看 ping-pong 在新架构里怎么写。IFFT 的系数 W 是复数，结果不好核对，所以这里换成一个结构完全相同、结果一眼能核对的算法：<strong>前缀和 (prefix sum)</strong>。输入 1, 2, …, 8，第 s 轮每格加上「往左隔 2^(s−1) 格」那一格（左边没有就加 0），三轮之后第 i 格就是前 i + 1 个数的和。它同样是每格读上一轮的两格，同样要 log₂8 = 3 轮。</p>
+<pre><code>// query-course.ts：课程写的 ScanPass（节选）
+execute(context: RenderPassContext): undefined {
+  const { backend, view } = context
+  this.log.length = 0
+
+  // 第 0 轮：写入 1..8
+  drawInto(backend, view, into(this.ping), this.item(this.seed))
+  this.log.push('第 0 轮　写 ping')
+
+  let read = this.ping
+  let write = this.mode === 'ping-pong' ? this.pong : this.ping
+
+  for (let s = 0; s &lt; 3; s++) {
+    const input = read.getColorAttachment(0) // 上一轮写好的那块画布
+    this.step.setParameter('uInput', { type: 'texture2D', value: input })
+    this.step.setParameter('uOffset', { type: 'float', value: 2 ** s })
+    const note = '读 ' + label(read) + '，写 ' + label(write) + '（d = ' + 2 ** s + '）'
+    this.log.push('第 ' + (s + 1) + ' 轮　' + note)
+    drawInto(backend, view, into(write), this.item(this.step))
+
+    if (this.mode === 'ping-pong') [read, write] = [write, read]
+  }
+
+  const result = read.getColorAttachment(0)
+  this.copy.setParameter('uInput', { type: 'texture2D', value: result })
+  drawInto(backend, view, SCREEN, this.item(this.copy))
+  this.log.push('最后　读 ' + label(read) + '，写屏幕')
+  return undefined
+}</code></pre>
+    <p>逐行说明：</p>
+    <ul>
+      <li><code>drawInto(backend, view, 目的地, item)</code> 是课程写的三行小函数：<code>backend.withRenderSurface(目的地, () =&gt; { backend.draw({ item, view }); return undefined })</code>。<strong>每调用一次，就进一次门。</strong></li>
+      <li><code>into(this.ping)</code> 生成 <code>{ surface: { kind: 'render-target', target: this.ping } }</code>，就是「画到 ping 这块画布上」；<code>SCREEN</code> 是 <code>{ surface: { kind: 'default-framebuffer' } }</code>。</li>
+      <li><code>this.step</code> 是一个 Material，它的 shader 读 <code>uInput</code> 这张纹理里的第 i 格和第 i − d 格，相加后写出去。每一轮用 <code>setParameter</code> 换掉它要读的纹理（<code>input</code>：上一轮写好的那块画布的颜色附件）和往左隔几格 d。</li>
+      <li><code>[read, write] = [write, read]</code>：交换两个变量，这一轮写的，下一轮读。</li>
+      <li>最后一次画到屏幕上，只是为了让课程能用 <code>readPixels</code> 把 8 个数读出来：项目的 Backend 还没有读回接口（迁移计划决定 5）。</li>
+    </ul>
+    <div id="lab-c"></div>
+
+    <h2 id="s5">5. 数到 592</h2>
+    <p>FFT 海面每层每帧要做的 draw（旧代码的做法，<code>claude-workspace/fft-ocean-migration/2026-10-02-legacy-v3-fft-pass-reference.zh-CN.md</code> 第 5、6 节）：</p>
+    <ul>
+      <li><strong>频谱 1 次</strong>：按时间 t 把初始频谱推到这一刻。</li>
+      <li><strong>IFFT 4 × 2 × 9 = 72 次</strong>：
+        <ul>
+          <li><strong>4 路信号</strong>：海面要 8 张实数图（高度、两个水平位移和它们的导数）。一次复数 IFFT 能同时算两张实数图（一张放实部、一张放虚部），所以 8 张两两打包成 4 路，做 4 次 IFFT。</li>
+          <li><strong>2 个方向</strong>：二维的 IFFT 先对每一行做一遍，再对每一列做一遍。</li>
+          <li><strong>9 轮</strong>：N = 512 = 2⁹，每个方向 log₂512 = 9 轮（图 2 是 N = 8 的 3 轮）。</li>
+        </ul>
+      </li>
+      <li><strong>组装 1 次</strong>：把 4 路结果拆开，算出海面 shader 要采样的位移、梯度、导数三张图。</li>
+    </ul>
+<pre>每层每帧 draw：1 + 4 × 2 × 9 + 1 = 74
+4 层（每层覆盖 256、64、16、4 米的海面）：4 × 74 = 296 次 draw
+每次 draw 写的画布都和上一次不同（ping-pong）→ 296 次进门
+每次进门问 2 次（不清屏，不套 scope）→ 296 × 2 = 592 次查询</pre>
+    <p>下面的实验台用真实的 Renderer、Pipeline、Backend 跑课程写的 <code>FFTShapedPass</code>：它照旧代码的顺序进门、draw，每层依次写 spectrum → ping → pong → … → packed → … → final，shader 只是把上一步的结果搬过来（我们只关心进门几次，不关心算出什么）。画布实际是 4 × 4 像素：查询次数和画布大小无关，小一点跑得快。你可以改层数、N 和「一次 IFFT 处理几路信号」，看公式和实际次数是否一致。</p>
+    <div id="lab-d"></div>
+    <div id="lab-e"></div>
+
+    <h2 id="s6">6. 旧代码为什么只问 7 次</h2>
+    <p>旧的 FFT 计算 Pass 是一整块代码，自己拿着 gl（<a data-src="src/renderers/passes/fft/FFTOceanComputePass-multi-layers-v3.ts:391">FFTOceanComputePass-multi-layers-v3.ts:391</a>）：</p>
+<pre><code>// FFTOceanComputePass-multi-layers-v3.ts:391–427、:474–504
+// （节选，注释是课程加的）
+execute(context: FrameContext, _camera: PerspectiveCamera): void {
+  const gl = this.gl
+  // 保存 GL 状态
+  const saved = captureGLState(gl) // 入口问 7 项：整个 Pass 只问这一次
+  gl.disable(gl.DEPTH_TEST)
+  for (let i = 0; i &lt; this.layerStates.length; i++) {
+    // …（每层：频谱、4 次 IFFT（每次 18 轮）、组装，一共 74 次 draw）
+  }
+  restoreGLState(gl, saved)        // 出口只写回，不再问
+  // …
+}
+
+private renderStockhamStage(/* …输入纹理、输出 FBO、sub、N… */): void {
+  const gl = this.gl
+  gl.bindFramebuffer(gl.FRAMEBUFFER, outputFBO.getFrameBuffer()) // 直接绑这一轮的画布
+  gl.viewport(0, 0, transformSize, transformSize)
+  // …（设 uniform）
+  gl.drawElements(
+    gl.TRIANGLES,
+    this.fullscreenQuad.count,
+    this.fullscreenQuad.indexData!.type,
+    0
+  )
+  // 画完不还原：下一轮自己会绑它要的画布
+}</code></pre>
+    <p><a data-src="src/utils/gl/withCleanGLState.ts:2">captureGLState</a> 问的 7 项是：framebuffer、viewport、CULL_FACE、SCISSOR_TEST、BLEND、DEPTH_TEST、COLOR_WRITEMASK。</p>
+
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 200" role="img" aria-label="上面一行是旧代码：入口问 7 项，然后连续绑 ping 画、绑 pong 画、绑 ping 画，最后还原一次。下面一行是新架构：每次 draw 都是一个完整的 scope，问 2 项、绑、画、还原，再进下一个 scope 又问 2 项。">
+          <text x="16" y="24" class="small">旧 v3：一整块，自己拿着 gl</text>
+          <rect x="16" y="34" width="70" height="34" rx="5" class="box hl" />
+          <text x="51" y="56" text-anchor="middle">问 7 项</text>
+          <rect x="94" y="34" width="96" height="34" rx="5" class="box" />
+          <text x="142" y="56" text-anchor="middle">绑 ping 画</text>
+          <rect x="198" y="34" width="96" height="34" rx="5" class="box" />
+          <text x="246" y="56" text-anchor="middle">绑 pong 画</text>
+          <rect x="302" y="34" width="96" height="34" rx="5" class="box" />
+          <text x="350" y="56" text-anchor="middle">绑 ping 画</text>
+          <text x="420" y="56" text-anchor="middle">……</text>
+          <rect x="444" y="34" width="96" height="34" rx="5" class="box" />
+          <text x="492" y="56" text-anchor="middle">绑 final 画</text>
+          <rect x="548" y="34" width="70" height="34" rx="5" class="box" />
+          <text x="583" y="56" text-anchor="middle">还原</text>
+          <text x="630" y="56" class="small">一帧问 7 次</text>
+
+          <text x="16" y="114" class="small">新架构：每次 draw 一个 scope，Pass 拿不到 gl</text>
+          <rect x="16" y="124" width="190" height="56" rx="6" class="box" />
+          <rect x="24" y="134" width="50" height="34" rx="5" class="box hl" />
+          <text x="49" y="156" text-anchor="middle">问 2</text>
+          <text x="112" y="156" text-anchor="middle">绑 ping 画</text>
+          <text x="178" y="156" text-anchor="middle">还原</text>
+          <rect x="214" y="124" width="190" height="56" rx="6" class="box" />
+          <rect x="222" y="134" width="50" height="34" rx="5" class="box hl" />
+          <text x="247" y="156" text-anchor="middle">问 2</text>
+          <text x="310" y="156" text-anchor="middle">绑 pong 画</text>
+          <text x="376" y="156" text-anchor="middle">还原</text>
+          <rect x="412" y="124" width="190" height="56" rx="6" class="box" />
+          <rect x="420" y="134" width="50" height="34" rx="5" class="box hl" />
+          <text x="445" y="156" text-anchor="middle">问 2</text>
+          <text x="508" y="156" text-anchor="middle">绑 ping 画</text>
+          <text x="574" y="156" text-anchor="middle">还原</text>
+          <text x="620" y="156" class="small">…… × 296</text>
+          <text x="630" y="194" class="small">一帧问 592 次</text>
+        </svg>
+      </div>
+      <figcaption>图 3　同样 296 次 draw。旧代码在门口问一次，中间直接换画布；新架构每次 draw 都进一次门、出一次门，每次进门都问。</figcaption>
+    </figure>
+
+    <p>旧代码能只问一次，靠的是三个前提：</p>
+    <ol>
+      <li><strong>它自己拿着 gl</strong>，可以直接调用 bindFramebuffer 换画布，不用经过任何「门」。</li>
+      <li><strong>它知道自己的顺序</strong>：下一次 draw 一定是自己的，而且一定会自己绑画布、设 viewport，所以两次 draw 之间不用还原。</li>
+      <li><strong>中间没有别人</strong>：74 × 4 次 draw 一口气做完，只有整个 Pass 的进出才需要保存和还原。</li>
+    </ol>
+    <p>新架构把这三条都拿掉了。第 30 课讲过，Pass 拿到的只有 <code>context.backend</code>，没有 gl；换画布的唯一办法是 withRenderSurface。而 withRenderSurface 是一个<strong>通用的零件</strong>：它不知道自己是 296 次中的第几次，不知道下一个 scope 会不会自己绑画布，也不信任自己的记忆（3.2 节），所以每次都问、每次都还原。图 3 下面那一行的每个「还原」，紧接着就被下一个 scope 的「绑」覆盖掉，这是白发的命令；每个「问 2」问到的，其实都是屏幕，这是白问的查询。</p>
+    <p>下面这张卡片在真实的 WebGL context 上，对同一串 296 块画布，分别按旧代码的写法和新架构的写法走一遍（省掉了 draw 本身）。新架构的写法用课程写的简化版 <code>LiteScope</code>：它只做「进门问、绑、出门绑回」三件事，和项目的 scope 问的是同样两项。</p>
+    <div id="lab-f"></div>
+    <aside class="note">
+      <strong>旧代码其实问得也不少。</strong>上面说的只是「状态查询」。旧的 <a data-src="src/shaders/Shader.ts:45">Shader.getUniformLocation</a> 没有缓存，每设一次 uniform 就调用一次 <code>gl.getUniformLocation</code>；参考文档估算 FFT 每帧约 2084 次。新架构在第一次 draw 时就把 uniform 位置缓存起来了（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:214">WebGL1Uniforms.ts:214</a>），卡片 A 里第 2 帧一次 getUniformLocation 都没有。所以「新代码问得多」只对 framebuffer 和 viewport 这两项成立。
+    </aside>
+
+    <h2 id="s7">7. 问得多就慢吗</h2>
+    <p>到这里，迁移计划那句话的每个数都有了来历。但「每帧 592 次查询」只是一个次数。它要多久，取决于浏览器怎样回答这两项查询（图 1）。备课时在无界面 Chrome（软件渲染 SwiftShader）里量到的：</p>
+<pre>每帧做 296 次进门、出门（不 draw）：
+  每次都问（项目现在的做法）     约 0.20–0.37 ms
+  自己记住、不问                 约 0.05–0.10 ms
+  只算那 592 次 getParameter     约 0.14 ms   （第 14 课量到的也是 0.14 ms）
+一帧的预算（60 帧每秒）：         16.7 ms</pre>
+    <p>差别约 0.1–0.3 ms，不到一帧预算的 2%（三次运行的范围）。作为对照，getError 每次要等 GPU 进程回话，37–62 μs 一次，592 次就是约 23 ms，超过一整帧（第 14 课 3.4 节）。所以在 Chrome 上，这 592 次查询是「频繁」，但不「贵」。Edge 用的是 Chrome 同一套内核，结果应该接近；Firefox、Safari 我没有测。</p>
+    <p>用你的浏览器量一量：下面每次运行做 6 轮，每轮 60 帧，两种做法交替。前一两轮常常偏高（浏览器还在「热身」），看后几轮。</p>
+    <div id="lab-g"></div>
+
+    <h2 id="s8">8. 如果要省：三种办法</h2>
+    <p>迁移计划列了三种办法，再加上决定 8 的「少换几次画布」。用 LiteScope 和 FFTShapedPass 实测（4 层，N = 512）：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>办法</th><th>每帧查询</th><th>代价和前提</th></tr>
+        <tr><td>A. 保持现状：每次进门都问</td><td>592</td><td>最稳；在 Chrome 上约 0.3 ms</td></tr>
+        <tr><td>C. 从栈推导：套在外层 scope 里时，入口就是外层刚绑的那块，只有最外层问</td><td>不套：592<br />每层套一个外层 scope：8</td><td>要改 FFT Pass 的写法（每层套一层），性能规则带进了 Pass；项目现在的代码套了反而更多，第 14 课实测 896（出门多一次 isFramebuffer）</td></tr>
+        <tr><td>B. State 自己记住上一次绑了什么</td><td>第 1 帧 2，之后 0</td><td>Backend 必须独占 context，所有绕过 State 的绑定都要让缓存失效；记错了会画到别处，<strong>而且不报错</strong>（卡片 I）</td></tr>
+        <tr><td>决定 8：一次 IFFT 同时处理 4 路信号（多附件 MRT）</td><td>160</td><td>每层 74 → 20 次 draw，查询跟着少；要改 shader 和画布的附件数</td></tr>
+      </table>
+    </div>
+    <div id="lab-h"></div>
+    <p>B 的前提有一半已经有了：Engine 的新旧路径互斥已经在工作区实现（<a data-src="src/engine.ts:266">engine.ts:266</a> 的 assertLegacyMode），新路径运行时旧代码不能碰 context。剩下的一半是第 14 课 2.5 节说的：每次绑定顶点输入都会让 State 的缓存整份失效，要先拆细，否则 B 记住的东西每次 draw 都被清空。</p>
+    <p>迁移计划的原则是「先测量再优化」。按第 7 节的数字，在 Chrome 上 A 是可以接受的；如果你的浏览器量出来明显更慢，再按 C、B 的顺序考虑。</p>
+
+    <h2 id="s9">9. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0039"></div>
+
+    <h2 id="s10">10. 延伸阅读</h2>
+    <ul>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices#avoid_blocking_api_calls_in_production">MDN：WebGL best practices · Avoid blocking API calls in production</a>：哪些调用会让 JavaScript 停下来等（本课最重要的一份资料）。</li>
+      <li><a href="https://registry.khronos.org/webgl/specs/latest/1.0/#webgl-context-lost-flag">WebGL 1.0 规范：webgl context lost flag</a>：isContextLost 只返回这个标志（见「Detecting context lost events」一节）；同一份规范的「Feedback Loops Between Textures and the Framebuffer」一节：读写同一块纹理时报 INVALID_OPERATION。</li>
+      <li>旧代码参考：<code>claude-workspace/fft-ocean-migration/2026-10-02-legacy-v3-fft-pass-reference.zh-CN.md</code> 第 5、6 节（四步细节、ping-pong 表）；迁移计划决定 4、决定 8、风险 6.2。</li>
+      <li><a href="0014-webgl1-state.html#s3">第 14 课第 3 节</a>：同一个问题第一次讲，用假 GL 数次数，有查询计时卡片和两种改法的细节。</li>
+      <li><a href="https://en.wikipedia.org/wiki/Cooley%E2%80%93Tukey_FFT_algorithm">Wikipedia：Cooley–Tukey FFT algorithm</a>：为什么 FFT 分 log₂N 轮（想看数学再读）。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：实验卡片和检查题各错了哪几题；第 7 节在你的浏览器里量到的数字（两种做法后几轮的中位数）。哪一节、哪一句还接不上，直接贴给我，我从那里接着讲。
+    </aside>
+
+    <div class="nav">
+      <a href="0030-frame-orchestration.html">← 第 30 课：帧编排</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0040-shadow-one-function.html">第 40 课：一个函数画完阴影 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 39 课 · 2026-10-15</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        const Q = window.RTeachQuery
+        const C = Q.course
+        const err = (e) => (e && e.name ? e.name : 'Error') + '：' + (e && e.message ? e.message : String(e))
+
+        // ---------------- 课程写的小工具 ----------------
+        const COUNT_NOTE =
+          '课程写的部分：countGL（query-course.ts）给 context 上的每个方法套一层，先记账再调用原来的方法；get…、is…、check…、readPixels 记为查询，isContextLost 单独数，其余记为命令（OES 扩展对象上的 bindVertexArrayOES 不在统计里）。'
+        const SCENE_NOTE =
+          COUNT_NOTE + ' 场景是课程搭的：一个三角形 Geometry、单色 shader。ForwardPass、Renderer、RenderPipeline、RenderListBuilder、WebGL1Backend 都是项目代码（2026-10-15 工作区版本）。'
+        const SCAN_NOTE =
+          COUNT_NOTE + ' ScanPass、drawInto、into 是课程写的（4.3 节的代码）；Renderer、RenderPipeline、WebGL1Backend、RenderTarget、Material 都是项目代码。最后的 readPixels 由课程直接调用 gl，不在计数里。'
+        const FFT_NOTE =
+          COUNT_NOTE + ' FFTShapedPass 是课程写的：照旧 FFT 代码的顺序进门、draw，shader 只把上一步的结果搬过来；「每次 4 路」只模拟 draw 的次数，没有真做多附件。Renderer、RenderPipeline、WebGL1Backend 都是项目代码。'
+        const LITE_NOTE =
+          COUNT_NOTE + ' LiteScope、runLikeV3、rawTargets、fftOrder 都是课程写的（query-course.ts）：画布是课程直接用 gl 建的 framebuffer，省掉了 draw 本身。LiteScope 只做「进门拿入口、绑、出门绑回」，和项目的 scope 问的是同样两项；runLikeV3 照旧代码 execute 的结构写。'
+
+        const frameOf = (n, w, h) =>
+          Object.freeze({ frameNumber: n, timeSeconds: n / 60, deltaSeconds: 1 / 60, drawingBufferWidth: w, drawingBufferHeight: h, pixelRatio: 1 })
+
+        /** 建 canvas、真实 Backend、Pipeline、Renderer，再给 context 套上计数器。 */
+        function harness(passes, w, h, fill) {
+          const canvas = document.createElement('canvas')
+          canvas.width = w
+          canvas.height = h
+          const backend = new Q.WebGL1Backend(canvas, 'lesson39', { preserveDrawingBuffer: true })
+          const gl = canvas.getContext('webgl') // 和 Backend 用的是同一个 context
+          const counter = C.countGL(gl)
+          const pipeline = new Q.RenderPipeline()
+          for (const pass of passes) pipeline.addPass(pass)
+          const renderer = new Q.Renderer(backend, pipeline, new Q.RenderListBuilder())
+          const scene = new Q.Scene()
+          const camera = new Q.PerspectiveCamera({ fovY: Math.PI / 4, aspect: w / h, near: 0.1, far: 100 })
+          scene.add(camera)
+          if (fill) fill(scene)
+          let n = 0
+          return {
+            gl,
+            counter,
+            render() {
+              n += 1
+              renderer.render({ scene, camera, frame: frameOf(n, w, h) })
+            },
+            dispose() {
+              renderer.dispose()
+              counter.stop()
+              const lose = gl.getExtension('WEBGL_lose_context')
+              if (lose) lose.loseContext()
+            }
+          }
+        }
+
+        /** 跑两帧，各自计数。 */
+        function twoFrames(h) {
+          h.counter.reset()
+          h.render()
+          const first = h.counter.read()
+          h.counter.reset()
+          h.render()
+          return { first, second: h.counter.read() }
+        }
+
+        function countLines(label, c, kind) {
+          const lines = [{ t: label, text: '查询 ' + c.queryTotal + ' 次，命令 ' + c.commands + ' 条（另有 isContextLost ' + c.lostChecks + ' 次）', kind: kind || 'server' }]
+          for (const [key, n] of c.queries) lines.push({ text: '　' + key + ' × ' + n, kind: 'muted' })
+          return lines
+        }
+
+        function flatShader() {
+          return new Q.ShaderModule({
+            name: 'lesson39/flat',
+            language: 'glsl-es-100',
+            vertexSource: 'attribute vec3 position;\nvoid main() { gl_Position = vec4(position, 1.0); }',
+            fragmentSource: 'precision mediump float;\nuniform vec4 uColor;\nvoid main() { gl_FragColor = uColor; }'
+          })
+        }
+
+        function triangleScene(count) {
+          return (scene) => {
+            const geometry = new Q.Geometry({
+              attributes: {
+                position: new Q.VertexAttribute({ data: new Float32Array([-0.5, -0.5, 0, 0.5, -0.5, 0, 0, 0.5, 0]), itemSize: 3 })
+              }
+            })
+            const material = new Q.Material({ shaderModule: flatShader(), parameters: { uColor: { type: 'vec4', value: [0, 1, 0, 1] } } })
+            for (let i = 0; i < count; i++) scene.add(new Q.Mesh(geometry, material))
+          }
+        }
+
+        // ---------------- 2：卡片 A ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-a'),
+          storageKey: 'lesson-0039-a',
+          cards: [
+            {
+              title: '卡片 A：HW2 那样的一帧',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '4 × 4 的画布。ForwardPass 画一个绿色三角形，连画两帧，每帧单独计数。',
+              note: SCENE_NOTE,
+              question: '第 2 帧一共查询 GL 几次？',
+              choices: ['7 次：只剩每帧都会发生的那几项', '37 次：和第 1 帧一模一样多', '0 次：答案第 1 帧全都记住了'],
+              answer: 0,
+              explain:
+                '第 1 帧 37 次，其中 30 次是第一次用到 shader 和几何体时「建」的那部分：问编译结果、问 program 里有哪些 attribute 和 uniform、建 VAO 前后用 getError 检查。第 2 帧只剩 7 次：framebuffer、viewport 两项，加上清屏前问的 DEPTH_BITS、两个写掩码和两个 isEnabled。这 7 次都是 ForwardPass 进门时 scope 问的（第 3 节）。',
+              run: () => {
+                const h = harness([new Q.ForwardPass()], 4, 4, triangleScene(1))
+                try {
+                  const { first, second } = twoFrames(h)
+                  return { lines: [...countLines('第 1 帧', first, 'muted'), ...countLines('第 2 帧', second, 'result')] }
+                } finally {
+                  h.dispose()
+                }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 3.4：卡片 B ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-b'),
+          storageKey: 'lesson-0039-b',
+          cards: [
+            {
+              title: '卡片 B：2 个物体和 200 个物体',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '同一个 ForwardPass，场景里分别放 2 个和 200 个三角形（共用一个 Geometry 和 Material），各画两帧，看第 2 帧。',
+              note: SCENE_NOTE,
+              question: '200 个物体时，第 2 帧查询几次？',
+              choices: ['7 次：和 2 个物体时一样多', '700 次：每个物体各问 7 次', '400 次：每个物体各问 2 次'],
+              answer: 0,
+              explain:
+                '两种都是 7 次，变的只有命令数：每多一次 draw，就多发近 20 条命令（useProgram、深度和剔除、uniform、drawArrays……），但一次查询也不多。查询只发生在进门、清屏的时候，ForwardPass 不管画多少东西都只进一次门。',
+              run: () => {
+                const lines = []
+                for (const count of [2, 200]) {
+                  const h = harness([new Q.ForwardPass()], 4, 4, triangleScene(count))
+                  try {
+                    const { second } = twoFrames(h)
+                    lines.push(...countLines(count + ' 个物体，第 2 帧', second, count === 200 ? 'result' : 'server'))
+                  } finally {
+                    h.dispose()
+                  }
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 4.3：卡片 C、D ----------------
+        function readRow(gl) {
+          const pixels = new Uint8Array(32)
+          gl.readPixels(0, 0, 8, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixels)
+          return Array.from(pixels).filter((_, i) => i % 4 === 0)
+        }
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-c'),
+          storageKey: 'lesson-0039-c',
+          cards: [
+            {
+              title: '卡片 C：前缀和，ping-pong',
+              tags: ['真实 WebGL', '项目代码 + 课程写的 Pass'],
+              desc: '8 × 1 的画布。Pipeline 里只有 ScanPass（ping-pong）。画两帧：第 1 帧之后读出屏幕上的 8 个数，再看第 2 帧的查询。',
+              note: SCAN_NOTE,
+              question: '第 2 帧一共查询 GL 几次？',
+              choices: ['10 次：进门 5 次，每次各问 2 次', '2 次：整个 Pass 只在开头问一次', '7 次：和 ForwardPass 的一帧一样'],
+              answer: 0,
+              explain:
+                '每调用一次 drawInto 就进一次门：第 0 轮 1 次、三轮各 1 次、最后画到屏幕 1 次，一共 5 次，每次问 FRAMEBUFFER_BINDING 和 VIEWPORT，5 × 2 = 10。不清屏，所以没有那 5 项。读出的 1, 3, 6, 10, 15, 21, 28, 36 正是 1..8 的前缀和：每一轮都读到了上一轮写好的整张图。',
+              run: () => {
+                const pass = new C.ScanPass('ping-pong')
+                const h = harness([pass], 8, 1)
+                try {
+                  h.counter.reset()
+                  h.render()
+                  const values = readRow(h.gl)
+                  const log = pass.log.slice()
+                  h.counter.reset()
+                  h.render()
+                  const second = h.counter.read()
+                  return {
+                    lines: [
+                      ...log.map((text) => ({ text, kind: 'user' })),
+                      { t: '读出', text: values.join(', '), kind: 'server' },
+                      ...countLines('第 2 帧', second, 'result')
+                    ]
+                  }
+                } finally {
+                  h.dispose()
+                }
+              }
+            },
+            {
+              title: '卡片 D：每一轮都读 ping、写 ping',
+              tags: ['真实 WebGL', '项目代码 + 课程写的 Pass'],
+              desc: '和卡片 C 一样，只是 ScanPass 用 same-target 模式：不交换 read 和 write，每一轮都写 ping，同时读 ping。',
+              note: SCAN_NOTE,
+              question: '会怎样？',
+              choices: ['抛 RenderTargetUnavailableError：不能读正在写的画布', '能算完，只是 8 个结果全都是 0', '能算完，结果和 ping-pong 完全一样'],
+              answer: 0,
+              explain:
+                '第 1 轮就停了：draw 解析 uInput 这张纹理之前，scope 先检查它是不是当前正在写的画布（WebGL1SurfaceScope.ts:276 的 assertCanSample），是就抛 RenderTargetUnavailableError。不检查的话，WebGL 规范规定这次 draw 报 INVALID_OPERATION，什么也不画。所以 ping-pong 不是性能技巧，是唯一的写法。',
+              run: () => {
+                const pass = new C.ScanPass('same-target')
+                const h = harness([pass], 8, 1)
+                try {
+                  try {
+                    h.render()
+                    return { lines: [...pass.log.map((text) => ({ text, kind: 'user' })), { text: '没有抛错', kind: 'late' }] }
+                  } catch (e) {
+                    return { lines: [...pass.log.map((text) => ({ text, kind: 'user' })), { t: '抛出', text: err(e), kind: 'abort' }] }
+                  }
+                } finally {
+                  h.dispose()
+                }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 5：自由组合 + 卡片 E ----------------
+        function runFFT(shape) {
+          const pass = new C.FFTShapedPass(shape)
+          const h = harness([pass], 4, 4)
+          try {
+            const { second } = twoFrames(h)
+            return { scopes: pass.scopes, second }
+          } finally {
+            h.dispose()
+          }
+        }
+        function formula(layers, rounds, channels) {
+          const signals = 4 / channels
+          const perLayer = 1 + signals * 2 * rounds + 1
+          return {
+            perLayer,
+            text:
+              '每层 1 + ' + signals + ' × 2 × ' + rounds + ' + 1 = ' + perLayer + ' 次 draw；' + layers + ' 层 = ' + layers * perLayer + ' 次进门；× 2 = ' + layers * perLayer * 2 + ' 次查询'
+          }
+        }
+        RTeach.traceLab.playground({
+          mount: document.getElementById('lab-d'),
+          title: '自由组合：FFT 形状的一帧（真实 Renderer、Pipeline、Backend）',
+          selects: [
+            { id: 'layers', options: [['4', '4 层'], ['2', '2 层'], ['1', '1 层']] },
+            { id: 'n', options: [['512', 'N = 512（9 轮）'], ['1024', 'N = 1024（10 轮）'], ['256', 'N = 256（8 轮）'], ['64', 'N = 64（6 轮）'], ['8', 'N = 8（3 轮）']] },
+            { id: 'channels', options: [['1', '每次 IFFT 1 路（旧代码）'], ['4', '每次 IFFT 4 路（决定 8）']] }
+          ],
+          describe: (v) => '公式：' + formula(Number(v.layers), Math.log2(Number(v.n)), Number(v.channels)).text + '。运行后对照实际次数。',
+          run: (v) => {
+            const layers = Number(v.layers)
+            const rounds = Math.log2(Number(v.n))
+            const channels = Number(v.channels)
+            const { scopes, second } = runFFT({ layers, rounds, channels, size: 4 })
+            return {
+              lines: [
+                { t: '公式', text: formula(layers, rounds, channels).text, kind: 'user' },
+                { t: '实际', text: '这一帧进门 ' + scopes + ' 次', kind: 'server' },
+                ...countLines('第 2 帧', second, 'result')
+              ]
+            }
+          }
+        })
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-e'),
+          storageKey: 'lesson-0039-e',
+          cards: [
+            {
+              title: '卡片 E：默认配置',
+              tags: ['真实 WebGL', '项目代码 + 课程写的 Pass'],
+              desc: '4 层，N = 512（每个方向 9 轮），每次 IFFT 处理 1 路信号，和旧代码一样。画两帧，看第 2 帧。',
+              note: FFT_NOTE,
+              question: '第 2 帧一共查询 GL 几次？',
+              choices: ['592 次：296 次进门，每次 2 次', '296 次：每次 draw 各问 1 次', '7 次：只在 Pass 的入口问一次'],
+              answer: 0,
+              explain:
+                '每层 1 + 4 × 2 × 9 + 1 = 74 次 draw，4 层 296 次；每次 draw 的画布都和上一次不同，所以进门 296 次，每次问 FRAMEBUFFER_BINDING 和 VIEWPORT，592 次。这就是迁移计划那句话里的数。把画布从 4 × 4 换成 512 × 512，次数不会变：查询只和进门次数有关。',
+              run: () => {
+                const { scopes, second } = runFFT({ layers: 4, rounds: 9, channels: 1, size: 4 })
+                return { lines: [{ t: '进门', text: scopes + ' 次', kind: 'server' }, ...countLines('第 2 帧', second, 'result')] }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 6：卡片 F ----------------
+        function freshGL() {
+          const canvas = document.createElement('canvas')
+          canvas.width = 4
+          canvas.height = 4
+          return canvas.getContext('webgl')
+        }
+        function release(gl) {
+          const lose = gl.getExtension('WEBGL_lose_context')
+          if (lose) lose.loseContext()
+        }
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-f'),
+          storageKey: 'lesson-0039-f',
+          cards: [
+            {
+              title: '卡片 F：旧写法和新写法，同一串 296 块画布',
+              tags: ['真实 WebGL', '课程代码'],
+              desc: '4 层，每层按 FFT 的顺序依次写 spectrum、ping、pong、……、packed、……、final，共 296 次换画布。旧写法照 v3 的 execute：入口问 7 项，中间直接绑。新写法每次换画布都走一次 LiteScope（ask：每次进门都问）。',
+              note: LITE_NOTE,
+              question: '两种写法各查询几次？',
+              choices: ['旧写法 7 次，新写法 592 次', '旧写法 592 次，新写法 7 次', '两种写法都是 592 次'],
+              answer: 0,
+              explain:
+                '旧写法只在入口问那 7 项（captureGLState），之后每次直接 bindFramebuffer、viewport，296 × 2 条命令，出口再写回几条，共 600 条命令。新写法每次进门问 2 次、绑 2 条、出门绑回 2 条：592 次查询、1184 条命令。多出来的一半命令是「出门绑回屏幕」，紧接着就被下一次进门的绑定覆盖了。',
+              run: () => {
+                const order = C.fftOrder({ rounds: 9, channels: 1 })
+                const lines = [{ text: '每层的顺序（前 22 个）：' + order.slice(0, 22).join(' ') + ' ……', kind: 'muted' }]
+                {
+                  const gl = freshGL()
+                  const layers = C.rawTargets(gl, 4, 4)
+                  const counter = C.countGL(gl)
+                  C.runLikeV3(gl, layers, order, 4)
+                  lines.push(...countLines('旧写法', counter.read(), 'server'))
+                  counter.stop()
+                  release(gl)
+                }
+                {
+                  const gl = freshGL()
+                  const layers = C.rawTargets(gl, 4, 4)
+                  const counter = C.countGL(gl)
+                  const scope = new C.LiteScope(gl, 'ask')
+                  for (const targets of layers) for (const name of order) scope.run(targets.get(name), 4, () => {})
+                  lines.push(...countLines('新写法', counter.read(), 'result'))
+                  counter.stop()
+                  release(gl)
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 7：计时 ----------------
+        const median = (xs) => {
+          const s = xs.slice().sort((a, b) => a - b)
+          return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2
+        }
+        RTeach.traceLab.playground({
+          mount: document.getElementById('lab-g'),
+          title: '在你的浏览器里计时（真实 WebGL）',
+          selects: [
+            { id: 'layers', options: [['4', '每帧 296 次进出（FFT 4 层）'], ['1', '每帧 74 次进出（FFT 1 层）']] }
+          ],
+          describe: (v) =>
+            '每轮把「每次都问」（LiteScope ask）和「自己记住」（LiteScope remember）各跑 60 帧，算每帧平均毫秒数，一共 6 轮。只有进门、绑定、出门，没有 draw。结果末尾给第 3–6 轮的中位数。',
+          run: async (v) => {
+            const order = C.fftOrder({ rounds: 9, channels: 1 })
+            const gl = freshGL()
+            const layers = C.rawTargets(gl, Number(v.layers), 4)
+            const results = { ask: [], remember: [] }
+            const lines = []
+            try {
+              for (let round = 1; round <= 6; round++) {
+                const row = []
+                for (const strategy of ['ask', 'remember']) {
+                  const scope = new C.LiteScope(gl, strategy)
+                  const frame = () => {
+                    for (const targets of layers) for (const name of order) scope.run(targets.get(name), 4, () => {})
+                  }
+                  frame()
+                  const t0 = performance.now()
+                  for (let f = 0; f < 60; f++) frame()
+                  const ms = (performance.now() - t0) / 60
+                  results[strategy].push(ms)
+                  row.push((strategy === 'ask' ? '每次都问 ' : '自己记住 ') + ms.toFixed(3) + ' ms')
+                }
+                lines.push({ t: '第 ' + round + ' 轮', text: row.join('　'), kind: 'server' })
+                await new Promise((r) => setTimeout(r, 0))
+              }
+              const ask = median(results.ask.slice(2))
+              const remember = median(results.remember.slice(2))
+              lines.push({
+                t: '中位数',
+                text: '每次都问 ' + ask.toFixed(3) + ' ms，自己记住 ' + remember.toFixed(3) + ' ms，相差 ' + (ask - remember).toFixed(3) + ' ms（一帧预算 16.7 ms 的 ' + (((ask - remember) / 16.7) * 100).toFixed(1) + '%）',
+                kind: 'result'
+              })
+              return { lines }
+            } finally {
+              release(gl)
+            }
+          }
+        })
+
+        // ---------------- 8：卡片 H、I ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-h'),
+          storageKey: 'lesson-0039-h',
+          cards: [
+            {
+              title: '卡片 H：三种拿入口的办法',
+              tags: ['真实 WebGL', '课程代码'],
+              desc: '同一串 296 块画布（4 层），LiteScope 分别用 ask（每次问）、stack（从栈推导）、remember（自己记住），每种跑「不套」和「每层套一个外层 scope」两种写法，各跑两帧。最后一行是决定 8：每次 IFFT 4 路，换画布的次数变少。',
+              note: LITE_NOTE,
+              question: '每层套一个外层 scope 时，stack 每帧查询几次？',
+              choices: ['8 次：只有 4 个外层 scope 要问', '592 次：内层每次照样都要问', '0 次：一次都不用问 GL'],
+              answer: 0,
+              explain:
+                'stack 只在栈空的时候问，也就是最外层。每层套一个外层 scope，外层 4 个，每个问 2 次，共 8 次；内层的入口就是外层刚绑的画布，不用问。不套的话，296 个 scope 都是最外层，照样 592 次：C 方案要求 Pass 改写法。remember 第 1 帧问 2 次，之后一次都不问。ask 套外层反而多了 8 次（600）；项目真实的 scope 套外层是 896 次，因为出门前还要用 isFramebuffer 确认外层画布还在（第 14 课实测）。',
+              run: () => {
+                const order = C.fftOrder({ rounds: 9, channels: 1 })
+                const lines = []
+                const names = { ask: 'ask（每次问）', stack: 'stack（从栈推导）', remember: 'remember（自己记住）' }
+                for (const strategy of ['ask', 'stack', 'remember']) {
+                  for (const outer of [false, true]) {
+                    const gl = freshGL()
+                    const layers = C.rawTargets(gl, 4, 4)
+                    const outers = outer ? C.rawTargets(gl, 4, 4).map((m) => m.get('final')) : null
+                    const counter = C.countGL(gl)
+                    const scope = new C.LiteScope(gl, strategy)
+                    const frame = () =>
+                      layers.forEach((targets, i) => {
+                        const inner = () => {
+                          for (const name of order) scope.run(targets.get(name), 4, () => {})
+                        }
+                        if (outer) scope.run(outers[i], 4, inner)
+                        else inner()
+                      })
+                    counter.reset()
+                    frame()
+                    const first = counter.read().queryTotal
+                    counter.reset()
+                    frame()
+                    const second = counter.read().queryTotal
+                    lines.push({
+                      t: names[strategy],
+                      text: (outer ? '每层套外层：' : '不套：') + '第 1 帧 ' + first + ' 次，第 2 帧 ' + second + ' 次',
+                      kind: strategy === 'stack' && outer ? 'result' : 'server'
+                    })
+                    counter.stop()
+                    release(gl)
+                  }
+                }
+                {
+                  const order4 = C.fftOrder({ rounds: 9, channels: 4 })
+                  const gl = freshGL()
+                  const layers = C.rawTargets(gl, 4, 4)
+                  const counter = C.countGL(gl)
+                  const scope = new C.LiteScope(gl, 'ask')
+                  for (const targets of layers) for (const name of order4) scope.run(targets.get(name), 4, () => {})
+                  lines.push({ t: '决定 8', text: '每次 IFFT 4 路：每层 ' + order4.length + ' 次换画布，ask 每帧 ' + counter.read().queryTotal + ' 次', kind: 'server' })
+                  counter.stop()
+                  release(gl)
+                }
+                return { lines }
+              }
+            },
+            {
+              title: '卡片 I：有人绕过 scope 直接绑了画布',
+              tags: ['真实 WebGL', '课程代码'],
+              desc: '1 × 1 的画布 A 和 X。scope 先进出 A 一次（入口是屏幕）。然后别的代码直接调用 gl.bindFramebuffer 绑上 X，准备往 X 里画；在它画之前，scope 又进出了 A 一次。最后别的代码把「当前画布」清成红色，读 X 和屏幕各一个像素。ask 和 remember 各做一遍。',
+              note: LITE_NOTE,
+              question: '用 remember 时，红色落在哪里？',
+              choices: ['屏幕上：出门时绑回了记住的屏幕', 'X 上：出门时绑回了别人绑的 X', '哪儿都没有：clear 会报一个错'],
+              answer: 0,
+              explain:
+                'remember 记得「上次出门绑的是屏幕」，不知道别人后来绑了 X。第二次进门它拿记住的屏幕当入口，出门就绑回了屏幕；别的代码以为自己在往 X 里清，红色却落在屏幕上，X 还是空的，getError 是 0：画错了地方，而且没有任何报错。ask 每次进门都问真实绑定，问到 X，出门绑回 X，红色落在 X 里。这就是 B 方案必须「Backend 独占 context」的原因。',
+              run: () => {
+                const lines = []
+                for (const strategy of ['ask', 'remember']) {
+                  const gl = freshGL()
+                  const [targets] = C.rawTargets(gl, 1, 1)
+                  const A = targets.get('ping')
+                  const X = targets.get('final')
+                  const scope = new C.LiteScope(gl, strategy)
+                  scope.run(A, 1, () => {})
+                  gl.bindFramebuffer(gl.FRAMEBUFFER, X) // 别的代码绕过 scope，直接绑 X
+                  scope.run(A, 1, () => {})
+                  const afterIsX = gl.getParameter(gl.FRAMEBUFFER_BINDING) === X
+                  gl.clearColor(1, 0, 0, 1)
+                  gl.clear(gl.COLOR_BUFFER_BIT) // 别的代码以为自己在清 X
+                  const read = (fb) => {
+                    gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
+                    const p = new Uint8Array(4)
+                    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p)
+                    return '(' + Array.from(p).join(', ') + ')'
+                  }
+                  lines.push({
+                    t: strategy,
+                    text: '出门后绑着 ' + (afterIsX ? 'X' : '屏幕') + '；X 读到 ' + read(X) + '，屏幕读到 ' + read(null) + '，getError ' + gl.getError(),
+                    kind: strategy === 'remember' ? 'abort' : 'server'
+                  })
+                  release(gl)
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0039"]'), [
+          {
+            q: 'HW2 每帧查询 7 次。场景里再加 300 个物体，每帧查询几次？',
+            opts: ['还是 7 次：查询只在进门和清屏时发生', '2107 次：每个物体多查询 7 次', '607 次：每个物体多查询 2 次'],
+            answer: 0,
+            why: 'ForwardPass 在一个 scope 里画完所有物体，只进一次门；draw 本身在缓存热了之后不查询（卡片 B）。'
+          },
+          {
+            q: 'FFT 为什么每次 draw 都要单独进一次门？',
+            opts: ['每轮写的画布都和上一轮不同，而一扇门只对一个目的地', 'Backend 规定每个 scope 里最多只能 draw 一次', '每次 draw 都要清屏，而清屏只能在进门时做'],
+            answer: 0,
+            why: '读写不能是同一块画布，只好 ping-pong；withRenderSurface 进门时定好目的地，换画布只能出门再进（4.3 节）。'
+          },
+          {
+            q: 'FFT 为什么不能一次 draw 把 IFFT 算完？',
+            opts: ['一次算完每格要读 N 格，分轮只读两格', 'fragment shader 每次最多只能读两次纹理', 'WebGL1 不允许一次 draw 用到多张纹理'],
+            answer: 0,
+            why: '同一次 draw 里像素互相看不到，一次算完只能每格直接读全部 N 格；分 log₂N 轮每轮只读两格，N = 512 时少读约 28 倍（4.2 节）。'
+          },
+          {
+            q: '4 层、N = 256（每个方向 8 轮）、每次 IFFT 1 路，每帧查询几次？',
+            opts: ['528 次：每层 66 次进门，共 264 次', '592 次：和 N = 512 时一样多', '264 次：每次进门只要问一次'],
+            answer: 0,
+            why: '每层 1 + 4 × 2 × 8 + 1 = 66，4 层 264 次进门，每次问 2 次，528 次。可以在第 5 节的自由组合里选 N = 256 核对。'
+          },
+          {
+            q: '旧 v3 只在入口问 7 次，靠的前提是什么？',
+            opts: ['自己拿着 gl、自己按顺序绑画布、中间没有别人', '旧代码用的浏览器能把查询结果全部缓存', '旧代码的每次 draw 都画到同一块画布上'],
+            answer: 0,
+            why: '它直接 bindFramebuffer 换画布，下一次 draw 一定是自己的、一定会自己绑，所以中间不还原也不问（第 6 节）。'
+          },
+          {
+            q: 'B 方案（State 自己记住绑定）最大的风险是什么？',
+            opts: ['有人绕过它直接绑定时，出门绑回错的画布却不报错', '第一帧要多查询很多次，启动时会明显卡顿', '缓存占用的内存会随着 scope 的个数一直增长'],
+            answer: 0,
+            why: '卡片 I：红色落在屏幕上，X 是空的，getError 为 0。所以它的前提是 Backend 独占 context，并且所有绕过 State 的绑定都要让缓存失效（第 8 节）。'
+          }
+        ])
+      })()
+    </script>
+
+  </body>
+</html>

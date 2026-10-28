@@ -1,0 +1,752 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 9 课 · Group、Scene、Mesh 与 Camera</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/gl-sandbox.js"></script>
+    <script src="../assets/predict.js"></script>
+    <script src="../assets/rendering-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 详细设计篇 3/12 · 约 60 分钟</p>
+    <h1>scene ②：Group、Scene、Mesh 与 Camera——节点树上挂的是什么</h1>
+    <p class="lede">
+      第 8 课讲了所有节点共有的部分：Transform 和 SceneNode。这一课讲四个子类各自在节点之上加了什么、为什么这样加：Group 什么都不加，Scene 加了资源账本，Mesh 加了两个借来的资源，Camera 加了投影。主线是一个场景的一生——建起来、每帧被读取、改镜头、被换下——每个函数都回答：作用、所在层、为什么、校验、状态变化、生命周期、和谁有关、挪了位置会怎样。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— Task 19 的 HW2 场景工厂要用这四个类建场景（第 3 节），Task 16 的 RenderListBuilder 每帧要从它们读数据（第 4 节）。读懂各自的契约，写这两个 Task 时就知道哪些检查已经有人做了、哪些得自己做——比如相机的世界矩阵不可逆，就得由 Builder 处理。
+    </div>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">设计问题：四个子类各加了什么</a></li>
+        <li><a href="#s2">一张图看全：一个场景的一生</a></li>
+        <li><a href="#s3">建场景</a>：<a href="#s3-1">Group</a> <a href="#s3-2">Scene</a> <a href="#s3-3">Mesh</a> <a href="#s3-4">相机的构造</a> <a href="#s3-5">验证</a> <a href="#s3-6">候选矩阵</a></li>
+        <li><a href="#s4">每帧读取（Task 16）</a></li>
+        <li><a href="#s5">改镜头：setPerspective</a></li>
+        <li><a href="#s6">换场景：Scene.dispose</a></li>
+        <li><a href="#s7">状态与生命周期总表</a></li>
+        <li><a href="#s8">卡片：跑真实的项目代码</a></li>
+        <li><a href="#s9">检查题</a></li>
+        <li><a href="#s10">架构视角</a></li>
+        <li><a href="#s11">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2>0. 热身：前几课还记得吗</h2>
+    <div class="quiz" data-quiz="lesson-0009-warmup"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0009-warmup"]'), [
+        {
+          q: '把节点从 P1 移到 P2，为什么只比较 worldVersion 不够？',
+          opts: ['两个父节点的版本号是各自数的，数字可能碰巧相等', 'worldVersion 只在读矩阵时才更新', 'add 会把 worldVersion 清零'],
+          answer: 0,
+          why: '第 8 课卡片 C 和那次答疑：版本号只能和同一个对象的旧版本比。这一课的 Mesh 把借来的资源设计成不能替换，也和「能不能重绑」有关（第 3.3 节）。'
+        },
+        {
+          q: '两个 Scene 共用一个 Geometry，其中一个 dispose 了，Geometry 会怎样？',
+          opts: ['引用数减一；另一个 Scene 还持有它，它继续活着', '立刻释放，另一个 Scene 再读它会抛错', 'dispose 抛错，因为还有别的 Scene 持有'],
+          answer: 0,
+          why: '第 5 课卡片 A：Scene.dispose 交还的是自己那一份引用，不是 resource.dispose()。第 6 节会补上第 5 课没讲的：dispose 还有哪些事不做。'
+        },
+        {
+          q: 'WebGL1Uniforms 上传的 uModel、uView 从哪里来？',
+          opts: ['这一次 draw 的 submission：item.worldMatrix 和 view', '共享 Material 的参数', 'Backend 自己保存的当前相机'],
+          answer: 0,
+          why: '第 19 课第 3.6 节。这两个值最初来自这一课的 Mesh 和 Camera：由 Task 16 的 Builder 每帧复制出来（第 4 节、图 3）。'
+        }
+      ])
+    </script>
+
+    <h2 id="s1">1. 设计问题：四个子类各加了什么</h2>
+    <p>
+      场景树上的东西有三类：用来分组的（Group、Scene），要画出来的（Mesh），用来看的（Camera）。它们都需要位置、父子关系、可见性和世界矩阵，所以都继承 (inheritance) SceneNode——它们「是一种」节点。各自多出来的东西却很少：
+    </p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 300" role="img" aria-label="SceneNode 下面有三个子类 Group、Mesh、Camera；Group 下面是 Scene，Camera 下面是 PerspectiveCamera；每个子类只多出少数几样东西">
+          <defs>
+            <marker id="c1-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+          </defs>
+          <rect x="180" y="20" width="400" height="56" rx="6" class="box hl" />
+          <text x="380" y="43" text-anchor="middle" class="title">SceneNode（第 8 课）</text>
+          <text x="380" y="63" text-anchor="middle" class="small">transform · 父子关系 · visible · 世界矩阵缓存</text>
+          <rect x="20" y="120" width="220" height="56" rx="6" class="box" />
+          <text x="130" y="143" text-anchor="middle" class="title">Group</text>
+          <text x="130" y="163" text-anchor="middle" class="small">只加了：debugType</text>
+          <rect x="270" y="120" width="220" height="56" rx="6" class="box" />
+          <text x="380" y="143" text-anchor="middle" class="title">Mesh</text>
+          <text x="380" y="163" text-anchor="middle" class="small">加了：借来的 geometry、material</text>
+          <rect x="520" y="120" width="220" height="56" rx="6" class="box" />
+          <text x="630" y="143" text-anchor="middle" class="title">Camera（抽象）</text>
+          <text x="630" y="163" text-anchor="middle" class="small">加了：投影矩阵、projectionVersion</text>
+          <rect x="20" y="230" width="220" height="56" rx="6" class="box" />
+          <text x="130" y="253" text-anchor="middle" class="title">Scene</text>
+          <text x="130" y="273" text-anchor="middle" class="small">加了：资源账本、disposed</text>
+          <rect x="520" y="230" width="220" height="56" rx="6" class="box" />
+          <text x="630" y="253" text-anchor="middle" class="title">PerspectiveCamera</text>
+          <text x="630" y="273" text-anchor="middle" class="small">加了：四个参数、校验、原子更新</text>
+          <line x1="130" y1="120" x2="250" y2="78" class="line" marker-end="url(#c1-tip)" />
+          <line x1="380" y1="120" x2="380" y2="78" class="line" marker-end="url(#c1-tip)" />
+          <line x1="630" y1="120" x2="510" y2="78" class="line" marker-end="url(#c1-tip)" />
+          <line x1="130" y1="230" x2="130" y2="178" class="line" marker-end="url(#c1-tip)" />
+          <line x1="630" y1="230" x2="630" y2="178" class="line" marker-end="url(#c1-tip)" />
+          <text x="380" y="222" text-anchor="middle" class="small">箭头指向父类：「是一种」SceneNode</text>
+          <text x="380" y="242" text-anchor="middle" class="small">都不是 Resource</text>
+        </svg>
+      </div>
+      <figcaption>图 1 · 四个子类各自在 SceneNode 之上加了什么。它们都有 Transform、父子关系、可见性和世界矩阵（第 8 课）。这几个类都不是 Resource：只有 Scene 有 dispose，释放的是它的账本和树，不是节点本身。</figcaption>
+    </figure>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 18%">类</th><th style="width: 30%">加了什么</th><th>为什么要加（或者为什么只加这么点）</th></tr>
+        <tr><td><a data-src="src/rendering/scene/Group.ts:17">Group</a></td><td>只有一个稳定的诊断类型</td><td>在代码里表达「这是一个分组」；SceneNode 本身就能 new，Group 不是技术上必需的（第 3.1 节）</td></tr>
+        <tr><td><a data-src="src/rendering/scene/Scene.ts:22">Scene</a></td><td>资源账本 <code>retainedResources</code>、单向的 <code>disposed</code></td><td>场景树的根，同时替这个场景登记它要用的资源（第 5 课、第 6 节）</td></tr>
+        <tr><td><a data-src="src/rendering/scene/Mesh.ts:22">Mesh</a></td><td>借来的 Geometry、Material，两个检查存活的 getter</td><td>「在哪里」由节点给，「画什么」由借来的资源给；Mesh 自己不拥有它们（第 3.3 节）</td></tr>
+        <tr><td><a data-src="src/rendering/scene/cameras/Camera.ts:18">Camera</a></td><td>投影矩阵、<code>projectionVersion</code>，抽象的 <code>copyProjectionMatrixTo</code></td><td>相机的位置和朝向由节点给（世界矩阵），镜头由投影给；两者独立变化</td></tr>
+        <tr><td><a data-src="src/rendering/scene/cameras/PerspectiveCamera.ts:150">PerspectiveCamera</a></td><td>fovY、aspect、near、far，验证与原子更新</td><td>具体的投影规则；参数一次整组提交，要么全改、要么不改（第 5 节）</td></tr>
+      </table>
+    </div>
+    <p>
+      <strong>继承和组合 (composition) 在这里各管一半。</strong>Mesh 继承 SceneNode（它「是」一个节点），同时组合了 Geometry 和 Material（它「有」两个资源），但只是借用 (borrow)，不拥有。设计文档写的是两个公开只读字段（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:895">设计 §14.1</a>），实现改成了私有字段加检查存活的 getter：借用方在使用时检查（第 5 课第 5 节）。
+    </p>
+
+    <h2 id="s2">2. 一张图看全：一个场景的一生</h2>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 380" role="img" aria-label="四个阶段顺时针排列：建场景、每帧读取、改镜头、换场景，每个阶段列出会调用的方法">
+          <defs>
+            <marker id="c2-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+          </defs>
+          <rect x="20" y="40" width="340" height="140" rx="8" class="box" />
+          <text x="34" y="64" class="title">① 建场景 · Task 19 的 HW2 场景工厂</text>
+          <text x="34" y="88" class="small">scene = new Scene()</text>
+          <text x="34" y="108" class="small">g = scene.retain(new Geometry(…))</text>
+          <text x="34" y="128" class="small">mesh = new Mesh(g, material)</text>
+          <text x="34" y="148" class="small">camera = new PerspectiveCamera(options)</text>
+          <text x="34" y="168" class="small">scene.add(mesh, camera)</text>
+          <rect x="400" y="40" width="340" height="140" rx="8" class="box hl" />
+          <text x="414" y="64" class="title">② 每帧读取 · Task 16 的 Builder（还没写）</text>
+          <text x="414" y="88" class="small">camera.copyWorldMatrixTo → 求逆得 view</text>
+          <text x="414" y="108" class="small">camera.copyProjectionMatrixTo</text>
+          <text x="414" y="128" class="small">scene.traverseVisible(…)</text>
+          <text x="414" y="148" class="small">mesh.geometry、mesh.material</text>
+          <text x="414" y="168" class="small">mesh.copyWorldMatrixTo</text>
+          <rect x="400" y="220" width="340" height="140" rx="8" class="box" />
+          <text x="414" y="244" class="title">③ 改镜头 · 窗口缩放时</text>
+          <text x="414" y="268" class="small">camera.setPerspective({ …, aspect })</text>
+          <text x="414" y="288" class="small">验证 → 比较 → 候选矩阵 → 提交 → 版本加一</text>
+          <text x="414" y="308" class="small">参数只能整组改，改了就重算</text>
+          <rect x="20" y="220" width="340" height="140" rx="8" class="box" />
+          <text x="34" y="244" class="title">④ 换场景 · 切换 preset 时</text>
+          <text x="34" y="268" class="small">engine.setScene(next.scene, next.camera)</text>
+          <text x="34" y="288" class="small">old.dispose()</text>
+          <text x="34" y="308" class="small">先换上新的，再释放旧的</text>
+          <text x="34" y="328" class="small">共用的资源只少一份引用</text>
+          <line x1="360" y1="110" x2="398" y2="110" class="line" marker-end="url(#c2-tip)" />
+          <line x1="570" y1="180" x2="570" y2="218" class="line" marker-end="url(#c2-tip)" />
+          <line x1="400" y1="290" x2="362" y2="290" class="line" marker-end="url(#c2-tip)" />
+        </svg>
+      </div>
+      <figcaption>图 2 · 一个场景的一生，也是这一课的阅读顺序。① 每个资源都要 retain，Mesh 只借用；相机也是节点，挂进场景树。② 每帧由 Task 16 的 RenderListBuilder 读取，它还没实现，调用顺序按<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1032">设计 §16</a>。③ 窗口缩放时改 aspect。④ 切换 preset 时先换上新场景，再释放旧场景（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1713">设计 §26</a>）。</figcaption>
+    </figure>
+
+    <h2 id="s3">3. 建场景</h2>
+    <p>读下面每一节时，先看代码摘录（行尾注释是我加的；「节选」表示省略了一部分），再看表。</p>
+
+    <h3 id="s3-1">3.1 Group：什么都不加的类</h3>
+    <pre><code>export class Group extends SceneNode {                                     // Group.ts:17–31
+  protected override get debugType(): string {
+    return 'Group'                                                         // 唯一加的东西：稳定的诊断类型
+  }
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>表示「这些节点在场景结构里属于同一组」。父子关系、Transform、遍历、世界矩阵全部继承 SceneNode（<a data-src="src/rendering/scene/Group.ts:9">Group.ts:9–15</a>）。</td></tr>
+      <tr><th>所在层</th><td>第一层 scene。</td></tr>
+      <tr><th>为什么需要它</th><td>一是语义：<code>new Group()</code> 比 <code>new SceneNode()</code> 更清楚地说出意图；二是诊断标签 (debug label)：不覆写的话，一个没起名的分组在日志里显示成 <code>SceneNode#xxxxxxxx</code>。</td></tr>
+      <tr><th>为什么写死字符串</th><td>生产构建会压缩 (minify) 类名，<code>constructor.name</code> 不可靠（:24–26）。第 7 课实测过：RenderingError.ts 里没写 name 的 19 个错误类，压缩后 name 是空字符串。scene 的类都用 debugType 写死了类型，没有这个问题。</td></tr>
+      <tr><th>状态、生命周期</th><td>没有新增状态。不是 Resource，没有 dispose，不拥有任何资源（:12–13）。</td></tr>
+    </table></div>
+
+    <h3 id="s3-2">3.2 Scene：第 5 课读过的账本，这里只补三点</h3>
+    <pre><code>export class Scene extends Group {                                         // Scene.ts:22–144（节选）
+  private disposedValue = false                                            // 单向：false → true
+  private readonly retainedResources = new Set&lt;Resource&gt;()                  // 本 Scene 的账本：每个资源最多记一次
+  retain&lt;T extends Resource&gt;(resource: T): T { … return resource }           // 返回原对象，可以写成一个表达式
+  release(resource: Resource): boolean { … }                               // 没登记过、或者已经在释放：返回 false，不抛错
+  dispose(): void { … }                                                    // 第 6 节
+}</code></pre>
+    <p>retain、release、dispose 各自的顺序，第 5 课第 4 节已经逐行读过了（先让资源同意再记账、先销账再交还、先标记再释放）。第 5 课没讲的三点：</p>
+    <ol>
+      <li><strong>Scene 也是节点。</strong>它继承 Group，所以有 Transform，也能被 <code>add</code> 到别的节点下面——包括另一个 Scene。add 只检查重复和环（第 8 课），不拒绝 Scene。卡片 G 和审查视角 1 讨论这件事。</li>
+      <li><strong>三个返回值各有用意。</strong>retain 返回传进来的那个对象，并保留具体类型（泛型 <code>T</code>）：<code>const geometry = scene.retain(new Geometry(…))</code> 一行里创建并登记（:72–75）。release 返回 boolean：「没登记过」是正常情况，不值得抛错。dispose 幂等：调几次都一样。</li>
+      <li><strong>真实流程里怎样用它。</strong>HW2 场景工厂加载失败时，已经 retain 的资源由 <code>scene.dispose()</code> 一起交还；还没登记的，由创建它的代码自己 dispose（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1740">设计 §26</a>）。所以工厂最稳妥的写法，是资源一创建就 retain。</li>
+    </ol>
+
+    <h3 id="s3-3">3.3 Mesh：借来的资源，换不掉</h3>
+    <pre><code>constructor(geometry: Geometry, material: Material) {                     // Mesh.ts:35–45
+  super()                                                                  // JS 规定：用 this 之前先调父类构造
+  if (!(geometry instanceof Geometry)) throw new InvalidMeshError('geometry')   // 运行时类型：TS 的类型编译后就没了
+  if (!(material instanceof Material)) throw new InvalidMeshError('material')
+  geometry.assertUsable()                                                  // 已经释放的资源不能借：抛 ResourceDisposedError
+  material.assertUsable()
+  this.geometryValue = geometry                                           // private readonly：构造之后再也换不了
+  this.materialValue = material                                            // 不 retain、不订阅：只借用
+}
+
+get geometry(): Geometry {                                                 // Mesh.ts:56–59
+  this.geometryValue.assertUsable()                                        // 每次读都查：构造之后资源仍可能被释放
+  return this.geometryValue                                                // 读字段，不读 this.geometry（那会无限递归）
+}</code></pre>
+    <aside class="note"><strong>10 月 10 日更新</strong>：这三处以前写的是 <code>if (geometry.disposed) throw new ResourceDisposedError('Geometry')</code>，资源名要手写；现在调用资源自己的 <code>assertUsable()</code>（它从 protected 改成了 public，见第 7 课的更新），错误里的名字由资源的 resourceType 给出。行为没变。</aside>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>把「在哪里」（继承来的节点和世界矩阵）和「画什么」（借来的 Geometry、Material）组合起来。</td></tr>
+      <tr><th>所在层</th><td>第一层 scene。第二层的 Builder 每帧读它（第 4 节）。</td></tr>
+      <tr><th>校验</th><td>构造时两层：类型不对抛 <code>InvalidMeshError</code>（调用者传错了东西），已释放抛 <code>ResourceDisposedError</code>。之后每次读 geometry、material 都再查一次存活（:56–69）。</td></tr>
+      <tr><th>状态变化</th><td>构造之后，Mesh 自己的状态只有继承来的那些（Transform、父子关系、可见性）。两个 getter 什么都不改。</td></tr>
+      <tr><th>生命周期</th><td>Mesh 没有 dispose（:14）。它的对象寿命交给垃圾回收：没人引用了就回收。它「能不能用」是另一回事，取决于借来的资源是否还活着（第 7 节的表）。</td></tr>
+      <tr><th>为什么不能替换</th><td>构造时验证一次就够了；如果允许 <code>mesh.geometry = other</code>，替换时就得重新验证类型和存活，还得决定谁去 retain 新资源——Mesh 并不知道自己在哪个 Scene 里。另外，将来任何按 Mesh 缓存的数据都要多一种失效（第 8 课答疑讲的「重绑」）。卡片 A 看看赋值会怎样。</td></tr>
+      <tr><th>模型矩阵在哪</th><td>就是继承来的世界矩阵，不另存一份，也不写进 Material（:16–19）。两个 Mesh 共用一个 Material 时，各自的模型矩阵仍然独立（测试 <a data-src="tests/unit/rendering/scene/Mesh.test.ts:103">Mesh.test.ts:103</a>）。</td></tr>
+      <tr><th>如果挪位置</th><td>构造函数里先赋值、后验证也不会留下「半个 Mesh」：构造函数一抛错，对象根本不会交到调用者手里。构造函数天然是原子的；真正要讲究顺序的是能被反复调用的 setter（第 5 节）。</td></tr>
+    </table></div>
+
+    <h3 id="s3-4">3.4 PerspectiveCamera 的构造：先有节点，再有镜头</h3>
+    <pre><code>constructor(options: PerspectiveCameraOptions) {                          // PerspectiveCamera.ts:165–176
+  super()                                                                  // Camera → SceneNode：先有节点
+  const next = copyValidatedOptions(options)                               // ① 每个字段读一次、验证，得到自己的快照
+  const projection = createProjection(next)                                // ② 用快照算候选矩阵，并检查 Float32 结果
+  this.fovYValue = next.fovY                                               // ③ 全部通过才写
+  this.aspectValue = next.aspect
+  this.nearValue = next.near
+  this.farValue = next.far
+  mat4.copy(this.projectionMatrixValue, projection)                        //    版本保持 0：新相机还没有「变化」
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>构造一个有效的透视相机：构造一结束，投影矩阵就可以用，<code>projectionVersion</code> 为 0。</td></tr>
+      <tr><th>所在层</th><td>第一层 scene 的 cameras/。父类 <a data-src="src/rendering/scene/cameras/Camera.ts:18">Camera</a> 是抽象类，构造器是 protected（:26–28）：只有单位矩阵占位的「相机」不算一个完整对象，外面不能直接 new。</td></tr>
+      <tr><th>为什么这样分工</th><td>相机的位置和朝向是节点的事：世界矩阵，由 SceneNode 管，所以相机可以挂在移动的物体上。镜头是投影的事：由 fovY、aspect、near、far 决定。两者各有自己的版本号（worldVersion、projectionVersion），互不影响（测试 <a data-src="tests/unit/rendering/scene/cameras/PerspectiveCamera.test.ts:204">PerspectiveCamera.test.ts:204</a>）。</td></tr>
+      <tr><th>Camera 不做的事</th><td>不缓存视图矩阵 (view matrix)：它就是世界矩阵的逆，由每帧提取时去求，不可逆的情况也在那里处理（<a data-src="src/rendering/scene/cameras/Camera.ts:11">Camera.ts:11–12</a>）。不是 Resource，没有引用计数，也没有 GPU 生命周期（:15）。</td></tr>
+      <tr><th>生命周期</th><td>和 Mesh 一样交给垃圾回收。一个场景里可以有多个相机，它不是全局单例（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:963">设计 §14.2</a>）。</td></tr>
+    </table></div>
+    <p>构造用到的两个函数，也是第 5 节 setPerspective 的前两步，下面逐个读。</p>
+
+    <h3 id="s3-5">3.5 copyValidatedOptions：读一次，得到自己的快照</h3>
+    <pre><code>function copyValidatedOptions(options: PerspectiveCameraOptions): PerspectiveCameraOptions {   // :38–86
+  assertNonArrayObject(                                                    // null、数组、数字都不是 options
+    options,
+    () =&gt; new InvalidPerspectiveCameraError('options', 'must be a non-array object')
+  )
+  const fovYInput = options.fovY                                           // 每个字段只读这一次
+  const fovY = requireFiniteNumber(                                        // 必须是 number 而且有限
+    fovYInput,
+    () =&gt;
+      new InvalidPerspectiveCameraError('fovY', 'must be a finite number', { received: fovYInput })
+  )
+  // aspect、near、far 照样：先存进 aspectInput 这样的局部变量，再查（:51–70）
+  if (fovY&lt;= 0 || fovY &gt;= Math.PI) throw …('fovY', 'must satisfy 0 &lt; fovY &lt; PI')   // 弧度：写成 90 度会被挡住
+  if (aspect &lt;= 0) throw …('aspect', 'must be positive')
+  if (near &lt;= 0) throw …('near', 'must be positive')
+  if (far &lt;= near) throw …('far', 'must be greater than near')           // 字段之间的关系
+  return { fovY, aspect, near, far }                                       // 新对象：之后只用它，不再碰调用者的 options
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>把调用者传来的配置读一遍、验证，复制成一个新的快照 (snapshot)。</td></tr>
+      <tr><th>为什么要快照</th><td>两个原因。一是验证过的值就是后面使用的值：如果提交时再去读 <code>options.near</code>，调用者的对象（比如一个 getter）完全可以返回另一个值（卡片 B）。二是不留别名：相机不保存调用者的对象，构造之后调用者再改它，相机不受影响（测试 <a data-src="tests/unit/rendering/scene/cameras/PerspectiveCamera.test.ts:51">PerspectiveCamera.test.ts:51</a>）。</td></tr>
+      <tr><th>校验</th><td>形状：是对象、不是数组、不是 null；类型：四个字段都是有限的 number（字符串 <code>'2'</code> 不行）；范围：0 &lt; fovY &lt; π，aspect &gt; 0，near &gt; 0；关系：far &gt; near，不接受 Infinity。测试把 19 种坏输入逐个试过（<a data-src="tests/unit/rendering/scene/cameras/PerspectiveCamera.test.ts:165">:165–195</a>）。</td></tr>
+      <tr><th>没有检查的</th><td>多余的字段。它只读这四个字段，别的字段悄悄忽略；第 19 课的 SurfaceScope 却会拒绝未知字段（审查视角 2）。</td></tr>
+      <tr><th>状态变化</th><td>无：这是一个纯函数，只读调用者的对象、返回新对象，不碰相机（:20）。</td></tr>
+    </table></div>
+    <aside class="note"><strong>10 月 10 日更新</strong>：这个函数换了写法，行为没变。以前它用本文件里自己写的 requireFiniteNumber(value, fieldName)，对象检查也是手写的 if；现在两样都换成 core/validation.ts 的共用函数（第 7 课 6.1 节），错误对象由这里传进去的工厂造。每个字段先存进 <code>fovYInput</code> 这样的局部变量：工厂捕获的就是这一次读到的值，报错时 details 里的 received 不会再去读一遍 options。</aside>
+
+    <h3 id="s3-6">3.6 createProjection：候选矩阵，先检查 Float32 结果</h3>
+    <pre><code>function createProjection(options: PerspectiveCameraOptions): Float32Array {   // :110–133
+  const matrix = new Float32Array(16)                                      // 候选：独立的缓冲，还没交给相机
+  const { fovY, aspect, near, far } = options
+  mat4.perspective(matrix, fovY, aspect, near, far)                        // 用 Number 计算，写入时舍入成 Float32
+  for (const value of matrix) {
+    if (!Number.isFinite(value)) throw …('projectionMatrix', 'must contain only finite Float32 values')
+  }
+  if (matrix[0] === 0 || matrix[5] === 0 || matrix[14] === 0) {           // x、y 的缩放和深度项：归零就塌了
+    throw …('projectionMatrix', 'must not collapse a projection axis or depth term to zero')
+  }
+  return matrix
+}</code></pre>
+    <p>先把矩阵写出来。记号：fovY 是垂直视场角（弧度）；aspect 是视口宽 ÷ 高；near、far 是近、远裁剪面到相机的正距离，单位和场景一致（比如米）；f = 1 / tan(fovY / 2)。按列主序存放，下标 i 对应「列 × 4 + 行」：</p>
+    <pre><code>m[0]  = f / aspect                          x 方向缩放
+m[5]  = f                                   y 方向缩放
+m[10] = (far + near) / (near − far)         深度的线性项
+m[11] = −1                                  把 −z 放进 w：透视除法的来源
+m[14] = 2 · far · near / (near − far)       深度的常数项
+其余各项都是 0
+
+例（测试用的那组）：fovY = π/2、aspect = 2、near = 1、far = 11
+→ f = 1，m[0] = 0.5，m[5] = 1，m[10] = −1.2，m[14] = −2.2（PerspectiveCamera.test.ts:69–73）</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>在一块独立的 Float32 缓冲里算出候选 (candidate) 投影矩阵，确认它能用，再交回去；自己不提交任何东西。</td></tr>
+      <tr><th>为什么要检查结果</th><td>「输入有限」不等于「Float32 结果可用」（<a data-src="src/rendering/scene/docs/mesh-and-camera.zh-CN.md:35">mesh-and-camera.zh-CN.md:35</a>）。计算用 Number（Float64），写进 Float32Array 时才舍入：fovY = 1e-39 通过了输入验证，但 f ≈ 2×10³⁹ 超出了 Float32 的上限（约 3.4×10³⁸），存进去就是 Infinity（卡片 C）。</td></tr>
+      <tr><th>为什么只查这三项是不是 0</th><td>x_clip = m[0]·x：m[0] 归零，所有点的 x 都塌成 0；m[5] 同理管 y。深度：z_ndc = (m[10]·z + m[14]) / (−z) = −m[10] − m[14]/z，只有 m[14] 让深度随 z 变化；它归零，所有点的深度都一样，深度测试就失效了。m[10] 不用查：near、far 都是正数，|far + near| &gt; |near − far|，所以 |m[10]| 总大于 1。m[11] 恒为 −1。</td></tr>
+      <tr><th>它不拦什么</th><td>只拦「明确不可用」的结果：Infinity、NaN、归零（:100–102）。aspect = 1e39 时，m[0] = 1e-39 在 Float32 里是一个次正规数 (subnormal)，不是 0，所以会被放行；aspect = 1e46 时 m[0] 舍入成 0，才会被拒绝（我用 Node 实测过）。这不是数值条件数评估。</td></tr>
+      <tr><th>如果挪位置</th><td>先把矩阵算进相机自己的缓冲、再检查，检查失败时旧矩阵已经被覆盖了。所以它必须用独立缓冲，检查通过才让调用者复制进去（第 5 节的 ④）。</td></tr>
+    </table></div>
+
+    <h2 id="s4">4. 每帧读取：Task 16 的 Builder 会调用什么</h2>
+    <p>（10 月 13 日补：Builder 已经实现，和这段示意的差别见<a href="0030-frame-orchestration.html#s5-1">第 30 课 5.1 节</a>。）Builder 还没实现。下面是按<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1032">设计 §16</a> 的顺序写的示意，<strong>是课程写的，项目里还没有这段代码</strong>；看它调用了这一课的哪些方法：</p>
+    <pre><code>// 示意（课程写的）：RenderListBuilder.build 会按这个顺序读场景
+build({ scene, camera }) {
+  const world = new Float32Array(16)
+  camera.copyWorldMatrixTo(world)                // ① 相机的世界矩阵（会先更新它的祖先）
+  const view = invert(world)                     //    视图矩阵是它的逆；不可逆（比如缩放为 0）要在这里拒绝
+  const projection = new Float32Array(16)
+  camera.copyProjectionMatrixTo(projection)      //    投影：复制一份，拿不到内部数组
+  const viewState = freeze({ viewMatrix: tuple(view), projectionMatrix: tuple(projection),
+                             cameraWorldPosition: [world[12], world[13], world[14]] })
+  scene.traverse((node) =&gt; node.updateWorldMatrix())   // ② 设计里的「更新场景 world matrix」：每个节点最多重算一次
+  scene.traverseVisible((node) =&gt; {                // ③ 只走可见的子树
+    if (!(node instanceof Mesh)) return
+    const matrix = new Float32Array(16)
+    node.copyWorldMatrixTo(matrix)               // ④ 模型矩阵就是世界矩阵：复制
+    items.push(freeze({ geometry: node.geometry, //    getter：先查存活，再借出同一个对象
+                        material: node.material,
+                        worldMatrix: tuple(matrix) }))
+  })
+  … 按 material.queue 分到 background / opaque，再冻结
+}</code></pre>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 260" role="img" aria-label="相机的世界矩阵求逆、投影矩阵复制，得到 ViewState；Mesh 的世界矩阵复制进 RenderItem，Geometry 和 Material 只借出同一个对象">
+          <defs>
+            <marker id="c3-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+          </defs>
+          <rect x="20" y="30" width="230" height="90" rx="6" class="box" />
+          <text x="135" y="52" text-anchor="middle" class="title">PerspectiveCamera</text>
+          <text x="34" y="76" class="small">世界矩阵（继承 SceneNode）</text>
+          <text x="34" y="96" class="small">投影矩阵（私有 Float32Array）</text>
+          <rect x="20" y="150" width="230" height="90" rx="6" class="box" />
+          <text x="135" y="172" text-anchor="middle" class="title">Mesh</text>
+          <text x="34" y="196" class="small">世界矩阵（继承 SceneNode）</text>
+          <text x="34" y="216" class="small">geometry、material（借来的）</text>
+          <rect x="510" y="30" width="230" height="90" rx="6" class="box hl" />
+          <text x="625" y="52" text-anchor="middle" class="title">ViewState（值快照）</text>
+          <text x="524" y="76" class="small">viewMatrix = 世界矩阵的逆</text>
+          <text x="524" y="94" class="small">projectionMatrix：16 个数</text>
+          <text x="524" y="112" class="small">cameraWorldPosition</text>
+          <rect x="510" y="150" width="230" height="90" rx="6" class="box hl" />
+          <text x="625" y="172" text-anchor="middle" class="title">RenderItem（快照 + 借用）</text>
+          <text x="524" y="196" class="small">worldMatrix：16 个数</text>
+          <text x="524" y="216" class="small">geometry、material：同一个对象</text>
+          <line x1="250" y1="62" x2="508" y2="62" class="line" marker-end="url(#c3-tip)" />
+          <text x="379" y="55" text-anchor="middle" class="small halo">copyWorldMatrixTo → 求逆</text>
+          <line x1="250" y1="98" x2="508" y2="98" class="line" marker-end="url(#c3-tip)" />
+          <text x="379" y="91" text-anchor="middle" class="small halo">copyProjectionMatrixTo：复制</text>
+          <line x1="250" y1="182" x2="508" y2="182" class="line" marker-end="url(#c3-tip)" />
+          <text x="379" y="175" text-anchor="middle" class="small halo">copyWorldMatrixTo：复制</text>
+          <line x1="250" y1="218" x2="508" y2="218" class="line dash" marker-end="url(#c3-tip)" />
+          <text x="379" y="211" text-anchor="middle" class="small halo">getter：先查存活，再借出同一个对象</text>
+        </svg>
+      </div>
+      <figcaption>图 3 · 每帧提取时，数据怎样从场景对象流进快照。实线是复制出来的值：矩阵变成 16 个 number 的元组，之后再移动相机、改 Mesh，已经做好的快照都不变；cameraWorldPosition 取相机世界矩阵的第 12–14 项。虚线是借来的身份：RenderItem 里的 Geometry、Material 还是原来那个对象，所以 Backend 用的时候还要再查一次存活（第 19 课）。</figcaption>
+    </figure>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 24%">被调用的方法</th><th style="width: 28%">它保证什么</th><th>为什么这样设计</th></tr>
+        <tr><td><code>camera.copyWorldMatrixTo(out)</code>（<a data-src="src/rendering/scene/SceneNode.ts:391">SceneNode.ts:391</a>）</td><td>先沿父链按需更新，再把世界矩阵复制进 out</td><td>相机是节点，所以挂在移动的父节点上也能拿到正确位置。视图矩阵不缓存，由 Builder 求逆（Camera.ts:11–12）</td></tr>
+        <tr><td><code>camera.copyProjectionMatrixTo(out)</code>（<a data-src="src/rendering/scene/cameras/PerspectiveCamera.ts:238">:238–240</a>）</td><td>只复制：不重算、不加版本、不交出内部缓冲</td><td>如果交出内部数组，调用者改了它，就绕过了 setPerspective 的验证和版本号（测试 <a data-src="tests/unit/rendering/scene/cameras/PerspectiveCamera.test.ts:99">:99</a>）</td></tr>
+        <tr><td><code>scene.traverseVisible(visitor)</code>（<a data-src="src/rendering/scene/SceneNode.ts:303">SceneNode.ts:303</a>）</td><td>跳过不可见节点的整棵子树</td><td>visible 管的是「画哪些 Mesh」。相机不靠遍历取得：RenderView 直接给出它，所以相机挂在不可见的分组下照样能用（卡片 F）</td></tr>
+        <tr><td><code>mesh.geometry</code>、<code>mesh.material</code>（<a data-src="src/rendering/scene/Mesh.ts:56">Mesh.ts:56–69</a>）</td><td>资源已释放就抛 <code>ResourceDisposedError</code></td><td>场景里漏 retain 的资源，会在提取这一步就报出来，而不是等到 draw（第 5 课卡片 E）</td></tr>
+        <tr><td><code>mesh.copyWorldMatrixTo(out)</code></td><td>同第一行</td><td>模型矩阵就是世界矩阵；每个 Mesh 一份，和共用的 Material 无关</td></tr>
+        <tr><td><code>material.queue</code>（<a data-src="src/rendering/resources/Material.ts:293">Material.ts:293</a>）</td><td>background 或 opaque</td><td>决定进哪个列表；第 11 课读 Material 时细讲</td></tr>
+      </table>
+    </div>
+    <p>这一步之后，本帧的 Pass 和 Backend 再也不读相机和 Mesh：ViewState 的注释说「Backend 不接收 Camera，因此不能在同一批 draw 中重新读取可变相机状态」（<a data-src="src/rendering/frame/ViewState.ts:11">ViewState.ts:11</a>）。第 6 课讲的「值快照当边界」，就发生在这里。</p>
+
+    <h2 id="s5">5. 改镜头：setPerspective</h2>
+    <pre><code>setPerspective(options: PerspectiveCameraOptions): void {                 // PerspectiveCamera.ts:209–228
+  const next = copyValidatedOptions(options)                               // ① 验证（可能抛错）
+  if (next.fovY === this.fovYValue &amp;&amp; next.aspect === this.aspectValue &amp;&amp;
+      next.near === this.nearValue &amp;&amp; next.far === this.farValue) {
+    return                                                                 // ② 四个 Number 全等：什么都不做
+  }
+  const projection = createProjection(next)                                // ③ 候选矩阵（可能抛错）
+  this.fovYValue = next.fovY                                               // ④ 提交：从这里开始不会再失败
+  this.aspectValue = next.aspect
+  this.nearValue = next.near
+  this.farValue = next.far
+  mat4.copy(this.projectionMatrixValue, projection)
+  this.projectionVersionValue++                                            // ⑤ 真的变了才加一
+}</code></pre>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 300" role="img" aria-label="setPerspective 的五步：验证、比较、候选矩阵、提交、版本加一；前三步的出口都在提交之前，失败时旧状态不变">
+          <defs>
+            <marker id="c4-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+            <marker id="c4-tip-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip bad" /></marker>
+          </defs>
+          <rect x="30" y="20" width="270" height="40" rx="5" class="box" />
+          <text x="44" y="45">① 复制并验证 copyValidatedOptions</text>
+          <rect x="30" y="76" width="270" height="40" rx="5" class="box" />
+          <text x="44" y="101">② 和已提交的四个值比较（===）</text>
+          <rect x="30" y="132" width="270" height="40" rx="5" class="box" />
+          <text x="44" y="157">③ 生成候选矩阵 createProjection</text>
+          <rect x="30" y="188" width="270" height="40" rx="5" class="box hl" />
+          <text x="44" y="213">④ 提交：写四个参数、复制矩阵</text>
+          <rect x="30" y="244" width="270" height="40" rx="5" class="box hl" />
+          <text x="44" y="269">⑤ projectionVersion 加一</text>
+          <line x1="165" y1="60" x2="165" y2="74" class="line" marker-end="url(#c4-tip)" />
+          <line x1="165" y1="116" x2="165" y2="130" class="line" marker-end="url(#c4-tip)" />
+          <line x1="165" y1="172" x2="165" y2="186" class="line" marker-end="url(#c4-tip)" />
+          <line x1="165" y1="228" x2="165" y2="242" class="line" marker-end="url(#c4-tip)" />
+          <rect x="400" y="20" width="340" height="40" rx="5" class="box bad" />
+          <text x="414" y="45">抛错：输入不合法 → 状态不变</text>
+          <rect x="400" y="76" width="340" height="40" rx="5" class="box" />
+          <text x="414" y="101">完全相同 → 直接返回，不重算、不加版本</text>
+          <rect x="400" y="132" width="340" height="40" rx="5" class="box bad" />
+          <text x="414" y="157">抛错：Float32 溢出或归零 → 状态不变</text>
+          <rect x="400" y="188" width="340" height="96" rx="5" class="box ok" />
+          <text x="414" y="228">走到 ④ 就不会再失败：</text>
+          <text x="414" y="250">参数、矩阵、版本一起更新</text>
+          <line x1="300" y1="40" x2="398" y2="40" class="line bad dash" marker-end="url(#c4-tip-b)" />
+          <text x="349" y="33" text-anchor="middle" class="small bad halo">失败</text>
+          <line x1="300" y1="96" x2="398" y2="96" class="line" marker-end="url(#c4-tip)" />
+          <text x="349" y="89" text-anchor="middle" class="small halo">相同</text>
+          <line x1="300" y1="152" x2="398" y2="152" class="line bad dash" marker-end="url(#c4-tip-b)" />
+          <text x="349" y="145" text-anchor="middle" class="small bad halo">失败</text>
+          <line x1="300" y1="236" x2="398" y2="236" class="line" marker-end="url(#c4-tip)" />
+          <text x="349" y="229" text-anchor="middle" class="small halo">成功</text>
+        </svg>
+      </div>
+      <figcaption>图 4 · setPerspective 的五步。会失败的两步（① 验证输入、③ Float32 结果）都在 ④ 提交之前，所以一旦抛错，相机还是调用前的样子（卡片 D）；② 在重算之前比较，完全相同就直接返回。构造函数走的是同一条路，只是没有 ② 和 ⑤：新相机的版本从 0 开始。</figcaption>
+    </figure>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>原子地 (atomically) 提交一整组新的透视参数：要么参数、矩阵、版本一起变，要么都不变（<a data-src="src/rendering/scene/cameras/PerspectiveCamera.ts:141">:141–142</a>）。</td></tr>
+      <tr><th>所在层</th><td>第一层 scene。调用者是应用层：窗口缩放时改 aspect，调焦时改 fovY。</td></tr>
+      <tr><th>为什么要整组传</th><td>不接受部分更新（:205），调用者要显式保留其余字段：<code>camera.setPerspective({ fovY: camera.fovY, aspect: w / h, near: camera.near, far: camera.far })</code>。多写几个字，换来的是：每一次修改都是一组完整、验证过的配置，不存在「改了一半」的中间状态。</td></tr>
+      <tr><th>校验</th><td>第 3.5、3.6 节的全部检查，外加 ② 的全等比较。</td></tr>
+      <tr><th>状态变化</th><td>成功：四个参数、投影矩阵、<code>projectionVersion + 1</code>。相同或失败：什么都不变。和 <code>worldVersion</code>、Transform 都无关（卡片 F 的相机位置不受它影响）。</td></tr>
+      <tr><th>版本的含义</th><td>参数按 Number 保存、按 Number 比较，只有矩阵是 Float32（:144–148）。所以重复设 near = 0.1 不加版本（测试 <a data-src="tests/unit/rendering/scene/cameras/PerspectiveCamera.test.ts:117">:117</a>）；而两个只差 2ε 的 aspect 算出完全相同的 Float32 矩阵，版本仍然加一（卡片 E）。版本记的是「配置变了」，不是「矩阵变了」。它是给消费者发现旧快照过期用的，不是历史记录（mesh-and-camera.zh-CN.md:52）。</td></tr>
+    </table></div>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 26%">调换</th><th style="width: 10%">硬 / 软</th><th>换了会怎样</th></tr>
+        <tr><td>④ 挪到 ③ 之前（先写参数，再算矩阵）</td><td>硬</td><td>③ 抛错时，参数已经是新的，矩阵还是旧的：相机自相矛盾，也回不到调用前。</td></tr>
+        <tr><td>③ 算进相机自己的缓冲</td><td>硬</td><td>检查失败时旧矩阵已被覆盖。所以候选矩阵必须用独立缓冲（第 3.6 节）。</td></tr>
+        <tr><td>② 挪到 ③ 之后（先算，再比较）</td><td>软</td><td>结果一样，只是相同的配置也白算一次矩阵。</td></tr>
+        <tr><td>⑤ 挪到 ④ 之前</td><td>软</td><td>④ 不会抛错，结果相同；但读代码的人要多想一步：「版本加了、状态没写」可能发生吗？</td></tr>
+        <tr><td>① 挪到后面</td><td>不可能</td><td>后面每一步用的都是 ① 返回的快照。</td></tr>
+      </table>
+    </div>
+    <p><strong>两种避开「Float64 输入比 Float32 存储」的办法。</strong>第 8 课的 Transform 和这里的相机都要回答「这次设置算不算变化」，做法不同：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 22%"></th><th>Transform（第 8 课）</th><th>PerspectiveCamera</th></tr>
+        <tr><td>保存成什么</td><td>Float32（vec3）</td><td>参数存 Number，只有矩阵是 Float32</td></tr>
+        <tr><td>比较什么</td><td>先 Math.fround，再比 Float32</td><td>直接比 Number</td></tr>
+        <tr><td>重复设 0.1</td><td>version 不变</td><td>projectionVersion 不变</td></tr>
+        <tr><td>只差一点点的两个值</td><td>量化后相同 → 不变</td><td>Number 不同 → 加一，即使矩阵完全相同</td></tr>
+        <tr><td>版本记的是</td><td>存储的值变了</td><td>配置变了</td></tr>
+      </table>
+    </div>
+
+    <h2 id="s6">6. 换场景：Scene.dispose 做什么、不做什么</h2>
+    <pre><code>dispose(): void {                                                          // Scene.ts:131–143
+  if (this.disposedValue) return                                           // 幂等
+  this.disposedValue = true                                                // 先标记：之后 retain 抛错、release 返回 false
+  this.removeAllChildren()                                                 // 只摘下直接子节点（它们的世界矩阵被标脏）
+  for (const resource of this.retainedResources) {
+    resource.releaseSceneReference()                                       // 交还自己那一份引用，不是 resource.dispose()
+  }
+  this.retainedResources.clear()
+}</code></pre>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 50%">做的事</th><th>不做的事</th></tr>
+        <tr><td>标记 disposed，从此拒绝 retain</td><td>不释放任何节点：节点不是 Resource。摘下来的 Mesh、相机还能挂到别的场景（测试 <a data-src="tests/unit/rendering/scene/Mesh.test.ts:125">Mesh.test.ts:125</a>）</td></tr>
+        <tr><td>摘下全部直接子节点</td><td>不把自己从父节点上摘下：Scene 如果被挂在别的节点下，dispose 之后还挂在那里（我用 Node 实测过）</td></tr>
+        <tr><td>对账本里每个资源交还一份引用；归零的资源随之真正释放</td><td>不级联到子 Scene：被挂在下面的另一个 Scene 只是被摘下，它自己的账本原封不动（卡片 G）</td></tr>
+        <tr><td>清空账本</td><td>不直接调用 resource.dispose()：别的 Scene 还持有的资源只少一份引用（第 5 课）</td></tr>
+      </table>
+    </div>
+    <p>
+      <strong>在真实流程里：</strong>Engine.setScene 先完成新场景、新相机的替换，再 dispose 旧场景；传入的相机不在新场景的树里就拒绝（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1713">设计 §26</a>）。先换新、后释放，新旧场景共用的资源才不会在交接的一瞬间被释放（第 5 课的检查题）。「相机必须在场景树里」这条检查，在这一课的类里还没有，是 Engine（Task 21）要做的。
+    </p>
+
+    <h2 id="s7">7. 状态与生命周期总表</h2>
+    <p><strong>每个函数改了什么：</strong></p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 30%">函数</th><th style="width: 38%">改了什么</th><th>不改什么</th></tr>
+        <tr><td><code>scene.retain(r)</code></td><td>首次：账本多一项，r 的 Scene 引用数加一</td><td>树、r 的其他状态</td></tr>
+        <tr><td><code>scene.release(r)</code></td><td>账本少一项，引用数减一；减到 0 时 r 真正释放</td><td>树</td></tr>
+        <tr><td><code>scene.dispose()</code></td><td>disposed；直接子节点全摘下；每个登记资源引用数减一；账本清空</td><td>节点对象本身、自己的父节点、子 Scene 的账本</td></tr>
+        <tr><td><code>new Mesh(g, m)</code></td><td>新的节点（UUID、Transform 等）</td><td>g、m 的引用数和订阅</td></tr>
+        <tr><td><code>mesh.geometry</code> / <code>material</code></td><td>无（资源已释放就抛错）</td><td>—</td></tr>
+        <tr><td><code>new PerspectiveCamera(o)</code></td><td>四个参数、投影矩阵；projectionVersion = 0</td><td>调用者的 o</td></tr>
+        <tr><td><code>camera.setPerspective(o)</code></td><td>成功时：四个参数、投影矩阵、projectionVersion + 1</td><td>worldVersion、Transform；失败或相同时什么都不改</td></tr>
+        <tr><td><code>camera.copyProjectionMatrixTo(out)</code></td><td>out</td><td>相机的任何状态</td></tr>
+        <tr><td><code>scene.traverseVisible(v)</code></td><td>无（visitor 自己做的除外）</td><td>—</td></tr>
+      </table>
+    </div>
+    <p><strong>谁怎样「结束」：</strong></p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 22%">对象</th><th style="width: 18%">是 Resource 吗</th><th>怎样结束，结束之后</th></tr>
+        <tr><td>Scene</td><td>否</td><td>scene.dispose()，单向。之后 retain 抛错、release 返回 false；对象本身交给垃圾回收</td></tr>
+        <tr><td>Group、Mesh、Camera</td><td>否</td><td>没有 dispose：没人引用了就被垃圾回收</td></tr>
+        <tr><td>Mesh「能不能用」</td><td>—</td><td>和对象寿命是两回事：取决于借来的 Geometry、Material 是否还活着，死了就在读 getter 时抛错</td></tr>
+        <tr><td>Geometry、Material 等</td><td>是</td><td>最后一个 Scene 交还引用时自动释放，或者没人持有时 dispose；GPU 副本由各个 Manager 在监听器里删除（第 4 课）</td></tr>
+      </table>
+    </div>
+
+    <h2 id="s8">8. 先预测、再运行：跑真实的项目代码</h2>
+    <p>准备代码里的 <code>OPTIONS</code>、<code>projection</code>、<code>makeGeometry</code>、<code>makeMaterial</code> 是课程写的小工具，项目里没有它们；其余都是项目的真实类。这一课的卡片都不涉及 GPU，不显示画布。</p>
+    <details>
+      <summary>每张卡片之前都会先运行的准备代码</summary>
+      <pre><code id="prelude-view"></code></pre>
+    </details>
+    <div id="predict-0009"></div>
+    <script>
+      ;(function () {
+        // 只为课程演示：SceneNode 用 crypto.randomUUID 生成 UUID，它要求安全上下文。
+        // 个别浏览器在 file:// 下没有这个函数，这里用 getRandomValues 补一个同格式的实现。
+        if (window.crypto && typeof window.crypto.randomUUID !== 'function') {
+          Object.defineProperty(window.crypto, 'randomUUID', {
+            configurable: true,
+            value: function randomUUID() {
+              const bytes = window.crypto.getRandomValues(new Uint8Array(16))
+              bytes[6] = (bytes[6] & 0x0f) | 0x40
+              bytes[8] = (bytes[8] & 0x3f) | 0x80
+              const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+              return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20)
+            }
+          })
+        }
+
+        const prelude = [
+          'const R = window.RTeachRendering                      // 打包进来的真实项目代码',
+          '// 以下四个是课程写的小工具',
+          'const OPTIONS = { fovY: Math.PI / 2, aspect: 2, near: 1, far: 11 }   // 和测试同一组，便于手算',
+          'const projection = (camera) => { const m = new Float32Array(16); camera.copyProjectionMatrixTo(m); return Array.from(m) }',
+          'const makeGeometry = () => new R.Geometry({ attributes: { position: new R.VertexAttribute({ data: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), itemSize: 3 }) } })',
+          "const makeMaterial = () => new R.Material({ shaderModule: new R.ShaderModule({ name: 'plain', language: 'glsl-es-100', vertexSource: 'void main() {}', fragmentSource: 'void main() {}' }) })"
+        ].join('\n')
+        document.getElementById('prelude-view').textContent = prelude
+
+        if (!window.RTeachRendering || !window.RTeachRendering.PerspectiveCamera) {
+          document.getElementById('predict-0009').textContent =
+            '没有加载到包含相机的 assets/rendering-bundle.js，卡片无法运行。按 MAINTENANCE.md「真实代码打包」重新构建一次。'
+          return
+        }
+
+        RTeach.predict({
+          mount: document.getElementById('predict-0009'),
+          storageKey: 'lesson-0009',
+          canvas: false,
+          prelude,
+          items: [
+            {
+              title: 'A · 给 mesh.geometry 赋一个新的 Geometry，会怎样？',
+              code: [
+                'const g = makeGeometry()',
+                'const mesh = new R.Mesh(g, makeMaterial())',
+                "try { mesh.geometry = makeGeometry() } catch (error) { log('赋值：', error.name) }",
+                "log('mesh.geometry 还是原来那个吗？', mesh.geometry === g)"
+              ].join('\n'),
+              choices: ['抛 TypeError：只有 getter，引用换不掉', '换成功了：之后读到的是新的 Geometry', '静默失败：不报错，值也没变'],
+              answer: 0,
+              explain: '卡片代码在严格模式 (strict mode) 下运行：给只有 getter 的属性赋值会抛 TypeError；非严格模式下是静默失败（第三个选项），TypeScript 则在编译时就报错。Mesh 的两个字段是 private readonly（<a data-src="src/rendering/scene/Mesh.ts:24">Mesh.ts:24、:27</a>），getter 只读（:56–69）：借来的引用构造时验证一次，之后永远是同一个对象（第 3.3 节）。three.js 的 mesh.geometry 是公开字段，随时可以换（第 10.1 节）。'
+            },
+            {
+              title: 'B · options.near 是一个 getter，第一次读返回 1、之后返回 -1：构造成功吗？near 是多少？',
+              note: '这个带 getter 的 options 是课程构造的刁钻输入，用来检验「每个字段只读一次」。',
+              code: [
+                'let reads = 0',
+                'const options = {',
+                '  fovY: Math.PI / 2, aspect: 2, far: 11,',
+                '  get near() { reads += 1; return reads === 1 ? 1 : -1 }   // 第一次返回 1，之后返回 -1',
+                '}',
+                'const camera = new R.PerspectiveCamera(options)',
+                "log('near 被读了', reads, '次；camera.near =', camera.near)"
+              ].join('\n'),
+              choices: ['构造成功，near 是 1：每个字段只读一次，之后只用快照', '抛错：第二次读到 -1，验证失败', '构造成功，但 near 变成了 -1'],
+              answer: 0,
+              explain: 'copyValidatedOptions 把每个字段读一次、验证，放进一个新对象（<a data-src="src/rendering/scene/cameras/PerspectiveCamera.ts:38">PerspectiveCamera.ts:38–86</a>）；createProjection 和提交都只用这份快照（:167–175）。所以被验证的值就是被使用的值。如果提交时再去读 options.near，就会把没验证过的 -1 写进相机。'
+            },
+            {
+              title: 'C · fovY = 1e-39：它有限、大于 0、小于 π，构造会成功吗？',
+              code: [
+                'const f = 1 / Math.tan(1e-39 / 2)                          // 用 Number（Float64）算出的 f',
+                "log('Number 里的 f =', f, '；存进 Float32 =', Math.fround(f))",
+                "try { new R.PerspectiveCamera({ ...OPTIONS, fovY: 1e-39 }); log('构造成功') } catch (error) { log(error.name, error.details.fieldName, '：', error.details.reason) }"
+              ].join('\n'),
+              choices: ['抛错：Float32 放不下 2e39，矩阵里出现 Infinity', '构造成功：1e-39 通过了输入验证', '抛错：fovY 太小，输入验证就拦下了'],
+              answer: 0,
+              explain: 'fovY = 1e-39 通过了输入验证。但 f = 1/tan(fovY/2) ≈ 2×10³⁹：Number 放得下，Float32 最大只有约 3.4×10³⁸，写进 Float32Array 就成了 Infinity。createProjection 在提交之前检查了舍入后的结果（<a data-src="src/rendering/scene/cameras/PerspectiveCamera.ts:115">PerspectiveCamera.ts:115–122</a>），所以相机根本没有被构造出来。注意 fieldName 是 projectionMatrix：错的不是哪一个输入，而是它们的计算结果。'
+            },
+            {
+              title: 'D · 已有一台有效的相机，setPerspective 传入 { fovY: 1, aspect: 1, near: 2, far: 1 }：抛错之后，相机的参数是什么？',
+              code: [
+                'const camera = new R.PerspectiveCamera(OPTIONS)',
+                "try { camera.setPerspective({ fovY: 1, aspect: 1, near: 2, far: 1 }) } catch (error) { log('抛出：', error.name, error.details.fieldName) }",
+                "log('fovY =', camera.fovY, '；aspect =', camera.aspect, '；near =', camera.near, '；far =', camera.far)",
+                "log('projectionVersion =', camera.projectionVersion)"
+              ].join('\n'),
+              choices: ['四个值都没变，版本还是 0', 'fovY、aspect 已经改了，near、far 没改', '四个值都改了，只有矩阵没更新'],
+              answer: 0,
+              explain: '前三个字段各自都合法，far 不大于 near，验证在 copyValidatedOptions 的最后一步才失败。但这时什么都还没写：写入在 ④，排在所有可能失败的步骤之后（图 4、<a data-src="src/rendering/scene/cameras/PerspectiveCamera.ts:209">PerspectiveCamera.ts:209–228</a>）。测试把 19 种坏输入逐个试过（<a data-src="tests/unit/rendering/scene/cameras/PerspectiveCamera.test.ts:165">PerspectiveCamera.test.ts:165–195</a>）。'
+            },
+            {
+              title: 'E · 新的 aspect 只比原来大 4.4e-16，Float32 矩阵完全相同：projectionVersion 会加一吗？',
+              code: [
+                'const camera = new R.PerspectiveCamera(OPTIONS)',
+                'const before = projection(camera)',
+                'camera.setPerspective({ ...OPTIONS, aspect: 2 + 2 * Number.EPSILON })   // 只差 4.4e-16',
+                'const after = projection(camera)',
+                "log('矩阵完全相同吗？', before.every((value, index) => Object.is(value, after[index])))",
+                "log('projectionVersion =', camera.projectionVersion)"
+              ].join('\n'),
+              choices: ['加一：参数按 Number 比较，两个 aspect 不相等', '不加：Float32 矩阵完全相同', '不加：差得这么小，比较时被当成相等'],
+              answer: 0,
+              explain: '参数按 Number 保存、按 Number 比较（<a data-src="src/rendering/scene/cameras/PerspectiveCamera.ts:144">PerspectiveCamera.ts:144–148</a>）。2 和 2 + 2ε 是两个不同的 Number，所以版本加一；而 f/aspect 存进 Float32 后都是 0.5，矩阵一模一样。对照第 8 课的 Transform：它先 Math.fround 再比较，同样的情形不会加 version。两种做法都避开了「拿 Float64 输入去比 Float32 存储值」的坑，只是版本的含义不同（第 5 节末尾的表）。'
+            },
+            {
+              title: 'F · 相机挂在一个不可见的 Group 下：这一帧还能用它渲染吗？',
+              code: [
+                'const scene = new R.Scene()',
+                'const rig = new R.Group()',
+                'rig.visible = false                                     // 整个相机支架都不可见',
+                'const camera = new R.PerspectiveCamera(OPTIONS)',
+                'camera.transform.setPosition([0, 0, 5])',
+                'scene.add(rig)',
+                'rig.add(camera)',
+                'const visited = []',
+                "scene.traverseVisible((node) => visited.push(node.debugLabel.split('#')[0]))",
+                "log('traverseVisible 访问到：', visited.join('、'))",
+                'const world = new Float32Array(16)',
+                'camera.copyWorldMatrixTo(world)',
+                "log('相机的世界位置 z =', world[14])"
+              ].join('\n'),
+              choices: ['能：可见性只决定遍历到哪些节点，相机照样有世界矩阵和投影', '不能：相机被跳过，取不到世界矩阵', '能，但相机的世界矩阵被当成单位矩阵'],
+              answer: 0,
+              explain: 'traverseVisible 遇到不可见的节点，就跳过它的整棵子树（<a data-src="src/rendering/scene/SceneNode.ts:303">SceneNode.ts:303–313</a>），所以只访问到 Scene。但 Builder 取相机不靠遍历：RenderView 直接给出 camera（<a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:965">设计 §15</a>），copyWorldMatrixTo 沿父链更新，和可见性无关。visible 管的是「画哪些 Mesh」，不是「节点存不存在」。'
+            },
+            {
+              title: 'G · 把一个 Scene 挂到另一个 Scene 下面，再释放外层：内层登记的资源怎样？',
+              code: [
+                'const outer = new R.Scene()',
+                'const inner = new R.Scene()',
+                'const geometry = inner.retain(makeGeometry())          // inner 的账本里有它',
+                'outer.add(inner)                                        // Scene 也是节点：能挂进去吗？',
+                "log('inner.parent 是 outer 吗？', inner.parent === outer)",
+                'outer.dispose()',
+                "log('outer 释放之后：inner.parent 是 null 吗？', inner.parent === null, '；inner.disposed =', inner.disposed)",
+                "log('geometry.disposed =', geometry.disposed, '；引用数 =', geometry.sceneReferenceCount)"
+              ].join('\n'),
+              choices: ['还活着：outer 只摘下 inner、交还自己的引用，inner 的账本没动', '跟着释放了：dispose 会递归到子 Scene', 'add 直接抛错：Scene 不能当子节点'],
+              answer: 0,
+              explain: 'Scene 继承 Group，也是普通节点；add 只检查重复和环（第 8 课），不拒绝 Scene。outer.dispose() 只摘下直接子节点、交还 outer 自己登记的引用（<a data-src="src/rendering/scene/Scene.ts:131">Scene.ts:131–143</a>）：inner 被摘下，但没有被 dispose，它登记的 geometry 仍有 1 份引用。「Scene 是根」只是约定，代码并不强制（审查视角 1）。'
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <h2 id="s9">9. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0009"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0009"]'), [
+        {
+          q: 'Mesh 的对象寿命和它「能不能用」的寿命，有什么区别？',
+          opts: ['对象由垃圾回收决定；能不能用，取决于借来的资源是否还活着', '两者相同：Mesh 被摘下就不能再用了', 'Mesh 要调用 dispose 才会结束'],
+          answer: 0,
+          why: '第 3.3 节、第 7 节的表。Mesh 没有 dispose，摘下来还能挂到别的场景；但借来的 Geometry 一旦被释放，读 mesh.geometry 就抛错。'
+        },
+        {
+          q: 'Mesh 的 geometry 为什么设计成不能替换？',
+          opts: ['构造时验证一次就够了；能替换的话，要重新验证，还得决定谁去 retain 新资源', 'JavaScript 的 getter 不能再配 setter', '替换会让 GPU 缓存崩溃'],
+          answer: 0,
+          why: '第 3.3 节、卡片 A。Mesh 不知道自己属于哪个 Scene，没法替新资源登记引用。'
+        },
+        {
+          q: 'createProjection 为什么只检查 m[0]、m[5]、m[14] 是不是 0？',
+          opts: ['这三项归零会让 x、y 或深度塌成常数；|m[10]| 总大于 1，m[11] 恒为 -1', '其余各项都不会被 shader 用到', '只有这三项存成 Float32'],
+          answer: 0,
+          why: '第 3.6 节。深度：z_ndc = −m[10] − m[14]/z，m[14] 归零，所有点的深度都一样。'
+        },
+        {
+          q: 'setPerspective 为什么先算出候选矩阵，再写参数？',
+          opts: ['候选矩阵可能因为 Float32 溢出或归零而失败，失败时旧状态必须完整', '为了少算一次矩阵', '因为参数要按 Float32 比较'],
+          answer: 0,
+          why: '第 5 节、图 4、卡片 D：所有可能失败的步骤都在提交之前。'
+        },
+        {
+          q: '重复 setPerspective 同样的 near = 0.1，projectionVersion 会变吗？',
+          opts: ['不变：参数按 Number 保存、按 Number 比较', '加一：0.1 存进 Float32 之后和输入不相等', '加一：每调用一次都算一次变化'],
+          answer: 0,
+          why: '第 5 节末尾的表。第 8 课的 Transform 用的是另一种办法：先量化，再比较。'
+        },
+        {
+          q: 'Camera 为什么不缓存视图矩阵？',
+          opts: ['视图矩阵是世界矩阵的逆，由每帧提取时去求，不可逆的情况也在那里处理', '视图矩阵只在 GPU 上才用得到', '因为相机不能被移动'],
+          answer: 0,
+          why: '<a data-src="src/rendering/scene/cameras/Camera.ts:11">Camera.ts:11–12</a>，第 4 节的示意代码。'
+        },
+        {
+          q: '相机挂在不可见的 Group 下，这一帧还能用它渲染吗？',
+          opts: ['能：可见性只决定 traverseVisible 收集哪些 Mesh', '不能：相机被跳过，ViewState 取不到', '能，但投影矩阵会被重置'],
+          answer: 0,
+          why: '卡片 F。Builder 从 RenderView 直接拿相机，不靠遍历。'
+        },
+        {
+          q: 'scene.dispose() 不做下面哪件事？',
+          opts: ['释放场景里的 Mesh 和相机', '摘下全部直接子节点', '对登记的每个资源交还一份引用'],
+          answer: 0,
+          why: '第 6 节的表：节点不是 Resource，摘下来还能挂到别处。'
+        }
+      ])
+    </script>
+
+    <h2 id="s10">10. 架构视角</h2>
+    <h3>10.1 对照 three.js</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 18%"></th><th style="width: 41%">three.js</th><th>本项目</th></tr>
+        <tr><td>相机参数</td><td>公开字段 fov、aspect、near、far，fov 用度数（<a data-src="node_modules/three/src/cameras/PerspectiveCamera.js:356">PerspectiveCamera.js:356</a>）；改完要自己调 <code>updateProjectionMatrix()</code>（:353），忘了就是旧矩阵。旧引擎的 resize 正是两行一起写（<a data-src="src/engine.ts:494">src/engine.ts:494–495</a>）</td><td>私有字段，只能整组 setPerspective，改了就重算；fovY 用弧度</td></tr>
+        <tr><td>Mesh 的资源</td><td>公开字段 geometry、material（<a data-src="node_modules/three/src/objects/Mesh.js:67">Mesh.js:67、:75</a>），随时可换</td><td>私有、只读，getter 每次检查存活</td></tr>
+        <tr><td>Group</td><td>只多了 isGroup 标记和 type（<a data-src="node_modules/three/src/objects/Group.js:33">Group.js:33–35</a>）</td><td>只多了 debugType</td></tr>
+        <tr><td>Scene 当子节点</td><td>可以：add 只拒绝把自己加给自己（<a data-src="node_modules/three/src/core/Object3D.js:734">Object3D.js:734</a>）</td><td>也可以（卡片 G）</td></tr>
+        <tr><td>资源释放</td><td>应用自己调 geometry.dispose()，没有引用计数</td><td>Scene 账本 + 引用计数（第 5 课）</td></tr>
+      </table>
+    </div>
+
+    <h3>10.2 审查视角：三处值得讨论的地方</h3>
+    <ol>
+      <li><strong>「Scene 是根」只是约定。</strong>Scene 的注释说它是「场景图根节点」（<a data-src="src/rendering/scene/Scene.ts:6">Scene.ts:6</a>），但代码允许把它挂到任何节点下面，包括另一个 Scene；dispose 既不把自己摘下，也不级联到子 Scene（卡片 G）。挂在别的节点下时，场景里所有物体的世界矩阵还会带上那个父节点的变换。<strong>想一想：</strong>要不要在 add 里拒绝 Scene 当子节点？这样做会不会挡住什么合理的用法？</li>
+      <li><strong>两种输入校验风格。</strong>第 19 课的 SurfaceScope 拒绝未知字段（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:55">WebGL1SurfaceScope.ts:55–57</a>），PerspectiveCamera 只读四个字段，其余静默忽略。<strong>想一想：</strong>从 three.js 迁移时，写出 <code>{ ...options, zoom: 2 }</code> 是很自然的事，这时会发生什么？这个边界上哪种风格更合适？</li>
+      <li><strong>单位检查只挡住了一半。</strong>fovY 用弧度，写成 90（度）会被 0 &lt; fovY &lt; π 挡住（测试 <a data-src="tests/unit/rendering/scene/cameras/PerspectiveCamera.test.ts:171">:171</a>）；但本意是 3 度、写成 3 的，会被当成 3 弧度（约 172°）接受。three.js 的 fov 是度数。<strong>想一想：</strong>迁移 HW2 的相机代码时，怎样防止单位写错？</li>
+    </ol>
+
+    <h2 id="s11">11. 延伸阅读</h2>
+    <p>
+      <strong>首选（一手来源，约 15 分钟）：</strong>模块自己的说明 <a data-src="src/rendering/scene/docs/mesh-and-camera.zh-CN.md:1">mesh-and-camera.zh-CN.md</a>（短，读完正好对照第 3 节），再读 HW2 设计的 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:893">§14 Mesh 与 Camera</a> 和 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:965">§15–§16 帧提取</a>，看 Task 16 要怎样读这一课的类。
+    </p>
+    <p>
+      补充：为什么投影矩阵用 Float32、在哪里第一次舍入，见 <a data-src="src/rendering/docs/projection-matrix-float32-rationale.zh-CN.md:1">projection-matrix-float32-rationale.zh-CN.md</a>；行为清单见 <a data-src="tests/unit/rendering/scene/cameras/PerspectiveCamera.test.ts:49">PerspectiveCamera.test.ts</a>、<a data-src="tests/unit/rendering/scene/Scene.test.ts:32">Scene.test.ts</a>、<a data-src="tests/unit/rendering/scene/Mesh.test.ts:63">Mesh.test.ts</a>。
+    </p>
+
+    <aside class="ask">
+      做完告诉我：热身题和检查题各错了哪几题、七张卡片猜对了几张；10.2 的三个问题可以直接在对话里回答。哪一步没讲清楚，直接指出来，我在对话里接着讲。
+    </aside>
+
+    <div class="nav">
+      <a href="0008-transform-and-scenenode.html">← 第 8 课：Transform 与 SceneNode</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0010-vertex-attribute-and-geometry.html">第 10 课：VertexAttribute 与 Geometry →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 9 课 · 2026-09-28</footer>
+  </body>
+</html>

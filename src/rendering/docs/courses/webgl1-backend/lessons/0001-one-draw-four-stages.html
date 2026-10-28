@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 1 课 · 一次 draw 的四段调用</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/gl-sandbox.js"></script>
+  </head>
+  <body>
+    <p class="kicker">选修动手课 1 · 约 20 分钟 · 精读主线从 <a href="0003-architecture-overview.html">第 3 课</a> 开始</p>
+    <h1>一次 draw 的四段调用</h1>
+    <p class="lede">
+      你能写出三角形，只是 API 记不住。这一课把「画一个三角形」切成四段，每段只需要记住<strong>调用的名字和先后顺序</strong>。你在沙盒里从空白把它敲出来，再让代码扛住三次故障注入。最后看 <code>backend/webgl1/</code> 怎样把同样这四段分给四个类——这就是整个后端的骨架。
+    </p>
+
+    <div class="mission">
+      <strong>和你的任务的关系</strong> —— Task 15 的 <code>WebGL1Backend.draw()</code> 做的事，就是把这四段按顺序串起来。前三段已经有 Manager 替你做好了；第四段有一半在 <code>WebGL1State</code> 里，另一半（uniform 上传和 <code>drawElements</code>）正是你要写的部分。
+    </div>
+
+    <h2>1. 四段，按依赖排序</h2>
+    <p>
+      WebGL 是一台<strong>状态机 (state machine)</strong>：大多数调用不返回结果，而是改写 context 里的某个「当前值」，后面的调用再去读这个值。所以调用顺序不是写法风格问题，而是<strong>数据依赖</strong>：
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>段</th><th>目的</th><th>调用（只写名字，按顺序）</th><th>要用到谁的产出</th></tr>
+        <tr>
+          <td>① 程序<br /><small>program</small></td>
+          <td>把两段 GLSL 编译、链接成 GPU 上能跑的程序</td>
+          <td><code>createShader</code> → <code>shaderSource</code> → <code>compileShader</code> → <code>getShaderParameter</code>（×2）<br /><code>createProgram</code> → <code>attachShader</code>（×2）→ <code>linkProgram</code> → <code>getProgramParameter</code></td>
+          <td>—</td>
+        </tr>
+        <tr>
+          <td>② 数据<br /><small>buffer</small></td>
+          <td>把顶点数组复制进 GPU 内存</td>
+          <td><code>createBuffer</code> → <code>bindBuffer</code> → <code>bufferData</code></td>
+          <td>—</td>
+        </tr>
+        <tr>
+          <td>③ 接线<br /><small>vertex input</small></td>
+          <td>告诉 GPU：shader 里的 <code>position</code> 从哪个 buffer 读、按什么格式读</td>
+          <td><code>getAttribLocation</code> → <code>bindBuffer</code> → <code>vertexAttribPointer</code> → <code>enableVertexAttribArray</code></td>
+          <td>① 的 location，② 的 buffer</td>
+        </tr>
+        <tr>
+          <td>④ 状态 + 绘制</td>
+          <td>选定输出区域和程序，清屏，发出 draw call</td>
+          <td><code>viewport</code> → <code>clearColor</code> → <code>clear</code> → <code>useProgram</code> → <code>drawArrays</code></td>
+          <td>①②③ 留在状态机里的一切</td>
+        </tr>
+      </table>
+    </div>
+    <aside class="note">
+      ③ 里的 <code>bindBuffer</code> 必须写在 <code>vertexAttribPointer</code> 前面：pointer 在调用的<strong>那一刻</strong>，把「当前绑在 ARRAY_BUFFER 上的 buffer」记进这个 location。它读的正是状态机的当前值。④ 的 <code>drawArrays</code> 本身几乎不带参数，它画的就是「此刻」状态机里的 program 和接线。
+    </aside>
+    <aside class="note">
+      顺序写反了，也不一定当场报错。我在 Chromium 里实测过：offset 为 0 时，pointer 会安静地记下 <code>null</code>，错误一直拖到 <code>drawArrays</code> 才以 <code>INVALID_OPERATION</code> 出现。沙盒的调用日志会把错误标在 drawArrays 那一行。记住这条：<strong>报错的地方不一定是犯错的地方</strong>。
+    </aside>
+
+    <details>
+      <summary>卡住了再展开：本课 21 个调用的签名</summary>
+      <div class="table-scroll">
+        <table>
+          <tr><th>调用</th><th>做什么</th></tr>
+          <tr><td><code>gl.createShader(gl.VERTEX_SHADER | gl.FRAGMENT_SHADER)</code></td><td>创建空 shader 对象；类型签名是 <code>WebGLShader | null</code>，要判 null</td></tr>
+          <tr><td><code>gl.shaderSource(shader, source)</code></td><td>把 GLSL 字符串交给 shader（不编译）</td></tr>
+          <tr><td><code>gl.compileShader(shader)</code></td><td>编译；<strong>不</strong>返回结果，也不抛异常</td></tr>
+          <tr><td><code>gl.getShaderParameter(shader, gl.COMPILE_STATUS)</code></td><td>问「编译成功了吗」→ <code>true</code>/<code>false</code></td></tr>
+          <tr><td><code>gl.getShaderInfoLog(shader)</code></td><td>编译日志（出错的行号和原因）</td></tr>
+          <tr><td><code>gl.createProgram()</code></td><td>创建空 program（现行规范里不返回 null，见下面的 createBuffer）</td></tr>
+          <tr><td><code>gl.attachShader(program, shader)</code></td><td>把 shader 挂到 program 上（vertex、fragment 各一次）</td></tr>
+          <tr><td><code>gl.linkProgram(program)</code></td><td>链接；同样不返回结果</td></tr>
+          <tr><td><code>gl.getProgramParameter(program, gl.LINK_STATUS)</code></td><td>问「链接成功了吗」</td></tr>
+          <tr><td><code>gl.getProgramInfoLog(program)</code></td><td>链接日志</td></tr>
+          <tr><td><code>gl.createBuffer()</code></td><td>创建空 buffer。旧版规范在 context 丢失时返回 <code>null</code>；现行规范和 TypeScript 类型都是非 null，Chromium 丢失时返回一个已经作废的对象</td></tr>
+          <tr><td><code>gl.bindBuffer(gl.ARRAY_BUFFER, buffer)</code></td><td>让 ARRAY_BUFFER 这个绑定点指向它</td></tr>
+          <tr><td><code>gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([...]), gl.STATIC_DRAW)</code></td><td>给「绑定点上的那个 buffer」分配存储并写入数据</td></tr>
+          <tr><td><code>gl.getAttribLocation(program, 'position')</code></td><td>查 attribute 的编号；<strong>找不到返回 -1</strong>，0 是合法值</td></tr>
+          <tr><td><code>gl.vertexAttribPointer(location, 2, gl.FLOAT, false, 0, 0)</code></td><td>这个 location 从当前 ARRAY_BUFFER 读：每顶点 2 个 float，不归一化，紧密排列，从第 0 字节开始</td></tr>
+          <tr><td><code>gl.enableVertexAttribArray(location)</code></td><td>让这个 location 从数组读（不启用就读一个常量值）</td></tr>
+          <tr><td><code>gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight)</code></td><td>NDC → 像素的映射区域</td></tr>
+          <tr><td><code>gl.clearColor(r, g, b, a)</code></td><td>只<strong>设置</strong>清屏颜色（状态）</td></tr>
+          <tr><td><code>gl.clear(gl.COLOR_BUFFER_BIT)</code></td><td>真正执行清屏</td></tr>
+          <tr><td><code>gl.useProgram(program)</code></td><td>设为当前程序</td></tr>
+          <tr><td><code>gl.drawArrays(gl.TRIANGLES, 0, 3)</code></td><td>从第 0 个顶点起画 3 个顶点，按三角形组装</td></tr>
+        </table>
+      </div>
+      <p>每个调用的完整说明（失败时怎么报告、要校验什么、项目里在哪用）见 <a href="../reference/webgl1-api.html">WebGL1 API 速查</a>。</p>
+    </details>
+
+    <h2>2. 动手：从空白敲出三角形</h2>
+    <p>
+      规则：先只看上面表格里的<strong>名字</strong>来敲；卡住了再展开签名；参考答案留到最后再看。凭记忆费力地「想起来」，本身就是在加深记忆，这一步不要省。
+    </p>
+    <p>
+      右边的判分分两组。第一组检查画面和调用本身。第二组是<strong>故障注入 (fault injection)</strong>：沙盒把你的代码放到新的 context 上再跑三遍，每一遍悄悄把某个 GL 调用改成返回失败值，看你的代码会不会在正确的地方停下。项目的单元测试做的就是这件事——<a data-src="tests/unit/rendering/backend/fakes/createFakeWebGL1ResourceContext.ts:12">createFakeWebGL1ResourceContext</a> 就是一个可以注入失败的假 context。
+    </p>
+
+    <div id="sandbox-0001"></div>
+
+    <script type="text/plain" id="template-0001">// gl 已经准备好：一个全新的 WebGL1 context（画布 320×200）。
+// log(值, …) 把任何值打印到右边的「输出」区。
+// ⌘/Ctrl + Enter 运行；每次运行都是全新的 context。
+
+const vertexSource = `
+attribute vec2 position;
+void main() {
+  gl_Position = vec4(position, 0.0, 1.0);
+}
+`
+
+const fragmentSource = `
+precision mediump float;
+void main() {
+  gl_FragColor = vec4(1.0, 0.4, 0.1, 1.0);
+}
+`
+
+// ① 程序：把两段 GLSL 编译成 shader，再链接成 program。
+//    每一步都问 GL「成功了吗」；失败就 throw，并把 info log 放进错误信息。
+
+
+// ② 数据：三个顶点 (0, 0.8)  (-0.8, -0.8)  (0.8, -0.8)，上传到 ARRAY_BUFFER。
+
+
+// ③ 接线：查 position 的 location，把它接到这个 buffer（每个顶点 2 个 float）。
+
+
+// ④ 状态 + 绘制：viewport → 清成深灰 (0.1, 0.1, 0.12, 1) → useProgram → drawArrays。
+
+</script>
+
+    <script>
+      ;(function () {
+        const esc = RTeach.gl.escape
+        const ORANGE = [255, 102, 26, 255]
+        const BACKGROUND = [26, 26, 31, 255]
+
+        RTeach.sandbox({
+          mount: document.getElementById('sandbox-0001'),
+          storageKey: 'lesson-0001',
+          template: document.getElementById('template-0001').textContent,
+          checks: [
+            {
+              label: '代码运行到底，没有抛异常',
+              test(c) {
+                if (!c.threw) return true
+                let detail = esc(c.describeThrow())
+                const last = c.lastCall()
+                if (last && last.name === 'getAttribLocation' && last.ret === 0) {
+                  detail +=
+                    '<br>提示：getAttribLocation 返回的是 0——0 是合法的 location，失败值是 -1。用 <code>location &lt; 0</code> 判断，不要用 <code>!location</code>。'
+                }
+                return detail
+              }
+            },
+            {
+              label: '全程没有产生 GL 错误',
+              test(c) {
+                if (c.errors.length === 0) return true
+                const first = c.errors[0]
+                return '第一个错误出现在 #' + first.index + '：<code>' + esc(c.formatCall(first)) + '</code>（展开下方调用日志看上下文）'
+              }
+            },
+            {
+              label: '两个 shader 都查询了 COMPILE_STATUS',
+              test(c) {
+                const count = c.count('getShaderParameter', (e) => e.args[1] === c.real.COMPILE_STATUS)
+                return count >= 2 || '对 vertex、fragment 各调用一次 <code>gl.getShaderParameter(shader, gl.COMPILE_STATUS)</code>（现在是 ' + count + ' 次）'
+              }
+            },
+            {
+              label: 'program 查询了 LINK_STATUS',
+              test(c) {
+                return (
+                  c.called('getProgramParameter', (e) => e.args[1] === c.real.LINK_STATUS) ||
+                  '链接之后用 <code>gl.getProgramParameter(program, gl.LINK_STATUS)</code> 检查'
+                )
+              }
+            },
+            {
+              label: 'attribute 的 location 来自查询，不是写死的',
+              test(c) {
+                return (
+                  c.called('getAttribLocation') ||
+                  c.called('bindAttribLocation') ||
+                  'location 由链接结果决定，用 <code>gl.getAttribLocation(program, "position")</code> 查询，不能假设它是 0'
+                )
+              }
+            },
+            {
+              label: '画面中心是三角形的橙色',
+              test(c) {
+                const pixel = c.readPixel(160, 100)
+                return c.near(pixel, ORANGE, 4) || '中心像素读到 ' + JSON.stringify(pixel) + '，期望约 [255, 102, 26, 255]'
+              }
+            },
+            {
+              label: '画面角落是清屏用的深灰色',
+              test(c) {
+                const pixel = c.readPixel(3, 3)
+                return (
+                  c.near(pixel, BACKGROUND, 3) ||
+                  '角落像素读到 ' + JSON.stringify(pixel) + '，期望约 [26, 26, 31, 255]。提醒：clearColor 只设颜色，真正清屏要调用 clear(gl.COLOR_BUFFER_BIT)'
+                )
+              }
+            }
+          ],
+          scenarios: [
+            {
+              label: '故障 1 · shader 编译失败（GLSL 里拼错了一个字）',
+              overrides: {
+                getShaderParameter: (args, callReal, real) => (args[1] === real.COMPILE_STATUS ? false : callReal(...args)),
+                getShaderInfoLog: () => "ERROR: 0:4: 'gl_Positon' : undeclared identifier",
+                getProgramParameter: (args, callReal, real) => (args[1] === real.LINK_STATUS ? false : callReal(...args)),
+                getProgramInfoLog: () => 'Attached vertex shader is not compiled.'
+              },
+              expect(c) {
+                if (!c.threw) return '代码没有停下：编译失败被当成了成功，一路执行到最后'
+                if (c.called('drawArrays')) return '抛错了，但在那之前已经调用过 drawArrays'
+                return true
+              },
+              note(c) {
+                if (!c.threw) return null
+                const notes = []
+                const message = String((c.threw && c.threw.message) || '')
+                if (!c.called('getShaderParameter', (e) => e.args[1] === c.real.COMPILE_STATUS)) {
+                  notes.push('你是靠 LINK_STATUS 拦下来的。这样做也对（MDN 甚至建议只在链接失败时才去查编译状态），代价是报错里拿不到「哪个 shader、第几行」。')
+                }
+                if (!message.includes('gl_Positon') && !message.includes('not compiled')) {
+                  notes.push('错误信息里没有带上 info log。项目的 <a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:315">ShaderCompilationError</a> 会同时带上 stage 和 infoLog。')
+                }
+                return notes.length > 0 ? notes.join('<br>') : null
+              }
+            },
+            {
+              label: '故障 2 · 找不到 attribute（getAttribLocation 返回 -1）',
+              overrides: { getAttribLocation: () => -1 },
+              expect(c) {
+                if (!c.called('getAttribLocation')) return true
+                const usedMinusOne =
+                  c.called('vertexAttribPointer', (e) => e.args[0] === -1) ||
+                  c.called('enableVertexAttribArray', (e) => e.args[0] === -1)
+                if (!c.threw) {
+                  return usedMinusOne
+                    ? '拿 -1 去调用了 vertexAttribPointer / enableVertexAttribArray：GL 只记下一个 INVALID_VALUE，画面空白，代码却没有停下'
+                    : '代码没有停下'
+                }
+                if (usedMinusOne) return '抛错了，但在那之前已经用 -1 调用过 pointer 或 enable'
+                return true
+              },
+              note(c) {
+                return c.called('getAttribLocation') ? null : '你用 bindAttribLocation 固定了 location，这一关对你不适用。'
+              }
+            },
+            {
+              label: '故障 3 · createBuffer 返回 null（旧版规范和测试用的假 context 会这样）',
+              overrides: { createBuffer: () => null },
+              expect(c) {
+                if (!c.threw) {
+                  return '代码没有停下。bindBuffer(ARRAY_BUFFER, null) 是合法调用（等于解绑），所以错误要等到 bufferData 才以 INVALID_OPERATION 出现'
+                }
+                if (c.called('bufferData')) return '抛错了，但 bufferData 已经在空绑定上执行过'
+                return true
+              }
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <details>
+      <summary>我写完了（或者真的卡死了）：参考答案</summary>
+      <pre><code>function compile(type, source, stage) {
+  const shader = gl.createShader(type)
+  if (shader === null) throw new Error(`createShader(${stage}) 返回 null`)
+  gl.shaderSource(shader, source)
+  gl.compileShader(shader)
+  if (gl.getShaderParameter(shader, gl.COMPILE_STATUS) !== true) {
+    const info = gl.getShaderInfoLog(shader)
+    gl.deleteShader(shader)
+    throw new Error(`${stage} shader 编译失败：${info}`)
+  }
+  return shader
+}
+
+// ① 程序
+const vertex = compile(gl.VERTEX_SHADER, vertexSource, 'vertex')
+const fragment = compile(gl.FRAGMENT_SHADER, fragmentSource, 'fragment')
+const program = gl.createProgram()
+if (program === null) throw new Error('createProgram 返回 null')
+gl.attachShader(program, vertex)
+gl.attachShader(program, fragment)
+gl.linkProgram(program)
+if (gl.getProgramParameter(program, gl.LINK_STATUS) !== true) {
+  throw new Error('链接失败：' + gl.getProgramInfoLog(program))
+}
+// 项目的 ProgramManager 在链接成功后还会 detachShader + deleteShader，第 6 课细讲。
+
+// ② 数据
+const buffer = gl.createBuffer()
+// 现行规范下 createBuffer 不会返回 null（TS 类型也是非 null），这一行防的是旧实现和假 context。
+// context 丢失时它返回一个已经作废的对象，要靠 gl.isContextLost() 才能发现——第 2 课讲。
+if (buffer === null) throw new Error('createBuffer 返回 null')
+gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0.8, -0.8, -0.8, 0.8, -0.8]), gl.STATIC_DRAW)
+
+// ③ 接线
+const location = gl.getAttribLocation(program, 'position')
+if (location &lt; 0) throw new Error('attribute position 不存在或没被使用（location = -1）')
+gl.bindBuffer(gl.ARRAY_BUFFER, buffer) // 其实已经绑着；写出来是强调 pointer 记下的是「此刻」的绑定
+gl.vertexAttribPointer(location, 2, gl.FLOAT, false, 0, 0)
+gl.enableVertexAttribArray(location)
+
+// ④ 状态 + 绘制
+gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight)
+gl.clearColor(0.1, 0.1, 0.12, 1)
+gl.clear(gl.COLOR_BUFFER_BIT)
+gl.useProgram(program)
+gl.drawArrays(gl.TRIANGLES, 0, 3)</code></pre>
+      <p>注意几个判断都写成 <code>=== null</code>、<code>!== true</code>、<code>&lt; 0</code>，没有用真假值：<code>0</code> 是合法的 location；context 丢失时状态查询返回 <code>null</code> 而不是 <code>false</code>。</p>
+    </details>
+
+    <h3>三道故障题在考什么</h3>
+    <p>三道题的共同点：<strong>WebGL 的失败几乎从不抛 JavaScript 异常。</strong>要么返回一个特殊值，要么把结果记在状态里，等你主动去问。所谓校验，就是在每个这种地方主动去问。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>注入</th><th>真实场景</th><th>GL 怎样报告</th><th>项目在哪拦住</th></tr>
+        <tr>
+          <td>编译失败</td>
+          <td>GLSL 拼错一个字</td>
+          <td><code>compileShader</code> 照常返回；只有去问 <code>COMPILE_STATUS</code> 才会知道。链接状态也会随之变成 false</td>
+          <td><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:310">ProgramManager.compile</a> → <code>ShaderCompilationError(stage, infoLog)</code></td>
+        </tr>
+        <tr>
+          <td>location = -1</td>
+          <td>attribute 名拼错，或者 shader 没用到它、被编译器优化掉了</td>
+          <td>返回 -1。拿 -1 去调用 pointer 会记一个 <code>INVALID_VALUE</code>，但 draw 照样执行，画面空白</td>
+          <td><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:156">ProgramManager.ts:156</a>；<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:87">VertexInputSupport.resolve</a></td>
+        </tr>
+        <tr>
+          <td>createBuffer = null</td>
+          <td>旧版规范规定 context 丢失时 <code>create*</code> 返回 null。现行规范里只剩 <code>createShader</code> 还可能返回 null；其余的（我在 Chromium 实测过）返回一个<strong>已经作废的对象</strong></td>
+          <td>null：<code>bindBuffer(…, null)</code> 合法，错误拖到 <code>bufferData</code> 才以 <code>INVALID_OPERATION</code> 出现。作废对象：之后的调用全部静默失效，只有 <code>isContextLost()</code> 会告诉你</td>
+          <td>两道防线：<a data-src="src/rendering/core/requireNonNull.ts:15">requireNonNull</a> 拦 null，紧接着的 <code>assertAvailable</code>（即 isContextLost）拦作废对象，见 <a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:321">GeometryManager.upload</a></td>
+        </tr>
+      </table>
+    </div>
+    <p>
+      MDN 的 <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices">WebGL best practices</a> 有一句很好的判断标准：「The only errors a well-formed page generates are OUT_OF_MEMORY and CONTEXT_LOST.」凡是出现 <code>INVALID_*</code>，都说明你的代码有 bug。下一课专门讲这五种失败通道。
+    </p>
+
+    <h2>3. 同样四段，在后端里分给了谁</h2>
+    <p>把你刚写的代码放到项目里，每一段都有一个类负责。区别在于：每个类都在原生调用之外，替你多做了几件事。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>段</th><th>负责的类与入口</th><th>在原生调用之外多做的事</th></tr>
+        <tr>
+          <td>①</td>
+          <td><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:80">WebGL1ProgramManager.get(shader)</a></td>
+          <td>以 ShaderModule <strong>对象</strong>为 key 缓存（两个 Material 共用一个 shader 时只编译一次）；失败时删掉本次创建的一切；链接后一次性反射所有 attribute、uniform 的 location</td>
+        </tr>
+        <tr>
+          <td>②</td>
+          <td><a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:104">WebGL1GeometryManager.get(geometry)</a></td>
+          <td>每个属性一个 buffer，外加可选的索引 buffer；上传前记下原来的绑定，结束后恢复；设备没有 32 位索引扩展时安全地降成 16 位</td>
+        </tr>
+        <tr>
+          <td>③</td>
+          <td><a data-src="src/rendering/backend/webgl1/WebGL1VertexInputManager.ts:62">createWebGL1VertexInputManager</a> 选出的策略的 <code>bind(...)</code></td>
+          <td>两种策略：有 <code>OES_vertex_array_object</code> 就把接线「录」进 VAO，下次一次 bind 全部恢复；没有就每次重接，并关掉上一个物体遗留的 location</td>
+        </tr>
+        <tr>
+          <td>④</td>
+          <td><a data-src="src/rendering/backend/webgl1/WebGL1State.ts:47">WebGL1State.useProgram</a>、<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:207">bindSurface</a> …<br />draw call：<code>WebGL1Backend</code> <span class="tag t15">Task 15</span></td>
+          <td>State 记住「上次设成了什么」，值没变就不再发 GL 命令；draw call 本身目前<strong>还没有任何代码</strong>在发——它在等你写</td>
+        </tr>
+      </table>
+    </div>
+    <p>这些类由 <a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:44">WebGL1ResourceManager</a> 统一组装。完整的依赖关系和所有权，见 <a href="../reference/architecture-map.html">架构地图</a>。</p>
+
+    <h2>4. 为什么要拆成这么多类：三个力</h2>
+    <p>你的沙盒代码只画一个三角形，一个函数就够了。一旦进入真实场景，下面三个力会把这一个函数撕成好几个类：</p>
+    <ol class="steps">
+      <li>
+        <strong>共享 (sharing)。</strong>两个 Mesh 共用一个 Geometry，照沙盒的写法会 <code>bufferData</code> 两次。要做到只上传一次，就需要一个<strong>以 CPU 对象为 key 的缓存</strong>——这就是每个 Manager 里的 <code>Map&lt;Geometry, …&gt;</code>、<code>Map&lt;ShaderModule, …&gt;</code>。
+      </li>
+      <li>
+        <strong>丢失 (context loss)。</strong>GPU 重置时，你创建的 buffer 和 program 全部一起作废，但 CPU 上的顶点数组还在。所以 CPU 资源（Geometry、ShaderModule）<strong>永远不保存 GPU 句柄 (handle)</strong>；句柄只活在「每个 context 一份」的 Manager 里，丢失时整批丢弃，恢复后再新建一批。
+      </li>
+      <li>
+        <strong>全局状态 (global state)。</strong>每次 <code>bindBuffer</code> 都在改写 context 里的全局值。谁改了谁就要负责：要么把原值恢复回去（GeometryManager 就是先保存、后恢复绑定），要么通知状态缓存「我动过了，你记的值不可信了」（<code>hooks.invalidateState</code>）。
+      </li>
+    </ol>
+    <p>之后你在 <code>webgl1/</code> 里读到的大部分「多出来的代码」，都能归到这三类里；剩下的是校验，也就是本课第二组判分在练的东西。</p>
+
+    <h2>5. 检查题</h2>
+    <p>不要翻回去看，凭记忆作答。答错的那题，回到对应小节重读一遍。</p>
+    <div class="quiz" data-quiz="lesson-0001"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0001"]'), [
+        {
+          q: 'vertexAttribPointer 记住的是哪一个 buffer？',
+          opts: ['调用它的那一刻绑在 ARRAY_BUFFER 上的', '调用 draw 那一刻绑在 ARRAY_BUFFER 上的', '最近一次被 bufferData 写入数据的那个'],
+          answer: 0,
+          why: 'pointer 在调用时把「当前的 ARRAY_BUFFER」记进这个 location 的属性状态（有 VAO 时记进 VAO）。之后再改绑 ARRAY_BUFFER，不影响已经配好的 location——所以 ③ 里 bindBuffer 必须在 vertexAttribPointer 之前。项目里对应的注释见 <a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:105">VertexInputSupport.apply</a>。'
+        },
+        {
+          q: 'CPU 侧的 Geometry 为什么不直接保存 WebGLBuffer？',
+          opts: ['WebGLBuffer 不能拿来当 Map 的 key 使用', 'handle 只属于某一个 context 的某一代', 'handle 太占内存，只能留在 GPU 那一侧'],
+          answer: 1,
+          why: '同一个 Geometry 可以上传进不同的 context（Phase 2 就打算让 WebGL1、WebGL2 两个后端并存，逐像素对比）。context 丢失后，旧 handle 全部作废，CPU 数据却还在，要重新上传。所以 handle 只放在「每个 context 一份」的 Manager 里，Geometry 只当缓存的 key。「不能拿来当 Map 的 key」不对：任何对象都能当 Map 的 key——GeometryManager 的 <code>Map&lt;Geometry, …&gt;</code> 用的正是对象身份。'
+        },
+        {
+          q: 'WebGL1ProgramManager 的缓存用什么当 key？',
+          opts: ['ShaderModule 上的 name 字符串', '两段 GLSL 源码拼接成的字符串', 'ShaderModule 这个对象本身的身份'],
+          answer: 2,
+          why: '同名不等于同一个资源。如果用源码拼成的字符串当 key，两个内容相同但生命周期不同的 ShaderModule 会共用一个 program，其中一个 dispose 时，就会删掉另一个还在用的 program。three.js r177 走的是另一条路：用参数拼出字符串 key，再用 <code>usedTimes</code> 引用计数防止误删（<a data-src="node_modules/three/src/renderers/webgl/WebGLPrograms.js:591">WebGLPrograms.acquireProgram</a>）。'
+        },
+        {
+          q: '在这个项目里，第 ④ 段（useProgram 和 draw call）由谁完成？',
+          opts: ['State 负责 useProgram，Backend 负责 draw', 'ProgramManager 编译完就顺手 useProgram 并 draw', 'VertexInputManager 接完线后直接发出 draw'],
+          answer: 0,
+          why: '编译不等于选用。ProgramManager 只负责创建和缓存 program，从不主动 useProgram（唯一的例外：删除正在使用的 program 之前，先调用 <code>useProgram(null)</code>）。选用走 <a data-src="src/rendering/backend/webgl1/WebGL1State.ts:47">WebGL1State.useProgram</a>（带缓存去重）；draw call 属于 WebGL1Backend.draw()——也就是 Task 15，你要写的那部分。'
+        },
+        {
+          q: 'gl.getAttribLocation 返回 0 说明什么？',
+          opts: ['没找到，这个 attribute 不存在或被优化掉', '找到了，这个 attribute 的位置编号就是 0', '查询失败了，需要再调用一次 getError 看原因'],
+          answer: 1,
+          why: '失败值是 -1，0 是完全合法的 location（通常第一个 attribute 就在 0）。所以项目写的是 <code>location &lt; 0</code>（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:156">ProgramManager.ts:156</a>）。<code>if (!location)</code> 会把合法的 0 当成失败——沙盒的第一条检查专门会抓这个错。'
+        }
+      ])
+    </script>
+
+    <h2>6. 延伸阅读</h2>
+    <p>
+      <strong>首选：</strong><a href="https://webglfundamentals.org/webgl/lessons/webgl-fundamentals.html">WebGL Fundamentals</a>（Gregg Tavares）。读到它第一次调用 <code>drawArrays</code> 为止，大约 15 分钟。它画三角形用的正好是本课这些调用，而且逐行解释了每一个。
+    </p>
+    <p>
+      读完再打开 <a href="https://webglfundamentals.org/webgl/lessons/resources/webgl-state-diagram.html">WebGL State Diagram</a>，单步执行它的三角形例子。盯住两处：全局状态里的 <code>ARRAY_BUFFER</code> 绑定，以及 attribute 表里每一行的 buffer 字段。亲眼看一次 pointer 是在哪一刻「记住」buffer 的——检查题第 1 题就在考这个。
+    </p>
+
+    <aside class="ask">
+      有任何没讲清楚的地方——某个调用、某条判分、某段项目代码——直接在对话里问我。我是你的老师，追问本身就是学习的一部分。做完之后，也请告诉我沙盒里有几项没通过、检查题错了哪题，我会据此调整第 2 课。
+    </aside>
+
+    <details>
+      <summary>课程路线图（15 课，按需调整）</summary>
+      <ol>
+        <li><strong>一次 draw 的四段调用</strong>（本课）</li>
+        <li>GL 怎样告诉你失败了：五种失败通道</li>
+        <li>状态机与状态缓存：WebGL1State</li>
+        <li>能力探测：扩展与上限</li>
+        <li>context 丢失与恢复：WebGLContextLifecycle</li>
+        <li>ProgramManager：编译、链接、反射、事务</li>
+        <li>GeometryManager：buffer 上传与绑定恢复</li>
+        <li>顶点输入的两条路：VAO 与手动接线</li>
+        <li>纹理：texImage2D、pixelStorei、sampler、NPOT、cubemap</li>
+        <li>离屏渲染：FBO、renderbuffer、completeness</li>
+        <li>组合根：ResourceManager 的接线与释放顺序</li>
+        <li>Task 15（上）：uniform 与纹理单元</li>
+        <li>Task 15（下）：withRenderSurface、clear、draw</li>
+        <li>对照 three.js r177 的 WebGL 内部实现</li>
+        <li>Code review 实战</li>
+      </ol>
+    </details>
+
+    <div class="nav">
+      <a href="../index.html">← 课程首页</a>
+      <span><a href="../reference/architecture-map.html">架构地图</a> · <a href="../reference/webgl1-api.html">WebGL1 API 速查</a></span>
+      <a href="0002-five-failure-channels.html">第 2 课：五条失败通道 →</a>
+    </div>
+    <footer>WebGL1 后端课程 · 第 1 课 · 2026-09-23</footer>
+  </body>
+</html>

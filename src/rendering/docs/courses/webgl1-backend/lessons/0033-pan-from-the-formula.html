@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 33 课 · 平移</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/camera-bundle.js"></script>
+    <script src="../assets/orbit-lab.js"></script>
+    <script src="../assets/view-lab.js"></script>
+  </head>
+  <body>
+    <p class="kicker">零基础重写 · 相机数学 2/4 · 约 20 分钟</p>
+    <h1>平移：拖 100 像素，相机该挪多少</h1>
+    <p class="lede">
+      右键拖动画面，相机跟着平移。这一课只回答两个问题：相机该挪多远？为什么一拖动，近处的东西比你的手挪得快，远处的比手挪得慢？两个答案都从第 32 课那条公式 ★ 推出来。
+    </p>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：第 32 课的 ★（点落在哪个像素），以及「深度 D」是相机正前方多远。<br />
+      <strong>这一课讲的</strong>：相机挪和点挪是同一件事的两面；为什么只有一个深度能跟手；挪多少的公式；项目的 applyPan 逐行读；在画布上亲手拖动验证。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">要回答的问题</a></li>
+        <li><a href="#s2">相机向左挪，点就向右挪</a></li>
+        <li><a href="#s3">代入 ★：挪的像素和深度有关</a></li>
+        <li><a href="#s4">让目标点跟手：相机挪多少</a></li>
+        <li><a href="#s5">其他深度挪多少：视差</a></li>
+        <li><a href="#s6">亲手拖一下</a></li>
+        <li><a href="#s7">项目代码：applyPan 逐行读</a></li>
+        <li><a href="#s8">检查题</a></li>
+        <li><a href="#s9">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 要回答的问题</h2>
+    <p>HW2 的相机在 (0, 20, 50)，看着目标 (0, 10, 0)，画布高 600 像素。你按住右键，向右拖了 100 像素。</p>
+    <ul>
+      <li>速查：<a href="../reference/camera-controls-math.html">相机控制的数学</a>（第 32–35 课的公式和数字都在这一页）。</li>
+      <li>你想要的效果：像用手按住一张照片往右拖，手底下的东西跟着手走。</li>
+      <li>要算的：相机该往哪个方向、挪多远。</li>
+    </ul>
+
+    <h2 id="s2">2. 相机向左挪，点就向右挪</h2>
+    <p>先看一维的例子。一条数轴上，相机在 0，一个点在 3。从相机看，点在右边 3。现在相机向左挪到 −2，点不动：从相机看，点在右边 5。</p>
+    <p>相机向左挪 2，点在相机看来就向右挪了 2。三维也一样：相机沿着自己的「右」方向挪 −s（向左 s），每个点的相机坐标 x 都增加 s。</p>
+    <p>还有一件事：相机这次是<strong>横着</strong>挪的，挪动方向和视线垂直，没有往前也没有往后。所以每个点的深度 D 都不变。</p>
+    <p>所以在相机坐标里，平移前后的变化只有一处：</p>
+<pre>平移前：点的相机坐标 (x,     y, −D)
+平移后：点的相机坐标 (x + s, y, −D)      （相机向左挪了 s）</pre>
+
+    <h2 id="s3">3. 代入 ★：挪的像素和深度有关</h2>
+    <p>第 32 课的 ★：px = W/2 + x × H / h(D)，其中 h(D) = 2 × D × tan(fovY/2)。平移前后，只有 x 变了，D 没变，所以列号的变化是：</p>
+<pre>Δpx = (x + s) × H / h(D) − x × H / h(D)
+    = s × H / h(D)</pre>
+    <p>s 是同一个数（相机只挪了一次），可 h(D) 和 D 成正比。所以：<strong>深度越小的点，在屏幕上挪得越多</strong>。同一次平移，不可能让所有点都正好挪 100 像素。这就是「近处的东西比手挪得快」的原因，叫<strong>视差 (parallax)</strong>。坐车时，路边的护栏飞快后退，远处的山几乎不动，是同一个道理。</p>
+
+    <h2 id="s4">4. 让目标点跟手：相机挪多少</h2>
+    <p>既然只能让某一个深度正好跟手，就要选一个。项目选的是<strong>目标点</strong>所在的深度，记作 d。理由：</p>
+    <ul>
+      <li>相机一直看着目标点，它在画面正中，通常也是你眼睛盯着的地方；</li>
+      <li>左键旋转时，相机绕的也是这个点。拖完以后，它还在你手底下。</li>
+    </ul>
+    <p>要求「目标点挪了 dx 像素」，代入第 3 节：</p>
+<pre>s × H / h(d) = dx
+⟹ s = dx × h(d) / H</pre>
+    <p>右边的 h(d) / H，就是第 32 课第 5 节的「深度 d 处 1 个像素等于多少世界单位」。拖 1 像素挪这么多单位，拖 dx 像素挪 dx 倍。代入 HW2 的数：</p>
+<pre>d = 50.99（相机到目标点的距离；目标在视线正中，所以距离就是深度）
+h(d) = 2 × 50.99 × tan(22.5°) = 42.24
+h(d) / H = 42.24 ÷ 600 = 0.0704
+s = 100 × 0.0704 = 7.04          相机向左挪 7.04 个世界单位</pre>
+    <p>HW2 实际挂载时传了 panSpeed: 0.8（<a data-src="src/gui/games202/setup.ts:127">setup.ts:127</a>），相机挪 7.04 × 0.8 = 5.63，目标点挪 80 像素，比手慢一点。下面的实验台用 panSpeed 1，目标点正好跟手。</p>
+
+    <h2 id="s5">5. 其他深度挪多少：视差</h2>
+    <p>把 s = dx × h(d) / H 代回第 3 节的 Δpx = s × H / h(D)：</p>
+<pre>Δpx = dx × h(d) / H × H / h(D)
+    = dx × h(d) / h(D)
+    = dx × d / D            （h 和深度成正比，2 × tan(fovY/2) 约掉了）</pre>
+    <p>深度为 D 的点，挪的像素是手的 d / D 倍。三个点（深度见第 32 课第 7 节）：</p>
+<pre>目标点 D = 50.99：  100 × 50.99 ÷ 50.99  = 100 像素（正好跟手）
+近点   D = 19.61：  100 × 50.99 ÷ 19.61  = 260 像素（比手快 2.6 倍）
+远点   D = 101.98： 100 × 50.99 ÷ 101.98 =  50 像素（只有手的一半）</pre>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 640 300" role="img" aria-label="俯视图。相机原来在下方的圆圈处，视线向右；三个点在原来的视线上，深度分别是 19.61、50.99、101.98。相机向左（图中向上）挪 7.04 以后，从新位置看三个点：近点偏离新视线的角度最大，屏幕上挪 260 像素；目标 100 像素；远点 50 像素。">
+          <defs>
+            <marker id="f2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+          </defs>
+          <line x1="60" y1="210" x2="610" y2="210" class="line dash" />
+          <text x="520" y="230" class="small">原来的视线</text>
+          <line x1="60" y1="140" x2="610" y2="140" class="line dash" />
+          <text x="490" y="130" class="small">挪动后相机的视线</text>
+          <circle cx="60" cy="210" r="5" fill="none" stroke="currentColor" />
+          <text x="30" y="236" class="small">原来的相机</text>
+          <circle cx="60" cy="140" r="5" fill="currentColor" />
+          <text x="30" y="124" class="small">挪动后</text>
+          <line x1="60" y1="202" x2="60" y2="150" class="line" marker-end="url(#f2a)" />
+          <text x="68" y="182" class="small">向左 7.04</text>
+          <line x1="60" y1="140" x2="158" y2="210" class="line bad" />
+          <line x1="60" y1="140" x2="315" y2="210" class="line accent" />
+          <line x1="60" y1="140" x2="570" y2="210" class="line" />
+          <circle cx="158" cy="210" r="6" fill="#b23a2f" />
+          <circle cx="315" cy="210" r="6" fill="#1f5f8b" />
+          <circle cx="570" cy="210" r="6" fill="currentColor" />
+          <text x="120" y="262" class="small">近点 D = 19.61</text>
+          <text x="120" y="282" class="small bad">屏幕上挪 260 px</text>
+          <text x="282" y="262" class="small">目标 D = 50.99</text>
+          <text x="282" y="282" class="small accent">挪 100 px</text>
+          <text x="520" y="262" class="small">远点 D = 101.98</text>
+          <text x="520" y="282" class="small">挪 50 px</text>
+        </svg>
+      </div>
+      <figcaption>图 1　从上往下看（俯视）。相机横着挪了 7.04，三个点都没动。从新位置看过去，近点偏离视线的角度最大，所以在屏幕上挪得最多。</figcaption>
+    </figure>
+    <p>这就是我上一轮那张表想说的事。表里的「近点」「远点」，指的是深度小于、大于目标点的点。</p>
+
+    <h2 id="s6">6. 亲手拖一下</h2>
+    <p>下面是项目真实的 PerspectiveCamera 加 mountOrbitCameraInput（panSpeed 1），画的是地面网格、一个代表 Mary 的方盒，和三个标记点。为了在画面上不叠在一起，近点、远点各往旁边挪了 6 个单位，横着挪不改变深度（第 32 课：深度只看视线方向）。</p>
+    <ul>
+      <li>在画布上按住<strong>右键</strong>拖。读数会显示这一次拖动（从按下开始）每个点挪了多少像素，旁边是 dx × d / D 算出来的值。</li>
+      <li>没有鼠标右键，就点「合成：右键向右拖 100 px」。</li>
+      <li>平移以后再用左键转一下，然后再平移：目标点变了，d 和 D 都会变，公式照样成立。</li>
+    </ul>
+    <p>实验台的画布只有 300 px 高，所以同样拖 100 px，相机挪 100 × 42.24 ÷ 300 = 14.08（第 4 节算的 7.04 是 600 px 高的画布）。三个点各挪多少像素，和画布高度无关：dx × d / D 里没有 H。</p>
+    <div id="pan"></div>
+
+    <h2 id="s7">7. 项目代码：applyPan 逐行读</h2>
+    <p>项目里平移就是这个函数（<a data-src="src/rendering/controls/mountOrbitCameraInput.ts:184">mountOrbitCameraInput.ts:184–229</a>）。dx、dy 是这次 pointermove 比上次移动了多少像素（第 37 课讲它们从哪来）。注释是课程加的；为了不超出页面宽度，课程把 panLocalMatrix 简写成 m，长行折了行：</p>
+<pre>function applyPan(camera: Camera, dx: number, dy: number): void {
+  if (!(camera instanceof PerspectiveCamera) || panSpeed === 0) return
+  // 当前的目标点：平移过就用平移后的，没平移过就用挂载时给的 [0, 10, 0]
+  const target = targets.get(camera) ?? initialTarget
+  const position = camera.transform.position
+  // d：相机到目标点的距离。目标在视线正中，所以它就是目标点的深度
+  const distance = Math.hypot(
+    position[0] - target[0],
+    position[1] - target[1],
+    position[2] - target[2]
+  )
+  // h(d) / H × panSpeed：拖 1 像素，相机挪多少个世界单位（第 4 节）
+  // clientHeight 是画布的 CSS 高度 H；横向也用它（第 32 课第 6 节）
+  const unitsPerPixel =
+    (2 * distance * Math.tan(camera.fovY / 2) * panSpeed) /
+    Math.max(1, canvas.clientHeight)
+  if (!Number.isFinite(unitsPerPixel) || unitsPerPixel === 0) return
+
+  // 相机的局部矩阵：第 0 列（下标 0、1、2）是相机的「右」方向，
+  // 第 1 列（下标 4、5、6）是「上」方向，都用世界坐标表示（第 25 课）
+  camera.transform.copyLocalMatrixTo(panLocalMatrix)
+  const m = panLocalMatrix // 课程为了排版起的短名字，原文每处都写 panLocalMatrix
+  const rightLength = Math.hypot(m[0]!, m[1]!, m[2]!)
+  const upLength = Math.hypot(m[4]!, m[5]!, m[6]!)
+  // …长度为 0 或不是有限数时直接返回（:200–206）
+
+  // 向右拖 dx：相机向左挪 dx × unitsPerPixel（负号）
+  // 除以长度：把方向变成长度为 1
+  const horizontal = (-dx * unitsPerPixel) / rightLength
+  // 向下拖 dy（屏幕 y 向下为正）：相机向上挪，画面里的东西才会往下走
+  const vertical = (dy * unitsPerPixel) / upLength
+  // 新位置 = 旧位置 + horizontal × 右方向 + vertical × 上方向
+  // Math.fround：按 Float32 存，和 Transform 里存的精度一致
+  const nextPosition: Vec3Tuple = [
+    Math.fround(position[0] + horizontal * m[0]! + vertical * m[4]!),
+    Math.fround(position[1] + horizontal * m[1]! + vertical * m[5]!),
+    Math.fround(position[2] + horizontal * m[2]! + vertical * m[6]!)
+  ]
+  // 目标点挪同样的距离：相机和目标一起平移，相机还看着目标，距离 d 也不变
+  const nextTarget: Vec3Tuple = [
+    target[0] + (nextPosition[0] - position[0]),
+    target[1] + (nextPosition[1] - position[1]),
+    target[2] + (nextPosition[2] - position[2])
+  ]
+  // …任何一个分量不是有限数就放弃这次平移（:221–226）
+  camera.transform.setPosition(nextPosition)
+  targets.set(camera, nextTarget)
+}</pre>
+    <p>对照第 4 节：<code>unitsPerPixel</code> 就是 h(d) / H，<code>horizontal</code> 就是 −s。相机不旋转，只改位置，所以平移后它的三根轴不变，看的方向也不变；目标点跟着挪了同样的距离，下一次旋转就绕新的目标点转。</p>
+    <p>three.js 的 OrbitControls 是同一个公式：<code>targetDistance × tan(fov/2)</code> 是半高，乘 2 再除以 clientHeight（本地文件 OrbitControls.js:899–910）。</p>
+
+    <h2 id="s8">8. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0033"></div>
+
+    <h2 id="s9">9. 延伸阅读</h2>
+    <ul>
+      <li>首选：three.js r177 的 OrbitControls 源码里 <code>_pan</code> 这一段（本地 <code>node_modules/<wbr />three/<wbr />examples/<wbr />jsm/<wbr />controls/<wbr />OrbitControls.js</code> 第 895–920 行）。只有十几行，和这一课的公式一一对应。</li>
+      <li>本课程第 26 课（轨道控制）第 3.6 节：右键平移在整个轨道控制里的位置。</li>
+    </ul>
+
+    <aside class="note">
+      哪一步推不下去，直接在对话里问我，说清楚是第几节的哪一句。做完告诉我检查题错了哪几题。
+    </aside>
+
+    <div class="nav">
+      <a href="0032-point-to-pixel.html">← 第 32 课：点落在哪个像素</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0034-zoom-by-multiplying.html">第 34 课：滚轮缩放 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 33 课 · 2026-10-15</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+        const V = RTeach.viewLab
+        const num = V.num
+
+        // 课程写的读数：记下按下时的指针位置，算这一次拖动的总位移
+        let downX = null
+        let downY = null
+        let lastX = null
+        let lastY = null
+        const markers = [
+          { name: '近点', point: [-6, 20, 30], color: '#b23a2f' },
+          { name: '目标', point: [0, 10, 0], color: '#1f5f8b' },
+          { name: '远点', point: [6, 0, -50], color: '#444' }
+        ]
+        const pan = V.scene(document.getElementById('pan'), {
+          orbit: { panSpeed: 1 },
+          markers,
+          buttons: [
+            {
+              label: '合成：右键向右拖 100 px',
+              run: (api) => {
+                const r = api.canvas.getBoundingClientRect()
+                downX = r.left + r.width / 2
+                downY = r.top + r.height / 2
+                lastX = downX + 100
+                lastY = downY
+                api.drag({ button: 2, dx: 100, dy: 0 })
+              }
+            },
+            {
+              label: '复位',
+              run: (api) => {
+                api.reset()
+                downX = null
+              }
+            }
+          ],
+          readout: (api, marks) => {
+            const camera = api.camera
+            const p = camera.transform.position
+            const lines = ['相机位置 (' + Array.from(p, (x) => num(x, 2)).join(', ') + ')']
+            const target = marks[1].at
+            if (target) lines[0] += '，目标点深度 d = ' + num(target.depth, 2)
+            if (api.snapshot === null || downX === null) {
+              lines.push('按住右键拖一下，或者点「合成」按钮。')
+              return lines.join('\n')
+            }
+            const dx = lastX - downX
+            const dy = lastY - downY
+            lines.push('这一次拖动：鼠标挪了 dx = ' + num(dx, 0) + ' px，dy = ' + num(dy, 0) + ' px')
+            const d = api.snapshot[1].at ? api.snapshot[1].at.depth : NaN
+            marks.forEach((m, i) => {
+              const before = api.snapshot[i].at
+              if (!before || !m.at) return lines.push(m.name + '：在相机背后')
+              const moved = Math.hypot(m.at.x - before.x, m.at.y - before.y)
+              const expect = (Math.hypot(dx, dy) * d) / before.depth
+              lines.push(
+                m.name + '：深度 D = ' + num(before.depth, 2) + '，屏幕上挪了 ' + num(moved, 1) + ' px；公式 |手的位移| × d ÷ D = ' + num(Math.hypot(dx, dy), 0) + ' × ' + num(d, 2) + ' ÷ ' + num(before.depth, 2) + ' = ' + num(expect, 1) + ' px'
+              )
+            })
+            return lines.join('\n')
+          }
+        })
+        window.__lesson33 = pan
+        // 只在右键拖动时记位移；左键旋转、滚轮不是这一课要验证的
+        pan.canvas.addEventListener('pointerdown', (event) => {
+          if (event.button !== 2) {
+            downX = null
+            return
+          }
+          downX = lastX = event.clientX
+          downY = lastY = event.clientY
+        })
+        pan.canvas.addEventListener('pointermove', (event) => {
+          if (downX === null || (event.buttons & 2) === 0) return
+          lastX = event.clientX
+          lastY = event.clientY
+        })
+        pan.canvas.addEventListener('wheel', () => {
+          downX = null
+        })
+
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0033"]'), [
+          {
+            q: '相机沿自己的右方向向左挪 3，一个点的相机坐标会怎样变？',
+            opts: ['x 增加 3，深度不变', 'x 减少 3，深度不变', 'x 不变，深度增加 3'],
+            answer: 0,
+            why: '第 2 节：相机向左挪，点在相机看来就向右挪；挪动方向和视线垂直，所以深度不变。'
+          },
+          {
+            q: '同一次平移，为什么近处的点在屏幕上挪得更多？',
+            opts: ['挪的像素和深度成反比', '近处的点被相机推得更远', '旋转时近处转得比较快'],
+            answer: 0,
+            why: '第 3 节：Δpx = s × H / h(D)，h(D) 和 D 成正比。s 对所有点都一样，所以 D 越小，挪的像素越多。'
+          },
+          {
+            q: '目标点深度 d = 20，fovY = 45°，画布高 400。要让目标点跟手挪 50 px，相机挪多少？',
+            opts: ['约 2.07 个世界单位', '约 50.0 个世界单位', '约 0.41 个世界单位'],
+            answer: 0,
+            why: 's = dx × h(d) / H = 50 × (2 × 20 × 0.41421) / 400 = 50 × 16.57 / 400 = 2.07。'
+          },
+          {
+            q: '目标点跟手挪了 100 px。一个深度是目标 4 倍的点，挪了多少？',
+            opts: ['25 px', '400 px', '100 px'],
+            answer: 0,
+            why: '第 5 节：Δpx = dx × d / D = 100 × 1/4 = 25。'
+          },
+          {
+            q: 'applyPan 里为什么让 target 也挪同样的距离？',
+            opts: ['相机还要看着它、绕着它转', '为了让画面向反方向移动', '为了让深度 d 每次都变大'],
+            answer: 0,
+            why: '第 7 节：平移只改相机位置、不改朝向。目标点跟着挪，相机仍然看着它，距离 d 不变，下一次左键旋转也绕新的目标点。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

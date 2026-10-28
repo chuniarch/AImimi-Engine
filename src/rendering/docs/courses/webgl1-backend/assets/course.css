@@ -1,0 +1,412 @@
+/* WebGL1 后端课程共用样式 —— lessons/、reference/ 与 index.html 都链接本文件。
+   基础排版沿用 FLIP 课程（claude-workspace/flip/teach/assets/course.css），两门课看起来是同一套讲义。 */
+
+:root {
+  --ink: #1b1b1b;
+  --muted: #5c5c5c;
+  --rule: #d9d4c7;
+  --paper: #fdfcf9;
+  --accent: #1f5f8b;
+  --ok: #2e7d32;
+  --bad: #b23a2f;
+  --warn: #8a6414;
+  --code-bg: #f3f1ea;
+  --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --serif: "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", Georgia, serif;
+}
+
+html { background: var(--paper); color: var(--ink); }
+body {
+  margin: 0;
+  padding: 3rem 1.25rem 6rem;
+  font: 17px/1.7 var(--serif);
+  max-width: 46rem;
+  margin-inline: auto;
+}
+body.wide { max-width: 60rem; }
+
+h1, h2, h3 { font-weight: 600; line-height: 1.25; letter-spacing: 0.01em; }
+h1 { font-size: 2rem; margin: 0 0 0.25rem; }
+h2 { font-size: 1.35rem; margin: 2.75rem 0 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.1rem; margin: 1.75rem 0 0.5rem; }
+
+.kicker { color: var(--muted); font-size: 0.9rem; letter-spacing: 0.08em; text-transform: uppercase; }
+.lede { font-size: 1.1rem; color: var(--muted); margin: 0 0 2rem; }
+
+p { margin: 0 0 1rem; }
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+a.src { font-family: var(--mono); font-size: 0.82em; white-space: nowrap; }
+/* 手机宽度下允许长文件名在任意位置换行：它紧跟在全角括号或行内代码后面时，整段没有断行点，会把页面撑宽 */
+@media (max-width: 480px) {
+  a.src { white-space: normal; overflow-wrap: anywhere; }
+}
+
+code, pre { font-family: var(--mono); font-size: 0.86em; }
+code { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 3px; }
+pre { background: var(--code-bg); padding: 0.9rem 1rem; overflow-x: auto; border-radius: 4px; line-height: 1.5; }
+pre code { background: none; padding: 0; }
+
+/* 内联 SVG 图示（第 8 课起）。文字与线条用 currentColor；只有需要强调的那一处用 --accent 或 --bad。 */
+figure.diagram { margin: 1.5rem 0 1.75rem; }
+figure.diagram .scroll { overflow-x: auto; }
+figure.diagram svg { display: block; width: 100%; min-width: 520px; height: auto; color: var(--ink); }
+figure.diagram figcaption { font-size: 0.88rem; color: var(--muted); margin-top: 0.45rem; line-height: 1.55; }
+.diagram text { fill: currentColor; font-family: var(--mono); font-size: 12px; }
+.diagram text.small { font-size: 11px; fill: var(--muted); }
+.diagram text.title { font-weight: 600; }
+.diagram .box { fill: var(--code-bg); stroke: var(--rule); stroke-width: 1.2; }
+.diagram .box.hl { fill: #e8f0f7; stroke: var(--accent); stroke-width: 1.6; }
+.diagram .box.bad { fill: #fbeeec; stroke: var(--bad); stroke-width: 1.6; }
+.diagram .box.ok { fill: #eef7ee; stroke: var(--ok); stroke-width: 1.6; }
+.diagram .line { stroke: currentColor; stroke-width: 1.3; fill: none; }
+.diagram .line.dash { stroke-dasharray: 4 3; }
+.diagram .line.accent { stroke: var(--accent); }
+.diagram .line.bad { stroke: var(--bad); }
+.diagram .tip { fill: currentColor; }
+.diagram .tip.accent { fill: var(--accent); }
+.diagram .tip.bad { fill: var(--bad); }
+.diagram text.accent { fill: var(--accent); }
+.diagram text.bad { fill: var(--bad); }
+.diagram text.ok { fill: var(--ok); }
+/* 贴在线上的标签：用纸色描边做一圈底，线从文字下面断开 */
+.diagram text.halo { paint-order: stroke; stroke: var(--paper); stroke-width: 5px; stroke-linejoin: round; }
+
+/* 逐函数精读的小表：列名窄、内容紧凑 */
+table.fn th { width: 17%; white-space: nowrap; }
+table.fn td code { white-space: normal; }
+
+table { border-collapse: collapse; width: 100%; margin: 1rem 0 1.5rem; font-size: 0.95rem; }
+th, td { text-align: left; vertical-align: top; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--rule); }
+th { font-weight: 600; border-bottom: 2px solid var(--ink); }
+td code { white-space: nowrap; }
+.table-scroll { overflow-x: auto; }
+
+aside.note {
+  border-left: 3px solid var(--rule);
+  padding: 0.25rem 0 0.25rem 1rem;
+  margin: 1.25rem 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+aside.ask {
+  border: 1px dashed var(--accent);
+  border-radius: 6px;
+  padding: 0.7rem 1rem;
+  margin: 2rem 0;
+  font-size: 0.95rem;
+}
+
+.mission {
+  background: #eef3f7;
+  border: 1px solid #cfdde8;
+  border-radius: 6px;
+  padding: 0.9rem 1.1rem;
+  margin: 1.5rem 0;
+  font-size: 0.95rem;
+}
+
+.steps { counter-reset: step; list-style: none; padding: 0; margin: 1rem 0 1.5rem; }
+.steps li { counter-increment: step; position: relative; padding-left: 2.4rem; margin: 0.6rem 0; }
+.steps li::before {
+  content: counter(step);
+  position: absolute; left: 0; top: 0.15rem;
+  width: 1.6rem; height: 1.6rem; border-radius: 50%;
+  background: var(--ink); color: var(--paper);
+  font: 600 0.8rem/1.6rem var(--mono); text-align: center;
+}
+
+details { margin: 1rem 0; }
+details > summary { cursor: pointer; color: var(--accent); }
+details[open] > summary { margin-bottom: 0.5rem; }
+
+/* 小标签：新后端独有、Task 15、未实现 */
+.tag { display: inline-block; font: 0.72rem/1.4 var(--mono); padding: 0 0.4rem; border-radius: 3px; border: 1px solid var(--rule); color: var(--muted); vertical-align: 0.15em; }
+.tag.new { border-color: #c9a24b; color: var(--warn); }
+.tag.t15 { border-color: var(--accent); color: var(--accent); }
+.tag.todo { border-style: dashed; }
+
+/* ---------- 沙盒 (gl-sandbox.js) ---------- */
+.sandbox { border: 1px solid var(--rule); border-radius: 6px; background: #fff; margin: 1.5rem 0; overflow: hidden; }
+.sandbox .bar { display: flex; flex-wrap: wrap; gap: 0.5rem 0.9rem; align-items: center; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--rule); font: 0.85rem var(--mono); background: #faf8f2; }
+.sandbox .bar button { font: inherit; padding: 0.25rem 0.8rem; border: 1px solid var(--ink); background: #fff; border-radius: 4px; cursor: pointer; }
+.sandbox .bar button.primary { background: var(--ink); color: var(--paper); }
+.sandbox .bar button:hover { background: var(--code-bg); }
+.sandbox .bar button.primary:hover { background: #333; }
+.sandbox .bar .summary { margin-left: auto; color: var(--muted); }
+.sandbox .editor { display: flex; align-items: stretch; }
+.sandbox .gutter {
+  flex: 0 0 auto; min-width: 2.4rem; box-sizing: border-box;
+  font: 13px/1.6 var(--mono); padding: 0.75rem 0.5rem 0.75rem 0.4rem;
+  text-align: right; color: #aaa391; background: #f6f4ee; border-right: 1px solid var(--rule);
+  white-space: pre; overflow: hidden; user-select: none;
+}
+.sandbox textarea.code {
+  display: block; flex: 1 1 auto; width: 100%; min-height: 28rem; box-sizing: border-box;
+  font: 13px/1.6 var(--mono); tab-size: 2;
+  border: 0; outline: none; resize: vertical; padding: 0.75rem 1rem;
+  background: #fcfbf7; color: var(--ink); white-space: pre; overflow: auto;
+}
+.sandbox .view { display: flex; flex-wrap: wrap; gap: 1rem; padding: 0.9rem; border-top: 1px solid var(--rule); align-items: flex-start; }
+.sandbox .screen { flex: 0 0 auto; }
+.sandbox .screen canvas {
+  display: block; width: 320px; height: 200px; border: 1px solid var(--rule);
+  background: repeating-conic-gradient(#eee 0% 25%, #fff 0% 50%) 50% / 16px 16px;
+}
+.sandbox .screen .caption { font: 0.75rem var(--mono); color: var(--muted); margin-top: 0.3rem; }
+.sandbox .results { flex: 1 1 16rem; min-width: 16rem; font-size: 0.9rem; line-height: 1.5; }
+.sandbox .results h4 { font: 600 0.8rem var(--mono); letter-spacing: 0.06em; color: var(--muted); margin: 0 0 0.3rem; text-transform: uppercase; }
+.sandbox .results ul { list-style: none; padding: 0; margin: 0 0 0.9rem; }
+.sandbox .results li { padding: 0.15rem 0 0.15rem 1.3rem; position: relative; }
+.sandbox .results li::before { position: absolute; left: 0; font-weight: 700; font-family: var(--mono); }
+.sandbox li.pass::before { content: "✓"; color: var(--ok); }
+.sandbox li.fail::before { content: "✗"; color: var(--bad); }
+.sandbox li.pending::before { content: "·"; color: var(--muted); }
+.sandbox li.info::before { content: "i"; color: var(--accent); }
+.sandbox li.optional::before { content: "○"; color: var(--muted); }
+.sandbox .detail { display: block; color: var(--muted); font-size: 0.84rem; }
+.sandbox .detail.bad { color: var(--bad); }
+.sandbox .console { font: 12px/1.5 var(--mono); background: #f6f4ee; padding: 0.5rem 0.75rem; white-space: pre-wrap; max-height: 12rem; overflow: auto; border-radius: 4px; margin: 0 0 0.9rem; }
+.sandbox .console .err { color: var(--bad); }
+.sandbox details.calls { margin: 0; padding: 0 0.9rem 0.9rem; }
+.sandbox details.calls pre { max-height: 20rem; overflow: auto; font-size: 11.5px; margin: 0.4rem 0 0; }
+.sandbox details.calls .err { color: var(--bad); font-weight: 600; }
+
+/* ---------- 测验 (quiz.js) ---------- */
+.quiz { margin: 1.5rem 0; }
+.quiz .q { border: 1px solid var(--rule); border-radius: 6px; padding: 0.9rem 1.1rem; margin: 0.9rem 0; }
+.quiz .q p { margin: 0 0 0.6rem; font-weight: 600; }
+.quiz .opts { display: grid; gap: 0.4rem; }
+.quiz button.opt { font: inherit; text-align: left; padding: 0.45rem 0.7rem; border: 1px solid var(--rule); background: #fff; border-radius: 4px; cursor: pointer; }
+.quiz button.opt:hover { border-color: var(--ink); }
+.quiz button.opt[data-state="ok"] { border-color: var(--ok); background: #eef7ee; }
+.quiz button.opt[data-state="bad"] { border-color: var(--bad); background: #fbeeec; }
+.quiz .why { margin-top: 0.6rem; font-size: 0.92rem; color: var(--muted); }
+.quiz .score { font-family: var(--mono); font-size: 0.9rem; color: var(--muted); margin-top: 0.5rem; }
+
+/* ---------- 先预测、再运行 (predict.js) ---------- */
+.predict { margin: 1.5rem 0; }
+.predict-card { border: 1px solid var(--rule); border-radius: 6px; padding: 0.9rem 1.1rem 1rem; margin: 1rem 0; background: #fff; }
+.predict-card .head { font-weight: 600; margin: 0 0 0.5rem; }
+.predict-card pre { margin: 0 0 0.7rem; font-size: 0.8rem; }
+.predict-card p.note { margin: -0.3rem 0 0.7rem; font-size: 0.85rem; color: var(--warn); }
+.predict-card .choices { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.predict-card button.choice { font: 0.88rem var(--mono); padding: 0.3rem 0.65rem; border: 1px solid var(--rule); background: #fff; border-radius: 4px; cursor: pointer; }
+.predict-card button.choice:hover { border-color: var(--ink); }
+.predict-card button.choice[data-state="ok"] { border-color: var(--ok); background: #eef7ee; }
+.predict-card button.choice[data-state="bad"] { border-color: var(--bad); background: #fbeeec; }
+.predict-card .result { margin-top: 0.8rem; font-size: 0.92rem; }
+.predict-card .verdict { font-weight: 600; margin: 0 0 0.5rem; }
+.predict-card .verdict.ok { color: var(--ok); }
+.predict-card .verdict.bad { color: var(--bad); }
+.predict-card .evidence { display: flex; gap: 0.9rem; align-items: flex-start; flex-wrap: wrap; margin-bottom: 0.6rem; }
+.predict-card .evidence canvas { width: 160px; height: 100px; border: 1px solid var(--rule); background: repeating-conic-gradient(#eee 0% 25%, #fff 0% 50%) 50% / 12px 12px; flex: 0 0 auto; }
+.predict-card .evidence ul { list-style: none; margin: 0; padding: 0; flex: 1 1 14rem; font-family: var(--mono); font-size: 0.8rem; line-height: 1.55; }
+.predict-card .evidence li { padding: 0.1rem 0; }
+.predict-card .evidence .err { color: var(--bad); }
+.predict-card .swatch { display: inline-block; width: 0.9em; height: 0.9em; border: 1px solid var(--rule); vertical-align: -0.1em; margin-left: 0.3em; }
+.predict-card .explain { color: var(--ink); }
+.predict-card details pre { font-size: 0.75rem; max-height: 14rem; overflow: auto; }
+.predict .score { font-family: var(--mono); font-size: 0.9rem; color: var(--muted); margin-top: 0.5rem; }
+
+/* ---------- 参考页 ---------- */
+.filter { position: sticky; top: 0; background: var(--paper); padding: 0.6rem 0; z-index: 2; border-bottom: 1px solid var(--rule); }
+.filter input { width: 100%; box-sizing: border-box; font: 0.95rem var(--mono); padding: 0.5rem 0.75rem; border: 1px solid var(--rule); border-radius: 4px; background: #fff; }
+.filter .hint { font-size: 0.8rem; color: var(--muted); margin-top: 0.3rem; }
+.toc { columns: 2; column-gap: 2rem; font-size: 0.92rem; margin: 0.5rem 0 1rem; }
+.toc ol, .toc ul { margin: 0; padding-left: 1.2rem; }
+.api { border-top: 1px solid var(--rule); padding: 0.9rem 0 0.5rem; break-inside: avoid; }
+.api h3 { font-family: var(--mono); font-size: 1rem; margin: 0 0 0.2rem; }
+.api .sig { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); margin: 0 0 0.55rem; white-space: pre-wrap; }
+.api dl { display: grid; grid-template-columns: 3.6rem 1fr; gap: 0.3rem 0.8rem; margin: 0; font-size: 0.93rem; line-height: 1.6; }
+.api dt { color: var(--muted); font-size: 0.78rem; letter-spacing: 0.04em; padding-top: 0.2rem; }
+.api dd { margin: 0; }
+.api dd ul { margin: 0; padding-left: 1.1rem; }
+.api.hidden { display: none; }
+.group-title.hidden { display: none; }
+
+/* 架构图用的方框 */
+.layers { display: grid; gap: 0.5rem; margin: 1rem 0 1.5rem; }
+.layer { border: 1px solid var(--rule); border-radius: 6px; padding: 0.6rem 0.9rem; background: #fff; }
+.layer .name { font: 600 0.8rem var(--mono); color: var(--muted); letter-spacing: 0.05em; }
+.layer.here { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.arrow-down { text-align: center; color: var(--muted); font: 0.8rem var(--mono); margin: -0.2rem 0; }
+
+.nav { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--rule); font-size: 0.95rem; }
+footer { margin-top: 3rem; color: var(--muted); font-size: 0.9rem; }
+
+/* 请求实验台（assets/fetch-lab.js）：先猜结果，再看一次请求里逐条发生了什么 */
+.lab { margin: 1.25rem 0; }
+.lab-card { border: 1px solid var(--rule); border-radius: 6px; padding: 0.9rem 1.1rem 1rem; margin: 1rem 0; background: #fff; }
+.lab-head { font-weight: 600; margin: 0 0 0.4rem; }
+.lab-meta { margin: 0 0 0.4rem; display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.lab-tag { font: 0.75rem/1.5 var(--mono); padding: 0 0.45rem; border: 1px solid var(--rule); border-radius: 3px; color: var(--muted); }
+.lab-desc { font-size: 0.9rem; color: var(--muted); margin: 0 0 0.5rem; }
+.lab-note { font-size: 0.85rem; color: var(--warn); margin: -0.2rem 0 0.5rem; }
+.lab-code { margin: 0 0 0.6rem; font-size: 0.8rem; }
+.lab-q { margin: 0 0 0.5rem; }
+.lab-choices { display: grid; gap: 0.35rem; }
+.lab-choice { font: inherit; font-size: 0.93rem; text-align: left; padding: 0.4rem 0.7rem; border: 1px solid var(--rule); background: #fff; border-radius: 4px; cursor: pointer; }
+.lab-choice:hover:not(:disabled) { border-color: var(--ink); }
+.lab-choice:disabled { cursor: default; color: var(--ink); }
+.lab-choice[data-state="ok"] { border-color: var(--ok); background: #eef7ee; }
+.lab-choice[data-state="bad"] { border-color: var(--bad); background: #fbeeec; }
+.lab-out { margin-top: 0.7rem; }
+.lab-running { color: var(--muted); font-size: 0.9rem; }
+.lab-trace { list-style: none; padding: 0.5rem 0.7rem; margin: 0; background: var(--code-bg); border-radius: 4px; font-size: 0.85rem; line-height: 1.55; }
+.lab-line { display: grid; grid-template-columns: 4.6rem 1fr; gap: 0.6rem; }
+.lab-t { font-family: var(--mono); color: var(--muted); white-space: pre; }
+.lab-line.server .lab-text { color: #44515c; }
+.lab-line.user .lab-text, .lab-line.abort .lab-text { color: var(--accent); }
+.lab-line.result .lab-text { font-weight: 600; }
+.lab-line.muted .lab-text { color: var(--muted); }
+.lab-line.late .lab-text { color: var(--warn); }
+.lab-summary { font: 0.82rem var(--mono); color: var(--muted); margin: 0.4rem 0 0; }
+.lab-verdict { margin-top: 0.6rem; font-size: 0.93rem; line-height: 1.6; }
+.lab-score { font-family: var(--mono); font-size: 0.9rem; color: var(--muted); }
+.lab-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0 0 0.4rem; }
+.lab-bar select, .lab-go { font: inherit; font-size: 0.9rem; padding: 0.25rem 0.5rem; border: 1px solid var(--rule); border-radius: 4px; background: #fff; }
+.lab-go { border-color: var(--ink); cursor: pointer; }
+
+/* 第 25 课：并排的两块线框画布（orbit-lab.js） */
+.orbit-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin: 1rem 0 0.5rem; }
+.orbit-view { margin: 0; min-width: 0; }
+.orbit-view figcaption { font-size: 0.82rem; color: var(--muted); margin-bottom: 0.3rem; }
+.orbit-canvas { display: block; width: 100%; height: 260px; border: 1px solid var(--rule); border-radius: 4px; cursor: grab; touch-action: none; background: #f7f7f5; }
+.orbit-canvas:active { cursor: grabbing; }
+.orbit-read { font: 0.74rem/1.5 var(--mono); background: var(--code-bg); padding: 0.4rem 0.55rem; margin: 0.35rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.orbit-bar { display: flex; flex-wrap: wrap; gap: 0.45rem 0.8rem; align-items: center; font-size: 0.88rem; margin-bottom: 1rem; }
+.orbit-bar button { font: inherit; font-size: 0.86rem; padding: 0.25rem 0.55rem; border: 1px solid var(--rule); border-radius: 4px; background: #fff; cursor: pointer; }
+.orbit-bar button:hover { border-color: var(--ink); }
+@media (max-width: 640px) { .orbit-pair { grid-template-columns: 1fr; } }
+
+/* 第 25 课：相机矩阵实验台 */
+.mlab-grid { display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 0.8rem; align-items: center; font-size: 0.9rem; margin: 0.8rem 0; }
+.mlab-grid span { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.mlab-grid input { width: 6.2rem; font: 0.88rem var(--mono); padding: 0.15rem 0.35rem; border: 1px solid var(--rule); border-radius: 4px; background: #fff; }
+.mlab-out { font-size: 0.78rem; line-height: 1.5; }
+
+@media print {
+  body { padding: 0; font-size: 11pt; max-width: none; }
+  .filter, .sandbox .bar, .nav { display: none; }
+  .api, .quiz .q, table { break-inside: avoid; }
+  a { color: inherit; text-decoration: none; }
+  .toc { columns: 3; }
+}
+
+/* 第 32–35 课：相机数学实验台（view-lab.js） */
+.vl-side, .vl-scene { margin: 1rem 0 1.25rem; padding: 0.8rem 0.9rem; border: 1px solid var(--rule); border-radius: 6px; background: #fff; }
+.vl-side-svg { display: block; width: 100%; height: auto; color: var(--ink); }
+.vl-side-svg text { fill: currentColor; font: 12px var(--mono); }
+.vl-side-svg .vl-small { fill: var(--muted); font-size: 11px; }
+.vl-side-svg .vl-label { fill: var(--bad); font-weight: 600; }
+.vl-axis { stroke: var(--muted); stroke-dasharray: 4 4; stroke-width: 1; }
+.vl-edge { stroke: currentColor; stroke-width: 1; }
+.vl-plane { stroke: var(--accent); stroke-width: 3; }
+.vl-measure { stroke: var(--muted); stroke-width: 1; }
+.vl-ray { stroke: var(--bad); stroke-width: 1; stroke-dasharray: 3 3; }
+.vl-dot { fill: var(--bad); }
+.vl-cam { fill: currentColor; }
+.vl-column { fill: #f3f1ea; stroke: currentColor; stroke-width: 1; }
+.vl-row { stroke: var(--bad); stroke-width: 3; }
+.vl-sliders { display: grid; gap: 0.35rem; margin: 0.6rem 0; font-size: 0.88rem; }
+.vl-slider { display: grid; grid-template-columns: minmax(9rem, 14rem) 1fr 4.5rem; gap: 0.6rem; align-items: center; }
+.vl-slider output { font-family: var(--mono); font-size: 0.85rem; text-align: right; }
+@media (max-width: 560px) { .vl-slider { grid-template-columns: 1fr 4rem; } .vl-slider span { grid-column: 1 / -1; } }
+.vl-read { font-size: 0.78rem; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0.5rem 0 0; }
+.vl-canvas { display: block; width: 100%; height: 300px; border: 1px solid var(--rule); border-radius: 4px; cursor: grab; touch-action: none; background: #f7f7f5; }
+.vl-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; }
+.vl-pair .vl-scene { margin: 0; min-width: 0; }
+.vl-pair .vl-canvas { height: 240px; }
+@media (max-width: 640px) { .vl-pair { grid-template-columns: 1fr; } }
+.vl-bar, .ev-bar { display: flex; flex-wrap: wrap; gap: 0.4rem 0.6rem; margin: 0.5rem 0 0; }
+.vl-bar button, .ev-bar button { font: inherit; font-size: 0.84rem; padding: 0.2rem 0.55rem; border: 1px solid var(--rule); border-radius: 4px; background: #fff; cursor: pointer; }
+.vl-bar button:hover, .ev-bar button:hover { border-color: var(--ink); }
+.vl-caption { font-size: 0.85rem; color: var(--muted); margin: 0 0 0.4rem; }
+
+/* 第 36–38 课：事件实验台（event-lab.js） */
+.ev-lab { margin: 1rem 0 1.25rem; padding: 0.8rem 0.9rem; border: 1px solid var(--rule); border-radius: 6px; background: #fff; }
+.ev-code { margin: 0 0 0.6rem; font-size: 0.8rem; }
+.ev-note { font-size: 0.88rem; color: var(--muted); margin: 0 0 0.5rem; }
+.ev-stage { position: relative; overflow: hidden; background: #e9e7e0; border-radius: 4px; user-select: none; -webkit-user-select: none; }
+.ev-hint { position: absolute; left: 0.6rem; top: 0.4rem; font-size: 0.8rem; color: var(--muted); pointer-events: none; }
+.ev-box { position: absolute; left: 0; top: 0; width: 60px; height: 60px; margin: -30px 0 0 -30px; background: #c8553d; border-radius: 6px; pointer-events: none; }
+.ev-log { list-style: none; margin: 0.6rem 0 0; padding: 0.45rem 0.6rem; background: var(--code-bg); border-radius: 4px; font: 0.76rem/1.55 var(--mono); max-height: 16rem; overflow-y: auto; }
+.ev-log.ev-static { max-height: none; }
+.ev-line { display: grid; grid-template-columns: 4.6rem 1fr; gap: 0.5rem; }
+.ev-t { color: var(--muted); white-space: pre; }
+.ev-text { overflow-wrap: anywhere; }
+.ev-line.muted .ev-text { color: var(--muted); }
+.ev-line.bad .ev-text { color: var(--bad); }
+.ev-sim { color: var(--accent); }
+
+/* code-view.js：按类别高亮代码行（第 40 课起） */
+.cv { margin: 1rem 0 1.25rem; }
+.cv-caption { font-size: 0.9rem; color: var(--muted); margin: 0 0 0.4rem; }
+.cv-bar { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.35rem; }
+.cv-button { font: inherit; font-size: 0.85rem; padding: 0.2rem 0.6rem; border: 1px solid var(--rule); border-radius: 999px; background: #fff; color: var(--ink); cursor: pointer; }
+.cv-button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+.cv-status { font-size: 0.85rem; color: var(--muted); margin: 0 0 0.35rem; min-height: 1.2em; }
+.cv-code { overflow-x: auto; font-size: 0.8rem; line-height: 1.45; }
+.cv-line { display: block; }
+.cv-no { color: var(--muted); user-select: none; margin-right: 0.8em; }
+.cv-line.cv-hit { background: #fff3c4; box-shadow: inset 3px 0 0 var(--warn); }
+.gl-stage { margin: 1rem 0; padding: 0.8rem; border: 1px solid var(--rule); border-radius: 6px; background: #fff; }
+.gl-stage canvas { display: block; width: 100%; max-width: 480px; height: auto; border-radius: 4px; background: #14161c; }
+.gl-stage .gl-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin: 0.6rem 0 0.3rem; font-size: 0.9rem; }
+.gl-stage .gl-readout { font-family: var(--mono); font-size: 0.8rem; white-space: pre-wrap; color: var(--ink); margin: 0.3rem 0 0; }
+
+/* 步骤代码框（step-view.js，第 47 课起）：一段调用链放在同一个框里，旁边是这一步的说明。
+   比正文宽：两栏并排时代码不用频繁横向滚动；窄屏时说明在上、代码在下。 */
+.sv { width: min(76rem, calc(100vw - 4rem)); margin: 1.2rem calc(50% - min(38rem, 50vw - 2rem)) 1.6rem; }
+.sv-route { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin-bottom: 0.6rem; font-size: 0.82rem; }
+.sv-chip { padding: 0.15rem 0.55rem; border: 1px solid var(--rule); border-radius: 4px; color: var(--muted); background: #fff; }
+.sv-chip.sv-here { border-color: var(--accent); color: #fff; background: var(--accent); }
+.sv-arrow { color: var(--muted); }
+.sv-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.9rem; margin-bottom: 0.4rem; }
+.sv-versions, .sv-steps { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.sv-version, .sv-step, .sv-nav { font: inherit; font-size: 0.85rem; padding: 0.15rem 0.55rem; border: 1px solid var(--rule); border-radius: 999px; background: #fff; color: var(--ink); cursor: pointer; }
+.sv-step { min-width: 2rem; }
+.sv-version[aria-pressed="true"], .sv-step[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+.sv-dim { font-size: 0.85rem; color: var(--muted); }
+.sv-status { font-size: 0.85rem; color: var(--muted); margin: 0 0 0.4rem; min-height: 1.2em; }
+.sv-body { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 1rem; align-items: start; }
+.sv-code { margin: 0; max-height: 38rem; overflow: auto; font-size: 0.76rem; line-height: 1.5; position: relative; }
+.sv-file { display: block; color: var(--accent); font-weight: 600; margin-top: 0.3rem; }
+.sv-line { display: block; white-space: pre; }
+.sv-no { color: var(--muted); user-select: none; margin-right: 0.8em; }
+.sv-dimmed .sv-line.sv-check { opacity: 0.4; }
+.sv-line.sv-hit { background: #fff3c4; box-shadow: inset 3px 0 0 var(--warn); opacity: 1 !important; }
+.sv-panel { max-height: 38rem; overflow: auto; border: 1px solid var(--rule); border-radius: 4px; background: #fff; padding: 0.8rem 1rem; font-size: 0.92rem; line-height: 1.65; }
+.sv-panel-head { font-weight: 600; margin: 0 0 0.5rem; color: var(--accent); }
+.sv-panel-body h4 { font-size: 0.82rem; letter-spacing: 0.04em; color: var(--muted); margin: 0.8rem 0 0.2rem; }
+.sv-panel-body h4:first-child { margin-top: 0; }
+.sv-panel-body p, .sv-panel-body ul { margin: 0 0 0.5rem; }
+.sv-panel-body ul { padding-left: 1.2rem; }
+.sv-panel-body table { font-size: 0.85rem; }
+@media (max-width: 1000px) {
+  .sv-body { grid-template-columns: 1fr; }
+  .sv-panel { order: -1; max-height: none; }
+  .sv-code { max-height: 26rem; }
+}
+
+/* 第 47 课的「真实代码画两帧」面板 */
+.dt-stage { display: grid; grid-template-columns: minmax(0, 360px) minmax(0, 1fr); gap: 1rem; align-items: start; }
+.dt-stage canvas { width: 100%; height: auto; border-radius: 4px; background: #000; display: block; }
+.dt-table td.num, .dt-table th.num { text-align: right; font-family: var(--mono); font-size: 0.85rem; }
+.dt-calls { max-height: 22rem; overflow: auto; font-size: 0.75rem; }
+@media (max-width: 760px) { .dt-stage { grid-template-columns: 1fr; } }
+
+/* ---- 第 22 课：审查意见的标签（Conventional Comments）和实验台的画面 ---- */
+.rv-label { display: inline-block; font: 600 0.78rem/1.5 var(--mono); padding: 0 0.45rem; border-radius: 3px; border: 1px solid currentColor; margin-right: 0.35rem; white-space: nowrap; }
+.rv-praise { color: var(--ok); }
+.rv-issue { color: var(--bad); }
+.rv-suggestion { color: var(--accent); }
+.rv-question { color: var(--warn); }
+.rv-nitpick, .rv-note { color: var(--muted); }
+.rv-head { margin: 0 0 0.6rem; font-weight: 600; }
+.rv-pic { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: flex-start; margin: 0.4rem 0 0; }
+.rv-pic canvas { width: 240px; max-width: 100%; height: auto; border-radius: 4px; background: #000; display: block; }
+.rv-pic figcaption { font-size: 0.8rem; color: var(--muted); }
+.rv-list { list-style: none; padding: 0; }
+.rv-list > li { border-top: 1px solid var(--rule); padding: 0.6rem 0; }
+.rv-list > li details { margin: 0.3rem 0 0; }

@@ -1,0 +1,1572 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 17 课 · 把图片交给 GPU</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/texture-bundle.js"></script>
+    <script src="../assets/hw2-cornellbox-faces.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 详细篇 11 · backend ⑤ · 约 70 分钟</p>
+    <h1>backend ⑤：把图片交给 GPU——CubeTextureManager 与上传作用域</h1>
+    <p class="lede">
+      HW2 的背景是一个天空盒：六张 JPEG 贴在一个大立方体的六个内壁上。CPU 上，它们是一个 CubeTexture，里面装着六张浏览器解码好的图片；要画出来，得把像素拷进 GPU 的一个 cubemap 纹理。这一课先用 HW2 的真实图片把纹理相关的 GL 调用看明白：纹理单元、上传设置、采样参数、颜色空间；再从旧引擎的写法出发一版一版补上缺的东西，最后读真实的 CubeTextureManager。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW2 每帧都要用这个 cubemap 画背景；HW1 的阴影、IBL 的环境图、你正在写的 Texture2D 上传，走的都是同一套「上传作用域」和同样的检查。这一课的 withTextureUploadState、assertTextureOperation 在 WebGL1TextureUploadSupport.ts 里，RenderTargetManager（下一课）也在用。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：第 16 课第 3 节，GeometryManager 上传前「先记下、再还回」绑定，失败时删掉本次建的对象，全部成功才写进缓存；第 15 课 2.8 节或第 14 课 2.6 节讲过的「一代一个 Manager」。CubeTexture 的字段（第 12 课）1.2 节会配着 HW2 的值再列一遍。如果其中哪一条其实没懂，告诉我，我先补那一块。<br />
+      <strong>这一课从零讲的</strong>：纹理的三个调用和 cubemap 的六个面；纹理单元：bindTexture 写进哪一格；四个上传设置为什么是整个 context 共用的；WebGL1 的 NPOT 限制和「纹理不完整就采样出黑色」；sRGB 纹理采样时怎样解码；上传作用域；validateStorage 每一条防的是什么；为什么 CubeTextureManager 不需要 beforeDelete；它和 Lifecycle 的关系。<br />
+      <strong>页面会用到你的显卡</strong>：卡片都在你的浏览器里创建真实的 WebGL context，用完释放。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">原始输入与需求</a>：<a href="#s1-1">六张图</a> <a href="#s1-2">CubeTexture</a> <a href="#s1-3">谁来要</a> <a href="#s1-4">需求</a></li>
+        <li><a href="#s2">先把 GL 调用看明白</a>：<a href="#s2-1">三步与六个面</a> <a href="#s2-2">纹理单元</a> <a href="#s2-3">上传设置</a> <a href="#s2-4">采样参数与 NPOT</a> <a href="#s2-5">颜色空间</a></li>
+        <li><a href="#s3">一版一版写</a>：<a href="#s3-1">第 1 版</a> <a href="#s3-2">第 2 版</a> <a href="#s3-3">真实代码</a> <a href="#s3-4">validateStorage</a>（<a href="#s3-4-1">四项之间的约束</a>） <a href="#s3-5">上传作用域</a> <a href="#s3-6">释放</a></li>
+        <li><a href="#s4">和 Lifecycle 的关系</a></li>
+        <li><a href="#s5">架构视角：对照 three.js</a></li>
+        <li><a href="#s6">审查视角</a></li>
+        <li><a href="#s7">检查题</a></li>
+        <li><a href="#s8">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 原始输入与需求</h2>
+    <h3 id="s1-1">1.1 六张图</h3>
+    <p>
+      HW2 有四个环境预设，每个一个目录、六张 JPEG，文件名固定：posx、negx、posy、negy、posz、negz，分别贴在立方体的 +X、−X、+Y、−Y、+Z、−Z 面（顺序写死在 <a data-src="src/scenes/games202/hw2/_config/hw2CPUSceneConfig.ts:12">hw2CPUSceneConfig.ts:12–20</a>，不按下载完成的先后）。实际尺寸（sips 实测）：
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>预设</th><th>每面尺寸</th><th>六个 JPEG 一共</th><th>解码成 RGBA 后（6 × 宽 × 高 × 4 字节）</th></tr></thead>
+      <tbody>
+        <tr><td>CornellBox</td><td>128 × 128</td><td>10.8 KB</td><td>393,216 字节（384 KiB）</td></tr>
+        <tr><td>GraceCathedral</td><td>256 × 256</td><td>109.2 KB</td><td>1,572,864 字节（1.5 MiB）</td></tr>
+        <tr><td>Skybox</td><td>256 × 256</td><td>25.9 KB</td><td>1.5 MiB</td></tr>
+        <tr><td>Indoor</td><td>512 × 512</td><td>361.6 KB</td><td>6,291,456 字节（6 MiB）</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      注意最后两列差了十几倍：JPEG 是压缩过的，GPU 不认 JPEG，它要的是一个一个像素。浏览器加载图片时把 JPEG 解码成像素（第 21 课的 loadHW2CubeImages 等到六张都 onload），texImage2D 拷进显存的是解码后的像素。打开 posx.jpg 的前 16 个字节：
+    </p>
+    <pre><code>ff d8 ff e0 00 10 4a 46 49 46 00 01 01 00 00 01
+// ff d8：JPEG 文件的开头标记；4a 46 49 46 是 ASCII 的 "JFIF"
+// 后面是压缩后的数据，不是一个个像素，texImage2D 也不认它</code></pre>
+    <p>
+      这一课的卡片用 CornellBox 的六张图（最小，六张一共 10.8 KB，转成 data: URL 放在 <code>assets/hw2-cornellbox-faces.js</code>）。用 file:// 打开页面时，直接读本地 JPEG 会被浏览器当成跨源图片，texImage2D 会拒绝；data: URL 不会。
+    </p>
+
+    <h3 id="s1-2">1.2 CubeTexture 里装着什么</h3>
+    <p>createHW2Scene 拿到六张图以后，把它们和一份描述一起包进 CubeTexture：</p>
+    <pre><code>// createHW2Scene.ts:320–343（节选，注释是课程加的）
+const texture = retain(
+  new CubeTexture({
+    // 诊断用的名字，比如「GraceCathedral / Mary / …/background」
+    label: settings.label + &#x27;/background&#x27;,
+    source: { kind: &#x27;images&#x27;, faces }, // 六个 HTMLImageElement，顺序 +X、-X、+Y、-Y、+Z、-Z
+    storage: { format: &#x27;rgba&#x27;, type: &#x27;uint8&#x27; }, // GPU 上每个像素 4 个通道、各 1 字节
+    colorSpace: &#x27;data&#x27;, // 采样时不解码：shader 拿到的就是 JPEG 里的原值（2.5 节）
+    sampler: {
+      wrapS: &#x27;clamp-to-edge&#x27;, // 出了边就取边上的像素
+      wrapT: &#x27;clamp-to-edge&#x27;,
+      minFilter: &#x27;linear&#x27;, // 缩小、放大都用双线性，不用 mipmap
+      magFilter: &#x27;linear&#x27;
+    },
+    mipmapPolicy: &#x27;none&#x27; // 只有原尺寸这一层
+  })
+)</code></pre>
+    <p>
+      第 12 课讲过：CubeTexture 是 CPU 上的逻辑资源，它<strong>借用</strong>这六张图（不复制像素、不关闭它们），不认识 WebGL。<code>source.kind</code> 还可以是 <code>'data'</code>：六个像素数组，每个带 width、height（比如程序生成的 HDR 环境图）。描述里的每个字段，这一课都会讲到它在 GPU 上变成了什么。
+    </p>
+
+    <h3 id="s1-3">1.3 谁来要 GPU 纹理</h3>
+    <p>
+      CubeTextureManager 不主动上传。第一次画背景时，Uniforms 准备 uniform，遇到 <code>uSkyboxMap</code> 这个 cubeTexture 参数，才去要它的 GPU 表示：
+    </p>
+    <pre><code>// WebGL1Uniforms.ts:164–173（prepare 里处理 cubeTexture 参数的一段，注释是课程加的）
+if (parameter.type === &#x27;cubeTexture&#x27;) {
+  const unit = nextTextureUnit++ // 背景只有一个 samplerCube：用单元 0
+  // resolveCube 就是 resources.cubeTextures.get（WebGL1Backend.ts:295）：
+  // 第一次会上传六面，以后直接交回缓存
+  const resource = this.resolveCube(parameter.value)
+
+  // prepare 只准备、不执行：交回一个函数，draw 时由 upload 依次调用
+  return () =&gt; {
+    this.gl.activeTexture(this.gl.TEXTURE0 + unit) // 选中单元 0
+    // 放进单元 0 的 cube 格子
+    this.gl.bindTexture(this.gl.TEXTURE_CUBE_MAP, resource.handle)
+    this.gl.uniform1i(entry.location, unit) // 告诉 shader：uSkyboxMap 读单元 0
+  }
+}</code></pre>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 262" role="img" aria-label="六个 JPEG 解码成六个 HTMLImageElement，包进 CubeTexture，这些都在 CPU 内存里；第一次 draw 时 CubeTextureManager.get 把六面上传成显存里的 cubemap 纹理，以后只交回 handle；每次 draw 把它绑进纹理单元 0 的 cube 格子，再用 uniform1i 告诉背景 shader 的 uSkyboxMap 读单元 0。">
+          <defs>
+            <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+            <marker id="f1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <text x="20" y="22" class="title">CPU：JS 对象，在内存里</text>
+          <rect x="20" y="34" width="190" height="66" class="box" />
+          <text x="115" y="56" text-anchor="middle">六个 JPEG 文件</text>
+          <text x="115" y="74" text-anchor="middle" class="small">GraceCathedral，各 256²</text>
+          <text x="115" y="90" text-anchor="middle" class="small">共约 109 KB</text>
+          <path d="M210 67 L281 67" class="line" marker-end="url(#f1a)" />
+          <text x="246" y="59" text-anchor="middle" class="small">解码</text>
+          <rect x="285" y="34" width="190" height="66" class="box" />
+          <text x="380" y="56" text-anchor="middle">六个 HTMLImageElement</text>
+          <text x="380" y="74" text-anchor="middle" class="small">loadHW2CubeImages</text>
+          <text x="380" y="90" text-anchor="middle" class="small">像素在浏览器手里</text>
+          <path d="M475 67 L546 67" class="line" marker-end="url(#f1a)" />
+          <text x="511" y="59" text-anchor="middle" class="small">包进</text>
+          <rect x="550" y="34" width="190" height="66" class="box hl" />
+          <text x="645" y="56" text-anchor="middle">CubeTexture</text>
+          <text x="645" y="74" text-anchor="middle" class="small">借用六张图 + 描述</text>
+          <text x="645" y="90" text-anchor="middle" class="small">createHW2Scene</text>
+          <path d="M20 134 L740 134" class="line dash" />
+          <path d="M645 100 L645 172" class="line accent" marker-end="url(#f1b)" />
+          <text x="633" y="124" text-anchor="end" class="small accent">CubeTextureManager.get</text>
+          <text x="633" y="154" text-anchor="end" class="small accent">第一次上传六面，以后只交回 handle</text>
+          <text x="20" y="154" class="title">GPU：在显存里</text>
+          <rect x="550" y="176" width="190" height="66" class="box hl" />
+          <text x="645" y="198" text-anchor="middle">cubemap 纹理</text>
+          <text x="645" y="216" text-anchor="middle" class="small">6 面 × 256² × RGBA</text>
+          <text x="645" y="232" text-anchor="middle" class="small">1.5 MiB，只传一次</text>
+          <path d="M550 209 L479 209" class="line" marker-end="url(#f1a)" />
+          <text x="514" y="201" text-anchor="middle" class="small">绑定</text>
+          <rect x="285" y="176" width="190" height="66" class="box" />
+          <text x="380" y="198" text-anchor="middle">纹理单元 0</text>
+          <text x="380" y="216" text-anchor="middle" class="small">的 cube 格子（2.2 节）</text>
+          <text x="380" y="232" text-anchor="middle" class="small">每次 draw 放一次</text>
+          <path d="M285 209 L214 209" class="line" marker-end="url(#f1a)" />
+          <text x="249" y="201" text-anchor="middle" class="small">uniform1i</text>
+          <rect x="20" y="176" width="190" height="66" class="box" />
+          <text x="115" y="198" text-anchor="middle">背景 shader</text>
+          <text x="115" y="216" text-anchor="middle" class="small">uSkyboxMap = 0</text>
+          <text x="115" y="232" text-anchor="middle" class="small">textureCube(…, 方向)</text>
+        </svg>
+      </div>
+      <figcaption>图 1　HW2 背景这一路。虚线以上是 CPU 内存里的 JS 对象，以下是显存。1.5 MiB 的像素只在第一次 get 时过一次虚线；以后每次 draw 只做两件小事：把 handle 放进纹理单元 0，告诉 shader 读单元 0（fragment.frag:7、:10 是 <code>uniform samplerCube uSkyboxMap</code> 和 <code>textureCube(uSkyboxMap, vTexCoord)</code>）。</figcaption>
+    </figure>
+
+    <h3 id="s1-4">1.4 需求：要应付哪些情况</h3>
+    <ol class="steps">
+      <li><strong>同一个 CubeTexture 只上传一次。</strong>Indoor 一次 6 MiB，不能每帧拷一遍。</li>
+      <li><strong>上传不受别人留下的设置影响，也不把自己的设置留给别人。</strong>上传设置和纹理绑定都是整个 context 共用的（2.2、2.3 节），旧引擎的代码和新后端在同一个 canvas 上共用一个 context。</li>
+      <li><strong>六面要么全传上去，要么一个都不留。</strong>传到第五面显存不够，前面建的纹理要删掉，缓存里也不能出现它。</li>
+      <li><strong>WebGL1 做不到的组合，在碰 GPU 之前就拒绝。</strong>NPOT 配 mipmap、float 没有扩展、要 sRGB 却没有 EXT_sRGB……这些做下去不一定报错，只是采样出黑色或颜色不对（2.4、2.5 节实测）。</li>
+      <li><strong>颜色空间说到做到。</strong>描述里写 sRGB，采样时就要解码成线性值；写 data，就原样交给 shader。</li>
+      <li><strong>释放、关闭、context 丢失时的规矩</strong>和前两课的 Manager 一样：释放时删干净，丢失时不乱发命令，恢复后能重新上传。</li>
+    </ol>
+
+    <h2 id="s2">2. 先把 GL 调用看明白</h2>
+    <h3 id="s2-1">2.1 纹理的三步，和 cubemap 的六个面</h3>
+    <p>和 buffer 一样（第 16 课 2.1 节），纹理也是「先建、再绑、再往里写」：</p>
+    <pre><code>const t = gl.createTexture()             // ① 建一个空的纹理对象，拿到句柄
+gl.bindTexture(gl.TEXTURE_CUBE_MAP, t)   // ② 绑到 cube 格子上（2.2 节说是哪一格）
+// ③ 往「当前绑着的那个纹理」的某一面写像素。cubemap 有六面，各有一个 target：
+//    TEXTURE_CUBE_MAP_POSITIVE_X = 0x8515，NEGATIVE_X = 0x8516，POSITIVE_Y = 0x8517，
+//    NEGATIVE_Y = 0x8518，POSITIVE_Z = 0x8519，NEGATIVE_Z = 0x851A，正好连续，
+//    所以代码里写 TEXTURE_CUBE_MAP_POSITIVE_X + i
+
+// 来源是图片：图片自带宽高，6 个参数
+gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image)
+//            哪一面                          第 0 层  GPU 上的格式  来源格式  每通道 1 字节
+
+// 来源是像素数组：数组不知道自己多宽多高，9 个参数
+gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X, 0, gl.RGBA, 256, 256, 0, gl.RGBA,
+              gl.UNSIGNED_BYTE, pixels)  // pixels：256 × 256 × 4 = 262,144 字节
+//                                              宽   高  边框（WebGL 里必须是 0）</code></pre>
+
+    <h3 id="s2-2">2.2 纹理单元：bindTexture 写进哪一格</h3>
+    <p>
+      shader 里的 <code>samplerCube uSkyboxMap</code> 并不直接存一个纹理，它存的是一个<strong>单元号</strong>。纹理单元 (texture unit) 是一排格子：每个单元有一个 2D 格子和一个 cube 格子。context 里还有一个「当前单元」(ACTIVE_TEXTURE)，<code>bindTexture</code> 写进的是<strong>当前单元</strong>的那个格子：
+    </p>
+    <pre><code>// 整个 context 一份（SwiftShader 实测 32 个单元；WebGL1 至少保证 8 个）
+// ACTIVE_TEXTURE → 单元 0
+// 单元    TEXTURE_2D 格子    TEXTURE_CUBE_MAP 格子
+//   0          null               null
+//   1          null               null
+//   …
+//  31          null               null
+
+gl.activeTexture(gl.TEXTURE3)              // 当前单元换成 3
+gl.bindTexture(gl.TEXTURE_CUBE_MAP, A)     // 单元 3 的 cube 格子 = A
+gl.activeTexture(gl.TEXTURE0)              // 当前单元换回 0
+gl.bindTexture(gl.TEXTURE_CUBE_MAP, B)     // 单元 0 的 cube 格子 = B；单元 3 还是 A
+gl.uniform1i(uSkyboxMapLocation, 3)        // shader 采样 uSkyboxMap 时读单元 3 → A</code></pre>
+    <p>
+      这和第 16 课的 ARRAY_BUFFER 是一类东西：整个 context 共用、藏在「当前」后面的状态。谁调用 bindTexture，就换掉了当前单元那一格里原来放的纹理。上传纹理必须先 bindTexture（第 ② 步），所以上传本身就会动到别人的格子——这就是需求 2 的一半。
+    </p>
+    <div id="lab-units"></div>
+
+    <h3 id="s2-3">2.3 上传设置：整个 context 只有一份</h3>
+    <p>
+      texImage2D 怎样把来源的字节排进纹理，还受四个<strong>上传设置</strong>控制，用 <code>pixelStorei</code> 设置。它们不存在纹理里，而是整个 context 一份：谁最后设，之后所有的 texImage2D 都照它来。四个设置、它们的初始值（实测，和规范一致）和作用：
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>设置</th><th>初始值</th><th>管什么</th><th>实测</th></tr></thead>
+      <tbody>
+        <tr><td>UNPACK_ALIGNMENT</td><td>4</td><td>数组来源每一行的起点按几字节对齐</td><td>3 × 3 的 RGB 面，每行 9 字节，按 4 对齐要补到 12，一共要 12 + 12 + 9 = 33 字节；只给 27 字节 → INVALID_OPERATION（1282）。设成 1 → 0</td></tr>
+        <tr><td>UNPACK_FLIP_Y_WEBGL</td><td>false</td><td>要不要上下翻转（最后一行最先传）</td><td>上红下蓝的 2 × 2 图：false 时第 0 行是红，true 时第 0 行是蓝；对像素数组也生效；对 ImageBitmap 不起作用</td></tr>
+        <tr><td>UNPACK_PREMULTIPLY_ALPHA_WEBGL</td><td>false</td><td>要不要把 alpha 乘进颜色</td><td>半透明像素 (200, 100, 50, 0.5)：false 时存成 (199, 100, 50, 128)，true 时存成 (100, 50, 25, 128)</td></tr>
+        <tr><td>UNPACK_COLORSPACE_CONVERSION_WEBGL</td><td>BROWSER_DEFAULT_WEBGL</td><td>要不要让浏览器按图片自带的色彩配置转换颜色</td><td>NONE 时除了转成 RGBA，不做任何颜色转换（规范原话）；默认值下，带色彩配置的图片（比如 Display P3 拍的照片）可能被改值</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      因为是全局的，一处设了忘了还，就会影响后面所有人。旧引擎就有一处现成的例子：它给 2D 纹理上传前把 FLIP_Y 设成 true，传完再手动设回 false：
+    </p>
+    <pre><code>// 旧引擎 src/textures/Texture.ts:66–72（原注释保留，挪到了行上方）
+gl.bindTexture(gl.TEXTURE_2D, this.handle)
+// 设置为 true 后，所有后续的 texImage2D 调用都会翻转 Y 轴，直到手动设回 false
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true)
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image)
+
+this.setupFiltering(image.width, image.height)
+
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false) // 恢复！
+// 课程注：texImage2D 或 setupFiltering 一旦抛错，上面这一行就走不到，
+// FLIP_Y 会一直是 true，之后谁上传都被翻转</code></pre>
+    <p>
+      这就是需求 2 的另一半：上传之前，不能假设这四个设置是初始值；上传之后，也不能把自己设的值留给别人。
+    </p>
+    <div id="lab-pixelstore"></div>
+
+    <h3 id="s2-4">2.4 采样参数，和 WebGL1 的 NPOT 限制</h3>
+    <p>
+      <code>texParameteri</code> 设的是采样参数：出了边界怎么办（wrap）、缩小放大时怎么取（filter）。和上传设置不同，它们<strong>存在纹理对象里</strong>，绑到哪个单元都跟着走。
+    </p>
+    <p>
+      WebGL1 对边长不是 2 的幂的纹理（NPOT，比如 100、300）有限制：wrap 只能是 CLAMP_TO_EDGE，缩小过滤只能是 NEAREST 或 LINEAR（不能用 mipmap），也不能 generateMipmap。违反了会怎样？下表是在无界面 Chrome 里实测的：用一个纯色 (200, 100, 50) 的 cubemap，画一个像素去采样它。
+    </p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>边长</th><th>wrap</th><th>缩小过滤</th><th>采样结果</th><th>getError</th></tr></thead>
+      <tbody>
+        <tr><td>4（2 的幂）</td><td>CLAMP</td><td>LINEAR</td><td>(200, 100, 50, 255)</td><td>0</td></tr>
+        <tr><td>3（NPOT）</td><td>CLAMP</td><td>LINEAR</td><td>(200, 100, 50, 255)</td><td>0</td></tr>
+        <tr><td>3（NPOT）</td><td>REPEAT</td><td>LINEAR</td><td><strong>(0, 0, 0, 255)</strong></td><td>0</td></tr>
+        <tr><td>3（NPOT）</td><td>CLAMP</td><td>LINEAR_MIPMAP_LINEAR</td><td><strong>(0, 0, 0, 255)</strong></td><td>0</td></tr>
+        <tr><td>4（2 的幂）</td><td>CLAMP</td><td>LINEAR_MIPMAP_LINEAR，但没生成 mipmap</td><td><strong>(0, 0, 0, 255)</strong></td><td>0</td></tr>
+      </tbody>
+    </table></div>
+    <p>
+      规则违反时，纹理叫作「不完整」(incomplete)：采样一律得到黑色 (0, 0, 0, 1)，<strong>没有任何错误码</strong>。另外，对 NPOT 纹理调用 generateMipmap 会报 INVALID_OPERATION（1282，实测）。最后一行说明，就算是 2 的幂，用了 mipmap 过滤却没有 mipmap，也一样是黑的。这条和 WebGL1 无关，所以 CPU 的 Texture 在构造时就拒绝它（<a data-src="src/rendering/resources/Texture.ts:208">Texture.ts:208–210</a>）；NPOT 那几条只是 WebGL1 的限制，留给后端的 CubeTextureManager 检查（3.4 节）。这和第 10 课的 Geometry 一样分工：和后端无关的规则由 CPU 资源查，和设备能力有关的由后端查。
+    </p>
+    <div id="lab-npot"></div>
+
+    <h3 id="s2-5">2.5 颜色空间：sRGB 纹理在采样时解码</h3>
+    <p>
+      先把数学说清楚。JPEG 里存的 8 位颜色值 <em>v</em>（0～255 的整数）是「为显示器编码过的」(sRGB 编码)，不是光的强度。记 <em>s</em> = <em>v</em> / 255（0～1）。光照计算要用线性值 <em>c</em>（和光的强度成正比），sRGB 的解码公式是：
+    </p>
+    <pre><code>c = s / 12.92                        当 s ≤ 0.04045
+c = ((s + 0.055) / 1.055) ^ 2.4      当 s > 0.04045
+
+例：v = 128 → s = 128 / 255 = 0.50196
+    c = ((0.50196 + 0.055) / 1.055) ^ 2.4 = 0.52793 ^ 2.4 = 0.21586
+    写回 8 位：0.21586 × 255 = 55.04 → 55</code></pre>
+    <p>
+      EXT_sRGB 扩展提供 SRGB_ALPHA_EXT 格式：像素照样按原值存，<strong>GPU 在采样时自动做上面的解码</strong>。实测：同样存 128，普通 RGBA 采样得到 128（也就是 0.502），SRGB_ALPHA_EXT 采样得到 55（0.216）。所以描述里写 <code>colorSpace: 'srgb'</code> 时，Manager 用 SRGB_ALPHA_EXT 上传，shader 拿到的已经是线性值，不能再自己解码一次。
+    </p>
+    <p>
+      HW2 现在写的是 <code>'data'</code>：原值交给 shader，背景 shader 直接把它写到屏幕上。JPEG 的值本来就是为显示编码的，所以看起来是对的。如果只把标签改成 'srgb'，shader 拿到的是 0.216 而不是 0.502，又没有在输出时编码回去，背景会变暗。这就是 createHW2Scene 那条 TODO 说的：colorSpace、背景 shader、输出变换要一起改（<a data-src="src/scenes/games202/hw2/createHW2Scene.ts:325">createHW2Scene.ts:325–334</a>）。
+    </p>
+    <div id="lab-srgb"></div>
+
+    <h2 id="s3">3. 一版一版写</h2>
+    <h3 id="s3-1">3.1 第 1 版：旧引擎的写法</h3>
+    <p>旧引擎的 CubeMapTexture 就是教程写法：建、绑、传六面、设采样参数，最后解绑。</p>
+    <pre><code>// 第 1 版：旧引擎的写法。GL 调用和 src/textures/CubeMapTexture.ts:64–108 一样，
+// 改写成了函数，去掉了注释掉的代码和错误类
+function uploadCubeV1(
+  gl: WebGLRenderingContext,
+  faces: readonly TexImageSource[] // 六张图，顺序 +X、-X、+Y、-Y、+Z、-Z
+): WebGLTexture {
+  const handle = gl.createTexture()!
+  // 绑在「当前单元」的 cube 格子上：那一格原来放着谁，现在被换掉了
+  gl.bindTexture(gl.TEXTURE_CUBE_MAP, handle)
+
+  for (let i = 0; i &lt; faces.length; i++) {
+    // +X、-X、+Y、-Y、+Z、-Z 是连续的六个数：0x8515 + i。
+    // 用的是此刻 context 里的上传设置：别人留下的 FLIP_Y、ALIGNMENT 照样生效。
+    // 不查 getError：这一面没传上去，函数也照样往下走
+    const face = gl.TEXTURE_CUBE_MAP_POSITIVE_X + i
+    gl.texImage2D(face, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, faces[i]!)
+  }
+
+  // 采样参数存在这个纹理对象里（和上传设置不同，不是整个 context 共用的）
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+
+  // 「收尾」：把当前单元的 cube 格子清空。原来放在那里的纹理也就没了
+  gl.bindTexture(gl.TEXTURE_CUBE_MAP, null)
+  return handle
+}</code></pre>
+    <p>对照 1.4 节的需求，它有三个问题：</p>
+    <ol class="steps">
+      <li><strong>继承别人的上传设置。</strong>它不碰 pixelStorei，用的是此刻 context 里的值。假如旧引擎的 Texture.ts 在 2.3 节那两行之间抛了错，FLIP_Y 留成 true，这六面就全被上下翻转了。</li>
+      <li><strong>动了当前单元的格子，最后清成 null。</strong>假如当前单元是 2，单元 2 的 cube 格子里原来放着别人的纹理 X，第一行 bindTexture 换掉了它，最后一行又清成 null。X 不会自己回来。</li>
+      <li><strong>不查错误，一面失败也照样交出纹理。</strong>显存不够时 texImage2D 不抛异常，只留一个错误码。第 1 版不问 getError，于是交出一个缺了一面的 cubemap：缺面的 cubemap 是「不完整」的，采样整个都是黑色。</li>
+    </ol>
+    <p>另外，它也没有缓存和释放的规矩，那是旧引擎里 Texture 对象自己管的。下面两张卡片只跑第 1 版：</p>
+    <div id="lab-v1"></div>
+
+    <h3 id="s3-2">3.2 第 2 版：上传作用域，加上「六面都成功才交出去」</h3>
+    <pre><code>// 第 2 版：上传作用域（先记下、设成自己要的、再还回），加上「六面都成功才交出去」
+function uploadCubeV2(
+  gl: WebGLRenderingContext,
+  faces: readonly TexImageSource[] // 六张图，顺序 +X、-X、+Y、-Y、+Z、-Z
+): WebGLTexture {
+  // ① 先记下别人的：当前是第几个单元、这个单元 cube 格子里的纹理、四个上传设置
+  const activeUnit = gl.getParameter(gl.ACTIVE_TEXTURE) as number
+  const previous = gl.getParameter(gl.TEXTURE_BINDING_CUBE_MAP) as WebGLTexture | null
+  const alignment = gl.getParameter(gl.UNPACK_ALIGNMENT) as number
+  const flip = gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL) as boolean
+  const premultiply = gl.getParameter(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL) as boolean
+  const conversion = gl.getParameter(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL) as number
+
+  let handle: WebGLTexture | null = null
+  try {
+    // ② 设成自己要的，不管别人留下的是什么
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1) // 每行紧挨着，不补齐到 4 字节
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false) // cubemap 的面不翻转
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false) // 颜色原样，不乘 alpha
+    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE) // 浏览器不做颜色转换
+
+    handle = gl.createTexture()!
+    gl.bindTexture(gl.TEXTURE_CUBE_MAP, handle)
+    for (let i = 0; i &lt; 6; i++) {
+      const face = gl.TEXTURE_CUBE_MAP_POSITIVE_X + i
+      gl.texImage2D(face, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, faces[i]!)
+      const error = gl.getError() // 每传一面问一次：显存不够时 GL 只记一个错误码
+      if (error !== gl.NO_ERROR) throw new Error(&#x27;face &#x27; + i + &#x27;: GL error &#x27; + error)
+    }
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    return handle // ③ 六面都成功，才把纹理交出去
+  } catch (error) {
+    if (handle !== null) gl.deleteTexture(handle) // 半成品删掉，不交给任何人
+    throw error
+  } finally {
+    // ④ 不管成功失败，把第 ① 步记下的东西原样还回去
+    gl.activeTexture(activeUnit)
+    gl.bindTexture(gl.TEXTURE_CUBE_MAP, previous)
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, alignment)
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, flip)
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, premultiply)
+    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, conversion)
+  }
+}</code></pre>
+    <p>
+      思路和第 16 课 GeometryManager 的第 2 版一样：<strong>先记下、设成自己要的、用完还回去</strong>。四个上传设置设成固定值，于是不管别人留下什么，这次上传的结果都一样；finally 保证不管成功还是抛错，都把别人的东西还回去。再加上每面问一次 getError、失败就删掉半成品。这个「记下 → 设定 → 还回」的范围，代码里叫上传作用域。同样两个场景，换成第 2 版：
+    </p>
+    <div id="lab-v2"></div>
+    <p>
+      第 2 版还缺：缓存（需求 1）；WebGL1 做不到的组合要先拒绝（需求 4）；sRGB 和 float（需求 5）；进门先清掉别人留下的错误（不然别人的错误会算成「第 0 面上传失败」，第 15 课 preflight 讲过）；context 丢失的处理（需求 6）。这些在真实代码里。
+    </p>
+
+    <h3 id="s3-3">3.3 真实代码：get</h3>
+    <p>get 分前后两半。前半全是 CPU 上的检查，一个 GPU 对象都还没建：</p>
+    <pre><code>// WebGL1CubeTextureManager.ts:80–113（get 的前半：还没碰 GPU；注释是课程加的）
+get(texture: CubeTexture): WebGL1CubeTextureResource {
+  this.assertReady() // Manager 关了吗？context 丢了吗（第 4 节）？
+  if (texture.disposed) throw new ResourceDisposedError(&#x27;CubeTexture&#x27;)
+  const cached = this.entries.get(texture)
+  if (cached !== undefined) return cached.resource // 第二次起：一条 GL 命令都不发
+
+  const gl = this.gl
+  let handle: WebGLTexture | null = null // 账本：建出来的纹理，失败时靠它删
+
+  try {
+    // 进门先取一次 getError：别人留下的错误不能算到这次头上（第 15 课 preflight）
+    assertTextureOperation(gl, &#x27;begin cube upload&#x27;, texture.label)
+    // { kind: &#x27;images&#x27;, faces: 六张图 }，或 { kind: &#x27;data&#x27;, faces: 六个像素数组 }
+    const source = texture.copySource()
+
+    // 每一面的真实像素尺寸：图片读 naturalWidth（不是 CSS 宽度），数据直接带着 width/height
+    const dimensionAt = (index: 0 | 1 | 2 | 3 | 4 | 5) =&gt;
+      source.kind === &#x27;images&#x27;
+        ? imageDimensions(source.faces[index], texture.label)
+        : source.faces[index]
+
+    const faces: CubeFaces&lt;{ readonly width: number; readonly height: number }&gt; = [
+      dimensionAt(0), dimensionAt(1), dimensionAt(2),
+      dimensionAt(3), dimensionAt(4), dimensionAt(5)
+    ]
+
+    // 和后端无关的规则：每面正方形、六面一样大（GraceCathedral：六个 256 × 256）
+    assertValidCubeFaceDimensions(
+      faces,
+      (reason) =&gt; new InvalidTextureSourceError(texture.label, reason)
+    )
+
+    const size = faces[0].width // 256
+    // 和 WebGL1 有关的规则：尺寸上限、NPOT、通道、float、sRGB（3.4 节）。
+    // 交回 texImage2D 要用的格式：RGBA，或 sRGB 时的 SRGB_ALPHA_EXT
+    const format = this.validateStorage(texture, source.kind, size)
+    const type = texture.storage.type === &#x27;float32&#x27; ? gl.FLOAT : gl.UNSIGNED_BYTE</code></pre>
+    <p>
+      两个细节。<code>imageDimensions</code> 读的是 naturalWidth、naturalHeight，也就是图片真实的像素尺寸；<code>width</code> 属性可能被 CSS 或 HTML 改过，不能用。它还检查 <code>image.complete</code>：图片没加载完就 texImage2D，会传上去一张 0 × 0 的空图（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:40">:40–53</a>）。另一个是检查的分工：「正方形、六面一样大」对任何后端都成立，交给 CPU 侧的 assertValidCubeFaceDimensions；「NPOT 不能 mipmap」只是 WebGL1 的限制，交给 validateStorage。
+    </p>
+    <p>后半在上传作用域里建纹理、传六面、设采样参数，全部成功才发布：</p>
+    <pre><code>// WebGL1CubeTextureManager.ts:115–189（get 的后半，接上一段；注释是课程加的）
+    // 上传作用域：进去前记下别人的状态、设成固定值，出来时还回去（3.5 节）
+    withTextureUploadState(gl, gl.TEXTURE_CUBE_MAP, () =&gt; {
+      handle = requireNonNull(
+        gl.createTexture(), // context 丢了会返回 null
+        () =&gt; new WebGLResourceCreationError(&#x27;cube-texture&#x27;, texture.label)
+      )
+      gl.bindTexture(gl.TEXTURE_CUBE_MAP, handle)
+
+      for (let index = 0; index &lt; 6; index++) {
+        const faceTarget = gl.TEXTURE_CUBE_MAP_POSITIVE_X + index // 0x8515 + index
+        if (source.kind === &#x27;data&#x27;) {
+          // 数组没有尺寸，要显式给 width、height（9 个参数的那个重载）
+          const face = source.faces[index]!
+          gl.texImage2D(faceTarget, 0, format, size, size, 0, format, type, face.data)
+        } else {
+          // 图片自带尺寸（6 个参数的那个重载）
+          gl.texImage2D(faceTarget, 0, format, format, type, source.faces[index]!)
+        }
+        // 每面问一次：显存不够时 texImage2D 不抛异常，只留错误码
+        assertTextureOperation(gl, &#x27;upload cube face &#x27; + index, texture.label)
+      }
+
+      // CPU 描述里的字符串 → GL 常量。Record 要求每个取值都写到，漏一个编译不过
+      const wraps: Record&lt;TextureWrapMode, number&gt; = {
+        &#x27;clamp-to-edge&#x27;: gl.CLAMP_TO_EDGE,
+        repeat: gl.REPEAT,
+        &#x27;mirrored-repeat&#x27;: gl.MIRRORED_REPEAT
+      }
+      const filters: Record&lt;TextureMinFilter, number&gt; = {
+        nearest: gl.NEAREST,
+        linear: gl.LINEAR,
+        &#x27;nearest-mipmap-nearest&#x27;: gl.NEAREST_MIPMAP_NEAREST,
+        &#x27;linear-mipmap-nearest&#x27;: gl.LINEAR_MIPMAP_NEAREST,
+        &#x27;nearest-mipmap-linear&#x27;: gl.NEAREST_MIPMAP_LINEAR,
+        &#x27;linear-mipmap-linear&#x27;: gl.LINEAR_MIPMAP_LINEAR
+      }
+
+      // 采样参数：存进这个纹理对象（HW2：clamp-to-edge、linear）
+      gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, wraps[texture.sampler.wrapS])
+      gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, wraps[texture.sampler.wrapT])
+      gl.texParameteri(
+        gl.TEXTURE_CUBE_MAP,
+        gl.TEXTURE_MIN_FILTER,
+        filters[texture.sampler.minFilter]
+      )
+      gl.texParameteri(
+        gl.TEXTURE_CUBE_MAP,
+        gl.TEXTURE_MAG_FILTER,
+        filters[texture.sampler.magFilter]
+      )
+
+      if (texture.mipmapPolicy === &#x27;generate&#x27;) gl.generateMipmap(gl.TEXTURE_CUBE_MAP)
+      assertTextureOperation(gl, &#x27;configure cubemap&#x27;, texture.label)
+    })
+
+    // 作用域里的还原也是 GL 命令，出来再问一次
+    assertTextureOperation(gl, &#x27;restore cube upload state&#x27;, texture.label)
+    // 防御：理论上同步过程中没人能释放它；万一有，也不把它写进缓存
+    if (texture.disposed) throw new ResourceDisposedError(&#x27;CubeTexture&#x27;)
+
+    const resource = Object.freeze({
+      handle: requireNonNull&lt;WebGLTexture&gt;(
+        handle,
+        () =&gt; new WebGLResourceCreationError(&#x27;cube-texture&#x27;, texture.label)
+      ),
+      target: gl.TEXTURE_CUBE_MAP
+    })
+
+    // 唯一的发布点：订阅释放、写进缓存，然后交出去
+    const unsubscribe = texture.onDispose(() =&gt; this.release(texture))
+    this.entries.set(texture, { resource, unsubscribe })
+    return resource
+  } catch (error: unknown) {
+    if (this.lost || gl.isContextLost()) {
+      this.invalidateForContextLoss() // 丢了：不 delete，整个 Manager 作废（第 4 节）
+      throw new WebGLContextLostError(&#x27;create cubemap&#x27;)
+    }
+    if (handle !== null) gl.deleteTexture(handle) // 半成品删掉
+    throw error
+  } finally {
+    this.hooks.invalidateState() // 告诉 State：有人绕过它动过 GL（第 6 节有一道想一想）
+  }
+}</code></pre>
+    <p>
+      和第 16 课的 GeometryManager 对照着看，骨架是同一个：入口检查 → 纯 CPU 的检查 → preflight → 在作用域里动 GPU（每一步建好就记进账本 <code>handle</code>）→ 还原 → 唯一的发布点（订阅 + 写缓存）→ catch 里分「丢了」和「真失败」两种收拾。下面三张卡片在你的浏览器里跑真实代码：上传 HW2 CornellBox 的六张 JPEG；在被别人改过状态的 context 里上传；第 5 面显存不够。
+    </p>
+    <div id="lab-real"></div>
+
+    <h3 id="s3-4">3.4 validateStorage：每一条防的是什么</h3>
+    <pre><code>// WebGL1CubeTextureManager.ts:203–262（注释是课程加的）
+private validateStorage(
+  texture: CubeTexture,
+  sourceKind: &#x27;images&#x27; | &#x27;data&#x27;,
+  size: number
+): number {
+  const gl = this.gl
+  const unsupported = (reason: string): never =&gt; {
+    throw new UnsupportedRenderFeatureError(&#x27;cubemap &#x27; + texture.label, reason)
+  }
+
+  // ① 尺寸上限：设备说了算（SwiftShader 是 16384；WebGL1 只保证 16）
+  if (
+    size &gt; requireTextureLimit(gl, gl.MAX_CUBE_MAP_TEXTURE_SIZE, &#x27;MAX_CUBE_MAP_TEXTURE_SIZE&#x27;)
+  ) {
+    unsupported(&#x27;face size exceeds device limit&#x27;)
+  }
+
+  // ② NPOT：边长不是 2 的幂（比如 100、300）时，只能 clamp、不能用 mipmap。
+  //    否则纹理「不完整」，采样得到黑色，而且不报错（2.4 节实测）
+  const pot = Number.isInteger(Math.log2(size)) // 256 → log2 = 8，是整数
+  if (
+    !pot &amp;&amp;
+    (texture.sampler.wrapS !== &#x27;clamp-to-edge&#x27; ||
+      texture.sampler.wrapT !== &#x27;clamp-to-edge&#x27; ||
+      texture.mipmapPolicy !== &#x27;none&#x27; ||
+      (texture.sampler.minFilter !== &#x27;nearest&#x27; &amp;&amp; texture.sampler.minFilter !== &#x27;linear&#x27;))
+  )
+    unsupported(&#x27;WebGL1 NPOT requires clamp-to-edge, base-level filtering and no mipmaps&#x27;)
+
+  // ③ 通道：只做 rgb、rgba。WebGL1 没有 R、RG 格式，最接近的 LUMINANCE 采样时
+  //    会把一个通道抄到 r、g、b 三个，和 &#x27;r&#x27; 的意思不同，所以不冒充
+  const storage = texture.storage
+  if (storage.format !== &#x27;rgb&#x27; &amp;&amp; storage.format !== &#x27;rgba&#x27;) {
+    unsupported(&#x27;r/rg channel mapping is not implemented&#x27;)
+  }
+
+  // ④ float32（HDR 环境图）：要扩展，而且限制多
+  if (storage.type === &#x27;float32&#x27;) {
+    // 图片解码出来都是 8 位，float 只能来自像素数组
+    if (sourceKind !== &#x27;data&#x27;) unsupported(&#x27;float32 requires CPU pixel data&#x27;)
+    if (this.capabilities.textureFloat === null)
+      unsupported(&#x27;OES_texture_float is required&#x27;)
+
+    const linear =
+      texture.sampler.magFilter === &#x27;linear&#x27; || texture.sampler.minFilter.includes(&#x27;linear&#x27;)
+
+    // 能存 float 不等于能对 float 做线性过滤：那是另一个扩展
+    if (linear &amp;&amp; this.capabilities.textureFloatLinear === null) {
+      unsupported(&#x27;OES_texture_float_linear is required&#x27;)
+    }
+    if (texture.mipmapPolicy !== &#x27;none&#x27;)
+      unsupported(&#x27;float32 mipmap generation is not implemented&#x27;)
+    if (texture.colorSpace === &#x27;srgb&#x27;) unsupported(&#x27;sRGB storage requires uint8&#x27;)
+  }
+
+  // ⑤ sRGB：要 EXT_sRGB，采样时由 GPU 解码成线性值（2.5 节）。
+  //    第一次用到才查扩展，查过就记住：undefined = 还没查，null = 查过、没有
+  if (texture.colorSpace === &#x27;srgb&#x27;) {
+    if (this.srgbExtension === undefined) this.srgbExtension = gl.getExtension(&#x27;EXT_sRGB&#x27;)
+    if (gl.isContextLost()) throw new WebGLContextLostError(&#x27;query EXT_sRGB&#x27;)
+
+    const extension = this.srgbExtension
+    if (extension === null) {
+      // 没有就报错，不悄悄当成 RGBA 存：那样颜色会偏亮，而且没人知道
+      throw new UnsupportedRenderFeatureError(
+        &#x27;sRGB cubemap&#x27;,
+        &#x27;EXT_sRGB is required; no implicit color-space fallback&#x27;
+      )
+    }
+    return storage.format === &#x27;rgb&#x27; ? extension.SRGB_EXT : extension.SRGB_ALPHA_EXT
+  }
+
+  // HW2 走到这里：rgba + data → gl.RGBA
+  return storage.format === &#x27;rgb&#x27; ? gl.RGB : gl.RGBA
+}</code></pre>
+    <p>
+      这五条有一个共同点：<strong>做下去不一定报错，只是结果悄悄不对</strong>。NPOT 配 REPEAT 采样出黑色（2.4 节）；拿 LUMINANCE 冒充 'r' 会让 g、b 也有值；没有 EXT_sRGB 就当 RGBA 存，颜色偏亮、没人发现。所以要在碰 GPU 之前，按描述逐条核对，做不到就明确报 UnsupportedRenderFeatureError。还要注意 <code>srgbExtension</code> 的三个值：undefined 是「还没查」，null 是「查过、没有」，和第 14 课 State 里 undefined 与 null 的区别是同一个思路。
+    </p>
+    <div id="lab-validate"></div>
+
+    <h4 id="s3-4-1">3.4 补：format、type、colorSpace、mipmap 之间的约束从哪来（2026-10-12 补）</h4>
+    <p>
+      上面的五条是按代码顺序读的。换一个角度：描述里的四项各管一件事，约束不是随便两两定的，而是有两个源头。一是一个纹素从显存到 shader 要经过四步，后一步对前一步交出来的东西有要求；二是 WebGL1 只给某些组合配了硬件或扩展。先看这四步：
+    </p>
+    <pre><code> ① 存：每个像素几个数 × 每个数怎么存          ← format × type
+        rgba × uint8 = 4 字节；rgba × float32 = 16 字节
+ ② 选：从哪一层 mipmap 取、几个纹素怎么混合    ← mipmapPolicy + minFilter / magFilter
+ ③ 解：把存的数换回「真实的量」               ← colorSpace
+        srgb：GPU 采样时解码（128 → 55）；linear、data：原样
+ ④ 交给 shader 一个 vec4</code></pre>
+    <div class="table-scroll"><table>
+      <thead><tr><th>项</th><th>回答的问题</th><th>例子（无界面 Chrome 实测）</th></tr></thead>
+      <tbody>
+        <tr><td>format</td><td>每个像素几个数</td><td>rgba 4 个，rgb 3 个，r 1 个</td></tr>
+        <tr><td>type</td><td>每个数怎么存</td><td>uint8 存 0～255 的整数，shader 读到 k / 255：0.3 存成 77，读回 0.30196；3.7 存不下，最大 1.0。float32 存 4 字节浮点：3.7 原样（采样后乘 0.25 读到 236，约 0.925 × 255）</td></tr>
+        <tr><td>colorSpace</td><td>存进去之前用了什么编码规则</td><td>srgb 存的是编码值，采样时 GPU 解码；linear 存的就是线性颜色；data 不是颜色（法线、LUT、打包的深度），任何时候都不转换</td></tr>
+        <tr><td>mipmapPolicy</td><td>有没有预先缩小的副本</td><td>generate：上传后 generateMipmap，每 2 × 2 求平均得到 1/2、1/4……各层；minFilter 决定采样时用不用</td></tr>
+      </tbody>
+    </table></div>
+    <p>逐条看约束。「谁规定」一栏分清哪些是 GL 的硬性规定、哪些是项目自己的选择：</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>组合</th><th>规则</th><th>为什么（实测）</th><th>谁规定</th><th>在哪查</th></tr></thead>
+      <tbody>
+        <tr><td>mipmap 过滤 × mipmapPolicy</td><td>带 mipmap 的过滤要配 generate</td><td>要读第 1、2…… 层，没有就「不完整」，采样黑色（2.4 节）</td><td>GL，所有后端</td><td>CPU：<a data-src="src/rendering/resources/Texture.ts:208">Texture.ts:208</a></td></tr>
+        <tr><td>mipmap × NPOT</td><td>NPOT 不能有 mipmap、只能 clamp</td><td>2.4 节的表</td><td>WebGL1</td><td>Manager ②</td></tr>
+        <tr><td>format</td><td>不做 r、rg</td><td>WebGL1 没有这两种格式；LUMINANCE 存 204 采样得 (204, 204, 204, 255)，r 的意思应是 (204, 0, 0, 255)</td><td>WebGL1 + 项目不冒充</td><td>Manager ③</td></tr>
+        <tr><td>float32 × 扩展</td><td>要 OES_texture_float</td><td>WebGL1 本身只有整数存储</td><td>WebGL1</td><td>Manager ④</td></tr>
+        <tr><td>float32 × 线性过滤</td><td>要 OES_texture_float_linear</td><td>只开前一个扩展、用 LINEAR：左黑右白中点采到 (0, 0, 0)，是整张不完整；再开这个扩展：(128, 128, 128)。能存不等于能过滤</td><td>WebGL1</td><td>Manager ④</td></tr>
+        <tr><td>float32 × generate</td><td>一律拒绝</td><td>generateMipmap 就是求平均，GL 只要求能过滤：没有 float_linear 时 1282，有时成功（错误码 0）。项目比 GL 更保守</td><td>项目</td><td>Manager ④</td></tr>
+        <tr><td>float32 × srgb</td><td>不允许</td><td>EXT_sRGB 只定义了配 UNSIGNED_BYTE 的格式；sRGB 配 FLOAT 上传得 1282。sRGB 是为「8 位只有 256 档」设计的编码：线性值低于 0.1 的部分，线性 8 位只分到 26 档，sRGB 分到 90 档；float 在 0 附近本来就密，不需要</td><td>GL</td><td>Manager ④</td></tr>
+        <tr><td><strong>srgb × generate</strong></td><td><strong>WebGL1 不允许</strong></td><td>见下面</td><td>GL（EXT_sRGB）</td><td><strong>现在没查</strong></td></tr>
+        <tr><td>图片 × float32</td><td>不允许</td><td>WebGL 其实允许：上传 (77, 128, 200) 的图片、type 用 FLOAT，错误码 0，读回仍是 77、128、200。图片解码只有 8 位，存成 float 多占 4 倍内存却没有多出信息</td><td>项目</td><td>Manager ④</td></tr>
+        <tr><td>type × 数组</td><td>Uint8Array ↔ uint8，Float32Array ↔ float32；长度 = 宽 × 高 × 通道数</td><td>第 12 课 4.2 节</td><td>项目</td><td>CPU：<a data-src="src/rendering/resources/texturePixelSnapshot.ts:108">texturePixelSnapshot.ts:108–126</a></td></tr>
+      </tbody>
+    </table></div>
+    <p class="small">表里「Manager ②③④」指 3.4 节节选里的编号。另外两条不算约束但要记得：SRGB_ALPHA 只解码 RGB、不动 alpha（存 128 采样得 (55, 55, 55, 128)）；linear 和 data 在 WebGL1 里处理完全一样，区别只在语义上，将来做色调映射、颜色管理时 data 绝不能被转换。</p>
+    <p>
+      <strong>少查了一条：srgb × generate。</strong>EXT_sRGB 的 OpenGL ES 原文（第 3.7.11 节 Mipmap Generation）：「If the format of a texture is sRGB, the error INVALID_OPERATION is generated.」理由在它的 Issue 4：正确的 mipmap 要先解码成线性值、再平均、再编码回去；直接平均编码值会偏暗，比如黑 0 和白 255 平均是 127.5，解码后是 0.214，而正确的平均是线性 0.5，应该存 188。当年硬件不都支持正确的做法，ES 2.0 的扩展干脆禁止。
+    </p>
+    <p>
+      validateStorage 的五条里没有这一条，所以 <code>colorSpace: 'srgb'</code> 加 <code>mipmapPolicy: 'generate'</code> 能通过检查：纹理照常建好、六面传完，到 generateMipmap 才留下 0x502，被 assertTextureOperation 拦下，抛出笼统的 WebGLOperationError（configure cubemap），catch 把纹理删掉。结果是安全的，只是报得晚、看不出原因。Texture2DManager 的 validateStorage 一样（第 29 课）。这条应该放在 WebGL1 的 Manager 里，在 createTexture 之前用 UnsupportedRenderFeatureError 说清楚；不放进 CPU 的 Texture，因为 OpenGL ES 3.0 / WebGL2 的 generateMipmap 只要求格式可渲染、可过滤，SRGB8_ALPHA8 两条都满足。
+    </p>
+    <div id="lab-srgb-mip"></div>
+    <p>
+      <strong>以后自己怎样推出这类约束</strong>：拿任意两项问两个问题。一，后一步要的东西，前一步一定给得出吗？（mipmap 过滤要读第 1 层，可 mipmapPolicy 可能没生成；generateMipmap 要求平均，可 float 不一定能过滤，sRGB 不能直接平均。）二，这台设备给这个组合配了硬件吗？去扩展规范的格式表里找，或者搜「generates INVALID_OPERATION」这类句子，上面这条就是这样查出来的。查出来以后，用第 29 课 8.1 节的三个问题决定放在哪一层、哪个时刻查。
+    </p>
+
+    <h3 id="s3-5">3.5 上传作用域：withTextureUploadState</h3>
+    <pre><code>// WebGL1TextureUploadSupport.ts:62–94（注释是课程加的）
+export function withTextureUploadState&lt;T&gt;(
+  gl: WebGLRenderingContext,
+  target: number, // TEXTURE_CUBE_MAP 或 TEXTURE_2D：只记下、还原这一种格子
+  callback: () =&gt; T
+): T {
+  // ① 记下别人的。注意不切到 TEXTURE0：就在当前单元上做，少动一样东西
+  const activeUnit = gl.getParameter(gl.ACTIVE_TEXTURE) as number
+  const bindingParameter =
+    target === gl.TEXTURE_CUBE_MAP ? gl.TEXTURE_BINDING_CUBE_MAP : gl.TEXTURE_BINDING_2D
+  const texture = gl.getParameter(bindingParameter) as WebGLTexture | null
+  const alignment = gl.getParameter(gl.UNPACK_ALIGNMENT) as number
+  const flip = gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL) as boolean
+  const premultiply = gl.getParameter(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL) as boolean
+  const conversion = gl.getParameter(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL) as number
+
+  // 丢失时 getParameter 只会返回 null 之类的默认值，记下来也没用
+  if (gl.isContextLost()) throw new WebGLContextLostError(&#x27;capture texture upload state&#x27;)
+
+  try {
+    // ② 设成固定值：不管别人留下什么，这次上传的结果都一样
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
+    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE)
+    return callback() // 真正的上传：createTexture、bindTexture、texImage2D……
+  } finally {
+    // ③ 不管 callback 成功还是抛错，都还回去；丢了就不发命令（旧状态已经没意义）
+    if (!gl.isContextLost()) {
+      gl.activeTexture(activeUnit)
+      gl.bindTexture(target, texture)
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, alignment)
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, flip)
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, premultiply)
+      gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, conversion)
+    }
+  }
+}</code></pre>
+    <p>四个固定值各有理由：</p>
+    <ul>
+      <li><strong>ALIGNMENT = 1</strong>：CPU 上的像素数组是一行紧挨一行的，宽度为 3 的 RGB 数据每行 9 字节，按默认的 4 对齐会多要字节（2.3 节）。</li>
+      <li><strong>FLIP_Y = false</strong>：cubemap 的六个面本来就按「图片的左上角是第一个像素」排，不需要翻转（three.js 的 CubeTexture 也把 flipY 默认设成 false）；像素数组的第 0 行就是第 0 行。</li>
+      <li><strong>PREMULTIPLY = false</strong>：颜色原样存，要不要预乘由使用它的 shader 决定。</li>
+      <li><strong>CONVERSION = NONE</strong>：不让浏览器按图片自带的色彩配置改值。颜色怎么解释由描述里的 colorSpace 决定（2.5 节），不由浏览器猜。</li>
+    </ul>
+    <p>
+      还有两点。第一，它不切换到 TEXTURE0，就在当前单元上做，只动「当前单元的这一种格子」，再还回去，能少动一样就少动一样。第二，ImageBitmap 不看这三个 WebGL 设置（规范如此，2.3 节实测 FLIP_Y 对它不起作用），它的方向和预乘要在 createImageBitmap 时就定好，所以注释里说「不能靠 pixelStore 补救」。RenderTargetManager 建颜色附件时也用这个作用域（下一课）。
+    </p>
+
+    <h3 id="s3-6">3.6 释放：为什么没有 beforeDelete</h3>
+    <pre><code>// WebGL1CubeTextureManager.ts:265–304（注释是课程加的）
+
+// CubeTexture.dispose() → 订阅的回调 → release
+release(texture: CubeTexture): void {
+  if (this.lost || this.gl.isContextLost()) {
+    this.invalidateForContextLoss() // 丢了：不发 delete
+    return
+  }
+
+  const entry = this.entries.get(texture)
+  if (entry === undefined) return // 从没上传过，或已经删过
+
+  this.entries.delete(texture) // 先从缓存拿掉
+  entry.unsubscribe()
+  this.gl.deleteTexture(entry.resource.handle) // 再删 GPU 纹理，没有 beforeDelete（3.6 节）
+  this.hooks.invalidateState()
+}
+
+// context 丢了：只丢记录和订阅，不 delete（第 4 节）
+invalidateForContextLoss(): void {
+  this.lost = true // 这个 Manager 永远不再用
+  for (const entry of this.entries.values()) entry.unsubscribe()
+  this.entries.clear()
+  this.hooks.invalidateState()
+}
+
+// Backend 关闭：先退订全部，再删全部；CPU 的 CubeTexture 不动
+dispose(): void {
+  if (this.disposed) return
+  this.disposed = true
+
+  const entries = [...this.entries.values()]
+  this.entries.clear()
+  for (const entry of entries) entry.unsubscribe()
+
+  if (this.lost || this.gl.isContextLost()) {
+    this.invalidateForContextLoss()
+    return
+  }
+
+  for (const entry of entries) this.gl.deleteTexture(entry.resource.handle)
+  this.hooks.invalidateState()
+}</code></pre>
+    <p>
+      和前两课比，这里少了 beforeDelete。GeometryManager 和 ProgramManager 需要它，是因为顶点输入按 buffer 和 program 录了 VAO（第 16 课 4.4 节）：删 buffer 或 program 之前，得先让录了它们的 VAO 放手。纹理没有这样的「下游」：Uniforms 每次 draw 都重新 bindTexture，不缓存任何按纹理建的 GPU 对象。所以 release 直接删就行。
+    </p>
+
+    <h2 id="s4">4. 和 Lifecycle 的关系</h2>
+    <p>第 13 课第 2 节说，context 丢了以后，Backend 要把旧的一代作废、再建新的一代。CubeTextureManager 在这两件事里做的事：</p>
+    <ul>
+      <li>
+        <strong>一代一个 CubeTextureManager。</strong>createGeneration 新建 ResourceManager（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:259">WebGL1Backend.ts:259–302</a>），它再新建 CubeTextureManager（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:108">WebGL1ResourceManager.ts:108</a>）。Uniforms 拿到的 resolveCube 也是这一代的（Backend.ts:295）。缓存跟着 Manager 走，所以也是一代一份。
+      </li>
+      <li>
+        <strong>lost 事件到达：丢记录、退订，不 delete。</strong>ResourceManager 逐个通知 Manager（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:171">WebGL1ResourceManager.ts:171–179</a>）。CubeTextureManager 这一步（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:281">:281–286</a>）记下 lost，退订所有 CubeTexture，清空缓存，通知 State。它不调用 deleteTexture：纹理已经随 context 一起失效了。退订的理由和第 15 课一样：CubeTexture 还活在 Scene 里，不退订的话，它的订阅会一直拽着这个旧 Manager。
+      </li>
+      <li>
+        <strong>事件还在排队、context 已经丢了：先发现，不乱删。</strong>get 开头的 assertReady 问 isContextLost（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:306">:306–312</a>）；上传到一半丢了，catch 先判断丢失、作废并抛 WebGLContextLostError，不去删已经失效的纹理（:180–183）；上传作用域的 finally 也不发还原命令。
+      </li>
+      <li>
+        <strong>恢复以后：新 Manager，空缓存，重新上传。</strong>第 2 代的 CubeTextureManager 什么都没有。第一次画背景时 get 重新上传六面。像素从哪来？CubeTexture 一直借着那六张图，从来不关闭它们（<a data-src="src/rendering/resources/CubeTexture.ts:335">CubeTexture.ts:335–344</a>），所以不用重新下载 JPEG。CPU 对象就是重建的原料（第 4 课）。
+      </li>
+    </ul>
+    <p>下面的卡片在你的浏览器里真的丢一次 context：</p>
+    <div id="lab-lifecycle"></div>
+
+    <h2 id="s5">5. 架构视角：对照 three.js r177</h2>
+    <ul>
+      <li>
+        <strong>three.js 已经不支持 WebGL1。</strong>r163 起就去掉了（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:61">WebGLRenderer.js:61</a>），r177 只建 webgl2 context。WebGL2 没有 NPOT 限制，sRGB 也是内置格式，所以这一课 validateStorage 里的 NPOT 和 EXT_sRGB 两条，在 three.js r177 里根本不存在。本项目要在 WebGL1 上跑，就得自己查。
+      </li>
+      <li>
+        <strong>上传设置：每次都设，但不还。</strong>three.js 上传 cubemap 前，按纹理自己的字段设四个上传设置（flipY、premultiplyAlpha、unpackAlignment、颜色转换，<a data-src="node_modules/three/src/renderers/webgl/WebGLTextures.js:1304">WebGLTextures.js:1304–1307</a>），之后不还原。它可以这样做，因为它独占这个 context，每次上传都自己重设一遍，从不假设旧值。本项目在迁移期间和旧引擎共用一个 context，所以多做一步「还回去」。
+      </li>
+      <li>
+        <strong>sRGB：同一个思路。</strong>three.js 对 sRGB 的 8 位纹理用 SRGB8_ALPHA8 内部格式（<a data-src="node_modules/three/src/renderers/webgl/WebGLTextures.js:213">WebGLTextures.js:213</a>），也是让 GPU 在采样时解码，和本项目用 EXT_sRGB 一样。
+      </li>
+      <li>
+        <strong>更新：版本号 vs 不可变。</strong>three.js 的纹理可以改了再设 needsUpdate，靠 source.version 判断要不要重新上传（<a data-src="node_modules/three/src/renderers/webgl/WebGLTextures.js:1296">:1296</a>）。本项目的 CubeTexture 上传后就是静态的，要换图就建一个新的 CubeTexture，Manager 只按对象身份缓存。
+      </li>
+    </ul>
+
+    <h2 id="s6">6. 审查视角</h2>
+    <ul>
+      <li>
+        <strong>想一想：get 的 finally 里那次 invalidateState 有用吗？</strong>State 缓存的是 7 样东西：program、两个 buffer 绑定、三项深度设置、剔除模式（第 14 课）。上传纹理改的是纹理单元、纹理绑定和上传设置，都不在这 7 样里。那这次 invalidate 现在起什么作用、代价是什么？留着它有没有道理？
+      </li>
+      <li>
+        <strong>想一想：还原当前单元的格子，在 Backend.draw 里是必须的吗？</strong>Uniforms.prepare 先把所有纹理都 get 完，upload 才开始 bindTexture（1.3 节的代码，以及 <a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:208">WebGL1Backend.ts:208–216</a> 的顺序）。也就是说，同一次 draw 里，上传弄乱的格子会马上被 upload 覆盖。那还原是在保护谁？如果把它去掉，会在什么情况下出问题？
+      </li>
+    </ul>
+
+    <h2 id="s7">7. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0017"></div>
+
+    <h2 id="s8">8. 延伸阅读</h2>
+    <ul>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/texImage2D">MDN：texImage2D</a>：两种重载、每个参数。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/pixelStorei">MDN：pixelStorei</a>：四个上传设置和初始值。</li>
+      <li><a href="https://registry.khronos.org/webgl/specs/latest/1.0/#PIXEL_STORAGE_PARAMETERS">WebGL 1.0 规范：Pixel Storage Parameters</a>：FLIP_Y、预乘、颜色转换的定义；ImageBitmap 不看这三个设置。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/Tutorial/Using_textures_in_WebGL">MDN：Using textures in WebGL</a>：其中「Non power-of-two textures」一段讲 WebGL1 的 NPOT 限制。</li>
+      <li><a href="https://registry.khronos.org/webgl/extensions/EXT_sRGB/">EXT_sRGB 扩展</a>：SRGB_EXT、SRGB_ALPHA_EXT 两个格式。</li>
+      <li><a href="https://learnopengl.com/Advanced-OpenGL/Cubemaps">LearnOpenGL：Cubemaps</a>：六个面的 target 和天空盒的画法。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：实验卡片和检查题各错了哪几题；审查视角的两个「想一想」，直接在对话里回答。哪一步还接不上，把那几行贴给我。
+    </aside>
+
+    <div class="nav">
+      <a href="0016-geometry-and-vertex-input.html">← 第 16 课：GeometryManager 与顶点输入</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0029-texture-family-design.html">第 29 课：纹理一族的设计思路 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 17 课 · 2026-10-10</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        const R = window.RTeachTexture
+
+        // 课程版（和页面上展示的代码出自同一份 TS，esbuild 去掉了类型）
+        function uploadCubeV1(gl, faces) {
+          const handle = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_CUBE_MAP, handle);
+          for (let i = 0; i < faces.length; i++) {
+            const face = gl.TEXTURE_CUBE_MAP_POSITIVE_X + i;
+            gl.texImage2D(face, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, faces[i]);
+          }
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.bindTexture(gl.TEXTURE_CUBE_MAP, null);
+          return handle;
+        }
+        function uploadCubeV2(gl, faces) {
+          const activeUnit = gl.getParameter(gl.ACTIVE_TEXTURE);
+          const previous = gl.getParameter(gl.TEXTURE_BINDING_CUBE_MAP);
+          const alignment = gl.getParameter(gl.UNPACK_ALIGNMENT);
+          const flip = gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL);
+          const premultiply = gl.getParameter(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL);
+          const conversion = gl.getParameter(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL);
+          let handle = null;
+          try {
+            gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+            gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+            gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+            handle = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_CUBE_MAP, handle);
+            for (let i = 0; i < 6; i++) {
+              const face = gl.TEXTURE_CUBE_MAP_POSITIVE_X + i;
+              gl.texImage2D(face, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, faces[i]);
+              const error = gl.getError();
+              if (error !== gl.NO_ERROR) throw new Error("face " + i + ": GL error " + error);
+            }
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            return handle;
+          } catch (error) {
+            if (handle !== null) gl.deleteTexture(handle);
+            throw error;
+          } finally {
+            gl.activeTexture(activeUnit);
+            gl.bindTexture(gl.TEXTURE_CUBE_MAP, previous);
+            gl.pixelStorei(gl.UNPACK_ALIGNMENT, alignment);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, flip);
+            gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, premultiply);
+            gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, conversion);
+          }
+        }
+
+        // ---------------- 真实 WebGL 的小工具（都是课程写的） ----------------
+        /** 建一个 1 × 1 的 canvas 和 WebGL context。inDom 为 true 时挂进页面（恢复 context 要用）。 */
+        function freshContext(inDom = false) {
+          const canvas = document.createElement('canvas')
+          canvas.width = 1
+          canvas.height = 1
+          if (inDom) {
+            canvas.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none'
+            document.body.appendChild(canvas)
+          }
+          canvas.addEventListener('webglcontextlost', (event) => event.preventDefault())
+          const gl = canvas.getContext('webgl')
+          if (!gl) throw new Error('这个浏览器拿不到 WebGL context')
+          const lose = gl.getExtension('WEBGL_lose_context')
+          return {
+            gl,
+            lose,
+            release: () => {
+              if (lose && !gl.isContextLost()) lose.loseContext()
+              canvas.remove()
+            }
+          }
+        }
+        async function withGL(body, inDom = false) {
+          const { gl, lose, release } = freshContext(inDom)
+          const lines = []
+          try {
+            await body(gl, lines, lose)
+          } catch (error) {
+            lines.push({ text: '实验里抛出了没有预料到的错误：' + (error && error.name) + '：' + (error && error.message), kind: 'late' })
+          } finally {
+            release()
+          }
+          return { lines }
+        }
+        const err = (e) => (e && e.name ? e.name : 'Error') + '：' + (e && e.message ? e.message : String(e))
+        const invalidateState = () => undefined
+        const rgb = (px, offset = 0) => '(' + px[offset] + ', ' + px[offset + 1] + ', ' + px[offset + 2] + ')'
+        const colorName = (px, offset = 0) => (px[offset] > 200 && px[offset + 2] < 50 ? '红' : px[offset + 2] > 200 && px[offset] < 50 ? '蓝' : rgb(px, offset))
+
+        /** 读回 cubemap 的某一面：把这一面挂到一个临时 framebuffer 上，再 readPixels。第 0 行是纹理的第 0 行。 */
+        function readFace(gl, texture, face, size) {
+          const previous = gl.getParameter(gl.FRAMEBUFFER_BINDING)
+          const framebuffer = gl.createFramebuffer()
+          gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer)
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_CUBE_MAP_POSITIVE_X + face, texture, 0)
+          const pixels = new Uint8Array(size * size * 4)
+          gl.readPixels(0, 0, size, size, gl.RGBA, gl.UNSIGNED_BYTE, pixels)
+          gl.bindFramebuffer(gl.FRAMEBUFFER, previous)
+          gl.deleteFramebuffer(framebuffer)
+          return pixels
+        }
+        /** 在 1 × 1 的画布上画一个像素，让 shader 采样 cubemap 的 +X 方向，读回颜色。 */
+        function sampleCube(gl, texture) {
+          const vs = 'attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }'
+          const fs = 'precision mediump float; uniform samplerCube u; void main() { gl_FragColor = textureCube(u, vec3(1.0, 0.0, 0.0)); }'
+          const program = gl.createProgram()
+          for (const [type, source] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+            const shader = gl.createShader(type)
+            gl.shaderSource(shader, source)
+            gl.compileShader(shader)
+            gl.attachShader(program, shader)
+          }
+          gl.linkProgram(program)
+          gl.useProgram(program)
+          const buffer = gl.createBuffer()
+          gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+          gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW)
+          gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+          gl.enableVertexAttribArray(0)
+          gl.activeTexture(gl.TEXTURE0)
+          gl.bindTexture(gl.TEXTURE_CUBE_MAP, texture)
+          gl.uniform1i(gl.getUniformLocation(program, 'u'), 0)
+          gl.getError()
+          gl.drawArrays(gl.TRIANGLES, 0, 3)
+          const error = gl.getError()
+          const pixel = new Uint8Array(4)
+          gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel)
+          return { error, pixel }
+        }
+        /** 直接用 gl 建一个纯色 cubemap（不经过 Manager），用来演示 GL 本身的规则。 */
+        function rawSolidCube(gl, size, color, options = {}) {
+          const texture = gl.createTexture()
+          gl.bindTexture(gl.TEXTURE_CUBE_MAP, texture)
+          const format = options.format || gl.RGBA
+          const data = new Uint8Array(size * size * 4)
+          for (let i = 0; i < size * size; i++) data.set(color, i * 4)
+          for (let face = 0; face < 6; face++) gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, format, size, size, 0, format, gl.UNSIGNED_BYTE, data)
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, options.wrap || gl.CLAMP_TO_EDGE)
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, options.wrap || gl.CLAMP_TO_EDGE)
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, options.min || gl.LINEAR)
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+          return texture
+        }
+        /** 一张 2 × 2 的图：上面一行红，下面一行蓝。先画在 canvas 上，再转成 data: URL 交给 Image。 */
+        let twoRowImage = null
+        async function redTopBlueBottom() {
+          if (twoRowImage) return twoRowImage
+          const canvas = document.createElement('canvas')
+          canvas.width = 2
+          canvas.height = 2
+          const context = canvas.getContext('2d')
+          context.fillStyle = 'rgb(255, 0, 0)'
+          context.fillRect(0, 0, 2, 1)
+          context.fillStyle = 'rgb(0, 0, 255)'
+          context.fillRect(0, 1, 2, 1)
+          twoRowImage = await loadImage(canvas.toDataURL('image/png'))
+          return twoRowImage
+        }
+        function loadImage(url) {
+          return new Promise((resolve, reject) => {
+            const image = new Image()
+            image.onload = () => resolve(image)
+            image.onerror = () => reject(new Error('图片加载失败'))
+            image.src = url
+          })
+        }
+        /** 2 × 2 的像素数组：第 0 行红、第 1 行蓝。 */
+        const RED_BLUE_DATA = new Uint8Array([255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255])
+        const SAMPLER = { wrapS: 'clamp-to-edge', wrapT: 'clamp-to-edge', minFilter: 'linear', magFilter: 'linear' }
+        const dataCube = (label, size, data) =>
+          new R.CubeTexture({
+            label,
+            source: { kind: 'data', faces: [0, 1, 2, 3, 4, 5].map(() => ({ width: size, height: size, data })) },
+            storage: { format: 'rgba', type: 'uint8' },
+            colorSpace: 'data',
+            sampler: SAMPLER,
+            mipmapPolicy: 'none'
+          })
+        /**
+         * 给 gl 套一层代理：数 createTexture，记下建过的纹理好查「还活着几个」，数每条 GL 调用；
+         * failUpload = n 时，第 n 次 texImage2D 不真的执行，并让下一次 getError 交回 OUT_OF_MEMORY（1285）。
+         */
+        function watch(gl, options = {}) {
+          const textures = []
+          const calls = []
+          let uploads = 0
+          let pending = 0
+          const proxy = new Proxy(gl, {
+            get(target, prop) {
+              const value = target[prop]
+              if (typeof value !== 'function') return value
+              return function () {
+                if (prop === 'texImage2D') {
+                  uploads += 1
+                  if (uploads === options.failUpload) {
+                    pending = target.OUT_OF_MEMORY
+                    calls.push('texImage2D（第 ' + uploads + ' 次：假装显存不够，什么也没传）')
+                    return undefined
+                  }
+                }
+                if (prop === 'getError' && pending !== 0) {
+                  const code = pending
+                  pending = 0
+                  target.getError()
+                  return code
+                }
+                const result = value.apply(target, arguments)
+                if (prop === 'createTexture' && result) textures.push(result)
+                if (prop !== 'getError' && prop !== 'isContextLost' && prop !== 'getParameter') calls.push(String(prop))
+                return result
+              }
+            }
+          })
+          return { gl: proxy, calls, textures, alive: () => textures.filter((t) => gl.isTexture(t)).length }
+        }
+        /** 模拟「别人」留下的状态：当前单元 2，单元 2 的 cube 格子里放着纹理 X，FLIP_Y 是 true，ALIGNMENT 是 8。 */
+        function pollute(gl) {
+          const X = gl.createTexture()
+          gl.activeTexture(gl.TEXTURE2)
+          gl.bindTexture(gl.TEXTURE_CUBE_MAP, X)
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true)
+          gl.pixelStorei(gl.UNPACK_ALIGNMENT, 8)
+          return X
+        }
+        function describeState(gl, X) {
+          const bound = gl.getParameter(gl.TEXTURE_BINDING_CUBE_MAP)
+          return '当前单元 ' + (gl.getParameter(gl.ACTIVE_TEXTURE) - gl.TEXTURE0) + '，它的 cube 格子 ' + (bound === X ? 'X' : bound === null ? 'null' : '新纹理') + '，FLIP_Y ' + gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL) + '，ALIGNMENT ' + gl.getParameter(gl.UNPACK_ALIGNMENT)
+        }
+        const HELPER_NOTE = 'freshContext、withGL、readFace、sampleCube、rawSolidCube、redTopBlueBottom、watch、pollute 都是课程写的辅助函数（项目里没有）：readFace 把某一面挂到临时 framebuffer 上读回像素；sampleCube 画一个像素去采样 +X 方向；watch 给 gl 套代理来计数，也能让某一次 texImage2D 假装显存不够。'
+
+        // ---------------- 2.2 纹理单元 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-units'),
+          storageKey: 'lesson-0017-units',
+          cards: [
+            {
+              title: '纹理单元：bindTexture 写进哪一格',
+              tags: ['真实 WebGL'],
+              desc: '照 2.2 节那几行做：activeTexture(TEXTURE3) 后绑 A，activeTexture(TEXTURE0) 后绑 B。然后分别查单元 0、单元 3 的 cube 格子，再看单元 3 的 2D 格子。',
+              question: '最后，单元 3 的 cube 格子里是谁？',
+              choices: ['A：后来绑 B 时，当前单元已经换成了 0', 'B：最后一次 bindTexture 说了算', 'null：切换当前单元会清空格子'],
+              answer: 0,
+              explain: 'bindTexture 只写「当前单元」的那一格。绑 A 时当前单元是 3，绑 B 时已经换成 0，所以单元 3 还是 A，单元 0 是 B。每个单元的 2D 格子和 cube 格子是分开的，单元 3 的 2D 格子一直是 null。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const A = gl.createTexture()
+                  const B = gl.createTexture()
+                  const name = (t) => (t === A ? 'A' : t === B ? 'B' : String(t))
+                  gl.activeTexture(gl.TEXTURE3)
+                  gl.bindTexture(gl.TEXTURE_CUBE_MAP, A)
+                  lines.push({ text: 'activeTexture(TEXTURE3)，bindTexture(CUBE, A)', kind: 'user' })
+                  gl.activeTexture(gl.TEXTURE0)
+                  gl.bindTexture(gl.TEXTURE_CUBE_MAP, B)
+                  lines.push({ text: 'activeTexture(TEXTURE0)，bindTexture(CUBE, B)', kind: 'user' })
+                  lines.push({ text: '单元 0 的 cube 格子 → ' + name(gl.getParameter(gl.TEXTURE_BINDING_CUBE_MAP)), kind: 'server' })
+                  gl.activeTexture(gl.TEXTURE3)
+                  lines.push({ text: '单元 3 的 cube 格子 → ' + name(gl.getParameter(gl.TEXTURE_BINDING_CUBE_MAP)) + '；单元 3 的 2D 格子 → ' + name(gl.getParameter(gl.TEXTURE_BINDING_2D)), kind: 'server' })
+                  lines.push({ t: '结果', text: '这台设备有 ' + gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS) + ' 个纹理单元（fragment shader 能用的）', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.3 上传设置 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-pixelstore'),
+          storageKey: 'lesson-0017-pixelstore',
+          cards: [
+            {
+              title: '别人留下 FLIP_Y = true',
+              tags: ['真实 WebGL'],
+              desc: '一张 2 × 2 的图，上面一行红、下面一行蓝。FLIP_Y 分别是 false、true 时，用 texImage2D 传到 +X 面，读回第 0 行。最后把同一张图转成 ImageBitmap，FLIP_Y = true 再传一次。',
+              note: HELPER_NOTE,
+              question: 'FLIP_Y 是 true 时，读回的第 0 行是什么颜色？',
+              choices: ['蓝：上下翻转了', '红：FLIP_Y 只对视频有效', '黑：上传失败了'],
+              answer: 0,
+              explain: '图片的第一个像素是左上角，FLIP_Y 为 false 时，图片的第一行就是纹理的第 0 行（红）。FLIP_Y 为 true 时，最后一行最先传，第 0 行变成蓝。这个设置是整个 context 一份，谁设了不还，后面所有人上传都被翻转。ImageBitmap 是例外：它不看这个设置，方向要在 createImageBitmap 时定。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const image = await redTopBlueBottom()
+                  const upload = (source, flip) => {
+                    const texture = gl.createTexture()
+                    gl.bindTexture(gl.TEXTURE_CUBE_MAP, texture)
+                    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, flip)
+                    for (let face = 0; face < 6; face++) gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source)
+                    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
+                    const pixels = readFace(gl, texture, 0, 2)
+                    return '第 0 行 ' + colorName(pixels, 0) + '，第 1 行 ' + colorName(pixels, 8)
+                  }
+                  lines.push({ text: 'HTMLImageElement，FLIP_Y = false：' + upload(image, false), kind: 'server' })
+                  lines.push({ text: 'HTMLImageElement，FLIP_Y = true：' + upload(image, true), kind: 'result' })
+                  if (typeof createImageBitmap === 'function') {
+                    const bitmap = await createImageBitmap(image)
+                    lines.push({ t: '结果', text: 'ImageBitmap，FLIP_Y = true：' + upload(bitmap, true) + '（不看这个设置）', kind: 'result' })
+                  }
+                })
+            },
+            {
+              title: '3 × 3 的 RGB 数据，用默认的 ALIGNMENT 上传',
+              tags: ['真实 WebGL'],
+              desc: '一面 3 × 3 的 RGB 像素，每行 9 字节，数组一共 27 字节。分别在 ALIGNMENT = 4（初始值）和 1 时上传，查 getError。最后在 ALIGNMENT = 4 时给 33 字节再试一次。',
+              question: 'ALIGNMENT 是 4、只给 27 字节时，getError 是多少？',
+              choices: ['1282：按 4 对齐，每行要补到 12 字节，一共要 33 字节', '0：GL 会按 3 × 3 自己算出每行 9 字节', '1281：3 不是 2 的幂'],
+              answer: 0,
+              explain: 'ALIGNMENT = 4 表示每一行的起点都要落在 4 的倍数上。第 0 行占 9 字节，第 1 行要从 12 开始，第 2 行从 24 开始、到 33 结束；数组只有 27 字节，不够，INVALID_OPERATION。设成 1 就是一行紧挨一行，27 字节刚好。NPOT 本身不影响上传，只影响采样（2.4 节）。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const texture = gl.createTexture()
+                  gl.bindTexture(gl.TEXTURE_CUBE_MAP, texture)
+                  const upload = (alignment, bytes) => {
+                    gl.pixelStorei(gl.UNPACK_ALIGNMENT, alignment)
+                    gl.getError()
+                    gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X, 0, gl.RGB, 3, 3, 0, gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array(bytes))
+                    return gl.getError()
+                  }
+                  lines.push({ text: 'ALIGNMENT 4，27 字节 → getError ' + upload(4, 27), kind: 'result' })
+                  lines.push({ text: 'ALIGNMENT 1，27 字节 → getError ' + upload(1, 27), kind: 'server' })
+                  lines.push({ t: '结果', text: 'ALIGNMENT 4，33 字节 → getError ' + upload(4, 33), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.4 NPOT ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-npot'),
+          storageKey: 'lesson-0017-npot',
+          cards: [
+            {
+              title: '纯色 cubemap，换着边长、wrap、过滤去采样',
+              tags: ['真实 WebGL'],
+              desc: '直接用 gl 建纯色 (200, 100, 50) 的 cubemap，按 2.4 节表里的五种组合各采样一次（画一个像素，采样 +X 方向），再对 3 × 3 的纹理调用一次 generateMipmap。',
+              note: HELPER_NOTE,
+              question: '3 × 3 的 cubemap 用 REPEAT，采样得到什么？getError 是多少？',
+              choices: ['(0, 0, 0)，getError 0：纹理不完整，悄悄变黑', '(200, 100, 50)，getError 0：REPEAT 只在出界时才有影响', '(0, 0, 0)，getError 1282：GL 会报错'],
+              answer: 0,
+              explain: 'WebGL1 里 NPOT 纹理只能 clamp、不能用 mipmap 过滤。违反时纹理「不完整」，采样一律是 (0, 0, 0, 1)，而且没有任何错误码，只能靠事前检查。对 NPOT 调 generateMipmap 倒是会报 1282。2 的幂的纹理用了 mipmap 过滤却没生成 mipmap，同样是黑的。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const color = [200, 100, 50, 255]
+                  const show = (label, texture) => {
+                    const r = sampleCube(gl, texture)
+                    const black = r.pixel[0] === 0 && r.pixel[1] === 0 && r.pixel[2] === 0
+                    lines.push({ text: label + ' → ' + rgb(r.pixel) + '，getError ' + r.error, kind: black ? 'result' : 'server' })
+                  }
+                  show('边长 4，CLAMP，LINEAR', rawSolidCube(gl, 4, color))
+                  show('边长 3，CLAMP，LINEAR', rawSolidCube(gl, 3, color))
+                  show('边长 3，REPEAT，LINEAR', rawSolidCube(gl, 3, color, { wrap: gl.REPEAT }))
+                  show('边长 3，CLAMP，LINEAR_MIPMAP_LINEAR', rawSolidCube(gl, 3, color, { min: gl.LINEAR_MIPMAP_LINEAR }))
+                  show('边长 4，CLAMP，LINEAR_MIPMAP_LINEAR，没生成 mipmap', rawSolidCube(gl, 4, color, { min: gl.LINEAR_MIPMAP_LINEAR }))
+                  const npot = rawSolidCube(gl, 3, color)
+                  gl.bindTexture(gl.TEXTURE_CUBE_MAP, npot)
+                  gl.getError()
+                  gl.generateMipmap(gl.TEXTURE_CUBE_MAP)
+                  lines.push({ t: '结果', text: '对 3 × 3 的纹理 generateMipmap → getError ' + gl.getError(), kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 2.5 sRGB ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-srgb'),
+          storageKey: 'lesson-0017-srgb',
+          cards: [
+            {
+              title: '同样存 128，RGBA 和 SRGB_ALPHA_EXT 各采样一次',
+              tags: ['真实 WebGL', 'EXT_sRGB'],
+              desc: '两个 1 × 1 的纯色 cubemap，每个通道都存 128。一个用普通的 RGBA，一个用 EXT_sRGB 的 SRGB_ALPHA_EXT。各画一个像素去采样，写回 8 位读出来。',
+              note: HELPER_NOTE,
+              question: 'SRGB_ALPHA_EXT 那个，采样写回 8 位是多少？',
+              choices: ['55', '128', '188'],
+              answer: 0,
+              explain: '128 / 255 = 0.502，按 2.5 节的解码公式得到线性值 0.216，写回 8 位是 55。普通 RGBA 不解码，还是 128。188 是把方向弄反了：那是把线性的 0.502 编码成 sRGB 的结果。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const ext = gl.getExtension('EXT_sRGB')
+                  const gray = [128, 128, 128, 255]
+                  lines.push({ text: 'RGBA → ' + rgb(sampleCube(gl, rawSolidCube(gl, 1, gray)).pixel), kind: 'server' })
+                  if (ext === null) return lines.push({ text: '这个浏览器没有 EXT_sRGB；真实代码在这里会报 UnsupportedRenderFeatureError', kind: 'late' })
+                  const r = sampleCube(gl, rawSolidCube(gl, 1, gray, { format: ext.SRGB_ALPHA_EXT }))
+                  lines.push({ t: '结果', text: 'SRGB_ALPHA_EXT → ' + rgb(r.pixel) + '，getError ' + r.error, kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.1 / 3.2 两个场景 ----------------
+        /** 在被 pollute 过的 context 里，用 upload 上传六张「上红下蓝」的图，报告前后状态。 */
+        async function uploadInPollutedContext(gl, lines, upload) {
+          const image = await redTopBlueBottom()
+          const X = pollute(gl)
+          lines.push({ text: '上传前：' + describeState(gl, X), kind: 'user' })
+          let texture = null
+          try {
+            texture = upload(gl, [image, image, image, image, image, image])
+          } catch (error) {
+            lines.push({ text: '抛出 ' + err(error), kind: 'result' })
+          }
+          lines.push({ text: '上传后：' + describeState(gl, X), kind: 'server' })
+          if (texture) {
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
+            const pixels = readFace(gl, texture, 0, 2)
+            lines.push({ t: '结果', text: '+X 面第 0 行 ' + colorName(pixels, 0) + (colorName(pixels, 0) === '蓝' ? '（被翻转了）' : '（没有翻转）'), kind: 'result' })
+          }
+        }
+        /** 第 5 次 texImage2D 假装显存不够。 */
+        async function uploadWithFifthFaceFailing(gl, lines, upload) {
+          const image = await redTopBlueBottom()
+          const w = watch(gl, { failUpload: 5 })
+          let texture = null
+          try {
+            texture = upload(w.gl, [image, image, image, image, image, image])
+            lines.push({ text: '函数正常返回了一个纹理', kind: 'server' })
+          } catch (error) {
+            lines.push({ text: '抛出 ' + err(error), kind: 'server' })
+          }
+          lines.push({ text: '调用：' + w.calls.join(' → '), kind: 'muted' })
+          if (texture) {
+            const r = sampleCube(gl, texture)
+            lines.push({ text: '用它采样 +X 方向 → ' + rgb(r.pixel) + '（+X 面明明传上去了）', kind: 'result' })
+          }
+          lines.push({ t: '结果', text: 'createTexture ' + w.textures.length + ' 次，还活着 ' + w.alive() + ' 个；context 里还剩下没人取的错误码 → ' + w.gl.getError(), kind: 'result' })
+        }
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v1'),
+          storageKey: 'lesson-0017-v1',
+          cards: [
+            {
+              title: '第 1 版：在别人改过状态的 context 里上传',
+              tags: ['真实 WebGL', '只跑第 1 版'],
+              desc: '先模拟「别人」：当前单元是 2，单元 2 的 cube 格子里放着纹理 X，FLIP_Y 留成 true，ALIGNMENT 是 8。然后用第 1 版上传六张上红下蓝的图。',
+              note: HELPER_NOTE,
+              question: '上传之后，单元 2 的 cube 格子里是谁？+X 面第 0 行是什么颜色？',
+              choices: ['null；蓝（被翻转了）', 'X；红', '新纹理；红'],
+              answer: 0,
+              explain: '第 1 版第一行 bindTexture 把单元 2 的格子换成新纹理，最后一行又清成 null，X 没了。它不碰上传设置，用的是别人留下的 FLIP_Y = true，六面全被上下翻转。它也没改 FLIP_Y 和 ALIGNMENT，所以这两个还是别人的值：这次它没弄乱别人，只是被别人弄乱了。',
+              run: () => withGL((gl, lines) => uploadInPollutedContext(gl, lines, uploadCubeV1))
+            },
+            {
+              title: '第 1 版：第 5 面显存不够',
+              tags: ['真实 WebGL', '只跑第 1 版'],
+              desc: '给 gl 套一层代理：第 5 次 texImage2D 不真的执行，只留下一个 OUT_OF_MEMORY 错误码，就像显存不够时那样。用第 1 版上传，再用交回的纹理采样 +X 方向。',
+              note: HELPER_NOTE,
+              question: '第 1 版返回了吗？用它采样 +X 方向得到什么？',
+              choices: ['返回了；黑色，整个 cubemap 都不能用', '抛错了：第 5 面失败', '返回了；+X 方向颜色正常，只有缺的那面是黑的'],
+              answer: 0,
+              explain: '第 1 版不问 getError，照样交出纹理。少一面的 cubemap 是「不完整」的，采样哪个方向都是黑色，+X 面传上去了也没用。更糟的是 1285 这个错误码还留在 context 里，没人取走；下一个调用 getError 的人会以为是自己出了错（第 15 课 preflight）。',
+              run: () => withGL((gl, lines) => uploadWithFifthFaceFailing(gl, lines, uploadCubeV1))
+            }
+          ]
+        })
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v2'),
+          storageKey: 'lesson-0017-v2',
+          cards: [
+            {
+              title: '第 2 版：同样在别人改过状态的 context 里上传',
+              tags: ['真实 WebGL', '只跑第 2 版'],
+              desc: '和 3.1 节第一张卡片同样的「别人」，换成第 2 版上传。',
+              note: HELPER_NOTE,
+              question: '上传之后，单元 2 的 cube 格子、FLIP_Y、+X 面第 0 行分别是什么？',
+              choices: ['X、true、红', 'null、false、红', 'X、true、蓝'],
+              answer: 0,
+              explain: '第 2 版进来先记下：单元 2、格子里的 X、FLIP_Y true、ALIGNMENT 8；上传时设成固定值（FLIP_Y false），所以六面没有翻转；finally 再把记下的原样还回去，X 回到格子里，FLIP_Y 又是 true、ALIGNMENT 又是 8。别人的东西一样没少，自己的结果也不受别人影响。',
+              run: () => withGL((gl, lines) => uploadInPollutedContext(gl, lines, uploadCubeV2))
+            },
+            {
+              title: '第 2 版：第 5 面显存不够',
+              tags: ['真实 WebGL', '只跑第 2 版'],
+              desc: '同样让第 5 次 texImage2D 假装显存不够，换成第 2 版。',
+              note: HELPER_NOTE,
+              question: '第 2 版怎样？',
+              choices: ['抛错，建过的纹理删掉了（活着 0 个）', '返回纹理，只是缺一面', '抛错，但纹理还留着（活着 1 个）'],
+              answer: 0,
+              explain: '第 5 面之后的 getError 取到 1285，第 2 版抛错；catch 删掉这个半成品，finally 还原状态。错误码也被它取走了，不会留给下一个人。',
+              run: () => withGL((gl, lines) => uploadWithFifthFaceFailing(gl, lines, uploadCubeV2))
+            }
+          ]
+        })
+
+        // ---------------- 3.3 真实代码 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-real'),
+          storageKey: 'lesson-0017-real',
+          cards: [
+            {
+              title: '真实代码上传 HW2 CornellBox 的六张 JPEG',
+              tags: ['真实 WebGL', '项目代码', 'HW2 原始输入'],
+              desc: '用 CornellBox 的六张 128 × 128 JPEG（posx…negz）建一个和 createHW2Scene 一样描述的 CubeTexture，交给真实的 CubeTextureManager。get 两次，数 GL 调用；读回每一面中心那个像素。',
+              note: HELPER_NOTE + ' 六张图来自 assets/hw2-cornellbox-faces.js（课程把 JPEG 转成了 data: URL）。',
+              question: '第二次 get 发了几条 GL 命令？',
+              choices: ['0 条：直接交回缓存里的同一个对象', '1 条：要重新 bindTexture', '6 条：每次都重新上传六面'],
+              answer: 0,
+              explain: '第一次 get：一次 createTexture、六次 texImage2D、四次 texParameteri，外加作用域里的设置和还原。第二次在第一行就查到了缓存，什么命令都不发，交回的是同一个冻结对象。把纹理放进单元是 Uniforms 每次 draw 自己做的事（1.3 节）。',
+              run: () =>
+                withGL(async (gl, lines) => {
+                  const images = await Promise.all(window.RTeachCornellFaces.map(loadImage))
+                  lines.push({ text: '六张图：' + images.map((image) => image.naturalWidth + '×' + image.naturalHeight).join('，'), kind: 'user' })
+                  const texture = new R.CubeTexture({
+                    label: 'CornellBox / background',
+                    source: { kind: 'images', faces: images },
+                    storage: { format: 'rgba', type: 'uint8' },
+                    colorSpace: 'data',
+                    sampler: SAMPLER,
+                    mipmapPolicy: 'none'
+                  })
+                  const w = watch(gl)
+                  const manager = new R.WebGL1CubeTextureManager(w.gl, R.detectWebGL1Capabilities(gl), { invalidateState })
+                  const first = manager.get(texture)
+                  const count = (name) => w.calls.filter((c) => c === name).length
+                  lines.push({ text: '第一次 get：createTexture ' + count('createTexture') + '，texImage2D ' + count('texImage2D') + '，texParameteri ' + count('texParameteri') + '，pixelStorei ' + count('pixelStorei') + '（设 4 次、还 4 次）', kind: 'server' })
+                  const faces = ['+X', '-X', '+Y', '-Y', '+Z', '-Z'].map((label, i) => label + ' ' + rgb(readFace(gl, first.handle, i, 128), (64 * 128 + 64) * 4))
+                  lines.push({ text: '每面中心像素：' + faces.join('，'), kind: 'muted' })
+                  const before = w.calls.length
+                  const second = manager.get(texture)
+                  lines.push({ t: '结果', text: '第二次 get 发了 ' + (w.calls.length - before) + ' 条 GL 命令；交回同一个对象 → ' + (first === second), kind: 'result' })
+                })
+            },
+            {
+              title: '真实代码：在别人改过状态的 context 里上传',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '同样先 pollute：当前单元 2、格子里是 X、FLIP_Y true、ALIGNMENT 8。真实的 CubeTextureManager 上传六面「上红下蓝」的 2 × 2 像素数组。',
+              note: HELPER_NOTE,
+              question: '上传之后，当前单元、单元 2 的格子、FLIP_Y、ALIGNMENT 分别是什么？+X 面第 0 行呢？',
+              choices: ['2、X、true、8；红', '0、null、false、1；红', '2、X、false、1；蓝'],
+              answer: 0,
+              explain: 'withTextureUploadState 进门记下全部六样，上传时用固定值（ALIGNMENT 1、FLIP_Y false……），出门原样还回去。它不切换到单元 0，就在单元 2 上做。数组的第 0 行（红）就是纹理的第 0 行。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const X = pollute(gl)
+                  lines.push({ text: '上传前：' + describeState(gl, X), kind: 'user' })
+                  const manager = new R.WebGL1CubeTextureManager(gl, R.detectWebGL1Capabilities(gl), { invalidateState })
+                  const resource = manager.get(dataCube('red-blue', 2, RED_BLUE_DATA))
+                  lines.push({ text: '上传后：' + describeState(gl, X), kind: 'server' })
+                  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
+                  lines.push({ t: '结果', text: '+X 面第 0 行 ' + colorName(readFace(gl, resource.handle, 0, 2), 0), kind: 'result' })
+                })
+            },
+            {
+              title: '真实代码：第 5 面显存不够，然后再 get 一次',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '代理让第 5 次 texImage2D 假装显存不够。真实的 CubeTextureManager get 一次（失败），再 get 一次（这次代理不再捣乱）。',
+              note: HELPER_NOTE,
+              question: '失败以后再 get 一次，会怎样？',
+              choices: ['重新上传，这次成功：失败的那次没进缓存', '直接抛同一个错：失败被缓存了', '交回上次那个缺面的纹理'],
+              answer: 0,
+              explain: '第 5 面之后 assertTextureOperation 取到 1285，抛 WebGLOperationError（信息里写着是 face 4，从 0 数）。catch 删掉 handle，缓存里没有它，订阅也没建。第二次 get 从头再来，这次成功：一共建过 2 个纹理，活着 1 个。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const w = watch(gl, { failUpload: 5 })
+                  const manager = new R.WebGL1CubeTextureManager(w.gl, R.detectWebGL1Capabilities(gl), { invalidateState })
+                  const texture = dataCube('oom', 2, RED_BLUE_DATA)
+                  try {
+                    manager.get(texture)
+                    lines.push({ text: '没有报错？', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: '第一次 get：抛出 ' + err(error), kind: 'server' })
+                  }
+                  lines.push({ text: '这时：建过 ' + w.textures.length + ' 个纹理，活着 ' + w.alive() + ' 个', kind: 'server' })
+                  manager.get(texture)
+                  lines.push({ t: '结果', text: '第二次 get 成功：建过 ' + w.textures.length + ' 个，活着 ' + w.alive() + ' 个', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.4 validateStorage ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-validate'),
+          storageKey: 'lesson-0017-validate',
+          cards: [
+            {
+              title: '3 × 3 的 cubemap 想要 mipmap',
+              tags: ['真实 WebGL', '项目代码'],
+              desc: '建一个 3 × 3（NPOT）的 CubeTexture，描述里写 minFilter: linear-mipmap-linear、mipmapPolicy: generate，交给真实的 CubeTextureManager，数 createTexture。再试着建一个 4 × 4 的，写 linear-mipmap-linear 却配 mipmapPolicy: none。',
+              note: HELPER_NOTE,
+              question: '3 × 3 那个在哪一步被拒绝？建了几个纹理？',
+              choices: ['validateStorage，createTexture 0 次', 'generateMipmap 报 1282 以后，删掉纹理', '构造 CubeTexture 时就被拒绝了'],
+              answer: 0,
+              explain: '「NPOT 不能 mipmap」只是 WebGL1 的限制，CPU 的 CubeTexture 不管，所以构造成功；Manager 的 validateStorage 在建纹理之前就拒绝了，一个 GPU 对象都没建。第二个反过来：「mipmap 过滤却不生成 mipmap」对任何后端都不成立，CPU 的 Texture 构造时就拒绝。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const w = watch(gl)
+                  const manager = new R.WebGL1CubeTextureManager(w.gl, R.detectWebGL1Capabilities(gl), { invalidateState })
+                  const mipSampler = { wrapS: 'clamp-to-edge', wrapT: 'clamp-to-edge', minFilter: 'linear-mipmap-linear', magFilter: 'linear' }
+                  const faces = (size) => [0, 1, 2, 3, 4, 5].map(() => ({ width: size, height: size, data: new Uint8Array(size * size * 4) }))
+                  let npot = null
+                  try {
+                    npot = new R.CubeTexture({ label: 'npot-3', source: { kind: 'data', faces: faces(3) }, storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'data', sampler: mipSampler, mipmapPolicy: 'generate' })
+                    lines.push({ text: '3 × 3 + generate：CubeTexture 构造成功', kind: 'server' })
+                    manager.get(npot)
+                    lines.push({ text: '没有报错？', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: 'manager.get 抛出 ' + err(error) + '；createTexture ' + w.textures.length + ' 次', kind: 'result' })
+                  }
+                  try {
+                    new R.CubeTexture({ label: 'pot-4', source: { kind: 'data', faces: faces(4) }, storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'data', sampler: mipSampler, mipmapPolicy: 'none' })
+                    lines.push({ text: '没有报错？', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ t: '结果', text: '4 × 4 + mipmap 过滤 + none：构造 CubeTexture 时就抛出 ' + err(error), kind: 'result' })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.4 补：srgb × generate ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-srgb-mip'),
+          storageKey: 'lesson-0017-srgb-mip',
+          cards: [
+            {
+              title: 'sRGB 的 cubemap 想要 mipmap',
+              tags: ['真实 WebGL', '项目代码', '2026-10-12 补'],
+              desc: '先用原生 GL 建一张 4 × 4 的 SRGB_ALPHA_EXT 纹理，调用 generateMipmap，问 getError。再建一个 2 × 2、colorSpace: srgb、mipmapPolicy: generate、minFilter: linear-mipmap-linear 的 CubeTexture，交给真实的 CubeTextureManager，数 createTexture、看还活着几个。最后把 colorSpace 换成 data，其余不变，再 get 一次。',
+              note: HELPER_NOTE + ' 没有 EXT_sRGB 的浏览器会在 validateStorage 里更早被拒，打印的结果会不同。',
+              question: 'srgb + generate 交给真实 Manager，在哪一步失败？',
+              choices: ['纹理建好、六面传完以后，generateMipmap 留下 0x502，被当成笼统的 GL 错误抛出，纹理被删掉', 'validateStorage 在建纹理之前就拒绝了', '不失败：sRGB 纹理照常生成了 mipmap'],
+              answer: 0,
+              explain: 'EXT_sRGB 规定对 sRGB 纹理调用 generateMipmap 产生 INVALID_OPERATION（1282，即 0x502）。validateStorage 的五条里没有这一条，所以前面的检查全部通过，createTexture、六次 texImage2D 都做了，最后一步才出错；assertTextureOperation 把它变成 WebGLOperationError，catch 删掉纹理（建过 1 个，活着 0 个）。换成 data 就成功，说明问题只在 sRGB 和 mipmap 的组合。',
+              run: () =>
+                withGL((gl, lines) => {
+                  const ext = gl.getExtension('EXT_sRGB')
+                  if (ext) {
+                    const raw = gl.createTexture()
+                    gl.bindTexture(gl.TEXTURE_2D, raw)
+                    gl.texImage2D(gl.TEXTURE_2D, 0, ext.SRGB_ALPHA_EXT, 4, 4, 0, ext.SRGB_ALPHA_EXT, gl.UNSIGNED_BYTE, new Uint8Array(64).fill(128))
+                    gl.getError()
+                    gl.generateMipmap(gl.TEXTURE_2D)
+                    lines.push({ text: '原生 GL：SRGB_ALPHA_EXT 纹理 generateMipmap → getError ' + gl.getError(), kind: 'user' })
+                    gl.deleteTexture(raw)
+                  }
+                  const mipSampler = { wrapS: 'clamp-to-edge', wrapT: 'clamp-to-edge', minFilter: 'linear-mipmap-linear', magFilter: 'linear' }
+                  const faces = () => [0, 1, 2, 3, 4, 5].map(() => ({ width: 2, height: 2, data: new Uint8Array(16).fill(128) }))
+                  const cube = (label, colorSpace) => new R.CubeTexture({ label, source: { kind: 'data', faces: faces() }, storage: { format: 'rgba', type: 'uint8' }, colorSpace, sampler: mipSampler, mipmapPolicy: 'generate' })
+                  const w = watch(gl)
+                  const manager = new R.WebGL1CubeTextureManager(w.gl, R.detectWebGL1Capabilities(gl), { invalidateState })
+                  try {
+                    manager.get(cube('sky-srgb', 'srgb'))
+                    lines.push({ text: 'srgb + generate：没有报错？', kind: 'late' })
+                  } catch (error) {
+                    lines.push({ text: 'srgb + generate → ' + err(error) + '；createTexture ' + w.textures.length + ' 次，活着 ' + w.alive() + ' 个', kind: 'server' })
+                  }
+                  const before = w.textures.length
+                  manager.get(cube('sky-data', 'data'))
+                  lines.push({ t: '结果', text: 'data + generate → 成功；这次 createTexture ' + (w.textures.length - before) + ' 次', kind: 'result' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 4. 和 Lifecycle 的关系 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-lifecycle'),
+          storageKey: 'lesson-0017-lifecycle',
+          cards: [
+            {
+              title: '上传、丢失、恢复、再上传',
+              tags: ['真实 WebGL', '项目代码', '真的丢一次 context'],
+              desc: '真实的 CubeTextureManager 上传一个 CubeTexture；用 WEBGL_lose_context 让 context 丢失，马上再 get；等恢复事件到达后，旧 Manager 再 get 一次；最后像 Backend 那样新建一个 Manager（第 2 代），get 同一个 CubeTexture。',
+              note: HELPER_NOTE + ' 这张卡片的 canvas 临时挂进页面（不挂的话，有的浏览器不会发出恢复事件），用完移除。',
+              question: '恢复以后，旧 Manager 再 get 会怎样？',
+              choices: ['抛 WebGLContextLostError：它记着 lost，永远不再用', '重新上传，交回新纹理', '交回丢失前的那个旧纹理'],
+              answer: 0,
+              explain: '丢失后第一次 get，assertReady 发现 isContextLost，作废并抛错；从此 lost 是 true。恢复以后 isContextLost 变回 false，但旧 Manager 看的是自己的 lost，照样拒绝。新一代的 Manager 从空缓存开始，用 CubeTexture 里还拿着的同一份像素重新上传，得到新纹理；旧纹理 isTexture 是 false，已经随旧 context 失效。',
+              run: () =>
+                withGL(async (gl, lines, lose) => {
+                  if (!lose) return lines.push({ text: '这个浏览器没有 WEBGL_lose_context', kind: 'late' })
+                  const texture = dataCube('life', 2, RED_BLUE_DATA)
+                  const first = new R.WebGL1CubeTextureManager(gl, R.detectWebGL1Capabilities(gl), { invalidateState })
+                  const oldHandle = first.get(texture).handle
+                  lines.push({ text: '第 1 代上传成功', kind: 'server' })
+                  lose.loseContext()
+                  try {
+                    first.get(texture)
+                  } catch (error) {
+                    lines.push({ text: '丢失后马上 get → ' + error.name, kind: 'server' })
+                  }
+                  await new Promise((resolve) => setTimeout(resolve, 50))
+                  const restored = new Promise((resolve) => gl.canvas.addEventListener('webglcontextrestored', resolve, { once: true }))
+                  lose.restoreContext()
+                  const outcome = await Promise.race([restored.then(() => 'restored'), new Promise((resolve) => setTimeout(() => resolve('timeout'), 3000))])
+                  if (outcome !== 'restored') return lines.push({ text: '3 秒内没等到恢复事件，实验停在这里', kind: 'late' })
+                  lines.push({ text: '恢复事件到达，isContextLost → ' + gl.isContextLost(), kind: 'user' })
+                  try {
+                    first.get(texture)
+                  } catch (error) {
+                    lines.push({ text: '旧 Manager 再 get → ' + error.name, kind: 'server' })
+                  }
+                  const second = new R.WebGL1CubeTextureManager(gl, R.detectWebGL1Capabilities(gl), { invalidateState })
+                  const newHandle = second.get(texture).handle
+                  lines.push({ t: '结果', text: '第 2 代 get 成功：新纹理 → ' + (newHandle !== oldHandle) + '；isTexture(旧) → ' + gl.isTexture(oldHandle) + '，isTexture(新) → ' + gl.isTexture(newHandle), kind: 'result' })
+                }, true)
+            }
+          ]
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0017"]'), [
+          {
+            q: 'WebGL1 里，colorSpace 是 srgb 的纹理能不能用 generateMipmap 生成 mipmap？',
+            opts: ['不能：EXT_sRGB 规定产生 INVALID_OPERATION；正确做法要先解码再平均，直接平均编码值会偏暗', '能，和普通 RGBA 一样', '能，但要先开 OES_texture_float_linear'],
+            answer: 0,
+            why: '3.4 补：validateStorage 现在没查这一条，所以要到 generateMipmap 才失败。WebGL2 的 SRGB8_ALPHA8 可以生成，所以这条属于 WebGL1 的 Manager。'
+          },
+          {
+            q: 'gl.bindTexture(gl.TEXTURE_CUBE_MAP, t) 把 t 放进了哪里？',
+            opts: ['当前单元（ACTIVE_TEXTURE）的 cube 格子', '所有单元的 cube 格子', 'shader 里的 samplerCube'],
+            answer: 0,
+            why: '每个单元有一个 2D 格子和一个 cube 格子，bindTexture 写当前单元的那一格；shader 的 samplerCube 只存单元号（2.2 节）。'
+          },
+          {
+            q: 'UNPACK_FLIP_Y_WEBGL 存在哪里？',
+            opts: ['整个 context 一份，之后所有上传都照它来', '存在当前绑着的纹理里', '存在当前纹理单元里'],
+            answer: 0,
+            why: '四个上传设置都是 context 级的，所以上传前要设成自己要的值，用完还回去（2.3、3.5 节）。'
+          },
+          {
+            q: 'WebGL1 里，3 × 3 的 cubemap 用 REPEAT，采样会怎样？',
+            opts: ['得到 (0, 0, 0, 1)，没有错误码', '得到正常颜色', '得到 (0, 0, 0, 1)，并报 INVALID_OPERATION'],
+            answer: 0,
+            why: 'NPOT 违反规则时纹理不完整，悄悄采样出黑色，所以要在上传前检查（2.4、3.4 节）。'
+          },
+          {
+            q: '每个通道存 128，用 SRGB_ALPHA_EXT 格式，shader 采样得到大约多少？',
+            opts: ['0.216', '0.502', '0.737'],
+            answer: 0,
+            why: 'sRGB 纹理在采样时解码：((0.502 + 0.055) / 1.055)^2.4 ≈ 0.216（2.5 节）。0.737 是把方向弄反了。'
+          },
+          {
+            q: '真实代码上传到第 5 面时显存不够，会怎样？',
+            opts: ['抛 WebGLOperationError，删掉这个纹理，缓存不记；下次 get 重新上传', '交回缺一面的纹理', '把失败记进缓存，以后每次 get 都抛同一个错'],
+            answer: 0,
+            why: '每面之后 assertTextureOperation 查错误码；catch 删 handle；只有全部成功才订阅、写缓存（3.3 节卡片）。'
+          },
+          {
+            q: '为什么 CubeTextureManager 不需要 beforeDelete？',
+            opts: ['没有别的模块按纹理缓存着 GPU 对象，Uniforms 每次 draw 都重新绑定', '纹理删不掉', 'WebGL 会自动删掉没人用的纹理'],
+            answer: 0,
+            why: 'beforeDelete 是给「有下游缓存」的资源用的，比如按 buffer、program 录的 VAO（3.6 节）。'
+          },
+          {
+            q: 'context 恢复以后，天空盒的像素从哪来？',
+            opts: ['CPU 的 CubeTexture 一直拿着六张图，新 Manager 第一次 get 时重新上传', '浏览器自动恢复显存里的纹理', '要重新从网络下载六张 JPEG'],
+            answer: 0,
+            why: 'CubeTexture 借用图片且从不关闭它们，CPU 对象就是重建的原料；旧纹理随旧 context 失效（第 4 节卡片）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

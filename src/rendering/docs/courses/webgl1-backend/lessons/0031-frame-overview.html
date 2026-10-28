@@ -1,0 +1,1601 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 31 课 · 一帧的全局图</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/overview-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">综合篇 · 全局复盘 · 约 80 分钟</p>
+    <h1>全局图：一帧数据怎样从 Scene 走到 gl.drawElements</h1>
+    <p class="lede">
+      你说你分不清每个类的职责，也许是缺少全局观念。我同意后一半：前面每课讲一个类，却没有一课把一帧从头到尾走一遍，并说明每个类为什么站在那个位置。这一课不讲新代码。我们从「画两个三角形，gl 到底要哪些参数」出发，推出代码为什么分成这五个目录；再看 CPU 对象怎样在 draw 的那一刻换成 GPU 对象；最后讲清楚 copy 和 freeze：它们只有两条规则，每一处都能举出一个不这样做就出错的具体例子。每个说法都配一张卡片，跑的是真实代码。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW1 的阴影要两遍画：阴影 Pass 先从灯的方向把深度画进一个 RenderTarget，ForwardPass 再采样它。两遍必须看到同一份物体和矩阵，否则阴影会和物体错开；阴影图是借来的附件，Material 里只存它的地址。这一课讲的「一帧只拍一张照」「按身份查表」「共享就冻结」，正是这两遍画能对上的原因。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：能写出一个原生 WebGL 三角形（createShader、bufferData、drawElements 这些调用见过、能读懂）。前面各课讲过的类，这一课会重新说一遍它在全局里的位置，所以不要求你记得细节；碰到「第 N 课」的链接，只在想深挖时才点。<br />
+      <strong>这一课从零讲的</strong>：gl 调用的每个参数从哪来；五个目录各自回答哪个问题；CPU 对象怎样在 draw 时换成 GPU 对象；一帧要经过哪些类；复制和冻结的两条规则；校验为什么分散在三层；每个类的职责表；对照 three.js。<br />
+      <strong>版本</strong>：按 2026-10-14 的工作区版本讲（WebGL1Backend、Uniforms、Material 等有未提交改动）。<br />
+      <strong>页面会用到你的显卡</strong>：卡片在你的浏览器里创建真实的 WebGL context，用完释放。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s0">先给结论</a></li>
+        <li><a href="#s1">原始输入：画两个三角形，gl 要哪些参数</a></li>
+        <li><a href="#s2">需求</a></li>
+        <li><a href="#s3">第 1 版和第 2 版：GPU 对象从哪来</a></li>
+        <li><a href="#s4">真实代码 ①：原件——resources 为什么要复制</a></li>
+        <li><a href="#s5">真实代码 ②：查表——draw 时把原件换成 GPU 对象</a>：<a href="#s5-1">Backend.draw</a> <a href="#s5-2">Manager 的表</a> <a href="#s5-3">一帧的 gl 调用</a> <a href="#s5-4">一份原件、几份副本</a></li>
+        <li><a href="#s6">真实代码 ③：一帧的照片——scene 和 frame 为什么分开</a></li>
+        <li><a href="#s7">copy 和 freeze：两条规则</a>：<a href="#s7-1">规则</a> <a href="#s7-2">提取时复制</a> <a href="#s7-3">共享就冻结</a> <a href="#s7-4">复制加冻结</a> <a href="#s7-5">什么不复制</a> <a href="#s7-6">全部位置</a> <a href="#s7-7">代价</a></li>
+        <li><a href="#s8">校验为什么分在三层</a></li>
+        <li><a href="#s9">每个类的职责表</a></li>
+        <li><a href="#s10">架构视角：对照 three.js r177</a></li>
+        <li><a href="#s11">审查视角</a></li>
+        <li><a href="#s12">检查题</a></li>
+        <li><a href="#s13">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s0">0. 先给结论</h2>
+    <ol class="steps">
+      <li><strong>scene 和 resources 里的东西不会被「转换过去」。</strong>Backend 每次 draw 都拿 CPU 对象去查表：<code>programs.get(material.shaderModule)</code>、<code>geometries.get(geometry)</code>。表里没有才编译、上传，有就直接用。CPU 对象始终是原件，GPU 对象只是某个 context 里的副本：可以有好几份，丢了还能从原件重建。证明见第 3、5 节。</li>
+      <li><strong>每个类的职责由三个问题决定</strong>：这个信息谁知道？多久变一次？活多久、归谁管？五个目录正好对应五种不同的回答（第 1、6、9 节）。</li>
+      <li><strong>复制和冻结只有两条规则。</strong>一是数据从「能改它的人」手里交到「需要它不变的人」手里时，复制一份。二是一份数据同时交给好几个读者时，冻结它。对象身份本身就是查表的 key，所以 Geometry、Material 这类对象不复制，只借用（第 7 节）。</li>
+    </ol>
+
+    <h2 id="s1">1. 原始输入：画两个三角形，gl 要哪些参数</h2>
+    <p>先忘掉项目代码。下面是课程写的最直接的版本（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/overview-course.ts:82">overview-course.ts:82</a>）：每一帧编译 program、上传顶点，然后画。每行右边的注释回答同一个问题：<strong>这个参数是从哪里来的</strong>。</p>
+<pre><code>// 课程写的第 1 版（节选，省略了类型标注；注释是课程加的）
+function drawFrameV1(gl, meshes) {
+  gl.clearColor(0, 0, 0, 1)            // 清成黑色：这一遍画画的设定
+  gl.clear(gl.COLOR_BUFFER_BIT)
+  // shaderSource(VERTEX_SOURCE)：shader 文件里的源码
+  const program = createProgramV1(gl)
+  for (const mesh of meshes) {
+    // bufferData(mesh.positions / mesh.indices)：模型文件
+    const buffers = uploadV1(gl, mesh)
+    drawOneV1(gl, program, buffers, mesh)
+  }
+}
+
+function drawOneV1(gl, program, buffers, mesh) {
+  gl.useProgram(program)               // 哪个 program：这个 context 建出来的
+  // 物体摆在哪：场景
+  gl.uniform1f(gl.getUniformLocation(program, 'uOffsetX'), mesh.offsetX)
+  // 什么颜色：材质
+  gl.uniform3fv(gl.getUniformLocation(program, 'uColor'), mesh.color)
+  // 哪个 buffer：同样是这个 context 建出来的
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffers.positionBuffer)
+  gl.enableVertexAttribArray(0)
+  // 每个顶点 2 个 float：顶点数据的格式
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffers.indexBuffer)
+  // 画几个索引：模型
+  gl.drawElements(gl.TRIANGLES, buffers.count, gl.UNSIGNED_SHORT, 0)
+}</code></pre>
+    <p>课程版把物体的位置简化成一个 <code>uOffsetX</code>。真实代码里它是 4 × 4 的模型矩阵 <code>uModel</code>，相机还会多出 <code>uView</code>、<code>uProjection</code> 两个矩阵。把这些参数逐个拿出来，问三个问题：<strong>谁知道它？多久变一次？坏了归谁管？</strong>答案只有五种，正好是 <code>src/rendering</code> 下的五个目录：</p>
+
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 462" role="img" aria-label="左边是一次 draw 用到的七组 gl 参数，右边是五个目录。shader 源码、顶点和索引、材质颜色来自 resources，几乎不变；物体位置和相机来自 scene，每帧可能变，每帧被复制成 frame 里的一份值；清屏和画到哪由 passes 决定；createBuffer 返回的 handle、bindBuffer、useProgram 只属于这个 context，由 backend 管。">
+          <defs>
+            <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+            <marker id="f1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <text x="16" y="18" class="small">gl 调用里的参数（信息从哪来）</text>
+          <text x="460" y="18" class="small">放在哪个目录</text>
+          <rect x="16" y="30" width="300" height="40" rx="5" class="box" />
+          <text x="26" y="47">shaderSource(源码)</text>
+          <text x="26" y="62" class="small">shader 文件</text>
+          <rect x="16" y="80" width="300" height="40" rx="5" class="box" />
+          <text x="26" y="97">bufferData(顶点、索引)</text>
+          <text x="26" y="112" class="small">模型文件（vertexAttribPointer 的格式也是）</text>
+          <rect x="16" y="130" width="300" height="40" rx="5" class="box" />
+          <text x="26" y="147">uniform3fv(uColor, …)</text>
+          <text x="26" y="162" class="small">材质设定</text>
+          <rect x="16" y="190" width="300" height="40" rx="5" class="box" />
+          <text x="26" y="207">uniform(uOffsetX，真实代码是 uModel)</text>
+          <text x="26" y="222" class="small">物体摆在哪</text>
+          <rect x="16" y="240" width="300" height="40" rx="5" class="box" />
+          <text x="26" y="257">uniform(uView、uProjection)</text>
+          <text x="26" y="272" class="small">相机</text>
+          <rect x="16" y="350" width="300" height="40" rx="5" class="box" />
+          <text x="26" y="367">clearColor、clear、bindFramebuffer</text>
+          <text x="26" y="382" class="small">这一遍画到哪、先清什么</text>
+          <rect x="16" y="405" width="300" height="40" rx="5" class="box" />
+          <text x="26" y="422">createBuffer 返回的 handle</text>
+          <text x="26" y="437" class="small">bindBuffer、useProgram 用的都是它</text>
+
+          <rect x="460" y="30" width="284" height="140" rx="5" class="box hl" />
+          <text x="472" y="54" class="title">resources/</text>
+          <text x="472" y="76">东西是什么</text>
+          <text x="472" y="98" class="small">加载时定下，之后基本不变</text>
+          <text x="472" y="116" class="small">（Material 的参数偶尔改）</text>
+          <text x="472" y="140" class="small">Geometry、ShaderModule、Material、纹理</text>
+          <rect x="460" y="190" width="284" height="90" rx="5" class="box hl" />
+          <text x="472" y="214" class="title">scene/</text>
+          <text x="472" y="236">放在哪、谁和谁组合、画不画</text>
+          <text x="472" y="258" class="small">用户随时改（拖相机、动画）</text>
+          <rect x="460" y="300" width="284" height="34" rx="5" class="box" />
+          <text x="472" y="322"><tspan class="title">frame/</tspan>  这一帧的值（照片）</text>
+          <rect x="460" y="350" width="284" height="40" rx="5" class="box hl" />
+          <text x="472" y="375"><tspan class="title">passes/</tspan>  画到哪、按什么顺序</text>
+          <rect x="460" y="405" width="284" height="40" rx="5" class="box hl" />
+          <text x="472" y="430"><tspan class="title">backend/</tspan>  在这个 context 上怎样做</text>
+
+          <path d="M316 50 L458 70" class="line" marker-end="url(#f1a)" />
+          <path d="M316 100 L458 100" class="line" marker-end="url(#f1a)" />
+          <path d="M316 150 L458 130" class="line" marker-end="url(#f1a)" />
+          <text x="330" y="92" class="small">几乎不变</text>
+          <path d="M316 210 L458 220" class="line" marker-end="url(#f1a)" />
+          <path d="M316 260 L458 250" class="line" marker-end="url(#f1a)" />
+          <text x="330" y="240" class="small">每帧可能变</text>
+          <path d="M602 280 L602 298" class="line accent" marker-end="url(#f1b)" />
+          <text x="612" y="294" class="small accent">每帧复制一份</text>
+          <path d="M316 370 L458 370" class="line" marker-end="url(#f1a)" />
+          <text x="330" y="362" class="small">每遍画画固定</text>
+          <path d="M316 425 L458 425" class="line" marker-end="url(#f1a)" />
+          <text x="330" y="417" class="small">每个 context 一份</text>
+        </svg>
+      </div>
+      <figcaption>图 1　一次 draw 的参数来自五个地方。分目录的依据是「信息由谁知道、多久变一次」，不是「功能相近的放一起」。</figcaption>
+    </figure>
+
+    <p>图 1 里最容易忽略的是最下面一行。<code>createBuffer</code> 返回的 handle 只在这个 context 里有效，context 丢了就全部作废。所以它不能放进 Geometry：Geometry 被两个 canvas 共用时该存哪一个？context 丢失后谁来把它换掉？这类东西只能放在 backend/，每个 context 一份。第 3 课说的分层判据「看它知不知道 gl 的存在」，就是从这一行推出来的。</p>
+
+    <h2 id="s2">2. 需求</h2>
+    <p>把第 1 版交给一个真实的作业项目，会被下面六条卡住。后面每一版代码都用这六条验收：</p>
+    <ol>
+      <li><strong>R1 GPU 对象只建一次。</strong>两个三角形画 3 帧，program 只编译 1 次，顶点和索引一共只上传 4 次，而不是 3 帧 × 4 = 12 次。</li>
+      <li><strong>R2 一份 CPU 数据可以给几个 context 用。</strong>例如 HW1 调试时把阴影图画到第二个 canvas 上。每个 context 必须用自己建的 buffer：第 5.4 节的卡片实测，把 A 的 buffer 绑到 B 上，B 报 1282（INVALID_OPERATION）。</li>
+      <li><strong>R3 GPU 对象丢了能重建。</strong>context 丢失后旧 handle 全部作废，要从同一份 CPU 数据再传一次。</li>
+      <li><strong>R4 一帧里所有 Pass 看到同一份数据。</strong>HW1 的阴影 Pass 和 ForwardPass 必须用同一个模型矩阵；阴影 Pass 为了自己方便重新排序物体时，不能改掉 ForwardPass 看到的顺序。</li>
+      <li><strong>R5 通过了的校验，不能被事后的修改悄悄作废。</strong>Geometry 构造时检查过每个索引都小于顶点数，用户之后改数组，也不能让某个索引变成 7。</li>
+      <li><strong>R6 错误要在离原因最近、能说出字段名的地方抛出。</strong>不能拖到 GPU 那里，变成「少画了半个方块」却没有任何报错。</li>
+    </ol>
+
+    <h2 id="s3">3. 第 1 版和第 2 版：GPU 对象从哪来</h2>
+    <h3 id="s3-1">3.1 第 1 版：每帧现建</h3>
+    <p>第 1 版每帧都建一个新 program、每个物体建两个新 buffer，而且从来不删。下面的卡片里，第 1 版和第 2 版各画 3 帧，同时数 gl 调用。第 2 版的代码见 3.2 节，可以先猜：</p>
+    <div id="lab-v1"></div>
+
+    <h3 id="s3-2">3.2 第 2 版：用物体本身当 key 缓存</h3>
+    <p>要让 R1 成立，第一次建好的 GPU 对象就得存起来，下一帧再找回来。用什么去找？最自然的 key 是物体对象本身：同一个对象，就是同一份顶点（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/overview-course.ts:98">overview-course.ts:98–122</a>）：</p>
+<pre><code>// 课程写的第 2 版（节选）
+class DrawerV2 {                       // 一个 context 一个
+  private program: WebGLProgram | null = null
+  // key：物体对象本身
+  private readonly buffers = new Map&lt;MeshDataV1, ReturnType&lt;typeof uploadV1&gt;&gt;()
+
+  drawFrame(meshes: readonly MeshDataV1[]): void {
+    // …清屏
+    this.program ??= createProgramV1(gl) // 只在第一帧编译
+    for (const mesh of meshes) {
+      let buffers = this.buffers.get(mesh)
+      if (buffers === undefined) {
+        buffers = uploadV1(gl, mesh)     // 这个 context 第一次见到这个物体
+        this.buffers.set(mesh, buffers)
+      }
+      drawOneV1(gl, this.program, buffers, mesh)
+    }
+  }
+}</code></pre>
+    <p>R1 解决了。因为 handle 只属于一个 context，每个 context 各有一个 DrawerV2，R2 也满足了。第 2 版看起来已经很像真实代码：<code>Map&lt;CPU 对象, GPU 对象&gt;</code> 就是第 4 课讲的 Manager。</p>
+
+    <h3 id="s3-3">3.3 第 2 版的漏洞：key 背后的内容变了</h3>
+    <p>第 2 版的物体由 <code>createMeshDataV2</code> 构造（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/overview-course.ts:128">overview-course.ts:128–138</a>）。它和 Geometry 构造函数做一样的检查（每个索引都小于顶点数），只是<strong>把调用者的数组原样存了下来，没有复制</strong>。下面这张卡片里，调用者在第 1 帧以后改了自己手里的数组。context A 第 1 帧就上传过，context B 第 2 帧才第一次上传：</p>
+    <div id="lab-v2"></div>
+
+    <h3 id="s3-4">3.4 推出来的结论</h3>
+    <p>3.3 节暴露的问题是：<strong>缓存里存的是「当时那份数据」的 GPU 副本，可 key 背后的数据还能被人改。</strong>A 缓存的是旧数据，B 上传的是新数据，同一个 key 在两个 context 里对应了两份不同的数据。context 丢失后重新上传，也会是改过以后的那份。改法只有两个方向：</p>
+    <ul>
+      <li><strong>让 key 背后的内容永远不变</strong>：构造时复制一份、检查这一份、不给任何修改方法。缓存就永远不会过期，构造时的检查也永远有效（R5）。项目的 VertexAttribute、Geometry、ShaderModule 都这样做（第 4 节）。</li>
+      <li><strong>允许修改，但要让缓存知道</strong>：每改一次，版本号加 1，Manager 发现版本变了就重新上传。three.js 的 BufferAttribute 是这样做的（第 10 节）；项目的 RenderTarget 用 revision 也是这个思路（第 4 课 5.2 节）。</li>
+    </ul>
+    <p>这就回答了「scene 和 resources 只是描述，那它们怎样到 backend 去」：它们不去 backend，backend 拿它们当 key 来查。它们「只是描述」也不是因为不重要：GPU 对象会丢，可以有好几份，<strong>CPU 对象是唯一不会丢的那一份原件</strong>，所以它必须完整、合法、不会悄悄变。</p>
+
+    <h2 id="s4">4. 真实代码 ①：原件——resources 为什么要复制</h2>
+    <p>VertexAttribute 在构造时复制调用者的数组，交出去的也是副本（<a data-src="src/rendering/resources/VertexAttribute.ts:79">VertexAttribute.ts:79–103</a>、<a data-src="src/rendering/resources/VertexAttribute.ts:123">:123–125</a>）：</p>
+<pre><code>// VertexAttribute.ts:79–103、:123–125（节选；注释是课程加的）
+constructor(options: {
+  readonly data: VertexAttributeData
+  readonly itemSize: number
+  readonly normalized?: boolean
+}) {
+  const { data, itemSize, normalized = false } = options
+
+  if (!Number.isInteger(itemSize) || itemSize &lt;= 0) {
+    throw new InvalidVertexAttributeError(/* … */)
+  }
+
+  if (data.length % itemSize !== 0) {
+    throw new InvalidVertexAttributeError(/* … */)
+  }
+
+  this.dataValue = copyVertexAttributeData(data) // 复制：之后调用者改 data，这里不变
+  this.itemSize = itemSize
+  this.normalized = normalized
+}
+
+copyData(): VertexAttributeData {
+  // 交出去的也是副本：拿到的人改它，不影响这里
+  return copyVertexAttributeData(this.dataValue)
+}</code></pre>
+    <p>Geometry 先复制、再检查副本，最后存下的正是检查过的那一份（<a data-src="src/rendering/resources/Geometry.ts:195">Geometry.ts:195–250</a>）。整个类没有任何修改方法：</p>
+<pre><code>// Geometry.ts:195–250（节选）
+const { attributes, indices, topology = 'triangles' } = options
+// 复制「名字 → 属性」这张表
+const copiedAttributes = new Map&lt;string, VertexAttribute&gt;(Object.entries(attributes))
+// …position 必须存在、各属性顶点数一致（:198–223）
+// 复制索引
+const copiedIndices = indices === undefined ? null : copyIndexData(indices)
+
+if (copiedIndices !== null) {
+  // 检查的是副本
+  for (const [indexOffset, vertexIndex] of copiedIndices.entries()) {
+    if (vertexIndex &gt;= vertexCount) {
+      // 例如 index 7 at offset 2 is outside vertex count 3
+      throw new InvalidGeometryError(/* … */)
+    }
+  }
+}
+// …drawCount 与 topology（:242–244）
+this.attributesValue = copiedAttributes // 存下的就是检查过的那一份
+this.indicesValue = copiedIndices</code></pre>
+    <p>Material 不一样：它的参数允许改（灯光颜色、粗糙度可以每帧调），所以不能做成完全不可变。它守住的是另外两件事：<strong>写进来要先复制并检查，读出去也给副本</strong>；纹理参数则保留原来那个对象（<a data-src="src/rendering/resources/materialParameters.ts:188">materialParameters.ts:188–191</a>、<a data-src="src/rendering/resources/materialParameters.ts:204">:204–214</a>、<a data-src="src/rendering/resources/Material.ts:312">Material.ts:312–320</a>、<a data-src="src/rendering/resources/Material.ts:342">:342–349</a>）：</p>
+<pre><code>// materialParameters.ts（节选；注释是课程加的；10 月 19 日以前这几段在 Material.ts）
+// :188–191，copyParameter 的一支：逐个检查有限数，放进新数组
+case 'vec3': {
+  const value = copyNumberArray(parameter.value, 3, fieldName, createError)
+  return { type: 'vec3', value: [value[0]!, value[1]!, value[2]!] }
+}
+// …
+// :204–214：Texture2D 原样保留（附件地址复制并冻结）；CubeTexture 也是同一个对象
+case 'texture2D':
+  return {
+    type: 'texture2D',
+    value: copyTexture2DSamplingSource(parameter.value, fieldName, createError)
+  }
+
+case 'cubeTexture':
+  return {
+    type: 'cubeTexture',
+    value: requireCubeTexture(parameter.value, fieldName, createError)
+  }
+
+// Material.ts（节选）
+// :312–320：出口也复制
+getParameter(name: string): MaterialParameter | undefined {
+  this.assertUsable()
+  assertValidParameterName(name, materialError)
+  const parameter = this.parametersValue.get(name)
+
+  return parameter === undefined
+    ? undefined
+    : copyParameter(parameter, 'parameters.' + name, materialError)
+}
+
+// :342–349：先检查、复制，成功了才写进去
+setParameter(name: string, parameter: MaterialParameter): void {
+  this.assertUsable()
+  if (this.blockParameterNames.has(name)) {
+    throw new InvalidMaterialError(name, 'is provided by a ParameterBlock')
+  }
+  const prepared = prepareParameter(this.shaderModule, name, parameter)
+  this.parametersValue.set(name, prepared)
+}</code></pre>
+    <aside class="note"><strong>10 月 19 日更新</strong>：复制规则搬进了 <a data-src="src/rendering/resources/materialParameters.ts:141">materialParameters.ts</a>，因为新的参数块 ParameterBlock 也走同一套：构造时复制每一项（<a data-src="src/rendering/resources/ParameterBlock.ts:60">ParameterBlock.ts:60–63</a>），<code>get</code> 给副本（<a data-src="src/rendering/resources/ParameterBlock.ts:84">:84–91</a>），<code>set</code> 先复制再替换（<a data-src="src/rendering/resources/ParameterBlock.ts:110">:110–130</a>）。块本身被几个材质借用，不复制，理由和纹理一样：别人要找的就是这一个对象（第 45 课）。</aside>
+    <p>为什么数组要复制，纹理却不复制？纹理是第 5 节那张表的 key：复制一份就成了新对象，Manager 会当成新纹理重新上传。数组只是几个数，复制很便宜，而且没人拿它当 key。卡片里同时跑了课程写的 MaterialV1：参数原样存下，不复制（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/overview-course.ts:299">overview-course.ts:299–312</a>）：</p>
+    <div id="lab-entry"></div>
+
+    <h2 id="s5">5. 真实代码 ②：查表——draw 时把原件换成 GPU 对象</h2>
+    <h3 id="s5-1">5.1 Backend.draw：每行进来什么、出去什么</h3>
+    <p>这一节回答你最直接的问题：「scene 和 resource 上的东西怎样转到 backend 里的代码」。转换只发生在一个地方，就是 <a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:206">WebGL1Backend.ts:206–231</a>：</p>
+<pre><code>// WebGL1Backend.ts:206–231（节选；注释是课程加的）
+const { geometry, material } = submission.item // 两个 CPU 原件（借来的，不是副本）
+
+const program = generation.resources.programs.get(material.shaderModule)
+//  进：ShaderModule（两段源码）
+//  出：{ program: WebGLProgram,
+//        attributes: Map&lt;名字, location&gt;, uniforms: Map&lt;名字, location&gt; }
+const buffers = generation.resources.geometries.get(geometry)
+//  进：Geometry（顶点、索引）
+//  出：{ attributes: Map&lt;名字, { buffer, type, itemSize, normalized }&gt;,
+//        indexBuffer, indexType, drawCount, primitiveMode }
+const commands = generation.uniforms.prepare(program, submission)
+//  进：Material 的参数 + item.worldMatrix + view 的矩阵
+//  出：一组还没执行的 uniform* 调用；类型对不上就在这里抛错，一条都不写
+
+this.assertCurrentDraw(generation)
+
+// GPU 对象 → gl 状态
+generation.state.useProgram(program.program)
+// Material.state（冻结的 RenderState）→ enable、depthFunc、cullFace
+this.applyDrawState(material, generation.state)
+// 执行 uniform*
+generation.uniforms.upload(commands)
+// VAO：把 buffer 接到 program 的 attribute 上
+generation.resources.vertexInputs.bind(geometry, buffers, program)
+
+this.assertCurrentDraw(generation)
+
+if (buffers.indexBuffer === null) {
+  this.gl.drawArrays(buffers.primitiveMode, 0, buffers.drawCount)
+} else {
+  // …indexType 为 null 时抛错（:224–226）
+  this.gl.drawElements(buffers.primitiveMode, buffers.drawCount, buffers.indexType, 0)
+}</code></pre>
+    <p>对照第 3 节：<code>programs.get</code>、<code>geometries.get</code> 就是 DrawerV2 里的 <code>this.buffers.get(mesh)</code>，只是拆成了每种资源一个 Manager，再由 ResourceManager 统一建、统一关（第 18 课）。<code>generation</code> 是「这一代」：context 丢失后，Backend 会换一个新的 generation，里面是一套新的空表（第 13 课）。</p>
+
+    <h3 id="s5-2">5.2 Manager 的表：命中就返回，没命中才上传</h3>
+    <p>以 GeometryManager 为例（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:104">WebGL1GeometryManager.ts:104–188</a>）：</p>
+<pre><code>// WebGL1GeometryManager.ts:104–188（节选；注释是课程加的；长行已折行）
+get(geometry: Geometry): WebGL1GeometryResource {
+  this.assertAvailable('get geometry')
+  if (geometry.disposed) throw new ResourceDisposedError('Geometry')
+  // …正在释放时拒绝（:109–111）
+  // entries: Map&lt;Geometry, GeometryEntry&gt;；热路径：第 2 帧起都走这里
+  const cached = this.entries.get(geometry)
+  if (cached !== undefined) return cached.resource
+
+  // 冷路径：这个 context 第一次见到这个 Geometry
+  // …
+  for (const name of geometry.getAttributeNames()) {
+    const attribute = geometry.getAttribute(name)!
+    const data = attribute.copyData()          // 从原件取一份副本来上传
+    const type = this.attributeType(data)
+    const buffer = this.upload(
+      gl.ARRAY_BUFFER, data, `Geometry.attribute:${name}`, owned
+    )
+    // …
+  }
+  // …索引、恢复绑定、检查错误
+  const resource: WebGL1GeometryResource = Object.freeze({
+    attributes,
+    indexBuffer,
+    indexType,
+    drawCount: geometry.drawCount,
+    primitiveMode: mode
+  })
+
+  // 原件释放时，删掉自己这份副本
+  const unsubscribe = geometry.onDispose(() =&gt; this.release(geometry))
+  this.entries.set(geometry, { resource, unsubscribe })
+  return resource
+}</code></pre>
+    <p>三个细节都和第 3 节对得上：key 是 Geometry 对象本身；上传用的是 <code>copyData()</code> 的副本，所以原件永远不变；Geometry 被 dispose 时，Resource 基类会通知每个订阅了它的 Manager，各自删掉自己那份 GPU 副本（第 4 课第 3 节）。</p>
+
+    <h3 id="s5-3">5.3 一帧到底发出哪些 gl 调用</h3>
+    <p>现在把整条链跑起来：真实的 Renderer、RenderPipeline、ForwardPass、RenderListBuilder、WebGL1Backend。场景里两个 Mesh 共用一个 Geometry 和一个 Material，分别放在 x = −1 和 x = 1，连续画 2 帧。卡片给 gl 套了一层记账代理，每条调用都从调用栈里找出是哪个类的哪个方法发出的：</p>
+    <div id="lab-trace"></div>
+
+    <h3 id="s5-4">5.4 一份原件、几份 GPU 副本</h3>
+    <p>R2、R3 说的是「一份原件对应几份副本」。下面这张卡片用同一个 Scene 喂两个 Backend（两个 canvas），再让第三个 Backend 的 context 丢失、恢复：</p>
+    <div id="lab-copies"></div>
+
+    <h2 id="s6">6. 真实代码 ③：一帧的照片——scene 和 frame 为什么分开</h2>
+    <p>第 5 节的 draw 收到的不是 Mesh，而是 <code>DrawSubmission = { item, view }</code>。为什么要多这一层？先看 Mesh 身上有什么：父节点、子节点、Transform、visible、uuid、世界矩阵缓存，外加借来的 Geometry 和 Material。这些都是<strong>可变的</strong>：轨道控制每次 pointermove 都会改相机，动画每帧都会改 Transform。把 Mesh 直接交给 Pass 和 Backend，会有两个问题：</p>
+    <ul>
+      <li>Backend 能看到 parent、children，就能去遍历场景、改场景。它的职责是「怎样调 gl」，不该知道场景树。</li>
+      <li>两个 Pass 各读一次 Mesh，中间只要有人改了 Transform，两次读到的值就不同。这违反了 R4，而且没有任何报错。</li>
+    </ul>
+    <p>所以每帧开始时，RenderListBuilder 遍历一次场景，给它「拍一张照」，之后的 Pass 和 Backend 只看照片。照片里放什么？<strong>只放下游真正用到的字段</strong>。数据结构是从消费者的需要倒推出来的（<a data-src="src/rendering/frame/RenderItem.ts:15">RenderItem.ts:15–20</a>、<a data-src="src/rendering/frame/ViewState.ts:13">ViewState.ts:13–20</a>、<a data-src="src/rendering/backend/RenderBackend.ts:6">RenderBackend.ts:6–9</a>）：</p>
+<pre><code>// RenderItem.ts:15–20、ViewState.ts:13–20、RenderBackend.ts:6–9
+// （节选；注释是课程加的）
+export interface RenderItem {
+  readonly geometry: Geometry   // → programs/geometries 查表的 key（借用身份）
+  readonly material: Material   // → shader、参数、RenderState、队列（借用身份）
+  readonly worldMatrix: Mat4Tuple // → uModel（复制的值，16 个数）
+}
+
+export interface ViewState {
+  readonly viewMatrix: Mat4Tuple        // → uView
+  readonly projectionMatrix: Mat4Tuple  // → uProjection
+  readonly cameraWorldPosition: Vec3Tuple // → cameraPosition（shader 用到时）
+}
+
+export interface DrawSubmission {
+  readonly item: RenderItem
+  readonly view: ViewState
+}</code></pre>
+    <p>这是不是凭空设计的？下面这张卡片给 submission 套一层代理，记下 Backend.draw 真正读了哪些字段：</p>
+    <div id="lab-fields"></div>
+
+    <p>到这里，五个目录的分工就能放在一条时间线上看了。每样东西活多久，决定了它该放在哪里：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 290" role="img" aria-label="时间线。原件 Geometry、ShaderModule、Material 从头活到尾；Mesh 的 Transform 也一直在，但用户在帧与帧之间改它；每一帧有一份自己的 RenderList、ViewState、FrameSnapshot 副本，帧结束就丢；每次 draw 有一个 DrawSubmission；GPU 对象属于一代，context 丢失时整代作废，恢复后建第二代。">
+          <text x="12" y="44">原件</text>
+          <text x="12" y="58" class="small">Geometry、Material…</text>
+          <rect x="160" y="34" width="584" height="16" rx="3" class="box hl" />
+          <text x="12" y="92">Mesh.transform</text>
+          <text x="12" y="106" class="small">用户随时改</text>
+          <rect x="160" y="84" width="584" height="12" rx="3" class="box" />
+          <path d="M262 78 L262 102" class="line accent" />
+          <path d="M362 78 L362 102" class="line accent" />
+          <path d="M632 78 L632 102" class="line accent" />
+          <text x="268" y="76" class="small accent">setPosition</text>
+          <text x="12" y="140">一帧的副本</text>
+          <text x="12" y="154" class="small">RenderList、ViewState…</text>
+          <rect x="170" y="132" width="80" height="16" rx="3" class="box" />
+          <rect x="270" y="132" width="80" height="16" rx="3" class="box" />
+          <rect x="370" y="132" width="80" height="16" rx="3" class="box" />
+          <rect x="550" y="132" width="80" height="16" rx="3" class="box" />
+          <rect x="650" y="132" width="80" height="16" rx="3" class="box" />
+          <text x="12" y="188">一次 draw</text>
+          <text x="12" y="202" class="small">DrawSubmission</text>
+          <rect x="190" y="182" width="16" height="12" class="box" />
+          <rect x="216" y="182" width="16" height="12" class="box" />
+          <rect x="290" y="182" width="16" height="12" class="box" />
+          <rect x="316" y="182" width="16" height="12" class="box" />
+          <rect x="390" y="182" width="16" height="12" class="box" />
+          <rect x="416" y="182" width="16" height="12" class="box" />
+          <rect x="570" y="182" width="16" height="12" class="box" />
+          <rect x="596" y="182" width="16" height="12" class="box" />
+          <rect x="670" y="182" width="16" height="12" class="box" />
+          <rect x="696" y="182" width="16" height="12" class="box" />
+          <text x="12" y="236">一代 GPU 对象</text>
+          <text x="12" y="250" class="small">Manager 表、buffer…</text>
+          <rect x="160" y="228" width="310" height="16" rx="3" class="box ok" />
+          <rect x="520" y="228" width="224" height="16" rx="3" class="box ok" />
+          <text x="300" y="262" class="small">第 1 代</text>
+          <text x="620" y="262" class="small">第 2 代</text>
+          <path d="M470 24 L470 250" class="line dash bad" />
+          <text x="430" y="20" class="small bad">context 丢失</text>
+          <path d="M520 24 L520 250" class="line dash" />
+          <text x="526" y="20" class="small">恢复</text>
+          <text x="210" y="284" class="small" text-anchor="middle">帧 1</text>
+          <text x="310" y="284" class="small" text-anchor="middle">帧 2</text>
+          <text x="410" y="284" class="small" text-anchor="middle">帧 3</text>
+          <text x="590" y="284" class="small" text-anchor="middle">帧 4</text>
+          <text x="690" y="284" class="small" text-anchor="middle">帧 5</text>
+        </svg>
+      </div>
+      <figcaption>图 2　五种寿命。原件从头活到尾；照片一帧一份；GPU 对象一代一份，丢失后从原件重建第 2 代。寿命不同的东西放进同一个对象，迟早有一方要被迫跟着另一方的寿命走。</figcaption>
+    </figure>
+    <p>图 2 也解释了 Scene 的第二个职责。它除了是场景树，还用 <code>retain</code> 登记自己用到的资源（<a data-src="src/rendering/scene/Scene.ts:77">Scene.ts:77–86</a>）：原件要活多久，由「还有没有 Scene 在用它」决定。Mesh 只借用 Geometry 和 Material，不管它们的寿命（<a data-src="src/rendering/scene/Mesh.ts:22">Mesh.ts:22–45</a>）；照片和 Backend 更不管。</p>
+
+    <h2 id="s7">7. copy 和 freeze：两条规则</h2>
+    <h3 id="s7-1">7.1 规则</h3>
+    <ul>
+      <li><strong>规则一：所有权换手的地方复制。</strong>数据从「能改它的人」手里，交到「需要它不变的人」手里。用户 → Geometry（第 4 节）、Mesh 的世界矩阵 → 一帧的照片（7.2 节）、Engine 的 frame 对象 → Renderer（7.4 节），都属于这种情况。反过来交出去的时候也一样：Geometry 把内部数组交给调用者，给的是副本。</li>
+      <li><strong>规则二：一份数据同时交给几个读者时冻结。</strong>RenderList 给每个 Pass 读，ViewState 给每次 draw 读，RenderState 给每个用这个 Material 的 draw 读。只要有一个读者能改它，其他读者就会看到被改过的数据（7.3 节）。</li>
+      <li><strong>例外：身份就是 key 的对象不复制。</strong>Geometry、Material、纹理是第 5 节那些表的 key，复制一份就成了一个新 key（7.5 节）。</li>
+    </ul>
+    <p>下面每一条都用一个「去掉这一处复制或冻结」的变体来跑。</p>
+
+    <h3 id="s7-2">7.2 提取时复制：不复制会怎样</h3>
+    <p>RenderListBuilder 遍历场景时，用一块 scratch 缓冲接每个 Mesh 的世界矩阵，再用 copyMat4Snapshot 复制成冻结的普通数组（<a data-src="src/rendering/frame/RenderListBuilder.ts:99">RenderListBuilder.ts:99–119</a>）：</p>
+<pre><code>// RenderListBuilder.ts:99–119（注释是课程加的）
+const background: RenderItem[] = []
+const opaque: RenderItem[] = []
+const scratch = new Float32Array(16) // 一块缓冲，整次遍历共用
+
+scene.traverseVisible((node) =&gt; {
+  if (!(node instanceof Mesh)) return
+
+  // SceneNode 不交出内部矩阵，只肯复制到你给的缓冲里
+  node.copyWorldMatrixTo(scratch)
+
+  const renderItem: RenderItem = {
+    geometry: node.geometry,           // 借用身份
+    material: node.material,           // 借用身份
+    // 检查有限数、复制、冻结
+    worldMatrix: copyMat4Snapshot(scratch, 'mesh.worldMatrix')
+  }
+
+  if (renderItem.material.queue === 'background') {
+    background.push(renderItem)
+  } else {
+    opaque.push(renderItem)
+  }
+})</code></pre>
+    <p>课程写的 <code>extractItemsV1</code> 只改了一处：把 <code>copyMat4Snapshot(scratch, …)</code> 换成 scratch 本身（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/overview-course.ts:146">overview-course.ts:146–162</a>）。三个 Mesh 放在 x = −2、0、2：</p>
+    <div id="lab-scratch"></div>
+
+    <h3 id="s7-3">7.3 共享就冻结：一个排序 Pass 引出的问题</h3>
+    <p>HW1 的阴影 Pass 可能想先按离灯的远近给物体排序。最顺手的写法是直接在 <code>context.renderList.opaque</code> 上 <code>sort</code>（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/overview-course.ts:184">overview-course.ts:184–199</a>）。但这个数组也是排在它后面的 ForwardPass 要读的：</p>
+<pre><code>// 课程写的 SortByLightPassV1（节选）
+execute(context: RenderPassContext): undefined {
+  const distance = (item: RenderItem) =&gt; Math.abs(item.worldMatrix[12] - this.lightX)
+  ;(context.renderList.opaque as RenderItem[]).sort((a, b) =&gt; distance(a) - distance(b))
+  return undefined
+}</code></pre>
+    <p>代码里的 <code>as RenderItem[]</code> 是故意加的。去掉它，TypeScript 先拦一次：<code>error TS2339: Property 'sort' does not exist on type 'readonly RenderItem[]'</code>（我用项目的 tsconfig 实测过）。可 <code>readonly</code> 只在编译时有效：<code>as</code>、<code>any</code>、普通 JavaScript 调用者都能绕过去。运行时的那道关是 <code>Object.freeze</code>，在 RenderList 的构造函数里（<a data-src="src/rendering/frame/RenderList.ts:5">RenderList.ts:5–32</a>）：</p>
+<pre><code>// RenderList.ts:5–11、:27–32
+function snapshotItem(item: RenderItem): RenderItem {
+  return Object.freeze({
+    geometry: item.geometry,
+    material: item.material,
+    worldMatrix: copyMat4Snapshot(item.worldMatrix, 'item.worldMatrix')
+  })
+}
+// …
+constructor(backgroundList: RenderItem[], opaque: RenderItem[]) {
+  this.background = Object.freeze(backgroundList.map(snapshotItem))
+  this.opaque = Object.freeze(opaque.map(snapshotItem))
+
+  Object.freeze(this)
+}</code></pre>
+    <p>下面的卡片跑三种组合：课程写的 UnfrozenBuilderV1（拿真实 Builder 的结果，换成不冻结的普通数组），真实 RenderList，以及先复制一份再排序的写法。为了看清 ForwardPass 的绘制顺序，卡片把真实 Backend 包了一层，每次 draw 记下 item 的 x：</p>
+    <div id="lab-freeze"></div>
+
+    <h3 id="s7-4">7.4 复制和冻结一起用：FrameSnapshot</h3>
+    <p>Renderer.render 收到 Engine 给的 <code>view.frame</code>（帧号、时间、画布尺寸六个数），先抄一份再冻结，然后交给所有 Pass（<a data-src="src/rendering/Renderer.ts:56">Renderer.ts:56–76</a>）：</p>
+<pre><code>// Renderer.ts:56–76（注释是课程加的）
+const source = view.frame
+
+const frame: FrameSnapshot = Object.freeze({ // 复制六个数，再冻结这份副本
+  frameNumber: source.frameNumber,
+  timeSeconds: source.timeSeconds,
+  deltaSeconds: source.deltaSeconds,
+  drawingBufferWidth: source.drawingBufferWidth,
+  drawingBufferHeight: source.drawingBufferHeight,
+  pixelRatio: source.pixelRatio
+})
+
+const { renderList, viewState } = this.renderListBuilder.build(view) // 一帧只拍一次照
+
+const context: RenderPassContext = Object.freeze({ // 所有 Pass 共用的包装，也冻结
+  frame,
+  view: viewState,
+  renderList,
+  backend: this.backend
+})
+
+this.pipeline.execute(context)</code></pre>
+    <p>为什么不直接冻结 <code>view.frame</code>，或者只复制不冻结？课程写了这两种变体（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/overview-course.ts:246">overview-course.ts:246–267</a>）。PausePassV1 想把 deltaSeconds 改成 0，「骗」后面的 Pass；ReadDeltaPass 记下自己看到的值：</p>
+    <div id="lab-frame"></div>
+
+    <h3 id="s7-5">7.5 什么不复制：Geometry 的身份</h3>
+    <p>既然复制这么好，为什么 RenderItem 里的 Geometry、Material 不复制？课程写的 CloningBuilderV1 每帧把 Geometry 深复制一份，顶点和索引都抄一遍（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/overview-course.ts:270">overview-course.ts:270–296</a>）。数据和原件一模一样，只是对象换了：</p>
+    <div id="lab-clone"></div>
+
+    <h3 id="s7-6">7.6 一帧路径上的全部复制与冻结</h3>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 270" role="img" aria-label="上排：用户代码把数组交给 resources，入口复制；scene 里的 Mesh 借用 resources 的身份。下排：RenderListBuilder 每帧遍历 scene，复制矩阵并冻结，产出 RenderList 和 ViewState；同一份冻结的照片交给每个 Pass；Pass 调 Backend.draw；Backend 拿 Geometry、Material 的身份去 Manager 表里查，第一次见到时才向原件要一份 copyData 的副本上传。">
+          <defs>
+            <marker id="f3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+            <marker id="f3b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip accent" /></marker>
+          </defs>
+          <rect x="16" y="30" width="130" height="44" rx="5" class="box" />
+          <text x="81" y="57" text-anchor="middle">用户代码</text>
+          <path d="M146 52 L268 52" class="line accent" marker-end="url(#f3b)" />
+          <text x="207" y="44" text-anchor="middle" class="small accent">① 入口复制</text>
+          <rect x="270" y="24" width="200" height="56" rx="5" class="box hl" />
+          <text x="370" y="48" text-anchor="middle" class="title">resources/ 原件</text>
+          <text x="370" y="66" text-anchor="middle" class="small">Geometry、Material、纹理</text>
+          <rect x="580" y="30" width="164" height="44" rx="5" class="box" />
+          <text x="662" y="57" text-anchor="middle">scene/ Mesh</text>
+          <path d="M580 52 L472 52" class="line dash" marker-end="url(#f3a)" />
+          <text x="526" y="44" text-anchor="middle" class="small">借用身份</text>
+
+          <path d="M662 74 L662 104 L90 104 L90 150" class="line" marker-end="url(#f3a)" />
+          <text x="376" y="98" text-anchor="middle" class="small">每帧遍历一次</text>
+
+          <rect x="16" y="152" width="148" height="44" rx="5" class="box" />
+          <text x="90" y="179" text-anchor="middle">RenderListBuilder</text>
+          <path d="M164 174 L218 174" class="line accent" marker-end="url(#f3b)" />
+          <text x="191" y="166" text-anchor="middle" class="small accent">② 复制</text>
+          <rect x="220" y="152" width="140" height="44" rx="5" class="box hl" />
+          <text x="290" y="172" text-anchor="middle">RenderList</text>
+          <text x="290" y="188" text-anchor="middle" class="small">ViewState · ③ 冻结</text>
+          <path d="M360 174 L408 174" class="line" marker-end="url(#f3a)" />
+          <text x="384" y="166" text-anchor="middle" class="small">同一份</text>
+          <rect x="410" y="152" width="110" height="44" rx="5" class="box" />
+          <text x="465" y="172" text-anchor="middle">Pass 1</text>
+          <text x="465" y="188" text-anchor="middle">Pass 2 …</text>
+          <path d="M520 174 L568 174" class="line" marker-end="url(#f3a)" />
+          <rect x="570" y="152" width="174" height="44" rx="5" class="box" />
+          <text x="657" y="179" text-anchor="middle">Backend.draw</text>
+          <path d="M657 196 L657 226" class="line" marker-end="url(#f3a)" />
+          <text x="666" y="216" class="small">身份当 key</text>
+          <rect x="400" y="228" width="344" height="34" rx="5" class="box ok" />
+          <text x="572" y="250" text-anchor="middle">Manager 表 → gl.*（<tspan class="accent">④ 第一次上传时 copyData</tspan>）</text>
+        </svg>
+      </div>
+      <figcaption>图 3　一帧路径上的复制（①②④）和冻结（③）。虚线表示借用身份、不复制。④ 只在这个 context 第一次见到某个原件时发生：Manager 向原件要一份副本来上传。</figcaption>
+    </figure>
+    <p>逐处列出来，每处都写明它挡住的是哪个卡片里的错误：</p>
+    <ul>
+      <li>① 入口复制：<a data-src="src/rendering/resources/VertexAttribute.ts:100">VertexAttribute.ts:100</a>、<a data-src="src/rendering/resources/Geometry.ts:196">Geometry.ts:196</a>、<a data-src="src/rendering/resources/Geometry.ts:225">:225</a>、<a data-src="src/rendering/resources/materialParameters.ts:141">copyParameter（materialParameters.ts:141，Material 和 ParameterBlock 共用）</a>。挡住 3.3 节的「A、B 画得不一样」和「索引 7」，以及 4 节卡片里的「共享数组」「NaN」。</li>
+      <li>出口复制：<a data-src="src/rendering/resources/VertexAttribute.ts:123">copyData（:123）</a>、<a data-src="src/rendering/resources/Geometry.ts:284">copyIndices（Geometry.ts:284）</a>、<a data-src="src/rendering/resources/Material.ts:312">getParameter（Material.ts:312）</a>、<a data-src="src/rendering/resources/ParameterBlock.ts:84">ParameterBlock 的 get（ParameterBlock.ts:84）</a>、<a data-src="src/rendering/scene/SceneNode.ts:391">copyWorldMatrixTo（SceneNode.ts:391）</a>。拿到副本的人改它，不影响原件。</li>
+      <li>② 提取复制：<a data-src="src/rendering/frame/RenderListBuilder.ts:68">相机（RenderListBuilder.ts:68、:82、:92–93）</a>、<a data-src="src/rendering/frame/RenderListBuilder.ts:111">每个 Mesh（:111）</a>、<a data-src="src/rendering/frame/RenderList.ts:9">RenderList 再复制一次（RenderList.ts:9）</a>、<a data-src="src/rendering/Renderer.ts:58">FrameSnapshot（Renderer.ts:58–65）</a>。挡住 7.2 节的「三个 item 都是 x = 2」和 7.4 节的「Pass 改了 Engine 的对象」。</li>
+      <li>③ 冻结：<a data-src="src/rendering/frame/copyMat4Snapshot.ts:40">每个矩阵（copyMat4Snapshot.ts:40）</a>、<a data-src="src/rendering/frame/RenderList.ts:28">两条队列和 RenderList 本身（RenderList.ts:28–31）</a>、<a data-src="src/rendering/frame/RenderListBuilder.ts:91">ViewState（RenderListBuilder.ts:91）</a>、<a data-src="src/rendering/Renderer.ts:69">RenderPassContext（Renderer.ts:69）</a>、<a data-src="src/rendering/resources/Material.ts:116">RenderState（Material.ts:116）</a>、<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:177">GPU 表项（WebGL1GeometryManager.ts:177）</a>。挡住 7.3 节的「排序改了别人的顺序」。</li>
+      <li>④ 上传时的副本：<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:145">WebGL1GeometryManager.ts:145</a>。原件不交出内部数组，只在第一次上传时给一份副本；第 2 帧起走缓存，不再复制。</li>
+      <li>不复制：RenderItem 里的 geometry、material（<a data-src="src/rendering/frame/RenderList.ts:7">RenderList.ts:7–8</a>），Material 里的纹理（<a data-src="src/rendering/resources/materialParameters.ts:204">materialParameters.ts:204–214</a>），以及 Material 借用的参数块。它们是 Manager 的 key，7.5 节的卡片说明了为什么不能复制。</li>
+    </ul>
+
+    <h3 id="s7-7">7.7 代价</h3>
+    <p>「不停地 copy」听起来很浪费。可以实际量一下：同样的场景，用真实的 RenderListBuilder（每个 Mesh 复制两次矩阵、检查 16 个数、冻结三个对象）和不复制的 extractItemsV1 各跑 100 次，取平均：</p>
+    <div id="lab-cost"></div>
+
+    <h2 id="s8">8. 校验为什么分在三层</h2>
+    <p>你还问到「数据校验」。整个代码里的校验分布在三层，原则只有一句：<strong>放在最早知道答案的那一层</strong>。早了，信息还不够；晚了，错误就离原因太远（R6）。</p>
+    <ul>
+      <li><strong>构造时</strong>（resources）：只看描述本身就能判断的，比如索引是否越界、itemSize 是否整除、参数是不是有限数、枚举值是否合法。</li>
+      <li><strong>提取时</strong>（frame）：要等到这一帧才知道的。Transform 的 setPosition 不做检查（<a data-src="src/rendering/scene/Transform.ts:186">Transform.ts:186–192</a>），因为轨道控制每次 pointermove 都会调它。世界矩阵要经过父子相乘才算得出来，相机矩阵可不可逆也一样。所以 copyMat4Snapshot 每帧检查一次有限数，Builder 检查相机矩阵能不能求逆（<a data-src="src/rendering/frame/RenderListBuilder.ts:84">RenderListBuilder.ts:84–85</a>）。</li>
+      <li><strong>draw 时</strong>（backend）：要有设备、有编译好的 program 才知道的。比如 uColor 在 shader 里到底是 vec3 还是 vec4，只有链接后的反射才知道。Material 不解析 GLSL（<a data-src="src/rendering/resources/materialParameters.ts:222">materialParameters.ts:222</a>），所以这类错误要等到 <a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:160">Uniforms.prepare（WebGL1Uniforms.ts:160–162）</a>。Uint32 索引要不要扩展、sampler 数量有没有超过纹理单元上限，也属于这一层。</li>
+    </ul>
+    <p>还有一类看起来重复的检查：Backend.draw 一开头又检查一遍 <code>instanceof Geometry</code>（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:197">WebGL1Backend.ts:197–204</a>），可是 RenderList 明明来自 Builder。原因是 RenderBackend 是公开接口，测试、自己写的 Pass 都能直接调 draw，Backend 不能假设调用者是 Builder。<strong>公开入口不信任调用者，私有函数信任已经检查过的输入</strong>。卡片里把五种错误各触发一次：</p>
+    <div id="lab-validate"></div>
+
+    <h2 id="s9">9. 每个类的职责表</h2>
+    <p>把前面的结论收成一张表，方便回查。「不知道」那一列是故意的：每一格都对应一个「知道了就会出事」的理由，理由写在括号里。</p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>类</th><th>它知道 / 它做</th><th>它故意不知道</th><th>活多久</th></tr></thead>
+        <tbody>
+          <tr><td>VertexAttribute、Geometry</td><td>顶点、索引、拓扑；构造时检查，之后不可变</td><td>gl、buffer（一份 Geometry 给几个 context 用）</td><td>到最后一个 Scene release 或 dispose</td></tr>
+          <tr><td>ShaderModule</td><td>两段源码、内建 uniform 名</td><td>program（同上）</td><td>同上</td></tr>
+          <tr><td>Material</td><td>用哪个 shader、参数、RenderState、队列；参数可改，进出都复制</td><td>相机、模型矩阵（一个 Material 被许多 Mesh 共用，第 3 课）；uniform 的 GLSL 类型（不解析 GLSL）</td><td>同上</td></tr>
+          <tr><td>Mesh、Group、SceneNode</td><td>放在哪、父子关系、画不画；借用 Geometry 和 Material</td><td>资源寿命（Scene 管）、gl</td><td>用户决定</td></tr>
+          <tr><td>Scene</td><td>根节点；用 retain 登记资源的寿命</td><td>怎样画、画几遍</td><td>用户决定</td></tr>
+          <tr><td>Camera、PerspectiveCamera</td><td>投影参数、自己的 Transform</td><td>画布、gl</td><td>用户决定</td></tr>
+          <tr><td>RenderListBuilder</td><td>每帧遍历一次场景，拍成照片（复制、检查、冻结）</td><td>Pass、Backend；不缓存上一帧</td><td>无状态，跟 Renderer 一样长</td></tr>
+          <tr><td>RenderList、RenderItem、ViewState、FrameSnapshot</td><td>这一帧的值</td><td>Scene、Mesh（Pass 不该再读可变的场景）</td><td>一帧</td></tr>
+          <tr><td>RenderPipeline</td><td>Pass 的顺序；拥有 Pass</td><td>Scene、gl</td><td>跟 Renderer</td></tr>
+          <tr><td>ForwardPass（以后的阴影 Pass）</td><td>画到哪、清什么、先画哪个队列</td><td>Scene、gl handle（只调 Backend 的接口）</td><td>跟 Pipeline</td></tr>
+          <tr><td>Renderer</td><td>一帧的流程：复制 frame → 提取 → 执行 Pipeline；关闭顺序</td><td>是哪种 Backend</td><td>应用决定</td></tr>
+          <tr><td>WebGL1Backend</td><td>把一个 DrawSubmission 翻译成 gl 调用；管一代代的 GPU 对象</td><td>Scene、Pass 的顺序；不拥有 CPU 资源</td><td>跟 canvas</td></tr>
+          <tr><td>ResourceManager 和六个 Manager</td><td><code>Map&lt;CPU 对象, GPU 对象&gt;</code>；建、查、删</td><td>场景、帧</td><td>一代（context 丢失就换）</td></tr>
+          <tr><td>WebGL1State、Uniforms、SurfaceScope</td><td>gl 状态缓存、uniform 上传、画到哪个 framebuffer</td><td>场景、帧</td><td>一代</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>以后读到一个新类，先问三个问题：它知道什么？它活多久？它故意不知道什么？三个都答得出来，这个类的职责就清楚了。答不出来，往往说明它在两个寿命不同的东西中间，值得多看两眼。</p>
+
+    <h2 id="s10">10. 架构视角：对照 three.js r177</h2>
+    <p>three.js 面对同样的六条需求，做了几乎相反的取舍：<strong>少复制，靠约定</strong>。</p>
+    <ul>
+      <li><strong>顶点数据：版本号加用户自觉。</strong>BufferAttribute 直接拿着用户的数组。改完要写 <code>attribute.needsUpdate = true</code>，这个 setter 只做一件事：<code>this.version++</code>（<a data-src="node_modules/three/src/core/BufferAttribute.js:152">BufferAttribute.js:152–156</a>）。WebGLAttributes 发现缓存的版本比对象的旧，就重新上传（<a data-src="node_modules/three/src/renderers/webgl/WebGLAttributes.js:206">WebGLAttributes.js:206–216</a>）。忘了写 needsUpdate，就是 3.3 节 context A 的情况：GPU 上留着旧数据，没有任何报错。项目的初版 Geometry 是静态的，干脆不允许改（第 10 课）。</li>
+      <li><strong>矩阵：draw 时现读。</strong>renderObject 先调用户的 <code>object.onBeforeRender</code>，再现读 <code>object.matrixWorld</code>（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:2001">WebGLRenderer.js:2001–2005</a>）。用户回调可以在两次 draw 之间改物体，后面的 draw 就会看到改过的值。项目里的 Pass 根本拿不到 Scene。</li>
+      <li><strong>渲染列表：跨帧复用对象，存的是活对象的引用。</strong>getNextRenderItem 复用上一帧的 renderItem，只把 <code>renderItem.object = object</code> 等字段换掉（<a data-src="node_modules/three/src/renderers/webgl/WebGLRenderLists.js:69">WebGLRenderLists.js:69–101</a>）。每帧零分配，可一帧内的一致性只能靠约定。</li>
+      <li><strong>表：WeakMap。</strong>WebGLAttributes 的表是 WeakMap（<a data-src="node_modules/three/src/renderers/webgl/WebGLAttributes.js:3">WebGLAttributes.js:3</a>），CPU 对象被回收时表项跟着消失，但 GPU buffer 不会自动删，还是要调 dispose。项目用 Map，表项要等 dispose 才删（7.5 节卡片的 20 个 buffer）。</li>
+    </ul>
+    <p>两种取舍各有适用的场合。three.js 要服务上万个物体、各种用户代码，零分配很重要；代价是忘了 needsUpdate、在回调里改物体这类错误，只会表现成画面不对。项目选「多复制，靠机制」：1000 个 Mesh 每帧多花约 0.4 ms（7.7 节），换来的是错误在离原因最近的地方、带着字段名抛出来。对 GAMES202 这种几个到几十个物体的作业，这笔账是划算的。</p>
+
+    <h2 id="s11">11. 审查视角</h2>
+    <h3 id="s11-1">11.1 跑卡片时测出来的两件事</h3>
+    <ol>
+      <li><strong>每次绑定顶点输入，都会清空整个 State 缓存。</strong>5.3 节卡片的第 2 帧里，两次 draw 用的是同一个 program、同样的深度和剔除设置，第二次 draw 却照样发出 useProgram、enable、depthMask、depthFunc、cullFace。原因在 OES 顶点输入的 bind：热路径在 try 里 return，finally 照样执行 <code>this.hooks.invalidateState()</code>（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:68">WebGL1OESVertex<wbr />InputManager.ts:68–73</a>、<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:136">:136–139</a>）；而 invalidate 会把 program、深度、剔除的缓存一起清掉（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:272">WebGL1State.ts:272–280</a>）。注释说的理由是「VAO 切换改变 EBO」，真正需要作废的只有 ELEMENT_ARRAY_BUFFER 这一项。结果没错，只是每次 draw 多发 6 条调用，State 缓存在连续的 draw 之间一次也命中不了。</li>
+      <li><strong>Transform 接受 NaN，报错时却说不出是哪个 Mesh。</strong>setPosition([NaN, 0, 0]) 不报错，直到下一帧提取才抛 <code>mesh.worldMatrix: component 12 must be finite</code>（7.2 节卡片）。场景里有 1000 个 Mesh 时，这条信息不够你找到是哪一个。SceneNode 有现成的 debugLabel，可以放进错误信息。</li>
+    </ol>
+    <p>另外两件看起来像问题、实测不是问题的事：第 2 帧的 138 条 gl 调用里有 72 条是 isContextLost，每条约 6 ns，一帧加起来不到 1 µs；getError 每条约 40 µs，但只出现在第 1 帧的冷路径（14 条），第 2 帧一条都没有。Builder 复制一次、RenderList 又复制一次，矩阵确实抄了两遍，但 7.7 节的数字说明代价很小；RenderList 是公开类，它不能假设调用者已经复制过。</p>
+
+    <h3 id="s11-2">11.2 想一想（直接在对话里回答）</h3>
+    <ol>
+      <li>HW1 的阴影 Pass 要用灯的 view 和 projection 矩阵，不是相机的。可 RenderPassContext 里只有一份 ViewState（相机的）。灯的矩阵应该在哪一层算、由谁复制和冻结、怎样交给 Backend.draw？Backend 需要改吗？</li>
+      <li>如果以后要支持每帧改顶点的 Geometry（比如布料），「入口复制 + 不可变」还成立吗？你会学 three.js 加版本号，还是每帧 new 一个 Geometry？7.5 节的卡片告诉你，第二种做法要额外做什么才不会泄漏？</li>
+      <li>8 节说 Backend.draw 的 <code>instanceof</code> 检查不多余。那 RenderList 构造函数里的第二次 copyMat4Snapshot 呢？如果把 RenderList 的构造函数改成模块私有、只让 Builder 调用，这次复制还需要吗？</li>
+    </ol>
+
+    <h2 id="s12">12. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0031"></div>
+
+    <h2 id="s13">13. 延伸阅读</h2>
+    <ul>
+      <li>本课程第 4 课（CPU 资源与每个 context 的 GPU 表示）：第 5 节 Manager 表的细节、缓存过期的三种办法。</li>
+      <li>本课程第 30 课（帧编排）：RenderListBuilder、RenderPipeline、Renderer 的逐行精读，以及 busy、closing 这些本课没讲的状态。</li>
+      <li>本课程第 18 课（ResourceManager）：六个 Manager 怎样一起建、一起丢、按什么顺序关。</li>
+      <li><a href="https://registry.khronos.org/webgl/specs/latest/1.0/">WebGL 1.0 规范</a>的 Enabled Vertex Attributes and Range Checking 一节：3.3 节卡片里「索引 7 不报错」的依据。规范允许两种结果：报 INVALID_OPERATION 并且不画，或者读到缓冲区里别处的值或 0。</li>
+      <li><a href="https://threejs.org/docs/#api/en/core/BufferAttribute.needsUpdate">three.js 文档：BufferAttribute.needsUpdate</a>：第 10 节「版本号加用户自觉」的官方说明。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：实验卡片和检查题各错了哪几题；11.2 的三个想一想，直接在对话里回答。读到哪一节又接不上了，告诉我是哪一节、哪一句。
+    </aside>
+
+    <div class="nav">
+      <a href="0018-resource-manager.html">← 第 18 课：ResourceManager</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0028-lifecycle-edge-cases.html">第 28 课：生命周期的边角情况 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 31 课 · 2026-10-14</footer>
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        const R = window.RTeachOverview
+        const C = R.course
+
+        // ---------------- 课程写的小工具 ----------------
+        const HELPER_NOTE =
+          '课程写的部分：instrument（给 gl 套一层代理，记下每条调用的函数名，并从调用栈里找出是哪个类的哪个方法发出的；VAO 通过包装 OES 扩展对象来记）、makeScene（一个三角形 Geometry、一个单色 ShaderModule 和 Material，按给定的 x 放几个 Mesh，再加一个 z = 2 的透视相机）、frameOf（一帧的六个标量）、pixel（读一个像素）。Renderer、RenderPipeline、ForwardPass、RenderListBuilder、WebGL1Backend 和资源类都是项目代码（工作区版本）。'
+        const err = (e) => (e && e.name ? e.name : 'Error') + '：' + (e && e.message ? e.message : String(e))
+
+        /** 每个实验自己建 canvas，结束时统一让 context 丢失，免得超过浏览器同时存在的 context 上限。 */
+        function scope() {
+          const contexts = []
+          return {
+            canvas(width = 8, height = 8, inDom = false) {
+              const canvas = document.createElement('canvas')
+              canvas.width = width
+              canvas.height = height
+              if (inDom) {
+                canvas.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none'
+                document.body.appendChild(canvas)
+              }
+              return canvas
+            },
+            track(gl) {
+              if (gl) contexts.push(gl)
+              return gl
+            },
+            release() {
+              for (const gl of contexts) {
+                const lose = gl.getExtension('WEBGL_lose_context')
+                if (lose && !gl.isContextLost()) lose.loseContext()
+                if (gl.canvas && gl.canvas.parentNode) gl.canvas.remove()
+              }
+            }
+          }
+        }
+        async function lab(body) {
+          const s = scope()
+          const lines = []
+          try {
+            await body(lines, s)
+          } catch (error) {
+            lines.push({ text: '实验里抛出了没有预料到的错误：' + err(error), kind: 'late' })
+          } finally {
+            s.release()
+          }
+          return { lines }
+        }
+
+        const OWNER = /at (?:new )?(WebGL1\w+|WebGLContextLifecycle|Renderer|ForwardPass|RenderPipeline|RenderListBuilder)\.([\w$<>]+)/
+        function caller() {
+          for (const line of new Error().stack.split('\n')) {
+            const match = OWNER.exec(line)
+            if (match) return match[1] + '.' + match[2]
+          }
+          return '课程代码'
+        }
+        function instrument(realGL) {
+          const calls = []
+          let extension = null
+          const wrapExtension = (real) =>
+            new Proxy(real, {
+              get(target, property) {
+                const value = target[property]
+                if (typeof value !== 'function') return value
+                return (...args) => {
+                  calls.push({ fn: String(property).replace(/OES$/, ''), by: caller() })
+                  return value.apply(target, args)
+                }
+              }
+            })
+          const gl = new Proxy(realGL, {
+            get(target, property) {
+              const value = target[property]
+              if (typeof value !== 'function') return value
+              return (...args) => {
+                if (property === 'getExtension') {
+                  const result = value.apply(target, args)
+                  if (result && args[0] === 'OES_vertex_array_object') {
+                    extension = extension || wrapExtension(result)
+                    return extension
+                  }
+                  return result
+                }
+                calls.push({ fn: String(property), by: caller() })
+                return value.apply(target, args)
+              }
+            }
+          })
+          return { gl, calls }
+        }
+        /** WebGL1Backend 自己调 canvas.getContext，所以在 canvas 上换掉 getContext，把代理递给它。 */
+        function instrumentCanvas(s, canvas) {
+          const holder = {}
+          const original = HTMLCanvasElement.prototype.getContext
+          canvas.getContext = function (type, attributes) {
+            const real = original.call(canvas, type, attributes)
+            if (!real) return real
+            s.track(real)
+            holder.t = holder.t || instrument(real)
+            holder.real = real
+            return holder.t.gl
+          }
+          return holder
+        }
+        const count = (calls, pattern) => calls.filter((call) => pattern.test(call.fn)).length
+        const isCheck = (call) => call.fn === 'isContextLost' || call.fn === 'getError'
+        /** 相邻的、同一个方法发出的调用合成一行；连续相同的函数写成 ×n。 */
+        function compress(calls) {
+          const groups = []
+          for (const call of calls) {
+            const last = groups[groups.length - 1]
+            if (last && last.by === call.by) last.fns.push(call.fn)
+            else groups.push({ by: call.by, fns: [call.fn] })
+          }
+          return groups.map((group) => {
+            const parts = []
+            for (const fn of group.fns) {
+              const previous = parts[parts.length - 1]
+              if (previous && previous.fn === fn) previous.n++
+              else parts.push({ fn, n: 1 })
+            }
+            return { by: group.by, text: parts.map((p) => p.fn + (p.n > 1 ? ' ×' + p.n : '')).join('，') }
+          })
+        }
+        function pixel(gl, x, y) {
+          const value = new Uint8Array(4)
+          gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, value)
+          return '(' + Array.from(value).join(', ') + ')'
+        }
+
+        const flatShader = (fragmentType = 'vec3') =>
+          new R.ShaderModule({
+            name: 'lesson31/flat-' + fragmentType,
+            language: 'glsl-es-100',
+            vertexSource:
+              'attribute vec3 position;\nuniform mat4 uModel;\nuniform mat4 uView;\nuniform mat4 uProjection;\nvoid main() { gl_Position = uProjection * uView * uModel * vec4(position, 1.0); }',
+            fragmentSource:
+              fragmentType === 'vec3'
+                ? 'precision mediump float;\nuniform vec3 uColor;\nvoid main() { gl_FragColor = vec4(uColor, 1.0); }'
+                : 'precision mediump float;\nuniform vec4 uColor;\nvoid main() { gl_FragColor = uColor; }',
+            builtInUniforms: { modelMatrix: 'uModel', viewMatrix: 'uView', projectionMatrix: 'uProjection' }
+          })
+        function makeScene(xs, options = {}) {
+          const scene = new R.Scene()
+          const geometry = scene.retain(
+            new R.Geometry({
+              attributes: {
+                [R.VertexAttributeSemantic.Position]: new R.VertexAttribute({
+                  data: new Float32Array([-0.8, -0.8, 0, 0.8, -0.8, 0, 0, 0.8, 0]),
+                  itemSize: 3
+                })
+              },
+              indices: new Uint16Array([0, 1, 2])
+            })
+          )
+          const shader = scene.retain(options.shader || flatShader())
+          const material = scene.retain(
+            new R.Material({ shaderModule: shader, parameters: { uColor: { type: 'vec3', value: [0, 1, 0] } } })
+          )
+          const meshes = xs.map((x) => {
+            const mesh = new R.Mesh(geometry, material)
+            mesh.transform.setPosition([x, 0, 0])
+            scene.add(mesh)
+            return mesh
+          })
+          const camera = new R.PerspectiveCamera({ fovY: Math.PI / 2, aspect: 1, near: 0.1, far: 100 })
+          camera.transform.setPosition([0, 0, 2])
+          return { scene, geometry, shader, material, meshes, camera }
+        }
+        const frameOf = (n) => ({
+          frameNumber: n,
+          timeSeconds: n / 60,
+          deltaSeconds: 1 / 60,
+          drawingBufferWidth: 32,
+          drawingBufferHeight: 32,
+          pixelRatio: 1
+        })
+        function makeRenderer(backend, passes, builder) {
+          const pipeline = new R.RenderPipeline()
+          for (const pass of passes) pipeline.addPass(pass)
+          return new R.Renderer(backend, pipeline, builder || new R.RenderListBuilder())
+        }
+        /** 包一层真实 Backend：每次 draw 先记下 item 的 x，再交给真实 Backend。 */
+        function recordingBackend(real, log) {
+          return {
+            get ready() {
+              return real.ready
+            },
+            resizeDrawingBuffer: (...args) => real.resizeDrawingBuffer(...args),
+            withRenderSurface: (descriptor, callback) => real.withRenderSurface(descriptor, callback),
+            draw: (submission) => {
+              log.push(submission.item.worldMatrix[12])
+              real.draw(submission)
+            },
+            dispose: () => real.dispose()
+          }
+        }
+        const LEFT = () => new Float32Array([-1, -1, 0, -1, 0, 1, -1, 1])
+        const RIGHT = () => new Float32Array([0, -1, 1, -1, 1, 1, 0, 1])
+
+        // ---------------- 3.1 第 1 版和第 2 版 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v1'),
+          storageKey: 'lesson-0031-v1',
+          cards: [
+            {
+              title: '第 1 版和第 2 版各画 3 帧',
+              tags: ['真实 WebGL', '课程版代码'],
+              desc: '两个物体：左半边一个红方块，右半边一个蓝方块（各 4 个顶点、6 个索引）。第 1 版每帧现建；第 2 版用物体对象当 key 缓存。每帧数一次 gl 调用，再读左右两个像素。',
+              note: 'drawFrameV1、DrawerV2 是课程写的（overview-course.ts）；instrument 是课程写的记账代理。',
+              question: '第 2 版画到第 3 帧，createBuffer 一共调了几次？',
+              choices: ['4 次：只在第 1 帧给两个物体各传一次顶点和索引', '12 次：每帧每个物体两次，和第 1 版一样', '2 次：两个物体共用同一组 buffer'],
+              answer: 0,
+              explain:
+                '第 1 版每帧 45 条 gl 调用：1 个 program、2 个 shader、4 个 buffer，三帧一共建了 3 个 program、12 个 buffer，而且一个都没删。第 2 版只有第 1 帧建，第 2、3 帧只剩 22 条调用：清屏、useProgram、两次 uniform、绑 buffer、draw。也就是说，第 1 版一帧里有一半调用是在「建东西」，而这些只需要做一次。两个物体的顶点不同，不能共用 buffer。',
+              run: () =>
+                lab((lines, s) => {
+                  const left = { positions: LEFT(), indices: new Uint16Array([0, 1, 2, 0, 2, 3]), color: [1, 0, 0], offsetX: 0 }
+                  const right = { positions: RIGHT(), indices: new Uint16Array([0, 1, 2, 0, 2, 3]), color: [0, 0, 1], offsetX: 0 }
+                  for (const version of ['第 1 版', '第 2 版']) {
+                    const t = instrument(s.track(s.canvas().getContext('webgl')))
+                    const drawer = version === '第 2 版' ? new C.DrawerV2(t.gl) : null
+                    for (let frame = 1; frame <= 3; frame++) {
+                      t.calls.length = 0
+                      if (drawer) drawer.drawFrame([left, right])
+                      else C.drawFrameV1(t.gl, [left, right])
+                      lines.push({
+                        t: '帧 ' + frame,
+                        text:
+                          version + '：createProgram ' + count(t.calls, /^createProgram$/) +
+                          '，createShader ' + count(t.calls, /^createShader$/) +
+                          '，createBuffer ' + count(t.calls, /^createBuffer$/) +
+                          '，共 ' + t.calls.length + ' 条；左 ' + pixel(t.gl, 2, 4) + '，右 ' + pixel(t.gl, 6, 4),
+                        kind: version === '第 2 版' && frame > 1 ? 'result' : 'server'
+                      })
+                    }
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 3.3 第 2 版的漏洞 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-v2'),
+          storageKey: 'lesson-0031-v2',
+          cards: [
+            {
+              title: '缓存之后，调用者改了自己的数组',
+              tags: ['真实 WebGL', '课程版代码'],
+              desc: '一个红方块，起初在左半边。context A 画完第 1 帧后，调用者把 positions 改成右半边的坐标；第 2 帧 A 接着画，同时新开 context B 第一次画。最后调用者把 indices[5] 改成 7（一共只有 4 个顶点），再新开 context D 画一次。',
+              note: 'createMeshDataV2、DrawerV2 是课程写的（overview-course.ts）。',
+              question: '调用者把 positions 挪到右半边以后，第 2 帧 A 和 B 各画在哪？',
+              choices: ['A 还在左边，B 在右边：A 用的是第 1 帧缓存的 buffer', '都挪到右边：两边画的是同一个数组', '都还在左边：DrawerV2 构造时已经复制了数组'],
+              answer: 0,
+              explain:
+                'A 第 1 帧就把数组传上了 GPU，之后一直用缓存，看不到调用者的修改；B 第 2 帧才第一次上传，传的是改过以后的数组。同一个 key 在两个 context 里对应了两份不同的数据。context 丢失后重新上传，也会传改过的那份。<br />索引那一步更隐蔽：createMeshDataV2 构造时确实检查了索引（最后一行，带 7 的构造当场被拦下），可事后修改绕过了检查。D 画出来少了右上角那个三角形，getError 却是 0（你的显卡也可能报 1282）。WebGL 规范允许两种结果：报 INVALID_OPERATION 并且不画，或者读到缓冲区里别处的值或 0。无论哪种，都不会告诉你是哪个数组的哪一位出了错（违反 R5、R6）。',
+              run: () =>
+                lab((lines, s) => {
+                  const mesh = C.createMeshDataV2({ positions: LEFT(), indices: new Uint16Array([0, 1, 2, 0, 2, 3]), color: [1, 0, 0] })
+                  const A = s.track(s.canvas().getContext('webgl'))
+                  const drawerA = new C.DrawerV2(A)
+                  drawerA.drawFrame([mesh])
+                  lines.push({ t: '帧 1', text: 'A：左 ' + pixel(A, 2, 4) + '，右 ' + pixel(A, 6, 4) })
+                  mesh.positions.set([0, -1, 1, -1, 1, 1, 0, 1])
+                  lines.push({ t: '调用者', text: 'mesh.positions.set(右半边的坐标)', kind: 'user' })
+                  drawerA.drawFrame([mesh])
+                  const B = s.track(s.canvas().getContext('webgl'))
+                  const drawerB = new C.DrawerV2(B)
+                  drawerB.drawFrame([mesh])
+                  lines.push({ t: '帧 2', text: 'A：左 ' + pixel(A, 2, 4) + '，右 ' + pixel(A, 6, 4), kind: 'result' })
+                  lines.push({ t: '帧 2', text: 'B：左 ' + pixel(B, 2, 4) + '，右 ' + pixel(B, 6, 4), kind: 'result' })
+                  mesh.indices[5] = 7
+                  lines.push({ t: '调用者', text: 'mesh.indices[5] = 7（一共只有 4 个顶点）', kind: 'user' })
+                  const D = s.track(s.canvas().getContext('webgl'))
+                  new C.DrawerV2(D).drawFrame([mesh])
+                  drawerB.drawFrame([mesh])
+                  lines.push({ t: 'D 画', text: 'getError ' + D.getError() + '；右下 ' + pixel(D, 6, 2) + '，右上 ' + pixel(D, 5, 6), kind: 'late' })
+                  lines.push({ t: '对照', text: 'B（第 2 帧上传的，索引还是好的）：右下 ' + pixel(B, 6, 2) + '，右上 ' + pixel(B, 5, 6) })
+                  try {
+                    C.createMeshDataV2({ positions: new Float32Array(8), indices: new Uint16Array([0, 1, 7]), color: [1, 0, 0] })
+                    lines.push({ t: '构造', text: '带 7 的构造没有报错' })
+                  } catch (error) {
+                    lines.push({ t: '构造', text: '构造时就带 7：' + err(error) })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 4 入口复制 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-entry'),
+          storageKey: 'lesson-0031-entry',
+          cards: [
+            {
+              title: '构造以后，调用者再改自己的数组',
+              tags: ['项目代码（工作区版本）', '课程版代码'],
+              desc: '和上一张卡片一样的修改，这次交给真实的 VertexAttribute 和 Geometry。然后让真实的 Material 和课程写的 MaterialV1 用同一个 tint = [1, 0, 0] 构造，再改 tint：先把 tint[1] 改成 1（另一个材质想要黄色），再把 tint[0] 改成 NaN。',
+              note: 'MaterialV1 是课程写的（overview-course.ts:299）：校验以后把调用者的数组原样存下。',
+              question: '构造之后调用者把 tint[0] 改成 NaN，真实 Material 的 uColor 是多少？',
+              choices: ['还是 [1, 0, 0]：构造时复制了数组', '[NaN, 1, 0]：存的是同一个数组', '抛 InvalidMaterialError：Material 监听着数组的修改'],
+              answer: 0,
+              explain:
+                '真实代码在入口复制，之后调用者怎么改自己的数组都和它无关，构造时的检查也就一直有效。MaterialV1 构造时同样检查过有限数，可它存的是调用者的数组：第一次修改把颜色悄悄变成了黄色，第二次修改让一个 NaN 越过了检查。JavaScript 没有办法「监听」普通数组的修改，所以只能在入口复制。<br />最后两行是出口方向：改 getParameter 拿到的副本不影响 Material；想改参数，只能走 setParameter，而它会重新检查（NaN 被拦下）。',
+              run: () =>
+                lab((lines) => {
+                  const data = LEFT()
+                  const attribute = new R.VertexAttribute({ data, itemSize: 2 })
+                  data.set([0, -1, 1, -1, 1, 1, 0, 1])
+                  lines.push({ t: 'Geometry', text: '改了 data 以后 attribute.copyData() 前两个数：' + Array.from(attribute.copyData().slice(0, 2)).join(', ') })
+                  const indices = new Uint16Array([0, 1, 2, 0, 2, 3])
+                  const geometry = new R.Geometry({ attributes: { position: attribute }, indices })
+                  indices[5] = 7
+                  lines.push({ t: 'Geometry', text: '改了 indices[5] = 7 以后 copyIndices()：' + Array.from(geometry.copyIndices()).join(', ') })
+                  try {
+                    new R.Geometry({
+                      attributes: { position: new R.VertexAttribute({ data: new Float32Array(8), itemSize: 2 }) },
+                      indices: new Uint16Array([0, 1, 7])
+                    })
+                  } catch (error) {
+                    lines.push({ t: 'Geometry', text: '构造时就带 7：' + err(error), kind: 'abort' })
+                  }
+                  const tint = [1, 0, 0]
+                  const shader = new R.ShaderModule({
+                    name: 'lesson31/tint',
+                    language: 'glsl-es-100',
+                    vertexSource: 'void main() { gl_Position = vec4(0.0); }',
+                    fragmentSource: 'precision mediump float;\nuniform vec3 uColor;\nvoid main() { gl_FragColor = vec4(uColor, 1.0); }'
+                  })
+                  const v1 = new C.MaterialV1({ uColor: { type: 'vec3', value: tint } })
+                  const real = new R.Material({ shaderModule: shader, parameters: { uColor: { type: 'vec3', value: tint } } })
+                  tint[1] = 1
+                  lines.push({ t: 'tint[1]', text: 'tint[1] = 1 以后 MaterialV1：' + JSON.stringify(v1.getParameter('uColor').value) + '；Material：' + JSON.stringify(real.getParameter('uColor').value), kind: 'user' })
+                  tint[0] = NaN
+                  lines.push({ t: 'tint[0]', text: 'tint[0] = NaN 以后 MaterialV1：[' + String(v1.getParameter('uColor').value) + ']；Material：[' + String(real.getParameter('uColor').value) + ']', kind: 'result' })
+                  const copy = real.getParameter('uColor')
+                  copy.value[0] = 0
+                  lines.push({ t: '出口', text: '改了 getParameter 拿到的副本以后再取：[' + String(real.getParameter('uColor').value) + ']' })
+                  try {
+                    real.setParameter('uColor', { type: 'vec3', value: [NaN, 0, 0] })
+                  } catch (error) {
+                    lines.push({ t: '出口', text: 'setParameter 传 NaN：' + err(error), kind: 'abort' })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 5.3 一帧的 gl 调用 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-trace'),
+          storageKey: 'lesson-0031-trace',
+          cards: [
+            {
+              title: '真实 Renderer 连画 2 帧，每条 gl 调用是谁发的',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '两个 Mesh 共用一个 Geometry 和一个 Material，放在 x = −1 和 1；Pipeline 里只有一个 ForwardPass。isContextLost 和 getError 这两种检查调用单独计数，不逐条列出。最后读左、中、右三个像素。',
+              note: HELPER_NOTE,
+              question: '第 2 帧会发出几条 create*（createShader、createBuffer、createVertexArray……）？',
+              choices: ['0 条：program、buffer、VAO 第 1 帧都建好了，查表就有', '6 条：每帧重建 program、两个 buffer 和 VAO', '3 条：只重建 VAO，因为 Mesh 的位置可能变了'],
+              answer: 0,
+              explain:
+                '第 1 帧是冷路径：ProgramManager 编译、链接、反射；GeometryManager 上传两个 buffer；Uniforms.reflect 查一次 4 个 active uniform；顶点输入读 attribute、建 VAO。两个 Mesh 共用资源，所以这些只做一套。第 2 帧一个 create 都没有，每次 draw 只走热路径：useProgram → 固定状态 → 深度、剔除 → 4 个 uniform → bindVertexArray → drawElements。<br />Mesh 的位置不在 VAO 里，它是 uModel 这个 uniform，每次 draw 都重新上传。<br />检查调用很多，但很便宜：isContextLost 每条约 6 ns；getError 每条约 40 µs，只出现在冷路径。另外留意第 2 帧的第二次 draw 又发了一遍 useProgram、depthFunc、cullFace，原因见 11.1 节。',
+              run: () =>
+                lab((lines, s) => {
+                  const canvas = s.canvas(32, 32)
+                  const h = instrumentCanvas(s, canvas)
+                  const backend = new R.WebGL1Backend(canvas, 'lesson31-trace')
+                  const scene = makeScene([-1, 1])
+                  const renderer = makeRenderer(backend, [new R.ForwardPass()])
+                  for (let frame = 1; frame <= 2; frame++) {
+                    h.t.calls.length = 0
+                    renderer.render({ scene: scene.scene, camera: scene.camera, frame: frameOf(frame) })
+                    const checks = h.t.calls.filter(isCheck)
+                    lines.push({
+                      t: '帧 ' + frame,
+                      text:
+                        'gl 调用 ' + h.t.calls.length + ' 条，其中检查 ' + checks.length +
+                        ' 条（isContextLost ' + count(checks, /^isContextLost$/) + '，getError ' + count(checks, /^getError$/) +
+                        '）；create* ' + count(h.t.calls, /^create/) + ' 条；drawElements ' + count(h.t.calls, /^drawElements$/) + ' 次',
+                      kind: 'result'
+                    })
+                    for (const group of compress(h.t.calls.filter((call) => !isCheck(call)))) {
+                      lines.push({ t: '', text: group.by + '：' + group.text, kind: /create/.test(group.text) ? 'server' : '' })
+                    }
+                  }
+                  lines.push({ t: '像素', text: '左 ' + pixel(h.real, 8, 16) + '，中 ' + pixel(h.real, 16, 16) + '，右 ' + pixel(h.real, 24, 16), kind: 'result' })
+                  renderer.dispose()
+                })
+            }
+          ]
+        })
+
+        // ---------------- 5.4 一份原件、几份副本 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-copies'),
+          storageKey: 'lesson-0031-copies',
+          cards: [
+            {
+              title: '同一个 Scene，两个 canvas；再丢失一次',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: 'Backend A、B 各有一个 canvas，画同一个 Scene（一个 Mesh 放在中间）。然后把 A 建的一个 buffer 拿到 B 上去绑；关掉 A，B 接着画。最后让第三个 Backend C 的 context 丢失，再恢复。',
+              note: HELPER_NOTE,
+              question: '两个 canvas 画同一个 Scene，Backend B 会建几套 program、buffer、VAO？',
+              choices: ['自己再建一套：每个 context 只能用自己建的对象', '一套都不建：直接用 A 建好的', '只建 VAO：program 和 buffer 可以跨 context 共用'],
+              answer: 0,
+              explain:
+                'A、B 各建了一套：2 个 shader、1 个 program、2 个 buffer、1 个 VAO。把 A 的 buffer 绑到 B 上，B 报 1282（INVALID_OPERATION）：handle 只属于建它的 context，这就是 Geometry 里不能放 WebGLBuffer 的原因（R2）。<br />A 关闭只删 A 自己的 GPU 副本：Geometry 没有被释放，B 下一帧照样画，一个 create 都没有。C 丢失时 ready 变成 false，render 什么都不做就返回；恢复以后，Backend 换了新的一代，表是空的，第一帧从同一份 CPU 原件把 6 个对象重新建了一遍（R3）。',
+              run: () =>
+                lab(async (lines, s) => {
+                  const scene = makeScene([0])
+                  const view = (n) => ({ scene: scene.scene, camera: scene.camera, frame: frameOf(n) })
+                  const canvasA = s.canvas(16, 16, true)
+                  const canvasB = s.canvas(16, 16, true)
+                  const hA = instrumentCanvas(s, canvasA)
+                  const hB = instrumentCanvas(s, canvasB)
+                  const A = new R.WebGL1Backend(canvasA, 'A')
+                  const B = new R.WebGL1Backend(canvasB, 'B')
+                  const rendererA = makeRenderer(A, [new R.ForwardPass()])
+                  const rendererB = makeRenderer(B, [new R.ForwardPass()])
+                  rendererA.render(view(1))
+                  rendererB.render(view(1))
+                  const created = (h) =>
+                    h.t.calls
+                      .filter((call) => /^create(Buffer|Program|Shader|VertexArray)$/.test(call.fn))
+                      .map((call) => call.fn.replace('create', ''))
+                      .join(' ')
+                  lines.push({ t: 'A 帧 1', text: '建了 ' + created(hA) + '；中心 ' + pixel(hA.real, 8, 8), kind: 'server' })
+                  lines.push({ t: 'B 帧 1', text: '建了 ' + created(hB) + '；中心 ' + pixel(hB.real, 8, 8), kind: 'server' })
+                  const bufferOfA = hA.real.createBuffer()
+                  hB.real.bindBuffer(hB.real.ARRAY_BUFFER, bufferOfA)
+                  lines.push({ t: '混用', text: '把 A 建的 buffer 绑到 B 上：B.getError() = ' + hB.real.getError(), kind: 'abort' })
+                  rendererA.dispose()
+                  hB.t.calls.length = 0
+                  rendererB.render(view(2))
+                  lines.push({
+                    t: 'B 帧 2',
+                    text: 'A 关闭以后：create ' + count(hB.t.calls, /^create/) + ' 条，中心 ' + pixel(hB.real, 8, 8) +
+                      '；Geometry.disposed = ' + scene.geometry.disposed + '，vertexCount = ' + scene.geometry.vertexCount,
+                    kind: 'result'
+                  })
+                  const canvasC = s.canvas(16, 16, true)
+                  const hC = instrumentCanvas(s, canvasC)
+                  const backendC = new R.WebGL1Backend(canvasC, 'C')
+                  const rendererC = makeRenderer(backendC, [new R.ForwardPass()])
+                  rendererC.render(view(1))
+                  const lose = hC.real.getExtension('WEBGL_lose_context')
+                  if (!lose) {
+                    lines.push({ t: 'C', text: '这个浏览器没有 WEBGL_lose_context，丢失这一段跳过。', kind: 'late' })
+                  } else {
+                    lose.loseContext()
+                    await new Promise((resolve) => setTimeout(resolve, 50))
+                    rendererC.render(view(2))
+                    lines.push({ t: 'C 丢失', text: 'ready = ' + backendC.ready + '；render 没有抛错，直接返回', kind: 'abort' })
+                    lose.restoreContext()
+                    for (let i = 0; i < 100 && !backendC.ready; i++) await new Promise((resolve) => setTimeout(resolve, 20))
+                    hC.t.calls.length = 0
+                    rendererC.render(view(3))
+                    lines.push({ t: 'C 恢复', text: 'ready = ' + backendC.ready + '；第一帧建了 ' + created(hC) + '；中心 ' + pixel(hC.real, 8, 8), kind: 'result' })
+                  }
+                  rendererB.dispose()
+                  rendererC.dispose()
+                })
+            }
+          ]
+        })
+
+        // ---------------- 6 Backend.draw 读了哪些字段 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-fields'),
+          storageKey: 'lesson-0031-fields',
+          cards: [
+            {
+              title: '给 DrawSubmission 套一层代理，看 draw 读了什么',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '用真实 RenderListBuilder 拍一张照，取出第一个 RenderItem，和 ViewState 一起包进代理；在一个 scope 里调一次 backend.draw，记下读过的字段。shader 只声明了 uModel、uView、uProjection、uColor。',
+              note: HELPER_NOTE + ' 代理（probe）也是课程写的，只记录读了哪个字段，原样返回值。',
+              question: 'Backend.draw 会读 submission 的哪些字段？',
+              choices: ['item 的三个字段，和 view 的 viewMatrix、projectionMatrix；不读 cameraWorldPosition', '每个字段都读，包括 cameraWorldPosition', '除了这些，还会去读 Mesh 的 transform 和 parent'],
+              answer: 0,
+              explain:
+                'draw 读了 item.geometry、item.material（查表的 key）、item.worldMatrix（uModel），以及 view.viewMatrix、view.projectionMatrix（uView、uProjection）。shader 没有声明 cameraPosition，所以 cameraWorldPosition 一次都没读：Uniforms 按 shader 实际用到的 uniform 取值。<br />Mesh 根本不在 submission 里，draw 想读 parent 也读不到。这就是「数据结构从消费者的需要倒推」：RenderItem 只有三个字段，正好是 draw 需要的那三个。',
+              run: () =>
+                lab((lines, s) => {
+                  const canvas = s.canvas(16, 16)
+                  const backend = new R.WebGL1Backend(canvas, 'lesson31-probe')
+                  s.track(canvas.getContext('webgl'))
+                  const scene = makeScene([0])
+                  const { renderList, viewState } = new R.RenderListBuilder().build({ scene: scene.scene, camera: scene.camera, frame: frameOf(1) })
+                  const reads = new Set()
+                  const probe = (object, path) =>
+                    new Proxy(object, {
+                      get(target, property) {
+                        if (typeof property === 'string') reads.add(path + property)
+                        const value = target[property]
+                        if ((property === 'item' || property === 'view') && value) return probe(value, path + property + '.')
+                        return value
+                      }
+                    })
+                  const item = renderList.opaque[0]
+                  lines.push({ t: '照片', text: 'RenderItem 的字段：' + Object.keys(item).join('、') + '；ViewState 的字段：' + Object.keys(viewState).join('、') })
+                  backend.withRenderSurface({ surface: { kind: 'default-framebuffer' }, clear: { color: [0, 0, 0, 1], depth: 1 } }, () => {
+                    backend.draw(probe({ item, view: viewState }, ''))
+                    return undefined
+                  })
+                  lines.push({ t: 'draw 读了', text: [...reads].join('、'), kind: 'result' })
+                  lines.push({ t: '像素', text: '中心 ' + pixel(canvas.getContext('webgl'), 8, 8) })
+                  backend.dispose()
+                })
+            }
+          ]
+        })
+
+        // ---------------- 7.2 提取时复制 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-scratch'),
+          storageKey: 'lesson-0031-scratch',
+          cards: [
+            {
+              title: '少了 copyMat4Snapshot 的提取',
+              tags: ['项目代码（工作区版本）', '课程版代码'],
+              desc: '三个 Mesh 放在 x = −2、0、2。分别用课程写的 extractItemsV1 和真实的 RenderListBuilder 提取，看每个 item 的 worldMatrix[12]（平移的 x 分量，列主序第 13 个数）。最后把第一个 Mesh 的位置设成 NaN，再提取一次。',
+              note: 'extractItemsV1 是课程写的（overview-course.ts:146）；makeScene 是课程写的小工具。',
+              question: '用 extractItemsV1 提取，三个 item 的 worldMatrix[12] 是多少？',
+              choices: ['2, 2, 2：三个 item 指向同一块 scratch，最后写进去的是 x = 2', '−2, 0, 2：每个 item push 的时候已经记下了自己的值', '0, 0, 0：遍历结束时 scratch 被清零了'],
+              answer: 0,
+              explain:
+                'push 进去的是 scratch 这个对象的引用，不是它当时的 16 个数。遍历到第三个 Mesh 时，scratch 被改写成 x = 2，前两个 item 也跟着变了：画出来三个物体叠在同一个位置。真实代码每个 Mesh 复制出一个新的冻结数组，三个值各自独立。<br />这里复制的理由和第 4 节不同：不是防用户，而是 Builder 自己为了省内存复用了缓冲，复制把「临时」和「交出去的」分开。不复用 scratch、每个 Mesh 新建一个 Float32Array 也能避免共享，但交出去的是可写的 TypedArray，Pass 照样能改；copyMat4Snapshot 一步做完检查、复制、冻结。最后一行：Transform 接受了 NaN，一直到提取才报错。',
+              run: () =>
+                lab((lines) => {
+                  const scene = makeScene([-2, 0, 2])
+                  const v1 = C.extractItemsV1(scene.scene)
+                  lines.push({
+                    t: 'V1',
+                    text: 'worldMatrix[12]：' + v1.map((item) => item.worldMatrix[12]).join(', ') + '；第 1 个和第 3 个是同一块存储：' + (v1[0].worldMatrix === v1[2].worldMatrix),
+                    kind: 'late'
+                  })
+                  const real = new R.RenderListBuilder().build({ scene: scene.scene, camera: scene.camera, frame: frameOf(1) }).renderList.opaque
+                  lines.push({
+                    t: '真实',
+                    text: 'worldMatrix[12]：' + real.map((item) => item.worldMatrix[12]).join(', ') + '；同一块存储：' + (real[0].worldMatrix === real[2].worldMatrix) +
+                      '；冻结：' + Object.isFrozen(real[0].worldMatrix) + '；' + (Array.isArray(real[0].worldMatrix) ? '普通数组' : 'TypedArray'),
+                    kind: 'result'
+                  })
+                  scene.meshes[0].transform.setPosition([NaN, 0, 0])
+                  lines.push({ t: 'NaN', text: 'mesh.transform.setPosition([NaN, 0, 0])：没有报错', kind: 'user' })
+                  try {
+                    new R.RenderListBuilder().build({ scene: scene.scene, camera: scene.camera, frame: frameOf(2) })
+                    lines.push({ t: 'NaN', text: '提取也没有报错' })
+                  } catch (error) {
+                    lines.push({ t: 'NaN', text: '提取时：' + err(error), kind: 'abort' })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 7.3 共享就冻结 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-freeze'),
+          storageKey: 'lesson-0031-freeze',
+          cards: [
+            {
+              title: '阴影 Pass 原地排序，ForwardPass 按什么顺序画',
+              tags: ['真实 WebGL', '项目代码（工作区版本）', '课程版代码'],
+              desc: '三个 Mesh 在 x = −2、0、2，灯在 x = 2。Pipeline：先 SortByLightPassV1（或先复制再排的 SortCopyByLightPass），再 ForwardPass。三种组合各画 2 帧，记下 ForwardPass 每次 draw 的 x。',
+              note: 'UnfrozenBuilderV1、SortByLightPassV1、SortCopyByLightPass 是课程写的（overview-course.ts:165–218）；recordingBackend 是课程写的包装，记下 x 后把 draw 原样交给真实 Backend。',
+              question: '用不冻结的列表，阴影 Pass 原地排序以后，ForwardPass 按什么顺序画？',
+              choices: ['2, 0, −2：ForwardPass 看到的就是被排过的那个数组', '−2, 0, 2：每个 Pass 拿到的是自己的列表', '抛 TypeError：RenderItem 数组不能 sort'],
+              answer: 0,
+              explain:
+                '两个 Pass 拿到的是同一个数组。阴影 Pass 为了自己方便排了序，ForwardPass 的顺序也跟着变了，没有任何报错。这个例子里顺序变了，画面还看不出来；等以后有了透明物体这类依赖绘制顺序的效果，画面就会错。<br />真实 RenderList 是冻结的，sort 在第一次写入时就抛出 TypeError：Cannot assign to read only property \'0\'。错误出在阴影 Pass 自己的那一行，而不是几个 Pass 之后、画面不对的时候。正确的写法是先复制一份自己的数组再排：阴影 Pass 拿到 2, 0, −2，ForwardPass 仍然是 −2, 0, 2。<br />TypeScript 在编译时已经拦过一次（readonly 数组没有 sort），卡片里的 as 是故意绕过的；freeze 是运行时的那道关。',
+              run: () =>
+                lab((lines, s) => {
+                  const scene = makeScene([-2, 0, 2])
+                  const setups = [
+                    ['不冻结 + 原地排序', new C.UnfrozenBuilderV1(), new C.SortByLightPassV1(2)],
+                    ['真实 RenderList + 原地排序', new R.RenderListBuilder(), new C.SortByLightPassV1(2)],
+                    ['真实 RenderList + 先复制再排', new R.RenderListBuilder(), new C.SortCopyByLightPass(2)]
+                  ]
+                  for (const [label, builder, sortPass] of setups) {
+                    const canvas = s.canvas(16, 16)
+                    const backend = new R.WebGL1Backend(canvas, 'lesson31-sort')
+                    s.track(canvas.getContext('webgl'))
+                    const log = []
+                    const renderer = makeRenderer(recordingBackend(backend, log), [sortPass, new R.ForwardPass()], builder)
+                    for (let frame = 1; frame <= 2; frame++) {
+                      log.length = 0
+                      try {
+                        renderer.render({ scene: scene.scene, camera: scene.camera, frame: frameOf(frame) })
+                        lines.push({
+                          t: '帧 ' + frame,
+                          text: label + '：ForwardPass 的顺序：' + log.join(', ') + (sortPass.sorted ? '；阴影 Pass 自己的顺序：' + sortPass.sorted.map((item) => item.worldMatrix[12]).join(', ') : ''),
+                          kind: label.startsWith('不冻结') ? 'late' : 'result'
+                        })
+                      } catch (error) {
+                        lines.push({ t: '帧 ' + frame, text: label + '：' + err(error), kind: 'abort' })
+                      }
+                    }
+                    renderer.dispose()
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 7.4 FrameSnapshot ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-frame'),
+          storageKey: 'lesson-0031-frame',
+          cards: [
+            {
+              title: '只冻结、只复制、复制再冻结',
+              tags: ['项目代码（工作区版本）', '课程版代码'],
+              desc: 'Engine 交来一个 frame 对象（deltaSeconds = 1/60）。三种 render 写法各跑一帧：只冻结时 Pipeline 里只放 ReadDeltaPass；另外两种是 PausePassV1 → ReadDeltaPass。跑完以后，Engine 照常为下一帧执行 frame.frameNumber += 1。',
+              note: 'renderFreezeOnlyV1、renderCopyOnlyV1、PausePassV1、ReadDeltaPass 是课程写的（overview-course.ts:221–267）；真实 Renderer 是项目代码。',
+              question: '真实 Renderer 下，PausePassV1 把 context.frame.deltaSeconds 改成 0，会怎样？',
+              choices: ['抛 TypeError，后面的 Pass 不执行；Engine 自己的对象照样能改', '改成功了，后面的 Pass 都看到 0', '改成功了，但只影响 PausePassV1 自己看到的值'],
+              answer: 0,
+              explain:
+                '只冻结：Renderer 冻住的是 Engine 自己的对象，Engine 下一帧 frameNumber += 1 时抛 TypeError，出错的位置在 Engine 里，离真正的原因很远。只复制：Pass 之间共用一份可写的副本，PausePassV1 一改，ReadDeltaPass 看到的就是 0，没有任何报错。<br />复制再冻结：Engine 的对象没被冻住，照常加 1；Pass 拿到的是冻结的副本，PausePassV1 一写就在自己那一行抛错，ReadDeltaPass 一次都没执行（Pipeline 遇到异常就停）。规则一和规则二要一起用：复制保护交出数据的人，冻结保护共用数据的几个读者。',
+              run: () =>
+                lab((lines, s) => {
+                  const scene = makeScene([0])
+                  const canvas = s.canvas(16, 16)
+                  const backend = new R.WebGL1Backend(canvas, 'lesson31-frame')
+                  s.track(canvas.getContext('webgl'))
+                  const builder = new R.RenderListBuilder()
+                  const pipelineOf = (passes) => {
+                    const pipeline = new R.RenderPipeline()
+                    for (const pass of passes) pipeline.addPass(pass)
+                    return pipeline
+                  }
+                  {
+                    const frame = frameOf(1)
+                    C.renderFreezeOnlyV1({ scene: scene.scene, camera: scene.camera, frame }, builder, pipelineOf([new C.ReadDeltaPass()]), backend)
+                    try {
+                      frame.frameNumber += 1
+                      lines.push({ t: '只冻结', text: 'Engine 下一帧 frameNumber += 1 成功' })
+                    } catch (error) {
+                      lines.push({ t: '只冻结', text: 'Engine 下一帧 frame.frameNumber += 1 → ' + err(error), kind: 'late' })
+                    }
+                  }
+                  {
+                    const frame = frameOf(1)
+                    const read = new C.ReadDeltaPass()
+                    C.renderCopyOnlyV1({ scene: scene.scene, camera: scene.camera, frame }, builder, pipelineOf([new C.PausePassV1(), read]), backend)
+                    lines.push({ t: '只复制', text: 'ReadDeltaPass 看到 deltaSeconds = ' + read.seen.join(', ') + '；Engine 的对象还是 ' + frame.deltaSeconds.toFixed(4), kind: 'late' })
+                  }
+                  {
+                    const frame = frameOf(1)
+                    const read = new C.ReadDeltaPass()
+                    const renderer = new R.Renderer(backend, pipelineOf([new C.PausePassV1(), read]), builder)
+                    try {
+                      renderer.render({ scene: scene.scene, camera: scene.camera, frame })
+                      lines.push({ t: '真实', text: 'render 没有抛错' })
+                    } catch (error) {
+                      lines.push({ t: '真实', text: err(error) + '；ReadDeltaPass 执行了 ' + read.seen.length + ' 次', kind: 'abort' })
+                    }
+                    frame.frameNumber += 1
+                    lines.push({ t: '真实', text: 'Engine 的对象冻结了吗：' + Object.isFrozen(frame) + '；frameNumber += 1 以后是 ' + frame.frameNumber, kind: 'result' })
+                    const read2 = new C.ReadDeltaPass()
+                    new R.Renderer(backend, pipelineOf([read2]), builder).render({ scene: scene.scene, camera: scene.camera, frame })
+                    lines.push({ t: '真实', text: '换成只读的 Pass：ReadDeltaPass 看到 ' + read2.seen.map((value) => value.toFixed(4)).join(', '), kind: 'result' })
+                  }
+                  backend.dispose()
+                })
+            }
+          ]
+        })
+
+        // ---------------- 7.5 什么不复制 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-clone'),
+          storageKey: 'lesson-0031-clone',
+          cards: [
+            {
+              title: '每帧把 Geometry 深复制一份',
+              tags: ['真实 WebGL', '项目代码（工作区版本）', '课程版代码'],
+              desc: '两个 Mesh 共用一个 Geometry，画 5 帧。一次用真实 RenderListBuilder（借用身份），一次用 CloningBuilderV1（每帧把每个 item 的 Geometry 换成内容相同的新对象）。数每帧的 createBuffer，以及 renderer.dispose 之前和之后的 deleteBuffer。',
+              note: 'cloneGeometryV1、CloningBuilderV1 是课程写的（overview-course.ts:270–296）。',
+              question: '用 CloningBuilderV1 画完 5 帧，GPU 上还活着多少个 buffer？',
+              choices: ['20 个：每帧 4 个新 buffer，旧的没人删', '4 个：Backend 发现内容一样，会复用', '2 个：旧的 Geometry 被回收时，buffer 跟着删了'],
+              answer: 0,
+              explain:
+                'Manager 只认对象身份，不比较内容（比较内容要把所有顶点逐个比一遍，比上传还贵）。每帧两个新 Geometry、各两个 buffer，5 帧就是 20 个。它们的表项一直留在 Map 里，因为克隆出来的 Geometry 没人 dispose，Manager 等不到释放通知。直到 renderer.dispose 关掉整个 Backend，20 个 buffer 才一起删掉。60 帧每秒的话，每秒多 240 个 buffer。<br />所以 RenderItem 里的 geometry、material 只借用不复制：它们的身份就是查表的 key，复制一份就成了一个新 key。',
+              run: () =>
+                lab((lines, s) => {
+                  for (const [label, builder] of [
+                    ['借用', new R.RenderListBuilder()],
+                    ['每帧克隆', new C.CloningBuilderV1()]
+                  ]) {
+                    const scene = makeScene([-0.6, 0.6])
+                    const canvas = s.canvas(16, 16)
+                    const h = instrumentCanvas(s, canvas)
+                    const backend = new R.WebGL1Backend(canvas, 'lesson31-clone')
+                    const renderer = makeRenderer(backend, [new R.ForwardPass()], builder)
+                    const perFrame = []
+                    for (let frame = 1; frame <= 5; frame++) {
+                      const before = count(h.t.calls, /^createBuffer$/)
+                      renderer.render({ scene: scene.scene, camera: scene.camera, frame: frameOf(frame) })
+                      perFrame.push(count(h.t.calls, /^createBuffer$/) - before)
+                    }
+                    const created = count(h.t.calls, /^createBuffer$/)
+                    const deleted = count(h.t.calls, /^deleteBuffer$/)
+                    lines.push({
+                      t: label,
+                      text: '每帧 createBuffer ' + perFrame.join(' / ') + '，共 ' + created + '；deleteBuffer ' + deleted + '；还活着 ' + (created - deleted),
+                      kind: label === '借用' ? 'result' : 'late'
+                    })
+                    renderer.dispose()
+                    lines.push({ t: label, text: 'renderer.dispose 以后，deleteBuffer 共 ' + count(h.t.calls, /^deleteBuffer$/), kind: 'muted' })
+                  }
+                })
+            }
+          ]
+        })
+
+        // ---------------- 7.7 代价 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-cost'),
+          storageKey: 'lesson-0031-cost',
+          cards: [
+            {
+              title: '复制和校验到底花多少时间',
+              tags: ['项目代码（工作区版本）', '课程版代码', '只用 CPU'],
+              desc: '3 个和 1000 个 Mesh 的场景，各预热 20 次，再跑 100 次取平均。最后单独量 Material.getParameterEntries（每次 draw 调一次）、isContextLost 和 getError。数字取决于你的电脑，每次运行也会有波动。',
+              note: 'extractItemsV1 是课程写的（不复制、不检查、不冻结），用来对照。',
+              question: '1000 个 Mesh 时，带复制和校验的 build 比不复制的版本每帧多花多少？',
+              choices: ['不到 1 毫秒，只占 60 帧每秒预算（16.7 ms）的几个百分点', '约 8 毫秒，帧率会掉一半', '几乎为 0：复制 16 个数不花时间'],
+              answer: 0,
+              explain:
+                '我在这台 Mac 的无界面 Chrome 155 上测到：3 个 Mesh 时 0.009 ms 对 0.001 ms；1000 个 Mesh 时 0.475 ms 对 0.051 ms，多出来的约 0.42 ms 就是两次复制、检查和冻结的代价，约占一帧预算的 2.5%。GAMES202 的场景只有几个到几十个 Mesh，可以忽略。<br />getParameterEntries 每次约 0.3 µs；isContextLost 约 6 ns，所以一帧几十次也无所谓；getError 约 40 µs，它要等 GPU 那边同步，所以项目只在冷路径（建对象时）调它。',
+              run: () =>
+                lab((lines, s) => {
+                  for (const n of [3, 1000]) {
+                    const xs = Array.from({ length: n }, (_, i) => (i % 40) * 0.1 - 2)
+                    const scene = makeScene(xs)
+                    const builder = new R.RenderListBuilder()
+                    const view = { scene: scene.scene, camera: scene.camera, frame: frameOf(1) }
+                    for (let i = 0; i < 20; i++) {
+                      builder.build(view)
+                      C.extractItemsV1(scene.scene)
+                    }
+                    let start = performance.now()
+                    for (let i = 0; i < 100; i++) builder.build(view)
+                    const real = (performance.now() - start) / 100
+                    start = performance.now()
+                    for (let i = 0; i < 100; i++) C.extractItemsV1(scene.scene)
+                    const v1 = (performance.now() - start) / 100
+                    lines.push({ t: n + ' 个', text: n + ' 个 Mesh：RenderListBuilder.build ' + real.toFixed(3) + ' ms；extractItemsV1 ' + v1.toFixed(3) + ' ms', kind: 'result' })
+                  }
+                  const scene = makeScene([0])
+                  let start = performance.now()
+                  for (let i = 0; i < 10000; i++) scene.material.getParameterEntries()
+                  lines.push({ t: '每次 draw', text: 'getParameterEntries（1 个 vec3 参数）约 ' + (((performance.now() - start) / 10000) * 1000).toFixed(2) + ' µs' })
+                  const gl = s.track(s.canvas().getContext('webgl'))
+                  for (let i = 0; i < 100000; i++) gl.isContextLost()
+                  start = performance.now()
+                  for (let i = 0; i < 1000000; i++) gl.isContextLost()
+                  lines.push({ t: '检查', text: 'isContextLost 约 ' + (((performance.now() - start) / 1000000) * 1000000).toFixed(1) + ' ns' })
+                  start = performance.now()
+                  for (let i = 0; i < 10000; i++) gl.getError()
+                  lines.push({ t: '检查', text: 'getError 约 ' + (((performance.now() - start) / 10000) * 1000).toFixed(2) + ' µs' })
+                })
+            }
+          ]
+        })
+
+        // ---------------- 8 校验分在三层 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-validate'),
+          storageKey: 'lesson-0031-validate',
+          cards: [
+            {
+              title: '五种错误，各在哪一层抛出',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '① 构造一个带越界索引的 Geometry；② 把 Mesh 的位置设成 NaN 再 render；③ 把相机的 scale 设成 0 再 render；④ shader 里 uColor 声明成 vec4，Material 却给 vec3，然后 render；⑤ 在 scope 里直接调 backend.draw，传一个假的 item。',
+              note: HELPER_NOTE,
+              question: 'shader 里 uColor 是 vec4，Material 给了 vec3。错误在哪一步抛出？',
+              choices: ['第一次 draw 时（Uniforms.prepare）：要链接后的 program 才知道 uColor 的类型', 'new Material 时：Material 会去读 shader 源码', '永远不报错：WebGL 会自动补一个 1'],
+              answer: 0,
+              explain:
+                '① 只看描述就能判断，在构造时报，错误里有偏移量和顶点数。②③ 要等世界矩阵、相机矩阵算出来才知道，在每帧提取时报；setPosition 本身不检查。④ 要有链接好的 program，靠反射才知道 uColor 是 vec4，所以只能在 draw 的 prepare 报；构造 Material 时一切正常。prepare 先检查全部 uniform，再执行上传，所以这次 draw 一条 uniform 都没写。⑤ 是公开入口的防御：调用者不一定是 Builder，Backend 自己检查一遍，报出的是带字段名的领域错误，而不是深处某个 undefined 的 TypeError。',
+              run: () =>
+                lab((lines, s) => {
+                  try {
+                    new R.Geometry({
+                      attributes: { position: new R.VertexAttribute({ data: new Float32Array(9), itemSize: 3 }) },
+                      indices: new Uint16Array([0, 1, 7])
+                    })
+                  } catch (error) {
+                    lines.push({ t: '① 构造', text: err(error), kind: 'abort' })
+                  }
+                  const scene = makeScene([0])
+                  const canvas = s.canvas(16, 16)
+                  const backend = new R.WebGL1Backend(canvas, 'lesson31-validate')
+                  s.track(canvas.getContext('webgl'))
+                  const renderer = makeRenderer(backend, [new R.ForwardPass()])
+                  scene.meshes[0].transform.setPosition([NaN, 0, 0])
+                  lines.push({ t: '② 设置', text: 'setPosition([NaN, 0, 0]) 没有报错', kind: 'user' })
+                  try {
+                    renderer.render({ scene: scene.scene, camera: scene.camera, frame: frameOf(1) })
+                  } catch (error) {
+                    lines.push({ t: '② 提取', text: err(error), kind: 'abort' })
+                  }
+                  scene.meshes[0].transform.setPosition([0, 0, 0])
+                  scene.camera.transform.setScale([0, 0, 0])
+                  try {
+                    renderer.render({ scene: scene.scene, camera: scene.camera, frame: frameOf(2) })
+                  } catch (error) {
+                    lines.push({ t: '③ 提取', text: err(error), kind: 'abort' })
+                  }
+                  const vec4Scene = makeScene([0], { shader: flatShader('vec4') })
+                  lines.push({ t: '④ 构造', text: 'shader 里 uColor 是 vec4，Material 给 vec3：new Material 没有报错', kind: 'user' })
+                  try {
+                    renderer.render({ scene: vec4Scene.scene, camera: vec4Scene.camera, frame: frameOf(3) })
+                  } catch (error) {
+                    lines.push({ t: '④ draw', text: err(error), kind: 'abort' })
+                  }
+                  try {
+                    backend.withRenderSurface({ surface: { kind: 'default-framebuffer' } }, () => {
+                      backend.draw({ item: { geometry: {}, material: {}, worldMatrix: [] }, view: {} })
+                      return undefined
+                    })
+                  } catch (error) {
+                    lines.push({ t: '⑤ 入口', text: '公开入口 backend.draw：' + err(error), kind: 'abort' })
+                  }
+                  renderer.dispose()
+                })
+            }
+          ]
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0031"]'), [
+          {
+            q: 'Backend 是怎样拿到一个 Geometry 的 GPU buffer 的？',
+            opts: ['draw 时拿 Geometry 对象去这一代的 GeometryManager 查表，没有才上传', 'Scene.add(mesh) 时 Scene 把顶点上传到 GPU', 'Geometry 构造时自己创建 WebGLBuffer 并保存'],
+            answer: 0,
+            why: '转换只发生在 Backend.draw 里（WebGL1Backend.ts:208–209）：CPU 对象是 key，GPU 对象是表里的值。Scene 和 Geometry 都不知道 gl；Geometry 要给几个 context 用，也不能只存一个 buffer（5.4 节卡片）。'
+          },
+          {
+            q: 'VertexAttribute 为什么要在构造时复制调用者的数组？',
+            opts: ['它是缓存 key 背后的原件：不复制的话，调用者事后一改，几个 context 上传的数据就不一样，构造时的检查也作废', '为了把 Float32Array 转成普通数组，方便 JSON 序列化', '为了让 GPU 上传更快：复制后的数组内存连续'],
+            answer: 0,
+            why: '3.3 节的第 2 版就是不复制的后果：A 画旧数据、B 画新数据；事后改成 7 的索引绕过了构造时的检查，画面少了半个方块，却没有报错。复制以后类型不变（仍然是 Float32Array），和上传速度无关。'
+          },
+          {
+            q: 'RenderListBuilder 为什么要对每个 Mesh 调 copyMat4Snapshot(scratch, …)？',
+            opts: ['scratch 整次遍历共用一块，不复制的话所有 item 指向同一块存储，最后都是最后一个 Mesh 的矩阵', '因为 Mesh 的世界矩阵是 Float64，要转成 Float32', '因为 copyWorldMatrixTo 不检查有限数，必须再算一遍矩阵'],
+            answer: 0,
+            why: '7.2 节卡片里，extractItemsV1 的三个 item 都是 x = 2。copyMat4Snapshot 同时做了三件事：检查有限数、复制成新数组、冻结。它不重新计算矩阵。'
+          },
+          {
+            q: '为什么 RenderList 要冻结，RenderItem 里的 Geometry 却只借用、不复制？',
+            opts: ['RenderList 由几个 Pass 共用，冻结防止一个 Pass 改了别的 Pass 看到的数据；Geometry 的身份是 Manager 的 key，复制就成了新 key', '冻结是为了性能；Geometry 太大，复制不了', 'Geometry 已经冻结了，所以不用复制；RenderList 没有冻结就会被垃圾回收'],
+            answer: 0,
+            why: '7.3 节：不冻结时阴影 Pass 原地排序，ForwardPass 的顺序跟着变了。7.5 节：每帧克隆 Geometry，5 帧建了 20 个 buffer。Geometry 并不是靠 Object.freeze 不可变的，它没有修改方法、数据在私有字段里。'
+          },
+          {
+            q: 'Renderer 为什么先复制 view.frame 再冻结，而不是直接 Object.freeze(view.frame)？',
+            opts: ['直接冻结会冻住 Engine 自己每帧还要改的对象，Engine 下一帧加帧号时就会抛错', '直接冻结在 JavaScript 里做不到，只能冻结新对象', '复制是为了把 number 转成 Float32'],
+            answer: 0,
+            why: '7.4 节卡片的「只冻结」：错误出现在 Engine 的 frameNumber += 1，离真正的原因（Renderer 冻结了别人的对象）很远。复制保护交出数据的人，冻结保护共用数据的读者。'
+          },
+          {
+            q: 'shader 里 uColor 声明成 vec4，Material 给了 vec3。为什么 new Material 时不报错？',
+            opts: ['Material 不解析 GLSL，uniform 的类型要等 program 链接以后靠反射才知道，所以在 draw 的 prepare 里报', 'Material 只检查参数名，不检查任何类型', '这是个缺陷：Material 应该在构造时就编译 shader'],
+            answer: 0,
+            why: 'Material 对 vec3 本身做了检查（3 个有限数），只是不知道 shader 要的是什么类型（materialParameters.ts:222）。在构造时编译 shader，就要让 Material 知道 gl，违反分层，也没法给几个 context 用。'
+          },
+          {
+            q: '两个 canvas 画同一个 Scene，然后 A 的 context 丢失了。下面哪句对？',
+            opts: ['A、B 各有一套自己的 GPU 对象；A 丢失不影响 B，A 恢复后从同一份 CPU 原件重建', 'B 借用 A 的 GPU 对象，A 丢失时 B 也画不出来', 'A 丢失时 Geometry 被 dispose，B 也要重新加载模型'],
+            answer: 0,
+            why: '5.4 节卡片：A 的 buffer 绑到 B 上报 1282，所以只能各建一套；Backend 关闭或丢失只影响自己那一代 GPU 对象，Geometry.disposed 仍然是 false。'
+          },
+          {
+            q: 'readonly 和 Object.freeze 的区别，下面哪句对？',
+            opts: ['readonly 只在编译时拦，as、any 或普通 JavaScript 能绕过；freeze 在运行时拦，严格模式下写入抛 TypeError', '两者等价，写一个就够了', 'freeze 只在开发模式生效，生产构建会被去掉'],
+            answer: 0,
+            why: '7.3 节：去掉 as，tsc 报 TS2339（readonly 数组没有 sort）；加上 as 绕过编译，运行时由 RenderList 的 freeze 抛 Cannot assign to read only property \'0\'。ES module 默认是严格模式，所以写入冻结对象会抛错，而不是静默失败。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

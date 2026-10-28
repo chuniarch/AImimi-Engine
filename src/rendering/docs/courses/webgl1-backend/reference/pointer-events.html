@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>指针事件：速查</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+  </head>
+  <body>
+    <p class="kicker">速查 · 来自第 36–38 课</p>
+    <h1>指针事件：速查</h1>
+    <p class="lede">登记监听、事件对象的字段、拖动的骨架、结束拖动的五种方式、滚轮和两根手指。每条后面是实测过的现象。</p>
+
+    <h2>登记</h2>
+<pre>元素.addEventListener('事件名', (event) => { … }, 选项)</pre>
+    <ul>
+      <li>只是登记，执行完就返回；以后每发生一次，浏览器调用一次，并把事件对象作为参数交进来。</li>
+      <li>选项 <code>{ passive: false }</code>：声明要调用 preventDefault。window、document、html、body 上的 wheel、touchstart、touchmove 默认 passive 为 true，调 preventDefault 不起作用。</li>
+      <li><code>event.preventDefault()</code>：取消浏览器对这件事的默认动作（右键菜单、滚动页面）。</li>
+    </ul>
+
+    <h2>事件对象的字段</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th>字段</th><th>意思</th></tr>
+        <tr><td><code>type</code></td><td>事件名，比如 'pointermove'</td></tr>
+        <tr><td><code>clientX</code>、<code>clientY</code></td><td>从浏览器窗口左上角量起的位置（CSS 像素），y 向下增大。舞台里的坐标 = clientX − stage.getBoundingClientRect().left</td></tr>
+        <tr><td><code>pointerType</code></td><td>'mouse'、'touch'、'pen'</td></tr>
+        <tr><td><code>pointerId</code></td><td>指针编号。鼠标一般不变；每根手指各一个</td></tr>
+        <tr><td><code>isPrimary</code></td><td>第一根手指是 true，后来的是 false</td></tr>
+        <tr><td><code>button</code></td><td>这一个事件变化的键：0 左键/手指，1 中键，2 右键；pointermove 时是 −1</td></tr>
+        <tr><td><code>buttons</code></td><td>此刻按着的键，按位：左 1，右 2，中 4。查右键：<code>(buttons &amp; 2) !== 0</code></td></tr>
+        <tr><td><code>deltaY</code>、<code>deltaMode</code>、<code>ctrlKey</code></td><td>wheel 事件：往下滚为正；单位 0 像素、1 行、2 页；触控板捏合时 ctrlKey 为 true</td></tr>
+      </table>
+    </div>
+
+    <h2>事件</h2>
+    <ul>
+      <li><strong>pointerdown / pointermove / pointerup</strong>：一次拖动 = 1 个 down、很多个 move、1 个 up。没按键划过也有 move（buttons 0）。</li>
+      <li><strong>组合键</strong>：第一个键按下以后，别的键按下、松开都只发 pointermove（看 button、buttons），不发 down/up。先松开第一个键时，它<strong>没有</strong> pointerup。</li>
+      <li><strong>contextmenu</strong>：右键之后发，默认弹菜单。</li>
+      <li><strong>pointercancel</strong>：浏览器认定这个指针不会再发事件（touch-action 不是 none 时，浏览器把手指的滑动拿去滚动页面）。</li>
+      <li><strong>lostpointercapture</strong>：捕获解除。pointerup、pointercancel 之后自动来一次。</li>
+      <li><strong>wheel</strong>：滚轮、触控板滑动、触控板捏合。</li>
+    </ul>
+
+    <h2>拖动的骨架（第 37 课第 3 版）</h2>
+<pre>let dragId = null, lastX = 0, lastY = 0      // 状态放在监听函数外面
+pointerdown：if (dragId !== null) return
+             dragId = event.pointerId; lastX/lastY = clientX/Y
+             stage.setPointerCapture(event.pointerId)   // 拖出元素也照样送来
+pointermove：if (event.pointerId !== dragId) return
+             dx = clientX − lastX；lastX = clientX；…用 dx、dy
+结束：pointerup、pointercancel、lostpointercapture、window 的 blur → 同一个 end
+      end 先查编号：已经结束过就什么都不做
+另外：每次 pointermove 检查 (buttons &amp; 开始的键) === 0，处理组合键</pre>
+
+    <h2>两根手指（第 38 课）</h2>
+    <ul>
+      <li>CSS <code>touch-action: none</code>：页面的滚动、缩放不能用 preventDefault 取消，只能事先这样声明。</li>
+      <li>手指按下时浏览器自动捕获（隐式捕获）。</li>
+      <li>用 Map 存「指针编号 → 上一次的位置」。</li>
+      <li>缩放 ×= 移动后两指距离 ÷ 移动前两指距离；中点挪这根手指位移的一半。</li>
+      <li>项目的轨道控制只认 isPrimary 的指针，所以没有双指缩放。</li>
+    </ul>
+    <p>来源：<a href="https://developer.mozilla.org/en-US/docs/Web/API/Pointer_events">MDN：Pointer events</a>、<a href="https://www.w3.org/TR/pointerevents3/">W3C Pointer Events Level 3</a>、<a href="https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/addEventListener">MDN：addEventListener</a>、<a href="https://developer.mozilla.org/en-US/docs/Web/API/Element/wheel_event">MDN：wheel event</a>。</p>
+    <p class="nav"><a href="../index.html">课程首页</a></p>
+  </body>
+</html>

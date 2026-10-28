@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 4 课 · CPU 资源与 GPU 表示</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/gl-sandbox.js"></script>
+    <script src="../assets/predict.js"></script>
+    <script src="../assets/rendering-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 架构篇 2/4 · 约 25 分钟</p>
+    <h1>架构决策一：一份 CPU 资源，每个 context 一份 GPU 表示</h1>
+    <p class="lede">
+      GPU 句柄 (handle) 应该放在哪里？这一课先用实测说明为什么不能放在 Geometry 身上，再精读 CPU 资源和 Manager 之间的协作协议：第一次用到时创建，之后复用；CPU 资源释放、context 丢失、Backend 关闭时，各自发生什么。读完你应该能说出 Manager 缓存表的三条不变量，并能预测一次 <code>get</code>、<code>dispose</code> 或 context 丢失会触发哪些 GL 调用。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 第 15–18 课精读的每一个 Manager，都是这一课这个模式的一个实例；Task 15 的 WebGL1Backend 也只是「借用」这些 Manager。记住这一课的协议，后面读任何一个 Manager，都只需要看它和这个模板哪里不一样。
+    </div>
+
+    <h2>1. 设计问题：句柄放在谁身上？</h2>
+    <p>
+      第 3 课看过旧引擎的做法：<a data-src="src/objects/Mesh.ts:23">旧 Mesh</a> 自己拿着 gl、VBO 和按 program 分的 VAO。直觉上这很自然：数据和它在 GPU 上的副本放在一起。新架构偏偏不这么做，原因是下面三个力 (force)。前两个我在浏览器里实测过（Chrome 152）：
+    </p>
+    <ol class="steps">
+      <li><strong>句柄只属于创建它的那个 context。</strong>把 context A 创建的 buffer 绑到 context B 上，B 记下 <code>INVALID_OPERATION</code>，<code>B.isBuffer(它)</code> 是 false。同一份几何体要画进两个 canvas（主视图加调试视图，或者离屏预计算），就需要两份句柄。句柄放在 Geometry 身上，就得改成「按 context 分的表」——又是第 3 课说的「共享一加入，就得给数据对象加维度」。</li>
+      <li><strong>context 丢失会让所有句柄同时作废，而且从外表看不出来。</strong>丢失再恢复之后，你拿到的还是<strong>同一个</strong> gl 对象；但旧 buffer 的 <code>isBuffer</code> 是 false，绑定它报 <code>INVALID_OPERATION</code>，只有新建的才能用。所以「同一个 gl」不等于「同一代」。句柄散在各个 CPU 对象上时，恢复就要找到每一个对象去清理、重建——可是没有任何地方知道「有哪些对象」。Manager 的缓存表本身就是这份清单：整张表丢掉就行。</li>
+      <li><strong>第一层不能知道 gl（第 3 课的判据）。</strong>CPU 资源因此可以脱离 GL 测试。更重要的是，CPU 数据是恢复时<strong>重建的唯一来源</strong>，它必须比任何一代 GPU 表示活得都长。</li>
+    </ol>
+
+    <h2>2. 决策：一对多，以对象身份为 key</h2>
+    <p>
+      新架构的回答是：CPU 逻辑资源 (logical resource) 只描述数据；每个 context 有一组 Manager，各自用一张 <code>Map&lt;CPU 对象, 这一代的 GPU 表示&gt;</code> 保存句柄。于是一份 CPU 资源可以同时有好几份 GPU 表示 (GPU representation)，每个 context 一份：
+    </p>
+    <pre><code>第一层（不知道 gl）    Geometry g：不可变快照（position、uv……）
+                        onDispose 监听器：[ A 的 release, B 的 release ]
+                                │
+              ┌─────────────────┴──────────────────┐
+              ▼                                    ▼
+第三层  context A 的 GeometryManager         context B 的 GeometryManager
+        Map { g → { resource, unsubscribe } }  Map { g → { resource, unsubscribe } }
+              │                                    │
+              ▼                                    ▼
+        A 这一代的 buffers                     B 这一代的 buffers</code></pre>
+    <p>四个 Manager 都是这个形状，只是 GPU 表示不同，「什么时候需要重建」也不同：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>CPU 资源（第一层）</th><th>Manager（第三层）</th><th>GPU 表示</th><th>什么时候需要重建</th></tr>
+        <tr><td>Geometry</td><td><a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:73">GeometryManager</a></td><td>每个属性一个 VBO，外加可选的 EBO</td><td>永远不需要：CPU 快照不可变</td></tr>
+        <tr><td>ShaderModule</td><td><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:59">ProgramManager</a></td><td>链接好的 program，以及 attribute / uniform 的 location</td><td>永远不需要：源码不可变</td></tr>
+        <tr><td>CubeTexture</td><td><a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:66">CubeTextureManager</a></td><td>一个 cubemap 纹理</td><td>不重建：内容要变，就新建一个 CubeTexture（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:38">:38</a>）</td></tr>
+        <tr><td>RenderTarget</td><td><a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:57">RenderTargetManager</a></td><td>FBO、颜色纹理、深度 renderbuffer</td><td><code>resize()</code> 让 revision 加一之后</td></tr>
+        <tr><td>Geometry × program（派生）</td><td><a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:30">VertexInputManager</a></td><td>VAO</td><td>两者之一被释放，或者 Geometry 的 GPU 表示换了一份</td></tr>
+      </table>
+    </div>
+    <p>
+      <strong>key 是对象身份 (object identity)，不是名字，也不是内容。</strong>源码里反复写着这一点：ShaderModule 的 <code>name</code>「不充当 GPU cache key」（<a data-src="src/rendering/resources/ShaderModule.ts:19">ShaderModule.ts:19–20</a>）；ProgramManager 的「cache key 是完整 CPU 对象身份，不是 name」（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:52">:52</a>）；CubeTextureManager 的「相同 label 的两个 CPU 对象不会合并」（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:79">:79</a>）。反例：两个同名但源码不同的 ShaderModule，如果按名字共用一个 program，其中一个就会画错。代价是内容完全相同的两个对象也会各编译一次（第 7 节卡片 D）；想共享，就共享同一个对象。
+    </p>
+
+    <h2>3. 精读 ①：Resource 这一侧只负责「通知」</h2>
+    <p>
+      <a data-src="src/rendering/core/Resource.ts:21">Resource</a> 的类注释写得很直白：它「不持有 WebGL context 或 GPU handle」。它对 Manager 一无所知，只维护一个监听器集合。和协作有关的代码只有两段：
+    </p>
+    <pre><code>// src/rendering/core/Resource.ts:104-112（行尾注释是我加的）
+onDispose(listener: DisposeListener): () =&gt; void {
+  this.assertUsable()                              // ① 已经释放了还来订阅：抛 ResourceDisposedError
+  this.disposeListeners.add(listener)              // ② 存进 Set，保持注册顺序
+  return () =&gt; {                                   // ③ 返回「退订」函数
+    this.disposeListeners.delete(listener)         //    Set.delete 调两次也无害：幂等 (idempotent)
+  }
+}
+
+// src/rendering/core/Resource.ts:204-216
+private finalizeDisposal(): void {
+  if (this.disposedValue) return
+  this.disposedValue = true                        // ④ 先标记：监听器里再想读这个资源，会被 assertUsable 拒绝
+  for (const listener of this.disposeListeners) {  // ⑤ 按注册顺序通知：每个 context 的 Manager 删掉自己的 GPU 表示
+    listener()
+  }
+  this.disposeListeners.clear()                    // ⑥ 清空监听器
+  this.disposeCPUData()                            // ⑦ 最后才丢 CPU 数据（例如 Geometry.ts:345 清空属性和索引）
+}</code></pre>
+    <ul>
+      <li><strong>术语：</strong>从 API 看，Manager 调用 <code>onDispose(listener)</code> 是<strong>注册监听器</strong>；从语义看，它因此<strong>订阅了这个资源的释放事件</strong>——两个说法指同一个动作（代码自己两个词都用：<a data-src="src/rendering/core/Resource.ts:98">Resource.ts:98</a>「注册一个同步释放监听器」，<a data-src="src/rendering/core/Resource.ts:101">:101</a>「取消订阅函数」）。被订阅的是「释放」这个<strong>事件</strong>（<code>disposed</code> 从 false 变成 true 的那一次跳变，由 Resource 推送），不是 <code>disposed</code> 这个<strong>状态</strong>：状态随时可以去读，但读它不会通知你。本课说「订阅」，都是指订阅释放事件。</li>
+      <li><strong>① 挡住的反例：</strong>给已经释放的资源订阅释放事件，得到的是一个永远不会触发的订阅。Manager 那条 entry 就再也没人来删，句柄一直泄漏到 Backend 关闭。（10 月 10 日以前这里写的是 <code>if (this.disposedValue) throw new ResourceDisposedError(…)</code>；现在改调 assertUsable()，行为一样。assertUsable 为什么从 protected 改成 public，见第 7 课的更新。）</li>
+      <li><strong>③ 为什么必须幂等：</strong>下一节会看到，Manager 关闭时会对同一条 entry 退订两次。</li>
+      <li><strong>④ 的后果：</strong>监听器运行的时候，资源已经是 disposed，任何 CPU getter 都会抛错。所以 Manager 的 release 故意不读 CPU 数据，只按对象身份查自己的表（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:160">OESVertexInputManager.ts:160</a> 和 <a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:363">RenderTargetManager.ts:363</a> 都写明了这一点）。删除 GPU 对象需要的一切，都事先存在 entry 里。</li>
+      <li><strong>这是观察者模式 (observer pattern)，也是依赖倒置 (dependency inversion)：</strong>第一层只暴露一个「我要被释放了」的回调口，第三层来订阅。运行时，通知从第一层发给第三层；代码里，却是第三层 import 第一层的类型——第一层连一个 Manager 的名字都不知道。数据不知道消费它的机器，这正是第 3 课说的「知识方向」。</li>
+    </ul>
+
+    <h2>4. 精读 ②：Manager 这一侧——一张表，三条出路</h2>
+    <p>拿 GeometryManager 当代表（另外三个 Manager 结构相同，第 15–17 课逐个讲差异）。先看表里存的是什么：</p>
+    <pre><code>// src/rendering/backend/webgl1/WebGL1GeometryManager.ts:54-57、73
+interface GeometryEntry {
+  readonly resource: WebGL1GeometryResource   // 交给调用者借用的 GPU 表示（冻结对象）
+  readonly unsubscribe: () =&gt; void            // 撤销对这个 CPU 资源释放事件的订阅
+}
+private readonly entries = new Map&lt;Geometry, GeometryEntry&gt;()   // key：CPU 对象本身</code></pre>
+    <p>再看<strong>入口</strong>：第一次用到才创建（懒创建 lazy creation），之后直接复用。</p>
+    <pre><code>// WebGL1GeometryManager.ts:104-114、185-188（省略了创建、上传、保存与恢复绑定——第 16 课细讲）
+get(geometry: Geometry): WebGL1GeometryResource {
+  this.assertAvailable('get geometry')             // Manager 没关闭、context 没丢失（一次 isContextLost）
+  if (geometry.disposed) throw new ResourceDisposedError('Geometry')
+  if (this.releasing.has(geometry)) throw …         // 正在释放它的途中又来要：拒绝
+  const cached = this.entries.get(geometry)
+  if (cached !== undefined) return cached.resource  // 命中：不发任何创建或上传命令，返回同一个冻结对象
+  // … preflight、createBuffer、bufferData、恢复绑定、错误检查——全部成功才往下走 …
+  const unsubscribe = geometry.onDispose(() =&gt; this.release(geometry))   // 先订阅
+  this.entries.set(geometry, { resource, unsubscribe })                  // 再发布
+  return resource
+}</code></pre>
+    <p>然后是<strong>三条出路</strong>。一条 entry 离开这张表，只有这三种方式：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 18%">事件</th><th>Manager 做什么</th><th style="width: 16%">GL 调用</th><th style="width: 20%">CPU 资源之后</th></tr>
+        <tr>
+          <td><strong>CPU 资源被释放</strong><br />（应用调用 dispose，或 Scene 引用归零）</td>
+          <td><a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:212">release</a>：先让依赖它的顶点输入放手（beforeDelete，<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:225">:225</a>），再退订、移出表（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:232">:232–233</a>），最后 deleteBuffer（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:235">:235–241</a>）</td>
+          <td>有：deleteBuffer</td>
+          <td>已经 disposed（这正是起因）</td>
+        </tr>
+        <tr>
+          <td><strong>context 丢失</strong></td>
+          <td><a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:250">invalidateForContextLoss</a>：标记 lost，<strong>退订全部</strong>，清空表</td>
+          <td>没有：句柄已经随 context 作废</td>
+          <td>不变；下一代 Manager 从它重建</td>
+        </tr>
+        <tr>
+          <td><strong>Backend 关闭</strong></td>
+          <td><a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:266">dispose</a>：先<strong>退订全部</strong>（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:273">:273</a>），再逐个 release（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:275">:275</a>）</td>
+          <td>有：deleteBuffer</td>
+          <td>不变：Manager 从不释放 CPU 资源（测试断言见 <a data-src="tests/unit/rendering/backend/webgl1/WebGL1ResourceManager.test.ts:306">ResourceManager.test.ts:306</a>）</td>
+        </tr>
+      </table>
+    </div>
+    <p>dispose 先退订一遍，release 里又退订一遍——这就是上一节说的「退订两次」，幂等让它无害。</p>
+    <p>把这些代码压缩成三条<strong>不变量 (invariant)</strong>。这是本课最重要的收获：</p>
+    <ol class="steps">
+      <li><strong>这张表是本 context 里这些句柄的唯一所有者。</strong>调用者拿到的 resource 只是借用（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:33">GeometryManager.ts:33–34</a>：「所有 buffer 均由 GeometryManager 拥有，调用者只借用」），谁也不许自己去 deleteBuffer。</li>
+      <li><strong>表里有一条 entry，就恰好有一个活着的订阅；entry 离开表，订阅同时撤销。</strong>三条出路都遵守它。反例一：entry 还在、订阅没了——CPU 资源释放时没人删 GPU 对象，泄漏。反例二：entry 没了、订阅还在——CPU 资源的监听器集合一直拽着一个已经作废的 Manager（连同它的 gl 和整张表），内存泄漏；等 CPU 资源终于释放，还会调进这个死掉的 Manager。</li>
+      <li><strong>只发布完整的结果。</strong>全部创建、上传成功之后，才订阅、才放进表；中途失败，只清理这一次新建的对象（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:195">:195</a>），表里什么都不留。这叫事务式发布 (transactional publish)，第 15、16 课细讲。</li>
+    </ol>
+
+    <h2>5. 精读 ③：缓存什么时候过期</h2>
+    <p>缓存最难的问题永远是失效。这套代码按 CPU 资源的性质，用了三种办法：</p>
+
+    <h3>5.1 不可变快照：永不过期</h3>
+    <p>
+      Geometry、ShaderModule 构造时复制输入，之后没有任何修改方法；读取时也只给副本（<code>copyIndices()</code>、<code>copyData()</code>）。内容永远不变，所以 GPU 表示永远不会过期，命中时不需要任何版本比较（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:113">GeometryManager.ts:113–114</a> 只查了一次 Map）。CubeTexture 借用的图片对象是可变的，所以它等到第一次真正上传时才读尺寸；上传成功之后按静态资源缓存，内容要变就新建一个 CubeTexture（<a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:37">CubeTextureManager.ts:37–38</a>）。
+    </p>
+    <p>这就是第一层坚持「不可变快照」的真正理由：<strong>不可变，让缓存失效这个难题直接消失。</strong></p>
+
+    <h3>5.2 版本号：RenderTarget 的 revision</h3>
+    <p>RenderTarget 必须能改尺寸（窗口会缩放）。<a data-src="src/rendering/resources/RenderTarget.ts:475">resize()</a> 验证成功后让 revision 加一（<a data-src="src/rendering/resources/RenderTarget.ts:492">:492</a>）；Manager 每次 get 都比较版本：</p>
+    <pre><code>// src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:76-78、103-109、121（节选）
+const old = this.entries.get(target)
+const revision = target.revision
+if (old?.resource.revision === revision) return old.resource           // 版本相同：直接复用
+next = this.create(target.descriptor, revision, label)                 // ① 先建好一整套新的
+const unsubscribe = old?.unsubscribe ?? target.onDispose(() =&gt; this.release(target))   // 沿用旧订阅
+this.entries.set(target, { resource: next, unsubscribe })              // ② 发布新的
+if (old !== undefined) this.deleteResource(old.resource)              // ③ 最后才删旧的</code></pre>
+    <p>两个细节。顺序是「建新 → 发布 → 删旧」（类注释 <a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:42">:42–45</a>）：新的建失败时，旧 entry 原样留着，调用者收到异常。替换时<strong>沿用旧的订阅</strong>，不再订阅第二次——不变量 2 在替换时也成立。</p>
+
+    <h3>5.3 派生缓存：核对「用哪一份 GPU 表示建的」</h3>
+    <p>
+      VAO 是从「某一份 Geometry 的 GPU 表示 + 某个 program」派生出来的。OES 策略在缓存里记下建 VAO 时用的那一份 GPU 表示，命中要求<strong>对象完全相同</strong>（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:66">OESVertexInputManager.ts:66–73</a>）；不同就重建，并删掉旧 VAO（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:116">:116–119</a>：「同一 CPU Geometry 的 GPU 表示若被重新创建，不能复用旧 buffers 的 VAO」）。GeometryManager 返回的冻结对象身份稳定，于是它自己就充当了版本号。
+    </p>
+
+    <h2>6. 「一代」：context 丢失以后</h2>
+    <p>
+      context 丢失时，Manager 不修补自己，而是<strong>整个作废</strong>：「一旦失效，不允许此实例在 context 恢复后重新使用旧记录」（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:79">GeometryManager.ts:79–80</a>）。恢复之后，Backend 重新探测能力，组装一个<strong>新的</strong> ResourceManager（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:38">ResourceManager.ts:38</a>）。CPU 资源一个字节都没动，新一代第一次 get 时从快照重建。测试<a data-src="tests/unit/rendering/backend/webgl1/WebGL1ResourceManager.test.ts:499">「新一代可从仍存活的 CPU 数据重建，旧一代仍拒绝工作」</a>验证的就是这件事。
+    </p>
+    <p>
+      为什么不让旧 Manager「复活」？第一，旧句柄全死了（第 1 节的实测），表里没有一条还能用。第二，恢复后设备的<strong>能力可能变了</strong>（例如换了一块 GPU），而好几处决定依赖能力：用 OES VAO 还是手动接线、Uint32 索引能不能直接用。重新探测、重新组装，是最简单、也最不容易错的规则。丢失时退订全部，正是为了让旧一代和 CPU 资源彻底断开（不变量 2）。
+    </p>
+
+    <h2>7. 先预测、再运行：跑真实的项目代码</h2>
+    <p>
+      下面的卡片运行的都是<strong>真实的项目代码</strong>：我把 worktree 里的 <code>src/rendering</code> 用 esbuild 打包成了一个普通脚本（<code>assets/rendering-bundle.js</code>，源码没有任何改动）。调用日志里是 Manager 真正发出的每一个 gl 调用。先选你的预测，再看证据。
+    </p>
+    <details>
+      <summary>每张卡片之前都会先运行的准备代码</summary>
+      <pre><code id="prelude-view"></code></pre>
+    </details>
+    <div id="predict-0004"></div>
+    <script>
+      ;(function () {
+        const prelude = [
+          'const R = window.RTeachRendering                      // 打包进来的真实项目代码',
+          'const hooks = { invalidateState: () => undefined }    // 这里没有 State 缓存，失效回调什么也不做',
+          "const geometries = new R.WebGL1GeometryManager(gl, { elementIndexUint: gl.getExtension('OES_element_index_uint') }, hooks)",
+          'const programs = new R.WebGL1ProgramManager(gl, hooks)',
+          "const targets = new R.WebGL1RenderTargetManager(gl, { drawBuffers: gl.getExtension('WEBGL_draw_buffers') }, hooks)",
+          'const geometry = new R.Geometry({ attributes: {',
+          '  position: new R.VertexAttribute({ data: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), itemSize: 3 }),',
+          '  uv: new R.VertexAttribute({ data: new Float32Array([0, 0, 1, 0, 0, 1]), itemSize: 2 })',
+          '} })',
+          "const VS = 'attribute vec3 position; void main() { gl_Position = vec4(position, 1.0); }'",
+          "const FS = 'precision mediump float; void main() { gl_FragColor = vec4(1.0); }'"
+        ].join('\n')
+        document.getElementById('prelude-view').textContent = prelude
+
+        if (!window.RTeachRendering) {
+          document.getElementById('predict-0004').textContent =
+            '没有加载到 assets/rendering-bundle.js，卡片无法运行。按 MAINTENANCE.md「真实代码打包」重新构建一次。'
+          return
+        }
+
+        RTeach.predict({
+          mount: document.getElementById('predict-0004'),
+          storageKey: 'lesson-0004',
+          canvas: false,
+          prelude,
+          items: [
+            {
+              title: 'A · 同一个 Geometry get 两次：一共调用几次 createBuffer？',
+              code: "const first = geometries.get(geometry)   // geometry 有 position、uv 两个属性\nconst second = geometries.get(geometry)\nlog('first === second:', first === second)",
+              choices: ['2 次：只有第一次会创建', '4 次：每次 get 各建两个', '0 次：构造 Geometry 时已建好'],
+              answer: 0,
+              explain: '第一次 get 为 position、uv 各建一个 buffer，发布进表；第二次命中缓存，返回<strong>同一个冻结对象</strong>（log 里 <code>first === second</code> 是 true）。看调用日志的最后一行：第二次 get 只发了一个 <code>isContextLost()</code>，那是入口的 assertAvailable，查的是浏览器里的一个标志，不需要等 GPU。日志里其余的 getParameter、getError、bindBuffer，是保存与恢复绑定、错误检查（第 16 课细讲）；排在最前面的那个 getError 就是 preflight。「构造时已建好」不对：Geometry 构造时根本不知道有 gl。'
+            },
+            {
+              title: 'B · 两个 context 共用一个 Geometry，dispose 之后谁删 buffer？',
+              code: "const other = RTeach.gl.freshContext()   // 第二个 context（它的调用不记进下面的日志）\nconst otherGeometries = new R.WebGL1GeometryManager(other, { elementIndexUint: null }, hooks)\nconst here = geometries.get(geometry)\nconst there = otherGeometries.get(geometry)\nlog('两边是同一个 buffer 吗？', here.attributes.get('position').buffer === there.attributes.get('position').buffer)\ngeometry.dispose()\nlog('另一个 context 里的 buffer 还在吗？', other.isBuffer(there.attributes.get('position').buffer))\nRTeach.gl.lose(other)                     // 用完释放这个 context",
+              choices: ['两个 context 各删各的', '只有先 get 的那个会删', '都不删，等着垃圾回收'],
+              answer: 0,
+              explain: '两个 Manager 各自订阅了同一个 Geometry 的释放事件，它的监听器集合里有两个 release。dispose 一次，两个都收到通知：这个 context 的日志末尾有两次 deleteBuffer，另一个 context 的 buffer 也没了（isBuffer 是 false）。第一条 log 是 false：两个 context 的句柄互不相通，本来就不可能是同一个。「等着垃圾回收」不对：WebGL 对象什么时候被回收不可预测，显存要靠显式 delete 才能及时释放。'
+            },
+            {
+              title: 'C · context 丢失之后 dispose Geometry：会发 deleteBuffer 吗？',
+              code: "geometries.get(geometry)\nRTeach.gl.lose(gl)                        // 模拟 GPU 重置：这个 context 丢失\ngeometry.dispose()\nlog('geometry.disposed =', geometry.disposed)",
+              choices: ['不会：只丢记录，不发删除', '会：照常删除，GL 自己忽略', '不会：dispose 会直接抛错'],
+              answer: 0,
+              explain: 'release 一进门就检查 <code>isContextLost()</code>（日志最后一行是 true），发现丢失就转去 invalidateForContextLoss：退订全部、清空表，直接返回（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:217">GeometryManager.ts:217–220</a>）。没有一个 deleteBuffer：那些句柄已经随 context 作废，删它们没有意义。也不抛错：CPU 资源的释放，不应该因为某一个 context 出了事就失败（Geometry 照样变成 disposed）。loseContext 那一行标着 CONTEXT_LOST_WEBGL，是第 2 课讲过的「丢失后第一次 getError」——记录代理替你取走了它。'
+            },
+            {
+              title: 'D · 两个同名、同源码的 ShaderModule：编译几次？',
+              code: "const make = () => new R.ShaderModule({ name: 'unlit', language: 'glsl-es-100', vertexSource: VS, fragmentSource: FS })\nconst a = make()\nconst b = make()                          // 同名、同源码，但是另一个对象\nlog('同一个 program 吗？', programs.get(a).program === programs.get(b).program)",
+              choices: ['两次：key 是对象的身份', '一次：源码相同就会复用', '零次：name 重复直接抛错'],
+              answer: 0,
+              explain: 'ProgramManager 的表以 ShaderModule 对象为 key，内容一样也是两个 key：调用日志里有两次 createProgram，log 是 false。这是有意的取舍：按对象身份，永远不会把两个生命周期不同的资源错误地合并（否则一个 dispose 时，会误删另一个还在用的 program）；代价是不会自动去重。想共享，就把同一个 ShaderModule 对象交给多个 Material。three.js 选了相反的路（第 9 节）。'
+            },
+            {
+              title: 'E · RenderTarget 改尺寸之后再 get：新旧 FBO 谁先谁后？',
+              code: "const target = new R.RenderTarget({ width: 64, height: 64, colors: [{ format: 'rgba8' }] })\nconst before = targets.get(target)\ntarget.resize(128, 128)                   // revision 从 0 变成 1\nconst after = targets.get(target)\nlog('FBO 换了吗？', before.framebuffer !== after.framebuffer, '；revision', before.revision, '→', after.revision)",
+              choices: ['先建好新的，再删掉旧的', '先删掉旧的，再建新的', '不重建，原地改附件尺寸'],
+              answer: 0,
+              explain: '看日志末尾：<code>createFramebuffer() → WebGLFramebuffer#2</code> 和 <code>checkFramebufferStatus → FRAMEBUFFER_COMPLETE</code> 都在前面，<code>deleteFramebuffer(WebGLFramebuffer#1)</code> 和 <code>deleteTexture(WebGLTexture#1)</code> 在最后。新的没建成，旧的就不动，表里任何时刻都有一份完整可用的表示。WebGL1 其实可以对同一个纹理再调一次 texImage2D，原地换一个尺寸；项目选择整套重建，是为了失败时旧的那一份原封不动。'
+            },
+            {
+              title: 'F · 先关闭 Manager，再 dispose Geometry：还会再删一次吗？',
+              code: "geometries.get(geometry)\ngeometries.dispose()                      // Backend 关闭：删掉自己的 GPU 表示\nlog('geometry.disposed =', geometry.disposed)\ngeometry.dispose()                        // 之后 CPU 资源才释放",
+              choices: ['不会：关闭时已经退订', '会：监听器还挂在上面', '不会：Geometry 早已被释放'],
+              answer: 0,
+              explain: '两次 deleteBuffer 都来自 <code>geometries.dispose()</code>；最后一行 <code>geometry.dispose()</code> 之后，日志里什么都没有：Manager 关闭时先退订了全部（不变量 2），Geometry 的监听器集合已经空了。log 显示 <code>geometry.disposed = false</code>：Manager 关闭从不释放 CPU 资源，因为别的 context、下一代 Manager 可能还要用它。'
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <h2>8. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0004"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0004"]'), [
+        {
+          q: 'GPU 句柄为什么不放在 Geometry 身上？',
+          opts: ['句柄只属于某个 context 的某一代', '构造 Geometry 时通常还没有 gl', 'TypeScript 不允许类里保存句柄'],
+          answer: 0,
+          why: '两条实测：拿到别的 context 用，报 INVALID_OPERATION；丢失再恢复之后 gl 对象还是同一个，旧句柄却全部作废。句柄放在 Geometry 上，就得变成「按 context、按代分的表」，第一层还得知道 gl。「构造时还没有 gl」只是表面原因：就算晚一点再把 gl 交给它，一份数据画进两个 context、丢失后重建，照样需要按 context、按代分开的表。'
+        },
+        {
+          q: 'context 丢失时，Manager 为什么要退订所有 CPU 资源？',
+          opts: ['让作废的 Manager 与存活的资源断开', '退订之后浏览器才会恢复这个 context', '好让 CPU 资源能尽快被垃圾回收'],
+          answer: 0,
+          why: 'CPU 资源通常比这一代 Manager 活得久（Scene 还拿着它，下一代还要用它）。不退订，它的监听器集合就一直拽着作废的 Manager，连同 gl 和整张表；等它终于释放，还会调进这个死掉的 Manager。恢复与退订无关，由浏览器决定。「让 CPU 资源被回收」说反了：拽住别人的是 CPU 资源的监听器，被拽住、回收不掉的是作废的 Manager。'
+        },
+        {
+          q: 'Geometry 的 GPU 表示为什么永远不需要重建？',
+          opts: ['CPU 快照构造后就不可变', 'Manager 每帧都会重新上传', 'buffer 用了 STATIC_DRAW'],
+          answer: 0,
+          why: '内容不变，缓存就永不过期，命中时连版本号都不用比。STATIC_DRAW 只是给驱动的用法提示，不保证任何东西；每帧重新上传恰恰是缓存要避免的。要改几何体，就新建一个 Geometry；旧的释放时，Manager 删掉它的 buffers。'
+        },
+        {
+          q: 'RenderTarget resize 之后再 get，Manager 按什么顺序做？',
+          opts: ['建好新的 → 发布新的 → 删掉旧的', '删掉旧的 → 建好新的 → 发布新的', '保留旧 FBO，只改附件的尺寸'],
+          answer: 0,
+          why: '新的没建成，旧的就原样留着，调用者收到异常；任何时刻表里都没有半成品（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:42">RenderTargetManager.ts:42–45</a>）。替换时沿用旧的订阅，不会订阅第二次。'
+        },
+        {
+          q: '两个 Material 想共用同一个 program，应该怎么做？',
+          opts: ['交给它们同一个 ShaderModule 对象', '给两个 ShaderModule 起同一个名字', '让两个 ShaderModule 的源码完全相同'],
+          answer: 0,
+          why: 'ProgramManager 以 ShaderModule 的对象身份为 key：同名、同源码的两个对象还是两个 key，会各编译一次（卡片 D）。共享要显式地表达成「同一个对象」。'
+        },
+        {
+          q: '在 dispose 监听器里，为什么不能读这个资源的 CPU 数据？',
+          opts: ['通知之前它已经被标记为 disposed', '监听器运行在另一个 Worker 线程里', '通知之前 CPU 数据已经被清空了'],
+          answer: 0,
+          why: 'finalizeDisposal 先把 disposed 置为 true，再通知监听器，最后才 disposeCPUData（<a data-src="src/rendering/core/Resource.ts:204">Resource.ts:204–216</a>）。所以通知时数据其实还在，但任何 getter 都会被 assertUsable 拒绝。Manager 删除 GPU 对象需要的一切，都事先存在自己的 entry 里。监听器是同步调用的，没有别的线程。'
+        }
+      ])
+    </script>
+
+    <h2>9. 架构视角</h2>
+    <h3>9.1 对照 three.js：同一个决策，几处不同的取舍</h3>
+    <p>
+      <strong>决策本身和 three.js 一致。</strong>three.js 的 BufferGeometry、Texture 也不持有 GL 句柄，渲染器内部按对象保存 GPU 数据：旧渲染器用 <a data-src="node_modules/three/src/renderers/webgl/WebGLProperties.js:3">WebGLProperties</a>（一个 WeakMap），新渲染器用 <a data-src="node_modules/three/src/renderers/common/DataMap.js:20">DataMap</a> 和 <a data-src="node_modules/three/src/renderers/common/Backend.js:43">Backend.data</a>（也是 WeakMap）。释放通知靠 CPU 对象派发的 <code>'dispose'</code> 事件，渲染器在第一次用到时才订阅：纹理见 <a data-src="node_modules/three/src/renderers/webgl/WebGLTextures.js:666">WebGLTextures.js:666–670</a>，几何体见 <a data-src="node_modules/three/src/renderers/webgl/WebGLGeometries.js:52">WebGLGeometries.js:52–56</a>，新渲染器见 <a data-src="node_modules/three/src/renderers/common/Geometries.js:194">common/Geometries.js:194</a>。context 恢复时，旧渲染器调用 <a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1035">initGLContext()</a>，把 properties、textures、geometries、bindingStates 等子系统<strong>全部新建一遍</strong>（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:401">:401–425</a>）——和本项目「整代丢弃、重新组装」是同一个思路。
+    </p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 18%"></th><th>本项目</th><th>three.js r177</th></tr>
+        <tr>
+          <td>缓存表</td>
+          <td><code>Map</code>：强引用，可以遍历</td>
+          <td><code>WeakMap</code>：CPU 对象没人用了，条目跟着被回收；但不能遍历</td>
+        </tr>
+        <tr>
+          <td>「全部删除 / 全部退订」</td>
+          <td>遍历表，逐项处理（第 4 节的三条出路）</td>
+          <td>没法逐项处理，只能换一张新表：<a data-src="node_modules/three/src/renderers/webgl/WebGLProperties.js:38">WebGLProperties.dispose()</a> 就是 <code>properties = new WeakMap()</code>，换表本身不删除任何 GL 对象</td>
+        </tr>
+        <tr>
+          <td>context 丢失时的旧订阅</td>
+          <td>主动退订，旧一代立刻和 CPU 资源断开</td>
+          <td><a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1013">onContextLost</a> 只设一个标志。旧一代的监听器还挂在 CPU 对象上，要等对象被 dispose 时才运行一次、摘掉自己（<a data-src="node_modules/three/src/renderers/webgl/WebGLTextures.js:301">WebGLTextures.js:301–305</a>），拿旧表里的旧句柄去删</td>
+        </tr>
+        <tr>
+          <td>program 的 key</td>
+          <td>ShaderModule 的对象身份，不去重</td>
+          <td>由材质参数拼成的字符串（<a data-src="node_modules/three/src/renderers/webgl/WebGLPrograms.js:377">getProgramCacheKey</a>）：内容相同就共用，再用 <code>usedTimes</code> 引用计数防止误删（<a data-src="node_modules/three/src/renderers/webgl/WebGLPrograms.js:591">acquireProgram</a>、<a data-src="node_modules/three/src/renderers/webgl/WebGLPrograms.js:622">releaseProgram</a>）</td>
+        </tr>
+      </table>
+    </div>
+    <p>
+      两边的取舍都说得通。three.js 的 shader 是由材质参数<strong>生成</strong>的，许多材质会生成同一份源码，所以必须按内容去重；本项目的 ShaderModule 是用户<strong>显式写</strong>的，共享用「同一个对象」来表达就够了。WeakMap 的好处是：CPU 对象忘了 dispose，也不会被渲染器一直拽着；Map 换来的是可枚举，关闭和丢失时能精确地删除、退订每一项。本项目为此付出的代价是：忘了释放的 CPU 资源，会被 Manager 的表一直拽着，直到 Backend 关闭——所以生命周期必须显式管理，这正是下一课 Scene 引用计数要解决的事。
+    </p>
+
+    <h3>9.2 审查视角：「一对多」留下的一个未决问题</h3>
+    <p>
+      一对多的通知有一个代码自己承认的缺口。<a data-src="src/rendering/TODOList.md:5">TODOList.md</a> 记着：Resource 的监听器抛错时怎么办，还没有定（<a data-src="src/rendering/core/Resource.ts:56">Resource.ts:56–58</a> 的注释也指向它）。现在的循环不 catch，所以只要有一个监听器抛错，释放就当场中断：后面的监听器收不到通知，监听器集合没清空，<code>disposeCPUData()</code> 也没执行——但 <code>disposed</code> 已经是 true 了。
+    </p>
+    <p>
+      放到本课的图里看：Geometry 被两个 context 共用，A 的 release 抛错，<strong>B 的 Manager 就永远收不到通知</strong>。再调一次 <code>geometry.dispose()</code> 也没用：它一进门就因为已经 disposed 而返回。B 的 buffers 只能等 B 整体关闭时才删。
+    </p>
+    <p>
+      TODO 里列了几个要做的决定：一个监听器失败后，要不要继续通知其余的？CPU 清理还做不做？报第一个错、最后一个错，还是用 <code>AggregateError</code> 汇总？或者干脆规定 Manager 的监听器不许抛错？<strong>先想一想你会选哪一种、为什么。</strong>第 7 课精读 Resource 时，我们拿你的选择去对照 TODO 里的约束。
+    </p>
+
+    <h2>10. 延伸阅读</h2>
+    <p>
+      <strong>首选（一手来源，约 10 分钟）：</strong>项目自己的两篇设计说明——<a data-src="src/rendering/core/docs/resource-lifecycle-and-errors.zh-CN.md:35">Resource 生命周期与错误设计 · 监听者为何先于 CPU 清理</a>，以及 <a data-src="src/rendering/backend/webgl1/docs/program-and-geometry-managers.zh-CN.md:96">ProgramManager 与 GeometryManager · 删除顺序与生命周期</a>。读的时候对照本课的三条不变量，看看每一句对应哪一条。
+    </p>
+    <p>
+      补充：<a data-src="src/rendering/resources/docs/textures-and-render-targets.zh-CN.md:49">Texture 与 RenderTarget · 快照与 revision</a>；three.js 的 <a data-src="node_modules/three/src/renderers/webgl/WebGLProperties.js:1">WebGLProperties.js</a> 只有 50 行，十秒钟就能看完「WeakMap 当缓存表」的全部实现。
+    </p>
+
+    <aside class="ask">
+      有任何没讲清楚的地方，直接在对话里问我（我会在对话里回答，不另写页面）。做完告诉我：检查题错了哪几题、六张卡片猜对了几张；第 3 课的检查题结果也可以一起告诉我。第 5 课讲所有权与生命周期：Scene 的引用计数、dispose 与 tryDispose、Mesh 和 Material 怎样借用资源。
+    </aside>
+
+    <div class="nav">
+      <a href="0003-architecture-overview.html">← 第 3 课：src/rendering 全景</a>
+      <a href="../index.html">课程首页</a>
+      <span style="color: var(--muted)">第 5 课（待发）→</span>
+    </div>
+    <footer>src/rendering 精读课 · 第 4 课 · 2026-09-24</footer>
+  </body>
+</html>

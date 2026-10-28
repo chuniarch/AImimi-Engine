@@ -1,0 +1,962 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 22 课 · 拿仿真需求审 src/rendering</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/step-view.js"></script>
+    <script src="../assets/review-sources.js"></script>
+    <script>
+      // 只为课程演示：SceneNode 用 crypto.randomUUID 生成 UUID，它要求安全上下文。
+      // 个别浏览器在 file:// 下没有这个函数，这里用 getRandomValues 补一个同格式的实现。
+      if (window.crypto && typeof window.crypto.randomUUID !== 'function') {
+        Object.defineProperty(window.crypto, 'randomUUID', {
+          value() {
+            const b = window.crypto.getRandomValues(new Uint8Array(16))
+            b[6] = (b[6] & 0x0f) | 0x40
+            b[8] = (b[8] & 0x3f) | 0x80
+            const h = [...b].map((x) => x.toString(16).padStart(2, '0')).join('')
+            return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20)
+          }
+        })
+      }
+    </script>
+    <script src="../assets/review-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">综合 · Code review 实战（仿真可视化方向）· 约 45 分钟</p>
+    <h1>拿仿真需求审 src/rendering</h1>
+    <p class="lede">
+      前面几十课读的都是「代码为什么这样写」。这一课换一个角度：拿你接下来真要用它做的事——把 FLIP 的结果画出来——去审它。哪些地方接得住，哪些接不住，接不住的是缺陷还是当初有意没做，最后写成一份审查意见。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 10 月 19 日起渲染引擎的定位是仿真可视化工具。FLIP 课的目标是 3D CPU 实现：32³ 网格、约 6 万个粒子的溃坝（dam break），v1 用粒子和切片可视化，验收里有「投影后 max|div| &lt; 1e-5」（FLIP 课的 MISSION.md；那是你的个人学习文件，不放进发布副本，这里只引它的数字）。这一课的审查结论，就是动手画 FLIP 之前，渲染这边要先补什么、可以不管什么。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 第 41 课：Manager 拿 CPU 对象当钥匙查表；② 第 42 课：数据的三种变法（不能变、revision、每次 draw 现读）；③ 第 46 课：context 丢失、一代；④ 第 47 课：一次 draw 怎样接起 CPU 资源、Pass 和 GPU 资源；⑤ 第 29、27 课：Texture2D 和 RenderTarget 的大致样子。<br />
+      <strong>在一帧里的位置和寿命</strong>：这一课不讲新的一帧路径，审的是三条需求分别压在哪几行代码上。第 1 节的五步可以用到以后任何一次审查；第 7 节的汇总表活到这些意见被处理为止，可以直接当 TODO 清单用。<br />
+      <strong>找茬题怎么做</strong>：每张卡片先猜再跑。不想猜、只想看答案，随便点一个选项，记录和解析会一起出来。<br />
+      <strong>页面会用到你的显卡</strong>：每张卡片和每个实验台运行时临时建一块画布和一个真实的 WebGL1Backend，用完立刻释放（<code>WEBGL_lose_context.loseContext()</code>，浏览器同时能开的 context 有上限）。卡片 E 会让它自己那块画布丢失再恢复。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">怎样审：五步，和意见的写法</a></li>
+        <li><a href="#s2">三条需求，带数字</a></li>
+        <li><a href="#s3">需求一：6 万个粒子每帧换位置（GPU buffer）</a></li>
+        <li><a href="#s4">需求二：一张散度切片每帧更新（纹理、浮点）</a></li>
+        <li><a href="#s5">需求三：跑很久（context 丢失、GPU 上的状态）</a></li>
+        <li><a href="#s6">纯渲染的条目（少讲，不跳过）</a></li>
+        <li><a href="#s7">审查意见汇总</a></li>
+        <li><a href="#s8">对照 three.js</a></li>
+        <li><a href="#s9">检查题</a></li>
+        <li><a href="#s10">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 怎样审：五步，和意见的写法</h2>
+    <p>
+      Google 的代码审查指南（code review guide）把「设计」放在第一位，其次是「功能」，问的是这段代码对它的使用者好不好用。它说的使用者有两种：受到改动影响的最终用户，以及以后要「使用」这段代码的开发者（<a href="https://google.github.io/eng-practices/review/reviewer/looking-for.html#functionality">What to look for in a code review · Functionality</a>）。这一课里，你就是后一种：以后拿 <code>src/rendering</code> 画仿真结果的人。所以审查从你的需求出发，不从代码出发。
+    </p>
+    <table>
+      <tr><th style="width: 22%">步骤</th><th>做什么</th><th style="width: 30%">这一课里的例子</th></tr>
+      <tr><td>① 写下需求和数字</td><td>写清要做什么、每帧多少数据、能容忍多大误差。没有数字就判断不了严重程度。</td><td>6 万个粒子，画成点每帧 703 KiB</td></tr>
+      <tr><td>② 找到接住它的代码</td><td>顺着第 47 课那条调用链，找到真正处理这条需求的那几行。</td><td>Geometry 构造、GeometryManager.get</td></tr>
+      <tr><td>③ 跑真实代码量一量</td><td>不靠读代码猜，把真实的类跑起来，数调用、数对象、看画面。</td><td>每帧新建 Geometry：多 14 条命令、12 次查询</td></tr>
+      <tr><td>④ 分类</td><td>先读设计文档再分类，下面的表是四类。</td><td>「Geometry 不能改」是有意的范围</td></tr>
+      <tr><td>⑤ 写意见</td><td>贴标签、写位置、写现象和理由、给建议。</td><td><code>question (blocking): 没有 points</code></td></tr>
+    </table>
+    <p>第 ④ 步最容易出错。同一个「做不到」可能属于四类中的任意一类，处理方式完全不同：</p>
+    <table>
+      <tr><th style="width: 18%">类别</th><th>怎么认</th><th style="width: 34%">意见应该怎样写</th></tr>
+      <tr><td>缺陷 (bug)</td><td>代码没做到它自己承诺的事（注释、类型、文档、测试说了 A，跑出来是 B）。</td><td>issue：指出承诺和现象，建议修法。</td></tr>
+      <tr><td>有意的范围 (scope)</td><td>设计文档、注释或 TODO 写明「这一版不做」。</td><td>note：说明它挡住了新需求，不要求「修」。</td></tr>
+      <tr><td>新需求下的缺口 (gap)</td><td>当初的范围合理，但新需求要它。</td><td>question 或 suggestion：要设计，列出设计要回答的问题。</td></tr>
+      <tr><td>取舍 (trade-off)</td><td>两种写法各有代价，当初选了一种。</td><td>thought 或 suggestion：写清两边的代价，用数字说哪边更重。</td></tr>
+    </table>
+    <p>
+      例子：<code>Geometry</code> 不能改，粒子每帧换位置只能整个重建。读代码时很像缺陷，可是类的注释写了「初版 Geometry 是完全静态的，不提供 revision、usage 或 updateAttribute()」（<a data-src="src/rendering/resources/Geometry.ts:135">Geometry.ts:135</a>），FLIP 交接文档也写了「不假设静态 Geometry 已经支持动态粒子数据」「不……在未设计生命周期、dirty range、版本和恢复语义前直接修改 Geometry」（<a data-src="src/rendering/docs/rendering-roadmap-flip-discussion-handoff.zh-CN.md:237">交接文档 §9</a>）。所以它是有意的范围；对 FLIP 来说是缺口，意见要写成「需要设计，设计要回答这四个问题」，不能写成「这是 bug，改成可变的」。
+    </p>
+    <p>
+      第 ⑤ 步用 Conventional Comments 的格式：<code>&lt;标签&gt; [修饰]: &lt;一句话&gt;</code>，下面再写讨论（<a href="https://conventionalcomments.org/">conventionalcomments.org</a>）。这一课用到的标签：
+      <span class="rv-label rv-praise">praise</span>真心觉得好的地方（规范建议每次审查至少写一条，不要写假的）；
+      <span class="rv-label rv-issue">issue</span>具体的问题，最好配一条建议；
+      <span class="rv-label rv-suggestion">suggestion</span>改进提议；
+      <span class="rv-label rv-question">question</span>有顾虑但不确定，请作者确认；
+      <span class="rv-label rv-note">note</span>不挡路，只提醒注意；
+      <span class="rv-label rv-nitpick">nitpick</span>小的偏好问题，天然不挡路。
+      修饰用 <code>(blocking)</code>（不解决不能接受）、<code>(non-blocking)</code>、<code>(if-minor)</code>（改动小就顺手改）。
+    </p>
+
+    <h2 id="s2">2. 三条需求，带数字</h2>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 6%"></th><th style="width: 34%">需求</th><th style="width: 34%">数字</th><th>来源</th></tr>
+        <tr><td>R1</td><td>粒子每帧换位置，画成点</td><td>约 60 000 个；画成点每帧 60 000 × 3 个 float × 4 B = 720 000 B ≈ 703 KiB</td><td>FLIP MISSION：约 6 万粒子，v1 粒子可视化</td></tr>
+        <tr><td>R2</td><td>一层网格切片上的标量（散度、压力）每帧更新，要看得出 1e-5 量级的散度</td><td>32 × 32；r 格式 float 4 KiB（4 096 字节），rgba float 16 KiB（16 384 字节）；8 位通道一格是 1/255 ≈ 0.0039</td><td>MISSION 的验收：max|div| &lt; 1e-5</td></tr>
+        <tr><td>R3</td><td>跑很久不坏：设备丢失、恢复以后能接着跑；GPU 上的状态丢了要知道；结果要能读回 CPU 去比</td><td>一次溃坝在 CPU 上可能要跑几分钟；GPU 版以后作为独立模块</td><td>交接文档 §8 第 9、10 条：resize、context lost、checkpoint、CPU 基准对照</td></tr>
+      </table>
+    </div>
+
+    <h2 id="s3">3. 需求一：6 万个粒子每帧换位置</h2>
+    <p>
+      现在的引擎能怎样画？没有 <code>points</code>，所以每个粒子只能画成一个小三角形（3 个顶点）。<code>Geometry</code> 不能改，<code>Mesh</code> 的 <code>geometry</code> 也不能换（<a data-src="src/rendering/scene/Mesh.ts:24">Mesh.ts:24</a> 是 <code>readonly</code>），所以位置一变，应用每帧要做四件事：
+    </p>
+    <pre><code>// 课程写的（assets/build/review-course.ts 的 createParticleDemo），引擎现在只能这样用
+scene.remove(oldMesh)                    // 1. 旧 Mesh 拿出场景
+scene.release(oldGeometry)               // 2. 最后一个引用 → dispose → 各 Manager 删 buffer、VAO
+const geometry = scene.retain(new Geometry({ attributes: { position: new VertexAttribute({ data, itemSize: 3 }) } }))
+scene.add(new Mesh(geometry, material))  // 3、4. 新建、登记、放进场景</code></pre>
+
+    <h3>3.1 先猜后跑：三张卡片</h3>
+    <div id="cards-r1"></div>
+
+    <h3>3.2 实验台：每帧要花多少</h3>
+    <p>选一种写法和粒子数，跑 30 帧（6 万个粒子跑 10 帧），数第 2 帧起每帧的调用。「什么都不变」是对照：粒子不动，只看引擎每帧的底数。最后两项是课程直接用原生 GL 写的对照，不经过引擎：一个 buffer 只分配一次，之后每帧 <code>bufferSubData</code> 改内容。</p>
+    <div id="lab-r1"></div>
+    <figure class="rv-pic" id="lab-r1-pic"></figure>
+    <p>我在这台 Mac 的无界面 Chrome（SwiftShader）上测到（1 000 个粒子，有 VAO 扩展）：</p>
+    <table>
+      <tr><th>写法</th><th class="num">每帧命令</th><th class="num">每帧查询</th><th>跑完 30 帧活着的 buffer / VAO</th></tr>
+      <tr><td>什么都不变（对照）</td><td class="num">34</td><td class="num">7</td><td>1 / 1</td></tr>
+      <tr><td>每帧新建、释放旧的</td><td class="num">48</td><td class="num">19（其中 getError 8）</td><td>1 / 1</td></tr>
+      <tr><td>每帧新建、忘了释放</td><td class="num">45</td><td class="num">19</td><td>30 / 30</td></tr>
+      <tr><td>课程写的原生 GL：bufferSubData</td><td class="num">4</td><td class="num">0</td><td>1 / 0</td></tr>
+    </table>
+    <p>
+      6 万个粒子时每帧顶点数据 2.06 MiB（2 160 000 字节，画成三角形，是画成点的 3 倍）。引擎在 CPU 上整份复制两次（<a data-src="src/rendering/resources/VertexAttribute.ts:100">VertexAttribute.ts:100</a> 构造时、<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:145">GeometryManager.ts:145</a> 上传前），再用 <code>bufferData</code> 整块重新分配、上传一次。光构造 VertexAttribute 和 Geometry，这台机器上每帧约 2–3 ms，占 60 fps 一帧预算（16.7 ms）的八分之一到六分之一。命令和查询的条数与粒子数无关，1 000 和 60 000 都是 48 和 19。没有 VAO 扩展时（Manual 路径）每次 draw 还要多 2 次 getError，这是找茬题 18。
+    </p>
+
+    <h3>3.3 审查面板</h3>
+    <p>左边是相关源码的原文，行号是真实行号。点 ①–⑥，每一条是一条审查意见：高亮它说的那几行，右边写标签、现象、理由和建议。</p>
+    <div id="board-r1"></div>
+
+    <h2 id="s4">4. 需求二：一张散度切片每帧更新</h2>
+    <p>
+      切片用 <code>DataTexture2D</code> 存，片元着色器按值上色：红是正，蓝是负，白是 0，乘上 <code>uScale = 1 / amplitude</code> 把 ±1e-5 放大到 ±1。场是课程写的 <code>1e-5 · sin(2πx) · sin(2πy)</code>，四个象限正负交替，样子像一张散度图。
+    </p>
+
+    <h3>4.1 实验台：纹理要过的几道关</h3>
+    <p>改尺寸、格式、类型、过滤、环绕，或者假装设备没有 <code>OES_texture_float_linear</code>（课程把扩展藏起来，模拟别的设备），看在哪一步被拦、拦下的是什么错误。「每帧换新纹理」模式按 32 × 32、rgba float 跑 20 帧，数每帧的调用。</p>
+    <div id="lab-r2"></div>
+    <figure class="rv-pic" id="lab-r2-pic"></figure>
+    <p>我测到的几组：</p>
+    <ul>
+      <li><strong>30 × 30、rgba、float32、linear、clamp</strong>：画得出来。左下象限 (217, 52, 39) 是红，右下 (39, 90, 217) 是蓝，正中接近白。30 不是 2 的幂，用 clamp、不要 mipmap 就能过 NPOT 那道关。</li>
+      <li><strong>换成 uint8</strong>：整张都是 (245, 245, 245) 的白。1e-5 × 255 取整是 0，数据在上传之前就没了。这就是 R2 必须用浮点的原因。</li>
+      <li><strong>藏起 OES_texture_float_linear</strong>：第一次 draw 抛 <code>UnsupportedRenderFeatureError</code>（OES_texture_float_linear is required）；同样设置改成 nearest 就画得出来。</li>
+      <li><strong>30 × 30 加 repeat</strong>：第一次 draw 抛 NPOT 的错；32 × 32 加 repeat 能画。</li>
+      <li><strong>每帧换新纹理</strong>：每帧 53 条命令、18 次查询；纹理不变时是 35 和 7。多出来的是 createTexture、texImage2D（整张重新分配）、4 次 texParameteri、8 次 pixelStorei（上传前后各设一遍）、deleteTexture，以及 4 次 getError、7 次 getParameter。</li>
+    </ul>
+
+    <h3>4.2 先猜后跑：一张卡片</h3>
+    <div id="cards-r2"></div>
+
+    <h3>4.3 审查面板</h3>
+    <div id="board-r2"></div>
+
+    <h2 id="s5">5. 需求三：跑很久</h2>
+    <p>
+      FLIP v1 在 CPU 上算，画面的原料全是 CPU 数据。设备丢失以后，引擎照着 CPU 原件重建就行（第 46、47 课）。可是将来 GPU 上算的版本（Stable Fluids 的速度场、时间累积……）把状态存在 RenderTarget 里，这些状态在 CPU 上没有原件。下面这张卡片用一个最简单的例子代表它们：两张 RenderTarget 轮流读写（ping-pong），每帧把上一帧的值加 1。
+    </p>
+    <div id="cards-r3"></div>
+    <h3>5.1 审查面板</h3>
+    <div id="board-r3"></div>
+
+    <h2 id="s6">6. 纯渲染的条目（少讲，不跳过）</h2>
+    <p>这些条目和仿真可视化关系不大，大多在前面的课里讲过。每条先给提示，答案折叠着，想自己找就先别展开。</p>
+    <ul class="rv-list">
+      <li>
+        <span class="rv-label rv-issue">issue</span>sRGB 纹理配 <code>mipmapPolicy: 'generate'</code>：看 <a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:141">Texture2DManager.ts:141</a> 和 <a data-src="src/rendering/backend/webgl1/WebGL1CubeTextureManager.ts:161">CubeTextureManager.ts:161</a>，事前的 validateStorage 少检查了什么？
+        <details><summary>答案（第 17 课讲过，找茬题 1）</summary><p>EXT_sRGB 规定对 sRGB 纹理调用 generateMipmap 产生 INVALID_OPERATION。两个 validateStorage 都没拦这个组合，错误在上传以后才以笼统的 WebGLOperationError 报出来，而不是事前的 UnsupportedRenderFeatureError。修法：两处各加一行；以后合并 validateStorage 时只加一处（找茬题 20）。</p></details>
+      </li>
+      <li>
+        <span class="rv-label rv-issue">issue</span>镜像的物体：<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:337">WebGL1Backend.ts:337</a> 每次 draw 都设 <code>frontFace(CCW)</code>。世界矩阵行列式小于 0（比如 scale.x = −1）时会怎样？
+        <details><summary>答案（第 11 课讲过，找茬题 10 ②）</summary><p>镜像以后三角形的绕向反了，剔除背面会剔掉正面。three.js 每次 draw 按 <code>object.matrixWorld.determinant() &lt; 0</code> 算 frontFaceCW（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1100">WebGLRenderer.js:1100</a>）。本项目的 RenderItem 已经有 worldMatrix 快照，可以在 draw 里同样算一次。</p></details>
+      </li>
+      <li>
+        <span class="rv-label rv-issue">issue</span>旧引擎的阴影打包：<a data-src="src/shaders/lighting/shadow/directional/rgbaPack.frag:7">rgbaPack.frag:7–8</a> 按 256 进位。8 位通道存的是什么？
+        <details><summary>答案（第 27 课附注讲过，找茬题 21）</summary><p>8 位通道存的是 k/255，按 256 进位再按 256 解，0.3 解出 0.30116。按 255 进位才能精确还原（第 40、47 课的深度着色器已经按 255 写）。和仿真的关系：有了浮点 RenderTarget，就不用再把一个数拆进四个 8 位通道。</p></details>
+      </li>
+      <li>
+        <span class="rv-label rv-suggestion">suggestion</span>State 缓存：同一个 Pass 里连着两次 draw，第二次的 useProgram、enable、depthFunc 有没有被缓存省掉？看 <a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:138">OESVertexInputManager.ts:138</a>。
+        <details><summary>答案（第 31、47 课讲过，找茬题 29）</summary><p>没有。OES 顶点输入的 bind 在 finally 里调 invalidateState，把 program、深度、剔除的缓存全清了，可它真正要作废的只有 ELEMENT_ARRAY_BUFFER。每次 draw 多 6 条左右的调用。仿真可视化如果要画很多个小物体（比如几千个箭头），这条会变要紧。</p></details>
+      </li>
+      <li>
+        <span class="rv-label rv-suggestion">suggestion</span>getError 怎样收：卡片 C 里，Manual 路径的错误信息是「GL error 1280」，OES 路径是「GL errors: 1280」。为什么不一样？
+        <details><summary>答案（找茬题 6、17）</summary><p>ProgramManager 和 GeometryManager 的 checkError 是有界循环（最多 32 次，一次报出全部错误码，<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:416">GeometryManager.ts:416</a>）；VertexInputSupport（<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputSupport.ts:168">:168</a>）和 TextureUploadSupport（<a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:27">:27</a>）只取一次。四处行为不一致，建议抽成一个共用函数。</p></details>
+      </li>
+      <li>
+        <span class="rv-label rv-nitpick">nitpick</span>不进门就 draw 时，错误信息说「enter surface scope failed for draw」。看 <a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:39">SurfaceScope.ts:39–40</a>。
+        <details><summary>答案（第 47 课卡片 B，找茬题 32）</summary><p>helper <code>invalid</code> 把操作名写死成 enter surface scope，可这次根本没人进门。给 invalid 加一个操作名参数就行。</p></details>
+      </li>
+      <li>
+        <span class="rv-label rv-nitpick">nitpick</span>文档和注释漂移，四处：<a data-src="src/rendering/backend/webgl1/docs/program-and-geometry-managers.zh-CN.md:102">program-and-geometry-managers.zh-CN.md:102</a>、<a data-src="src/rendering/resources/docs/static-geometry.zh-CN.md:8">static-geometry.zh-CN.md:8</a>、<a data-src="src/rendering/resources/docs/shader-and-material.zh-CN.md:40">shader-and-material.zh-CN.md:40</a>、<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:235">WebGL1State.ts:235</a>。每处和现码哪里对不上？
+        <details><summary>答案（第 15、10、11、14 课布置过，找茬题 2、8、9、15）</summary><p>① 文档说 Program「没有 detachShader」，<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:136">ProgramManager.ts:136</a> 起已经在链接成功后 detach；② 示例写 <code>new VertexAttribute(array, 3)</code>，构造函数收的是 <code>{ data, itemSize }</code>；③ 写的是 <code>Material.renderState</code>，代码里叫 <code>state</code>；④ 注释说 restoreSurfaceState 只在单元测试里被调用，生产路径 SurfaceScope.run 早就在调用它。</p></details>
+      </li>
+      <li>
+        <span class="rv-label rv-nitpick">nitpick</span><a data-src="src/rendering/backend/webgl1/WebGL1Capabilities.ts:34">WebGL1Capabilities.ts:34</a> 的函数名。
+        <details><summary>答案（第 13 课布置过，找茬题 4）</summary><p><code>reqiurePositiveLimit</code> 拼错了，应为 require。</p></details>
+      </li>
+    </ul>
+
+    <h2 id="s7">7. 审查意见汇总</h2>
+    <p>这就是这次审查的结论。「对 FLIP v1」一列说的是：画 6 万个粒子和 32 × 32 切片、CPU 上算的第一版，会不会被它挡住。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 7%">编号</th><th style="width: 22%">标签</th><th>一句话</th><th style="width: 16%">对 FLIP v1</th></tr>
+        <tr><td>R1-①</td><td><span class="rv-label rv-question">question</span>(blocking)</td><td>没有 points 拓扑；TODO 已列出要改的四处</td><td>挡路</td></tr>
+        <tr><td>R1-②</td><td><span class="rv-label rv-note">note</span></td><td>Geometry 静态是有意的范围，不是缺陷</td><td>—</td></tr>
+        <tr><td>R1-③</td><td><span class="rv-label rv-issue">issue</span>(non-blocking)</td><td>每帧整套重建：2 次 CPU 复制、重新分配 buffer 和 VAO，多 14 条命令、12 次查询</td><td>能用，6 万粒子每帧复制约 2–3 ms</td></tr>
+        <tr><td>R1-④</td><td><span class="rv-label rv-question">question</span></td><td>忘了释放就每帧泄漏一个 buffer、一个 VAO，垃圾回收管不到</td><td>容易踩</td></tr>
+        <tr><td>R1-⑤</td><td><span class="rv-label rv-issue">issue</span>(blocking)</td><td>释放路径变成每帧都走，Manual unbind 不做 preflight，残留错误让释放半途而废、永久泄漏</td><td>没有 VAO 的设备上会踩</td></tr>
+        <tr><td>R1-⑥</td><td><span class="rv-label rv-suggestion">suggestion</span></td><td>可更新的顶点属性：revision + bufferSubData + DYNAMIC_DRAW，先回答交接文档的四个问题</td><td>做了 ③④⑤ 都没了</td></tr>
+        <tr><td>R2-①</td><td><span class="rv-label rv-praise">praise</span></td><td>浮点上传、浮点线性过滤、NPOT、sRGB 各查各的，不偷偷降级</td><td>—</td></tr>
+        <tr><td>R2-②</td><td><span class="rv-label rv-issue">issue</span>(non-blocking)</td><td>CPU 层收下 r 格式，WebGL1 到第一次 draw 才拒绝</td><td>用 rgba 绕开</td></tr>
+        <tr><td>R2-③</td><td><span class="rv-label rv-suggestion">suggestion</span>(if-minor)</td><td>data 色彩空间的 r 可以映射到 LUMINANCE</td><td>省 12 KiB，不急</td></tr>
+        <tr><td>R2-④</td><td><span class="rv-label rv-issue">issue</span>(non-blocking)</td><td>静态纹理每帧换：3 次复制、整张重新分配，多 18 条命令、11 次查询</td><td>32 × 32 下无所谓</td></tr>
+        <tr><td>R2-⑤</td><td><span class="rv-label rv-nitpick">nitpick</span></td><td>NPOT 用 log2 判断，范围内结果正确</td><td>—</td></tr>
+        <tr><td>R3-①</td><td><span class="rv-label rv-praise">praise</span></td><td>一代模型：CPU 原件在恢复后自动重传</td><td>—</td></tr>
+        <tr><td>R3-②</td><td><span class="rv-label rv-praise">praise</span></td><td>rgba32f 的三道关分开查</td><td>—</td></tr>
+        <tr><td>R3-③</td><td><span class="rv-label rv-issue">issue</span>(blocking)</td><td>「附件内容由生产者重画」，可生产者拿不到换代信号，累加的状态悄悄归零</td><td>v1 不挡；GPU 版挡路</td></tr>
+        <tr><td>R3-④</td><td><span class="rv-label rv-issue">issue</span></td><td>没有回读接口，GPU 的结果没法和 CPU 基准比</td><td>v1 不挡；GPU 版挡路</td></tr>
+        <tr><td>R3-⑤</td><td><span class="rv-label rv-question">question</span></td><td>恢复失败没人通知，只能轮询 lastFailure</td><td>跑久了会遇到</td></tr>
+        <tr><td>R3-⑥</td><td><span class="rv-label rv-question">question</span></td><td>失效通知靠「不许抛错」的契约，没有代码兜底</td><td>—</td></tr>
+        <tr><td>R3-⑦</td><td><span class="rv-label rv-issue">issue</span>(non-blocking)</td><td>生命周期测试缺 restore-failed 之后再恢复成功等几格</td><td>—</td></tr>
+        <tr><td>第 6 节</td><td>2 issue、2 suggestion、3 nitpick（含 4 处漂移）</td><td>纯渲染条目</td><td>—</td></tr>
+      </table>
+    </div>
+    <p>
+      <strong>我建议的顺序</strong>（你来定）：先做 R1-①（points），FLIP v1 少了它就画不成点；再设计 R1-⑥（可更新的顶点属性），顺带消掉 ③④⑤。R2 用 rgba float 就能开工。R3-③④ 等 GPU 版开工时再做，到那时它们是挡路的。按交接文档的边界，这些都是设计任务，要先写设计、再改代码。
+    </p>
+
+    <h2 id="s8">8. 对照 three.js</h2>
+    <p>three.js r177 的 WebGLRenderer 从 r163 起只支持 WebGL 2（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:101">WebGLRenderer.js:101</a>），所以下面只比「怎样表达这件事」，不比扩展。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 16%"></th><th style="width: 46%">three.js r177</th><th>本项目</th></tr>
+        <tr><td>顶点数据会变</td><td><code>BufferAttribute.setUsage(DynamicDrawUsage)</code>（<a data-src="node_modules/three/src/core/BufferAttribute.js:164">BufferAttribute.js:164</a>）；改完设 <code>needsUpdate = true</code>，version 加一（<a data-src="node_modules/three/src/core/BufferAttribute.js:152">:152–154</a>）；可以只标一段 <code>addUpdateRange</code>（<a data-src="node_modules/three/src/core/BufferAttribute.js:178">:178</a>）。WebGLAttributes 比 version，不一样就 <code>bufferSubData</code>（<a data-src="node_modules/three/src/renderers/webgl/WebGLAttributes.js:76">WebGLAttributes.js:76</a>、<a data-src="node_modules/three/src/renderers/webgl/WebGLAttributes.js:86">:86</a>）；尺寸变了直接抛错，不支持改大小（<a data-src="node_modules/three/src/renderers/webgl/WebGLAttributes.js:210">:210</a>）</td><td>不能变；每帧新建 Geometry（R1-③），R1-⑥ 的方向和 three.js 一样</td></tr>
+        <tr><td>点</td><td><code>Points</code> 对象，draw 时 <code>setMode(gl.POINTS)</code>（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1205">WebGLRenderer.js:1205–1207</a>）</td><td>没有（R1-①）</td></tr>
+        <tr><td>context 恢复</td><td><code>onContextRestore</code> 调 <code>initGLContext()</code> 把内部表全部重建（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1023">:1023–1035</a>）；RenderTarget 的内容同样没了，应用要自己在 canvas 上听 <code>webglcontextrestored</code></td><td>新的一代、表从空开始（R3-①）；生产者拿不到信号（R3-③）</td></tr>
+      </table>
+    </div>
+    <p>
+      R3-③ 现在有一个权宜之计：应用自己在 canvas 上听 <code>webglcontextrestored</code>。Backend 的监听器在构造时先注册，所以先执行；应用的监听器后执行，可以记下「下一帧要重新播种」。可这样应用就得知道 Backend 生命周期的细节，比如恢复可能失败，还得去查 <code>ready</code> 和 <code>lastFailure</code>。所以建议还是把「这是新的一代」放进 Pass 拿得到的地方。
+    </p>
+
+    <h2 id="s9">9. 检查题</h2>
+    <p>凭记忆作答，错了回到对应的面板重读。</p>
+    <div class="quiz" data-quiz="lesson-0022"></div>
+
+    <h2 id="s10">10. 延伸阅读</h2>
+    <p>
+      <strong>首选（约 15 分钟）：</strong>Google Engineering Practices 的 <a href="https://google.github.io/eng-practices/review/reviewer/looking-for.html">What to look for in a code review</a>。按顺序列了设计、功能、复杂度、测试、命名、注释、风格、一致性、文档、每一行、上下文、好的地方。对照这一课：第 2 节的需求是「功能」里说的使用者；R3-⑦ 是「测试」；第 6 节的漂移是「文档」；R2-①、R3-①② 是「好的地方」。
+    </p>
+    <p>
+      补充：① <a href="https://conventionalcomments.org/">Conventional Comments</a>，标签和修饰的完整列表，第 1 节只用了其中一部分；② MDN 的 <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices">WebGL best practices</a>，「Don't assume you can render into float textures」一节说很多移动设备能建 RGBA32F 纹理，挂到 framebuffer 上却不完整（R3-②），「Avoid blocking API calls in production」一节说 getError、getParameter 会让调用线程同步等待（R1-③、R2-④ 里多出来的查询）；③ WebGL 1.0 规范 <a href="https://registry.khronos.org/webgl/specs/latest/1.0/#TEXIMAGE2D">texImage2D</a>：pixels 为 null 时传入一块全 0 的缓冲区，这就是卡片 E 恢复后累加值从 0 重来的原因；④ <a href="https://registry.khronos.org/OpenGL/extensions/OES/OES_texture_float.txt">OES_texture_float</a> 的格式表里有 LUMINANCE + FLOAT，这是 R2-③ 的依据。
+    </p>
+
+    <aside class="ask">
+      做完告诉我：检查题错了哪几题、五张卡片哪张和你猜的不一样。还有两件事想听你的：① 汇总表里有没有你不同意的分类或严重程度；② 你想先处理哪一条，我按那一条准备下一步（设计还是课）。
+    </aside>
+
+    <div class="nav">
+      <a href="0047-how-draw-connects.html">← 第 47 课：一次 draw 怎样接起三样东西</a>
+      <a href="../index.html">课程首页</a>
+      <span>下一课：看你想先处理哪条意见</span>
+    </div>
+    <footer>src/rendering 精读课 · 第 22 课 · 2026-10-20</footer>
+
+    <script>
+      ;(function () {
+        const S = window.RTeachReviewSources
+        if (!S) {
+          for (const id of ['board-r1', 'board-r2', 'board-r3']) {
+            document.getElementById(id).textContent = '没有加载到 assets/review-sources.js，审查面板无法显示。'
+          }
+          return
+        }
+        const GEO = 'src/rendering/resources/Geometry.ts'
+        const VA = 'src/rendering/resources/VertexAttribute.ts'
+        const MESH = 'src/rendering/scene/Mesh.ts'
+        const GM = 'src/rendering/backend/webgl1/WebGL1GeometryManager.ts'
+        const MAN = 'src/rendering/backend/webgl1/WebGL1ManualVertexInputManager.ts'
+        const RES = 'src/rendering/core/Resource.ts'
+        const TEX = 'src/rendering/resources/Texture.ts'
+        const T2D = 'src/rendering/resources/Texture2D.ts'
+        const SNAP = 'src/rendering/resources/texturePixelSnapshot.ts'
+        const T2M = 'src/rendering/backend/webgl1/WebGL1Texture2DManager.ts'
+        const BE = 'src/rendering/backend/webgl1/WebGL1Backend.ts'
+        const REN = 'src/rendering/Renderer.ts'
+        const CTX = 'src/rendering/passes/RenderPassContext.ts'
+        const RB = 'src/rendering/backend/RenderBackend.ts'
+        const RTM = 'src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts'
+        const RM = 'src/rendering/backend/webgl1/WebGL1ResourceManager.ts'
+
+        window.__board22 = {}
+
+        // ---------------- 需求一 ----------------
+        window.__board22.r1 = RTeach.stepView({
+          mount: document.getElementById('board-r1'),
+          route: [
+            { key: 'app', label: '应用：每帧换 Geometry' },
+            { key: 'cpu', label: 'Geometry / VertexAttribute' },
+            { key: 'manager', label: 'GeometryManager' },
+            { key: 'input', label: '顶点输入' },
+            { key: 'gl', label: 'gl.*' }
+          ],
+          versions: [
+            {
+              key: 'real',
+              label: '现码',
+              segments: S.particles,
+              dim: [[GM, 105, 111], [VA, 86, 98]]
+            }
+          ],
+          steps: [
+            {
+              mark: '①',
+              title: 'question (blocking)：没有 points',
+              route: ['cpu', 'manager'],
+              lines: { real: [[GEO, 16, 20], [GM, 357, 383]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-question">question</span>(blocking)：没有 <code>points</code> 拓扑，粒子只能画成三角形，数据是点的 3 倍。</p>
+<h4>现象</h4>
+<p>照 three.js 的习惯写 <code>topology: 'points'</code>，类型上就写不进去；从 JSON 读进来绕过类型，构造时 <code>assertValidDrawCount</code> 的 default 分支抛 <code>ExhaustiveMatchError</code>（卡片 A）。</p>
+<h4>为什么挡路</h4>
+<p>FLIP v1 的粒子可视化最自然的画法就是 <code>gl.POINTS</code> 加 <code>gl_PointSize</code>，每个粒子 1 个顶点。画成三角形每帧 2.06 MiB，画成点 703 KiB。</p>
+<h4>好的地方</h4>
+<p>TODO 写得好：它不只说「以后加 points」，还写明不能只扩展联合类型，要同步改类型、drawCount 验证、WebGL1 的拓扑映射和测试（<a data-src="src/rendering/resources/Geometry.ts:16">:16–18</a>）。<code>primitiveMode</code> 的 default 留在 switch 里调 assertNever（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:378">GeometryManager.ts:378</a>），加了 <code>'points'</code> 却忘了映射，编译就过不去。</p>
+<h4>建议</h4>
+<p>照 TODO 的清单做：联合类型加 <code>'points'</code>；drawCount 至少 1；映射到 <code>gl.POINTS</code>；测试。shader 里写 <code>gl_PointSize</code>，它的上限要查 <code>ALIASED_POINT_SIZE_RANGE</code>（SwiftShader 是 1–1023）。标成 question，是想先确认：粒子以后要不要画成球（imposter）？那样还要多一个点大小随距离变的约定。</p>`
+            },
+            {
+              mark: '②',
+              title: 'note：Geometry 静态是有意的范围',
+              route: ['cpu'],
+              lines: { real: [[GEO, 131, 135]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-note">note</span>：Geometry 不能改，是当初写明的范围，不是缺陷。</p>
+<h4>依据</h4>
+<p>类的注释：「初版 Geometry 是完全静态的，不提供 revision、usage 或 updateAttribute()」（<a data-src="src/rendering/resources/Geometry.ts:135">:135</a>）。FLIP 交接文档：「不假设静态 Geometry 已经支持动态粒子数据」，并且「不因为 FLIP 需要动态资源，就在未设计生命周期、dirty range、版本和恢复语义前直接修改 Geometry」（<a data-src="src/rendering/docs/rendering-roadmap-flip-discussion-handoff.zh-CN.md:237">交接文档 :237–238</a>）。</p>
+<h4>为什么这样写这条意见</h4>
+<p>HW2 只画加载好就不变的模型，静态的好处是实在的：上传一次，之后每帧查表 0 条命令（第 47 课）；CPU 快照不会被调用者偷偷改掉（第 10 课）。审查时把它标成 note，意思是「它挡住了新需求，要设计」，不是「当初写错了」。</p>`
+            },
+            {
+              mark: '③',
+              title: 'issue (non-blocking)：每帧整套重建',
+              route: ['app', 'cpu', 'manager', 'gl'],
+              lines: { real: [[VA, 100, 100], [MESH, 24, 24], [GM, 145, 148], [GM, 321, 321], [GM, 329, 330]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-issue">issue</span>(non-blocking)：位置一变就整套重建，CPU 复制两次，GPU 上每帧重新分配。</p>
+<h4>现象（实验台，1 000 个粒子）</h4>
+<ul>
+<li>每帧 48 条命令、19 次查询；什么都不变时 34 和 7。多出来的是 createBuffer、bufferData、deleteBuffer、建删 VAO，以及冷路径的 8 次 getError、4 次 getParameter。</li>
+<li>6 万个粒子：每帧 2.06 MiB（2 160 000 字节），构造时复制一份（<a data-src="src/rendering/resources/VertexAttribute.ts:100">VertexAttribute.ts:100</a>），上传前再复制一份（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:145">:145</a>），再 <code>bufferData(…, STATIC_DRAW)</code> 整块分配（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:330">:330</a>）。光构造这一步，这台机器上每帧约 2–3 ms。</li>
+</ul>
+<h4>为什么是 non-blocking</h4>
+<p>能用：画面对，没有泄漏。代价按数字算，每帧多十几条命令，2–3 ms 的复制占一帧预算（16.7 ms）的八分之一到六分之一。FLIP v1 的瓶颈在 CPU 求解器（PCG），渲染这点开销排不上号。</p>
+<h4>两个复制都是有意的</h4>
+<p>第一个保证调用者改原数组不会悄悄改掉 Geometry（第 10 课）；第二个是 <code>copyData()</code> 只给副本的契约。所以建议不是「去掉复制」，而是换一种表达「会变」的方式（⑥）。</p>`
+            },
+            {
+              mark: '④',
+              title: 'question：忘了释放就泄漏',
+              route: ['app', 'manager'],
+              lines: { real: [[GM, 73, 73], [GM, 113, 114]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-question">question</span>：每帧新建的写法下，忘了 <code>scene.release</code>，每帧泄漏一个 buffer 和一个 VAO。</p>
+<h4>现象（卡片 B）</h4>
+<p>跑 30 帧，活着的 buffer 30 个、VAO 30 个。表是 <code>Map&lt;Geometry, …&gt;</code>（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:73">:73</a>），对 Geometry 是强引用；就算应用再也不碰旧 Geometry，它也不会被垃圾回收，GPU 上的 buffer 更不会。</p>
+<h4>为什么是 question</h4>
+<p>这是第 5 课定下的所有权规则：释放 CPU 资源是所有者的事，Manager 只订阅释放事件。规则本身没错，HW2 里一个模型建一次、用到最后，忘不了。问题在于「每帧新建」把犯错的机会放大了 60 倍。想确认的是：以后真要支持每帧变的数据，是给应用一套不用每帧新建的接口（⑥），还是让 Manager 用 WeakMap 兜底？three.js 的 <code>properties</code> 就是 WeakMap（第 41 课），可它照样要求应用调 <code>dispose()</code> 才删 GPU 对象。</p>`
+            },
+            {
+              mark: '⑤',
+              title: 'issue (blocking)：释放路径变成每帧都走',
+              route: ['app', 'manager', 'input'],
+              lines: { real: [[GM, 225, 225], [MAN, 107, 128], [RES, 207, 215]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-issue">issue</span>(blocking)：Manual 顶点输入的 <code>unbind</code> 不先做 preflight，残留的错误标志会让释放半途而废。这就是找茬题 7。</p>
+<h4>现象（卡片 C）</h4>
+<p>上一帧留下一个没人查的错误标志（课程用 <code>gl.disable(0xDEAD)</code> 造，代表热路径按设计不查 getError 留下的标志），这一帧释放旧 Geometry：</p>
+<ul>
+<li>链路：<code>scene.release</code> → <code>finalizeDisposal</code> → GeometryManager.release → beforeDelete（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:225">:225</a>）→ <code>releaseGeometry</code> → <code>unbind</code> → <code>resetBindings</code> 之后 <code>checkError</code>（<a data-src="src/rendering/backend/webgl1/WebGL1ManualVertexInputManager.ts:117">Manual…:116–117</a>）读到 1280，抛「unbind manual vertex input failed」。错误算到了 unbind 头上，可 unbind 什么错也没犯。</li>
+<li>后果：Geometry 已经标成 disposed（<a data-src="src/rendering/core/Resource.ts:207">Resource.ts:207</a>），监听器循环中断（:209–211），监听器没清、CPU 数据没断开（:213、:215），Manager 的条目和 buffer 都还在。再调一次 <code>dispose()</code> 直接返回，什么也补不了。跑完活着的 buffer 是 2 个，旧的那个永远留着。</li>
+<li>OES 路径的 releaseGeometry 不查错，释放成功；残留的标志被下一次 <code>GeometryManager.get</code> 开头的 preflight 抓到，那一帧抛「preflight failed for Geometry」，归属是对的，下一帧恢复正常。</li>
+</ul>
+<h4>为什么现在才是 blocking</h4>
+<p>HW2 里释放只在换场景、退出时发生，碰上残留标志的机会很小。按 ③ 的写法每帧都释放，冷路径变成了热路径。这是这次审查最重要的一个结论：<strong>同一段代码，需求变了，严重程度跟着变</strong>。</p>
+<h4>建议</h4>
+<p>unbind 开头先 preflight，或者释放路径干脆不查 getError（释放失败也不影响正确性）。更根本的是 Resource 监听器抛错时的策略还没定（<a data-src="src/rendering/core/Resource.ts:57">Resource.ts:57</a> 的注释指向 TODOList）。</p>`
+            },
+            {
+              mark: '⑥',
+              title: 'suggestion：可更新的顶点属性',
+              route: ['cpu', 'manager', 'gl'],
+              lines: { real: [[GM, 113, 114], [GM, 330, 330]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-suggestion">suggestion</span>：给会变的顶点数据一种表达，表里按 revision 判断要不要上传，同尺寸用 <code>bufferSubData</code>。</p>
+<h4>方向</h4>
+<ul>
+<li>CPU 侧：一个可写的属性对象（或 Geometry 的一个变体），写入时 revision 加一，像 RenderTarget 的 revision（第 42 课的第二种变法）。</li>
+<li>Manager：查表命中以后再比 revision（现在命中就直接返回，<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:113">:113–114</a>）；不一样就 <code>bufferSubData</code>，buffer 用 <code>DYNAMIC_DRAW</code> 分配（现在固定 STATIC_DRAW，<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:330">:330</a>）。</li>
+<li>对照：课程用原生 GL 写的这种写法每帧 4 条命令、0 次查询（实验台）。three.js 也是这样做的（第 8 节）。</li>
+</ul>
+<h4>设计前要回答的四个问题（交接文档 §9）</h4>
+<ul>
+<li>生命周期：可写的数据谁拥有？写入时 GPU 可能还在读上一帧，要不要双缓冲？</li>
+<li>dirty range：只改了一段时，要不要只传那一段？</li>
+<li>版本：粒子数变了（重播种 reseeding）怎么办？three.js 直接抛错不支持改大小。</li>
+<li>恢复语义：设备丢失以后，要按最新的 revision 重传，而不是构造时的那一份。</li>
+</ul>`
+            }
+          ]
+        })
+
+        // ---------------- 需求二 ----------------
+        window.__board22.r2 = RTeach.stepView({
+          mount: document.getElementById('board-r2'),
+          route: [
+            { key: 'app', label: '应用：每帧新场' },
+            { key: 'cpu', label: 'DataTexture2D' },
+            { key: 'manager', label: 'Texture2DManager' },
+            { key: 'gl', label: 'gl.*' }
+          ],
+          versions: [{ key: 'real', label: '现码', segments: S.texture, dim: [[T2M, 184, 194]] }],
+          steps: [
+            {
+              mark: '①',
+              title: 'praise：几道关各查各的',
+              route: ['manager'],
+              lines: { real: [[TEX, 35, 35], [T2M, 174, 176], [T2M, 198, 207], [T2M, 213, 224]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-praise">praise</span>：浮点上传、浮点线性过滤、NPOT、sRGB 分开检查，不满足就明说，不偷偷降级。</p>
+<h4>好在哪</h4>
+<ul>
+<li>能上传浮点（OES_texture_float）不等于能线性过滤浮点（OES_texture_float_linear），这两件事最容易被混成一件。这里分两次查（<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:215">:215</a>、<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:216">:216–220</a>），注释也写明了（<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:174">:174–176</a>）。实验台藏起 linear 扩展，报错就点名这个扩展；改成 nearest 就能画。</li>
+<li>不自动把 linear 改成 nearest。对散度图来说，悄悄换过滤方式会让画面和数据对不上，还没有任何提示。</li>
+<li>NPOT 的三个条件一次说全（<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:198">:198–207</a>）。网格分辨率常常不是 2 的幂（比如 30 × 30），这条每个仿真项目都会碰到。</li>
+<li>色彩空间有 <code>'data'</code>（<a data-src="src/rendering/resources/Texture.ts:35">Texture.ts:35</a>），说明它不是颜色，不做 sRGB 转换。</li>
+</ul>`
+            },
+            {
+              mark: '②',
+              title: 'issue (non-blocking)：r 格式到第一次 draw 才被拒',
+              route: ['cpu', 'manager'],
+              lines: { real: [[TEX, 24, 24], [T2M, 210, 212]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-issue">issue</span>(non-blocking)：CPU 层收下 <code>'r'</code>，WebGL1 后端到第一次 draw 才拒绝。</p>
+<h4>现象（卡片 D）</h4>
+<p><code>TextureFormat</code> 列了 r、rg、rgb、rgba（<a data-src="src/rendering/resources/Texture.ts:24">Texture.ts:24</a>），DataTexture2D 构造成功；第一次 draw 时 validateStorage 抛 <code>UnsupportedRenderFeatureError</code>：r/rg channel mapping is not implemented（<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:210">:210–212</a>）。</p>
+<h4>为什么要提</h4>
+<p>仿真跑了几分钟、第一次切到某个可视化模式才报错，代价比启动时报大。同样的事 RenderTarget 是另一种做法：只列已经实现的格式（找茬题 13 ⑤，两边取舍原则不一致）。</p>
+<h4>建议</h4>
+<p>二选一，并写进注释：要么 CPU 层也只列后端都实现了的格式；要么后端提供一个「这个描述在本设备上能不能做」的查询，应用在启动时先问一遍。浮点能力、NPOT、sRGB 这些关卡都适用。</p>`
+            },
+            {
+              mark: '③',
+              title: 'suggestion (if-minor)：r 可以映射到 LUMINANCE',
+              route: ['manager', 'gl'],
+              lines: { real: [[T2M, 174, 174], [T2M, 233, 233]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-suggestion">suggestion</span>(if-minor)：色彩空间是 <code>'data'</code> 时，r 可以用 LUMINANCE 存。</p>
+<h4>依据</h4>
+<p>OES_texture_float 的格式表里有 LUMINANCE + FLOAT，每个像素 4 字节；我在 SwiftShader 上实测上传成功。采样 LUMINANCE 得到 (L, L, L, 1)，着色器读 <code>.r</code> 就是那个值。</p>
+<h4>为什么只是 if-minor</h4>
+<p>注释说 r/rg「不冒充 LUMINANCE 系列」（<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:174">:174</a>），理由站得住：LUMINANCE 的 g、b 不是 0，a 是 1，着色器读 <code>.g</code> 会读到同一个值。用数字算代价：32 × 32 的切片，rgba float 16 KiB，r float 4 KiB，差 12 KiB。对 FLIP v1 是零头。到 512 × 512 才差 3 MiB，那时再说也不迟。WebGL2 有真正的 R32F，迁到 WebGL2 或 WebGPU 时这条自然消失。</p>`
+            },
+            {
+              mark: '④',
+              title: 'issue (non-blocking)：静态纹理每帧换',
+              route: ['app', 'cpu', 'manager', 'gl'],
+              lines: { real: [[T2D, 18, 20], [SNAP, 129, 129], [T2D, 148, 148], [T2M, 53, 53], [T2M, 103, 103], [T2M, 125, 135]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-issue">issue</span>(non-blocking)：场每帧都变，只能每帧新建 DataTexture2D：复制三次，GPU 上整张重新分配。</p>
+<h4>现象（实验台「每帧换新纹理」）</h4>
+<ul>
+<li>每帧 53 条命令、18 次查询，纹理不变时 35 和 7。多出来的：createTexture、texImage2D、4 次 texParameteri、8 次 pixelStorei、deleteTexture，以及 4 次 getError、7 次 getParameter。</li>
+<li>复制：构造时一份（<a data-src="src/rendering/resources/texturePixelSnapshot.ts:129">texturePixelSnapshot.ts:129</a>），上传前 <code>copySource()</code> 再一份（<a data-src="src/rendering/resources/Texture2D.ts:148">Texture2D.ts:148</a>，由 <a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:53">Manager :53</a> 调用），然后 <code>texImage2D</code> 整张分配、上传（<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:125">:125–135</a>）。</li>
+</ul>
+<h4>为什么 non-blocking</h4>
+<p>32 × 32 的 rgba float 只有 16 KiB，三次复制加起来不到 50 KiB。注释也写明了这一版是静态的，动态上传要单独设计（<a data-src="src/rendering/resources/Texture2D.ts:18">Texture2D.ts:18–20</a>）。</p>
+<h4>建议</h4>
+<p>和 R1-⑥ 一起设计：revision + 同尺寸时 <code>texSubImage2D</code>（只改内容、不重新分配）。MDN 的 WebGL 最佳实践对 WebGL2 的建议也是「texStorage 分配一次 + texSubImage 改内容」。</p>`
+            },
+            {
+              mark: '⑤',
+              title: 'nitpick：NPOT 用 log2 判断',
+              route: ['manager'],
+              lines: { real: [[T2M, 198, 198]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-nitpick">nitpick</span>：<code>Number.isInteger(Math.log2(width))</code> 判断 2 的幂，这个范围里结果是对的；位运算 <code>(n &amp; (n - 1)) === 0</code> 更直接。</p>
+<h4>为什么只是 nitpick</h4>
+<p>担心的是浮点误差：一个不是 2 的幂的数，log2 会不会恰好舍入成整数？在 MAX_TEXTURE_SIZE 以内不会。比如 2¹⁴ + 1，它的 log2 和 14 差约 8.8 × 10⁻⁵，比 double 在 14 附近的间距（约 1.8 × 10⁻¹⁵）大得多。规范没保证 <code>Math.log2</code> 对 2 的幂返回精确整数，可主流实现都是精确的。位运算不依赖这两个前提（找茬题 5）。</p>`
+            }
+          ]
+        })
+
+        // ---------------- 需求三 ----------------
+        window.__board22.r3 = RTeach.stepView({
+          mount: document.getElementById('board-r3'),
+          route: [
+            { key: 'browser', label: '浏览器：lost / restored' },
+            { key: 'backend', label: 'Backend：换一代' },
+            { key: 'renderer', label: 'Renderer' },
+            { key: 'pass', label: 'Pass（生产者）' },
+            { key: 'rt', label: 'RenderTarget 内容' }
+          ],
+          versions: [{ key: 'real', label: '现码', segments: S.longrun, dim: [] }],
+          steps: [
+            {
+              mark: '①',
+              title: 'praise：CPU 原件在恢复后自动重传',
+              route: ['browser', 'backend'],
+              lines: { real: [[BE, 79, 95], [REN, 51, 51]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-praise">praise</span>：丢失时只作废这一代，恢复时换一个空的新一代，CPU 原件在第一次用到时自动重传。应用不用写一行恢复代码。</p>
+<h4>现象（卡片 E）</h4>
+<p>丢失期间 <code>ready</code> 是 false，Renderer 整帧返回（<a data-src="src/rendering/Renderer.ts:51">Renderer.ts:51</a>），0 条命令。恢复后第 1 帧 153 条命令，新建 buffer 2 个、program 2 个、纹理 2 张、framebuffer 2 个；第 2 帧回到 57 条。三角形的顶点是 CPU 原件，照原样重传了。</p>
+<h4>对 FLIP v1 的意义</h4>
+<p>CPU 上算的粒子、切片全是 CPU 原件，设备丢了照样接着画，什么都不用做。</p>`
+            },
+            {
+              mark: '②',
+              title: 'praise：rgba32f 的三道关',
+              route: ['backend', 'rt'],
+              lines: { real: [[RTM, 247, 271]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-praise">praise</span>：rgba32f 的 RenderTarget 分三道关：能建浮点纹理、能往浮点颜色附件里画、能线性过滤浮点。</p>
+<h4>好在哪</h4>
+<p>MDN 的 WebGL 最佳实践专门有一节「Don't assume you can render into float textures」：很多系统能建 RGBA32F 纹理，挂到 framebuffer 上却得到 FRAMEBUFFER_INCOMPLETE_ATTACHMENT，WebGL1 要查 WEBGL_color_buffer_float。这里正是这样查的（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:247">:247–271</a>），而且只查浮点槽位自己的 sampler。</p>
+<p>卡片 E 里同一个累加 Pass 换成 rgba8，值停在 1.0：8 位通道最大就是 1。GPU 上算的状态必须用浮点目标。</p>`
+            },
+            {
+              mark: '③',
+              title: 'issue (blocking)：生产者拿不到换代信号',
+              route: ['backend', 'renderer', 'pass', 'rt'],
+              lines: { real: [[BE, 289, 290], [RTM, 324, 324], [CTX, 10, 15]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-issue">issue</span>(blocking，对 GPU 上积累的状态)：设计说「附件内容必须由生产者重画」，可生产者不知道什么时候该重画。</p>
+<h4>现象（卡片 E）</h4>
+<p>累加 Pass 跑到 10，设备丢失、恢复，接下来读到 1、2、3。新的一代里 RenderTarget 是新分配的纹理，<code>texImage2D(…, null)</code> 按 WebGL 规范填的是 0（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:324">:324</a>）。Pass 不知道，照常读「上一帧」加 1。没有错误，没有警告，画面看起来也正常，只是状态悄悄从头开始了。</p>
+<h4>为什么生产者不知道</h4>
+<p>Backend 的注释写明恢复后附件内容要由生产者重画（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:289">:289–290</a>）。可 Pass 每帧拿到的 context 只有 frame、view、renderList、backend 四个字段（<a data-src="src/rendering/passes/RenderPassContext.ts:10">RenderPassContext.ts:10–15</a>），backend 能问的只有 <code>ready</code>。恢复以后 ready 又是 true，和丢失前看不出区别。</p>
+<p>像阴影图这样每帧整张重画的生产者不受影响，出问题的只有「读上一帧」的生产者。</p>
+<h4>建议</h4>
+<p>把「这是第几代」交给 Pass：RenderPassContext 加一个 generation 编号，或者 RenderTarget 级别的「内容已丢失」标志。Pass 看到代号变了，就重新播种（从 CPU 的初始条件或最近一次回读的检查点）。第 8 节说了现在的权宜之计和它的代价。</p>`
+            },
+            {
+              mark: '④',
+              title: 'issue：没有回读接口',
+              route: ['backend', 'rt'],
+              lines: { real: [[RB, 18, 44]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-issue">issue</span>：<code>RenderBackend</code> 只有 ready、resizeDrawingBuffer、withRenderSurface、draw、dispose，没有任何办法把 RenderTarget 的内容读回 CPU。</p>
+<h4>现象</h4>
+<p>卡片 E 读累加值，课程只能绕过引擎：读 Backend 的私有字段拿到 framebuffer，再调原生 <code>readPixels</code>，读完还得手动让 State 缓存作废（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/review-course.ts:1">review-course.ts</a> 的 readTarget）。</p>
+<h4>为什么要</h4>
+<ul>
+<li>验收：GPU 版要和 CPU 基准逐格比（max|div| &lt; 1e-5 这类数字），得先读得回来。</li>
+<li>检查点（checkpoint）：配合 ③，设备丢失后从最近一次回读恢复，而不是从头开始。</li>
+</ul>
+<h4>建议</h4>
+<p>Backend 加一个读颜色附件的方法，在 scope 外调用，返回 Float32Array。设计时要回答：要不要检查 IMPLEMENTATION_COLOR_READ_FORMAT / TYPE（SwiftShader 对浮点目标报 RGBA + FLOAT）；readPixels 会让 CPU 等 GPU 做完（MDN 最佳实践建议用异步回读，WebGL1 没有 PBO 和 fence，只能同步读）。</p>`
+            },
+            {
+              mark: '⑤',
+              title: 'question：恢复失败没人通知',
+              route: ['browser', 'backend'],
+              lines: { real: [[BE, 103, 105]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-question">question</span>：<code>onRestoreFailed</code> 是空函数（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:103">:103–105</a>），应用怎么知道恢复失败了？</p>
+<p>现在只能轮询 <code>backend.lastFailure</code>。仿真跑了半小时，设备丢了、恢复又失败，画面停在最后一帧，应用不会主动知道。第 13 课公开讨论过（找茬题 4 的附带两条之一），放在跑很久的需求下，严重程度上升了一级。</p>`
+            },
+            {
+              mark: '⑥',
+              title: 'question：失效通知靠契约',
+              route: ['backend'],
+              lines: { real: [[RM, 171, 179]] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-question">question</span>：ResourceManager 先把 lost 设成 true，再逐个通知子 Manager（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:171">:171–179</a>）。中间某一个抛错，后面的收不到通知，第二次调用又因为 lost 早退。</p>
+<p>现在靠「子方法不发 GL、hooks 不许抛错」的契约（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:168">:168</a>）成立，没有代码兜底。第 18 课讲过（找茬题 28）。标成 question：契约要不要用测试钉住，还是改成「每个都通知、最后再抛第一个错误」？</p>`
+            },
+            {
+              mark: '⑦',
+              title: 'issue (non-blocking)：生命周期测试的空格',
+              route: ['browser', 'backend'],
+              lines: { real: [] },
+              html: `
+<p class="rv-head"><span class="rv-label rv-issue">issue</span>(non-blocking)：<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:1">WebGLContextLifecycle.test.ts</a> 没有覆盖这几格：restore-failed 之后再收到 restored 并恢复成功（唯一能走出 restore-failed 的路）；restore-failed 时收到 lost；dispose 保留最后一次 lastFailure。</p>
+<p>这一条在面板左边没有对应的行：缺的是测试，不是代码。第 28 课第 7.1 节讲过（找茬题 31）。跑很久的需求下，这几条路都会真的走到。</p>`
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <script>
+      ;(function () {
+        const C = window.RTeachReview && window.RTeachReview.course
+        if (!C) {
+          for (const id of ['cards-r1', 'cards-r2', 'cards-r3', 'lab-r1', 'lab-r2']) {
+            document.getElementById(id).textContent = '没有加载到 assets/review-bundle.js，实验跑不了。'
+          }
+          return
+        }
+        const NOTE =
+          '课程写的：FakeParticles、场、累加 Pass、记账、回读，以及把扩展藏起来模拟别的设备（assets/build/review-course.ts）。Renderer、WebGL1Backend、Scene、Geometry、DataTexture2D、RenderTarget 是真实代码。'
+        const err = (e) => (e ? e.name + '：' + e.message : '没有错误')
+        const kb = (bytes) => bytes.toLocaleString('en-US').replace(/,/g, ' ') + ' 字节（' + (bytes >= 1048576 ? (bytes / 1048576).toFixed(2) + ' MiB' : (bytes / 1024).toFixed(1) + ' KiB') + '）'
+        const n = (x) => (Number.isInteger(x) ? String(x) : x.toFixed(1))
+        const pick = (byName, names) =>
+          names
+            .filter((name) => byName[name])
+            .map((name) => name.replace('vertex_array_object.', 'VAO.') + ' ' + n(byName[name]))
+            .join('、')
+        const showPicture = (id, canvas, caption) => {
+          const box = document.getElementById(id)
+          box.replaceChildren()
+          if (!canvas) return
+          box.append(canvas)
+          const text = document.createElement('figcaption')
+          text.textContent = caption
+          box.append(text)
+        }
+
+        // ---------------- 需求一：卡片 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('cards-r1'),
+          storageKey: 'lesson22-r1',
+          cards: [
+            {
+              title: 'A · 想画成点',
+              tags: ['R1-①'],
+              desc: '照 three.js 的习惯，构造 Geometry 时写 topology: \'points\'。TypeScript 本来就不让写；这里用 as never 绕过类型，模拟从 JSON 配置读进来的字符串。',
+              note: NOTE,
+              question: '构造 Geometry 时会怎样？',
+              choices: [
+                '构造时就抛错：拓扑检查的 default 分支拒绝它',
+                '构造成功，第一次 draw 时才在 Manager 里报错',
+                '构造成功，Backend 自动改成三角形去画'
+              ],
+              answer: 0,
+              explain:
+                'Geometry 构造时用真正要画的数量检查拓扑，switch 的 default 分支调 assertNever，抛 ExhaustiveMatchError（<a data-src="src/rendering/resources/Geometry.ts:112">Geometry.ts:112–113</a>）。检查放在构造时，错误离写错的地方最近。要支持 points，按 TODO（<a data-src="src/rendering/resources/Geometry.ts:16">:16–18</a>）四处一起改，见面板 ①。',
+              run() {
+                const r = C.tryPointsTopology()
+                return {
+                  lines: [
+                    { t: '构造', text: r.created ? '成功' : '失败', kind: r.created ? 'result' : 'late' },
+                    { t: '错误', text: err(r.error), kind: 'late' }
+                  ]
+                }
+              }
+            },
+            {
+              title: 'B · 每帧新建，忘了释放',
+              tags: ['R1-④'],
+              desc: '1 000 个粒子，每帧新建 Geometry 和 Mesh，把旧 Mesh 从场景拿掉，但旧 Geometry 既没 scene.retain 也没 dispose，就这么不管了。跑 30 帧。',
+              note: NOTE,
+              question: '跑完 30 帧，GPU 上活着几个顶点 buffer？',
+              choices: [
+                '30 个：Manager 的表一直引用着每个旧 Geometry',
+                '1 个：旧 Geometry 没人用了，被垃圾回收',
+                '0 个：Renderer 每帧结束时清空 Manager 的表'
+              ],
+              answer: 0,
+              explain:
+                'GeometryManager 的表是 <code>Map&lt;Geometry, …&gt;</code>（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:73">:73</a>），强引用：表里的旧 Geometry 永远不会被垃圾回收；GPU 上的 buffer 只在 Geometry 被 dispose 时删（订阅在 <a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:185">:185</a>）。每帧泄漏一个 buffer、一个 VAO。见面板 ④。',
+              run() {
+                const r = C.runParticles(1000, 'forget', 30)
+                return {
+                  lines: [
+                    { t: '每帧', text: n(r.perFrame.commands) + ' 条命令、' + n(r.perFrame.queries) + ' 次查询' },
+                    { t: '30 帧后', text: '活着的 buffer ' + r.liveBuffers + ' 个、VAO ' + r.liveVAOs + ' 个', kind: 'result' },
+                    { t: '对照', text: '每帧新建并释放旧的：活着的 buffer 1 个、VAO 1 个（实验台可以自己跑）', kind: 'muted' }
+                  ]
+                }
+              }
+            },
+            {
+              title: 'C · 冷路径变成热路径（找茬题 7）',
+              tags: ['R1-⑤', '找茬题 7'],
+              desc: '每帧新建并释放旧 Geometry 的写法，200 个粒子。画完第 1 帧以后，课程用 gl.disable(0xDEAD) 留下一个没人查的错误标志（INVALID_ENUM，1280），代表热路径按设计不查 getError 留下的标志。然后画第 2 帧：先释放第 1 帧的 Geometry，再画新的。设备假装没有 OES_vertex_array_object，Backend 走 Manual 顶点输入。',
+              note: NOTE,
+              question: '释放第 1 帧的 Geometry 时会怎样？',
+              choices: [
+                'unbind 把旧标志当成自己的错误抛出，旧 buffer 永远留下',
+                '释放成功；旧标志在画新 Geometry 前的 preflight 被抓到',
+                '释放成功；旧标志一直留着，没有任何地方报出来'
+              ],
+              answer: 0,
+              explain:
+                'Manual 的 releaseGeometry 发现当前正借用这个 Geometry，调 unbind；unbind 先 resetBindings 再 checkError（<a data-src="src/rendering/backend/webgl1/WebGL1ManualVertexInputManager.ts:116">:116–117</a>），前面没有 preflight，读到的 1280 被算成「unbind manual vertex input failed」。异常穿出 Resource 的监听器循环：Geometry 已经是 disposed，监听器没清、CPU 数据没断开，Manager 的条目和 buffer 都留着，再 dispose 一次直接返回。OES 路径的释放不查错，释放成功，旧标志被下一次 GeometryManager.get 的 preflight 抓到（另一个选项说的就是它），那一帧失败、归属正确。见面板 ⑤。',
+              run() {
+                const m = C.staleFlagThenRelease(true)
+                const o = C.staleFlagThenRelease(false)
+                const yes = (b) => (b ? '是' : '否')
+                return {
+                  lines: [
+                    { t: 'Manual', text: '释放：' + err(m.releaseError), kind: 'late' },
+                    { t: 'Manual', text: 'disposed ' + yes(m.disposed) + '；Manager 条目还在 ' + yes(m.entryKept) + '；buffer 还活着 ' + yes(m.bufferAlive) + '；监听器剩 ' + m.listenersLeft + ' 个；CPU 属性剩 ' + m.cpuAttributesLeft + ' 个' },
+                    { t: 'Manual', text: '再 dispose 一次：' + (m.retryThrew ? '抛错' : '直接返回') + '；条目还在 ' + yes(m.entryKeptAfterRetry), kind: 'result' },
+                    { t: 'Manual', text: '下一帧：' + err(m.nextFrameError) + '；跑完活着的 buffer ' + m.liveBuffers + ' 个' },
+                    { t: 'OES', text: '释放：' + err(o.releaseError) + '；条目还在 ' + yes(o.entryKept) },
+                    { t: 'OES', text: '同一帧画新的：' + err(o.renderError), kind: 'late' },
+                    { t: 'OES', text: '下一帧：' + err(o.nextFrameError) + '；跑完活着的 buffer ' + o.liveBuffers + ' 个' }
+                  ]
+                }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 需求一：实验台 ----------------
+        RTeach.traceLab.playground({
+          mount: document.getElementById('lab-r1'),
+          title: '实验台 1 · 每帧换位置的代价',
+          selects: [
+            {
+              id: 'mode',
+              options: [
+                ['rebuild', '每帧新建 Geometry，释放旧的'],
+                ['forget', '每帧新建，忘了释放'],
+                ['static', '什么都不变（对照）'],
+                ['raw-triangles', '课程写的原生 GL：bufferSubData，三角形'],
+                ['raw-points', '课程写的原生 GL：bufferSubData，画成点']
+              ]
+            },
+            { id: 'count', options: [['1000', '1 000 个粒子'], ['60000', '60 000 个粒子']] },
+            { id: 'vao', options: [['yes', '有 VAO 扩展'], ['no', '没有 VAO 扩展（Manual）']] }
+          ],
+          describe(v) {
+            if (v.mode.startsWith('raw')) return '不经过引擎：一个 buffer 用 DYNAMIC_DRAW 分配一次，之后每帧 bindBuffer + bufferSubData + clear + drawArrays。VAO 选项对它不起作用。'
+            if (v.mode === 'static') return '只在第 1 帧建 Geometry，之后不换（粒子不动）。看引擎每帧的底数。'
+            return '真实的 Renderer、WebGL1Backend；每帧 scene.remove、scene.release、new Geometry、new Mesh、scene.add。'
+          },
+          run(v) {
+            const count = Number(v.count)
+            const frames = count > 1000 ? 10 : 30
+            const r = v.mode.startsWith('raw')
+              ? C.runRawDynamic(count, v.mode === 'raw-points' ? 'points' : 'triangles', frames)
+              : C.runParticles(count, v.mode, frames, v.vao === 'no' ? ['OES_vertex_array_object'] : [])
+            showPicture('lab-r1-pic', r.picture, '最后一帧（' + count + ' 个粒子）')
+            const b = r.perFrame.byName
+            return {
+              lines: [
+                { t: '每帧', text: n(r.perFrame.commands) + ' 条命令、' + n(r.perFrame.queries) + ' 次查询（getError ' + n(b.getError || 0) + '、getParameter ' + n(b.getParameter || 0) + '）', kind: 'result' },
+                { t: '新建删除', text: pick(b, ['createBuffer', 'bufferData', 'bufferSubData', 'deleteBuffer', 'vertex_array_object.createVertexArrayOES', 'vertex_array_object.deleteVertexArrayOES']) || '没有' },
+                { t: '跑完', text: frames + ' 帧后活着的 buffer ' + r.liveBuffers + ' 个、VAO ' + r.liveVAOs + ' 个' },
+                { t: '数据', text: '每帧顶点数据 ' + kb(r.bytesPerFrame) + '；CPU 上整份复制 ' + r.cpuCopies + ' 次' },
+                { t: '时间', text: '整帧中位数 ' + r.frameMsMedian.toFixed(1) + ' ms' + (r.buildMsMedian ? '，其中构造 Geometry ' + r.buildMsMedian.toFixed(1) + ' ms' : '') + '（只在你这台机器上有参考意义）', kind: 'muted' },
+                { t: '错误', text: err(r.error), kind: r.error ? 'late' : 'muted' }
+              ]
+            }
+          }
+        })
+
+        // ---------------- 需求二：实验台 ----------------
+        RTeach.traceLab.playground({
+          mount: document.getElementById('lab-r2'),
+          title: '实验台 2 · 纹理关卡',
+          selects: [
+            { id: 'mode', options: [['once', '画一次'], ['rebuild', '每帧换新纹理（32 × 32、rgba float、20 帧）']] },
+            { id: 'size', options: [['30', '30 × 30（不是 2 的幂）'], ['32', '32 × 32']] },
+            { id: 'format', options: [['rgba', 'rgba'], ['r', 'r']] },
+            { id: 'type', options: [['float32', 'float32'], ['uint8', 'uint8']] },
+            { id: 'filter', options: [['linear', 'linear'], ['nearest', 'nearest']] },
+            { id: 'wrap', options: [['clamp-to-edge', 'clamp-to-edge'], ['repeat', 'repeat']] },
+            { id: 'device', options: [['full', '设备完整'], ['nolinear', '藏起 OES_texture_float_linear']] }
+          ],
+          describe(v) {
+            if (v.mode === 'rebuild') return '每帧新建 DataTexture2D，用 material.setParameter 换上，scene.release 旧的。其余选项不起作用。'
+            return '场的幅度 1e-5；着色器把它乘 1e5 再上色：红正、蓝负、白 0。uint8 时按「值 × 255 取整」存。'
+          },
+          run(v) {
+            if (v.mode === 'rebuild') {
+              const r = C.runFieldRebuild(32, 20)
+              showPicture('lab-r2-pic', null, '')
+              const b = r.perFrame.byName
+              return {
+                lines: [
+                  { t: '每帧', text: n(r.perFrame.commands) + ' 条命令、' + n(r.perFrame.queries) + ' 次查询', kind: 'result' },
+                  { t: '纹理', text: pick(b, ['createTexture', 'texImage2D', 'texParameteri', 'pixelStorei', 'deleteTexture']) },
+                  { t: '查询', text: pick(b, ['getError', 'getParameter']) },
+                  { t: '跑完', text: '活着的纹理 ' + r.liveTextures + ' 张；每帧上传 ' + kb(r.bytesPerFrame) },
+                  { t: '错误', text: err(r.error), kind: r.error ? 'late' : 'muted' }
+                ]
+              }
+            }
+            const r = C.drawField({
+              size: Number(v.size),
+              format: v.format,
+              type: v.type,
+              filter: v.filter,
+              wrap: v.wrap,
+              hideFloatLinear: v.device === 'nolinear',
+              amplitude: 1e-5
+            })
+            showPicture('lab-r2-pic', r.picture, '160 × 160 的画布')
+            const lines = [
+              { t: '构造', text: r.constructed ? 'DataTexture2D 构造成功' : '构造失败：' + err(r.constructError), kind: r.constructed ? '' : 'late' },
+              { t: '数据', text: kb(r.bytes) }
+            ]
+            if (r.constructed) {
+              lines.push({ t: '第一帧', text: r.renderError ? err(r.renderError) : '画出来了（' + r.firstFrame.commands + ' 条命令、' + r.firstFrame.queries + ' 次查询）', kind: r.renderError ? 'late' : 'result' })
+            }
+            if (r.secondFrame) {
+              lines.push({ t: '第二帧', text: r.secondFrame.commands + ' 条命令、' + r.secondFrame.queries + ' 次查询（纹理已在表里）' })
+              lines.push({ t: '像素', text: '左下 ' + r.pixels[0].slice(0, 3).join(', ') + '；右下 ' + r.pixels[1].slice(0, 3).join(', ') + '；中心 ' + r.pixels[2].slice(0, 3).join(', ') })
+            }
+            return { lines }
+          }
+        })
+
+        // ---------------- 需求二：卡片 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('cards-r2'),
+          storageKey: 'lesson22-r2',
+          cards: [
+            {
+              title: 'D · 单通道的浮点场',
+              tags: ['R2-②'],
+              desc: '散度只有一个数，用 format: \'r\'、type: \'float32\'、colorSpace: \'data\' 建一张 32 × 32 的 DataTexture2D，nearest 过滤，交给材质，画一帧。',
+              note: NOTE,
+              question: '在哪一步、出什么结果？',
+              choices: [
+                '构造成功，第一次 draw 时后端拒绝 r 格式',
+                '构造时就被拒绝：Texture 层不认识 r 格式',
+                '能画出来：后端自动改用 LUMINANCE 存放'
+              ],
+              answer: 0,
+              explain:
+                'CPU 层的 TextureFormat 列了 r（<a data-src="src/rendering/resources/Texture.ts:24">Texture.ts:24</a>），构造只检查数组长度对不对；WebGL1 后端的 validateStorage 在第一次 draw 时才拒绝（<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:210">:210–212</a>），注释说不冒充 LUMINANCE（<a data-src="src/rendering/backend/webgl1/WebGL1Texture2DManager.ts:174">:174</a>）。改成 rgba 就能画，多 12 KiB。见面板 ②③。',
+              run() {
+                const base = { size: 32, type: 'float32', filter: 'nearest', wrap: 'clamp-to-edge', hideFloatLinear: false, amplitude: 1e-5 }
+                const r = C.drawField(Object.assign({ format: 'r' }, base))
+                const g = C.drawField(Object.assign({ format: 'rgba' }, base))
+                return {
+                  lines: [
+                    { t: 'r', text: '构造：' + (r.constructed ? '成功' : err(r.constructError)) + '；数据 ' + kb(r.bytes) },
+                    { t: 'r', text: '第一帧：' + err(r.renderError), kind: 'late' },
+                    { t: 'rgba', text: '构造：' + (g.constructed ? '成功' : err(g.constructError)) + '；数据 ' + kb(g.bytes) },
+                    { t: 'rgba', text: '第一帧：' + (g.renderError ? err(g.renderError) : '画出来了'), kind: 'result' }
+                  ]
+                }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 需求三：卡片 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('cards-r3'),
+          storageKey: 'lesson22-r3',
+          cards: [
+            {
+              title: 'E · 状态在 GPU 上，设备丢了',
+              tags: ['R3-①②③④'],
+              desc: '两张 4 × 4 的 rgba32f RenderTarget 轮流读写（ping-pong），每帧把上一帧的值加 1；场景里另有一个普通三角形（CPU 原件）。跑 10 帧，用 WEBGL_lose_context 让设备丢失，等丢失事件派发后画一帧，再 restoreContext，等 Backend 换好新的一代，画 3 帧。每帧之后读一次累加值。',
+              note: NOTE + ' 读累加值要绕过引擎（引擎没有回读接口，见面板 ④）。',
+              question: '恢复以后的 3 帧，读到的累加值是多少？',
+              choices: [
+                '1、2、3：新目标从 0 开始，Pass 不知道换了一代',
+                '11、12、13：浏览器把纹理内容保留了下来',
+                '抛错：Backend 发现目标内容丢失，拒绝再画'
+              ],
+              answer: 0,
+              explain:
+                '新的一代里 RenderTarget 重新分配，<code>texImage2D(…, null)</code> 按 WebGL 规范填 0（<a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:324">:324</a>）。Pass 拿到的 context 和丢失前一样（frame、view、renderList、backend），照常读上一帧再加 1，没有任何错误。三角形是 CPU 原件，自动重传了（新建 buffer）。同一个 Pass 换成 rgba8，值停在 1：8 位通道装不下更大的数。见面板 ①②③④。',
+              async run() {
+                const f = await C.loseWhileAccumulating('rgba32f', 10, 3)
+                const u = await C.loseWhileAccumulating('rgba8', 3, 1)
+                if (f.setupError) return { lines: [{ text: '实验没跑起来：' + err(f.setupError), kind: 'late' }] }
+                const made = (s) => Object.entries(s.created).map(([k, x]) => k.replace('create', '') + ' ' + x).join('、')
+                const lines = f.steps.map((s) => ({
+                  t: s.label.replace('第 ', '').replace(' 帧', ''),
+                  text: (s.value === null ? 'ready = ' + s.ready + '，没画' : '累加值 ' + s.value) + '；' + s.commands + ' 条命令' + (made(s) ? '；新建 ' + made(s) : '') + (s.error ? '；' + err(s.error) : ''),
+                  kind: s.label.startsWith('恢复') ? 'result' : s.value === null ? 'late' : ''
+                }))
+                lines.push({ t: 'context', text: 'Pass 每帧拿到的字段：' + f.contextKeys.join('、'), kind: 'muted' })
+                lines.push({ t: 'rgba8', text: '同一个 Pass 用 rgba8：' + u.steps.filter((s) => s.value !== null).map((s) => s.value).join('、'), kind: 'muted' })
+                return { lines }
+              }
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0022"]'), [
+        {
+          q: '「Geometry 不能改，粒子每帧要整个重建」，审查时该归哪一类？',
+          opts: [
+            '有意划定的范围；对新需求来说是要设计的缺口',
+            '缺陷：应该当作 bug，直接把 Geometry 改成可变',
+            '取舍：两种写法都行，审查意见里不必提到它'
+          ],
+          answer: 0,
+          why: '第 1 节、面板一 ②：类注释和交接文档 §9 都写明了。'
+        },
+        {
+          q: '每帧新建 Geometry 却不释放旧的，30 帧后 GPU 上有几个顶点 buffer？',
+          opts: [
+            '30 个：Manager 的表强引用着每一个旧 Geometry',
+            '1 个：旧 Geometry 没人用了，会被垃圾回收掉',
+            '0 个：Renderer 每帧结束时会清空 Manager 的表'
+          ],
+          answer: 0,
+          why: '卡片 B、面板一 ④。'
+        },
+        {
+          q: '为什么「每帧换 Geometry」让找茬题 7 从罕见变成要紧？',
+          opts: [
+            '释放从偶尔走变成每帧走，碰上残留标志的机会多了',
+            'Manual 路径每次 draw 都会自己产生 INVALID_ENUM',
+            '每帧新建 buffer 会很快用完 32 次 getError 的预算'
+          ],
+          answer: 0,
+          why: '卡片 C、面板一 ⑤：需求变了，严重程度跟着变。'
+        },
+        {
+          q: '32 × 32 的散度切片用 rgba float 代替 r float，多占多少？对 FLIP v1 算哪一级？',
+          opts: [
+            '多 12 KiB；量很小，算 if-minor 的建议，不挡路',
+            '多 12 KiB；浪费三倍，算 blocking，必须先改掉',
+            '多 48 KiB；带宽吃紧，算 issue，要尽快改掉它'
+          ],
+          answer: 0,
+          why: '面板二 ③：16 384 − 4 096 = 12 288 字节。严重程度靠数字定。'
+        },
+        {
+          q: '设备丢失又恢复后，累加 Pass 读到的值从 10 变成 1，为什么没有报错？',
+          opts: [
+            '新目标是全 0 的新纹理，Pass 拿不到换了一代的信号',
+            'readPixels 读的是丢失前缓存在 CPU 上的那份旧值',
+            '浏览器保留了旧纹理，只是 Pass 读错了另一张目标'
+          ],
+          answer: 0,
+          why: '卡片 E、面板三 ③。'
+        },
+        {
+          q: '「浮点上传、浮点线性过滤分开检查，做得对」，用 Conventional Comments 的哪个标签？',
+          opts: [
+            'praise：指出真心觉得好的地方，每次审查至少一条',
+            'nitpick：只是个人偏好的小意见，天然不挡路',
+            'note：不挡路，只是提醒读者注意某件事'
+          ],
+          answer: 0,
+          why: '第 1 节、面板二 ①。'
+        }
+      ])
+    </script>
+  </body>
+</html>

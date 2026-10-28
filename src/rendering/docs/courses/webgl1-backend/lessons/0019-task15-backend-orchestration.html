@@ -1,0 +1,989 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 19 课 · Task 15 编排</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/gl-sandbox.js"></script>
+    <script src="../assets/predict.js"></script>
+    <script src="../assets/rendering-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 综合篇（提前到第 7 课之后）· 2026-09-27 重写 · 旧版，已由第 47 课取代</p>
+    <h1>Task 15：WebGL1Backend 怎样把零件串成一次 draw</h1>
+    <p class="lede">
+      这一课顺着 <code>WebGL1Backend.draw</code> 一行一行往下走。每一步都回答同样几个问题：它是谁的方法、在哪一层；为什么需要它；它检查什么；它改了哪些状态；它和哪段生命周期有关；它和前后的步骤是什么关系，能不能调换，调换了具体坏在哪里。
+    </p>
+    <aside class="note">
+      <strong>2026-09-27 重写说明：</strong>第一版只列出了流程和每个类的一句话职责，没有顺着流程讲下去。这一版把 draw 逐行展开，补了四张图、三张总表和两张新卡片（G、H）。重写时对照源码、在真实浏览器里重新核对，第一版有两处解释不准确，已经改正：一是「先解析资源、后设状态」并不是正确性上的硬约束（第 4 节）；二是 prepare 和 upload 分开，价值不在于「防止半套 uniform 被画出来」（第 3.6 节）。
+      <br /><strong>2026-09-28 更新：</strong>代码改了两处，本课跟着改。一是 <code>WebGL1Backend</code> 把 canvas 从构造参数属性改成了显式字段，逻辑没变，本课引用它的行号整体后移了一到两行；二是 ResourceManager 删掉了空 catch，10.2 的第 4 条因此改成「已经修好」。另外，新增的浏览器测试验证了图 3 最下面那条时间线（第 6 节）。
+      <br /><strong>2026-10-20：这一课已经重写成<a href="0047-how-draw-connects.html">第 47 课</a>，以后读第 47 课。</strong>这一页保留，因为别的课引用了它的小节。
+      <br /><strong>2026-10-19 说明：</strong>这一课等着重写，10 月 13 日那次全课同步跳过了它，正文和节选停在 9 月 30 日的代码。之后变了的主要有：二维纹理和 RenderTarget 附件已经能采样（10 月 12 日，第 27 课 4.2 节）；存活检查改调资源自己的 <code>assertUsable()</code>（10 月 10 日）；Material 多了 dither（10 月 14 日）和借用的参数块，uniform 的值多了块这一处来源（10 月 19 日，第 11 课第 5 节、第 45 课）。指向 Material.ts、WebGL1Uniforms.ts 的链接和正文里这两个文件的行号已经改到现在的代码；代码节选里的行号没改。
+    </aside>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 这一课讲的就是 Task 15 本身。读懂它，你才能审查它、修改它。Task 17 写 ForwardPass、Task 18 写 Renderer 时，要调用的正是这里的 <code>withRenderSurface</code> 和 <code>draw</code>。
+    </div>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">设计问题：四个问题、四个类</a></li>
+        <li><a href="#s2">一张图看全：draw 调用了谁</a></li>
+        <li><a href="#s3">逐行精读 draw</a>：<a href="#s3-1">①</a> <a href="#s3-2">②</a> <a href="#s3-3">③</a> <a href="#s3-4">④</a> <a href="#s3-5">⑤</a> <a href="#s3-6">⑥</a> <a href="#s3-7">⑦⑫⑭</a> <a href="#s3-8">⑧</a> <a href="#s3-9">⑨</a> <a href="#s3-10">⑩</a> <a href="#s3-11">⑪</a> <a href="#s3-12">⑬</a></li>
+        <li><a href="#s4">顺序：哪些能换，哪些不能</a></li>
+        <li><a href="#s5">状态与生命周期总表</a></li>
+        <li><a href="#s6">一代：丢失与恢复</a></li>
+        <li><a href="#s7">作用域的栈</a></li>
+        <li><a href="#s8">卡片：跑真实的项目代码</a></li>
+        <li><a href="#s9">检查题</a></li>
+        <li><a href="#s10">架构视角</a></li>
+        <li><a href="#s11">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2>0. 热身：前几课还记得吗</h2>
+    <div class="quiz" data-quiz="lesson-0019-warmup"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0019-warmup"]'), [
+        {
+          q: 'context 丢失再恢复之后，旧的 GPU 句柄会怎样？',
+          opts: ['全部作废：要新建一代 Manager，再从 CPU 资源重新上传', '自动变回可用：浏览器会帮忙重建', '只有 program 作废，buffer 还能继续用'],
+          answer: 0,
+          why: '第 4 课第 6 节：恢复之后 gl 对象还是同一个，旧句柄却全部失效。这一课第 6 节看 Backend 怎样把「一代」写成代码。'
+        },
+        {
+          q: '嵌套的输出作用域里，内层退出时，绑定恢复成什么？',
+          opts: ['内层进入之前的样子，也就是外层的目标', '一律恢复成画布', '保持内层的目标，等外层退出再处理'],
+          answer: 0,
+          why: '第 6 课第 3 节：每一层恢复到自己进入之前捕获的真实状态。这一课第 7 节画出了栈里的每一帧。'
+        },
+        {
+          q: 'ResourceManager 的 disposalOrder 为什么把 vertexInputs 排在第一个？',
+          opts: ['VAO 借用了 buffer 和 program，借用方要先松手', '它的对象最少，关得最快', '按文件名的字母顺序排的'],
+          answer: 0,
+          why: '上次答疑讲过的删除顺序：先删 buffer 再删 VAO，会留下僵尸 buffer，或者让下一次 draw 报错（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:108">WebGL1ResourceManager.ts:108–115</a>）。'
+        }
+      ])
+    </script>
+
+    <h2 id="s1">1. 设计问题：Backend 要回答四个问题</h2>
+    <p>上层（将来的 ForwardPass）只说一句话：「把这个物体，用这个视角，画到这里」。要把它变成 gl 调用，得回答四个问题，每个问题交给一个专门的类：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 16%">问题</th><th style="width: 25%">负责的类</th><th style="width: 32%">它做什么</th><th>拥有什么</th></tr>
+        <tr><td>画到哪里</td><td><a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:165">WebGL1SurfaceScope</a></td><td>绑定输出目标、入口清除、退出时恢复</td><td>只拥有一个作用域栈；目标是借来的</td></tr>
+        <tr><td>用什么画</td><td><a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:43">WebGL1ResourceManager</a> 和它组装的五个 Manager</td><td>把 CPU 资源变成这个 context 里的 GPU 对象</td><td>GPU 对象归各个 Manager</td></tr>
+        <tr><td>带什么参数</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:70">WebGL1Uniforms</a></td><td>验证并上传这一次 draw 的全部 uniform</td><td>只缓存反射（reflection）得到的元数据</td></tr>
+        <tr><td>设备出事了怎么办</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:42">WebGL1Backend</a></td><td>把上面几样和 State 打包成「一代」；丢失时整代作废，恢复时换上新的一代</td><td>context、生命周期、当前这一代</td></tr>
+      </table>
+    </div>
+    <p>Backend 的类注释把分工说得很清楚：「上层决定画什么、画到哪里、先后顺序；本类负责如何执行 gl.*」（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:38">WebGL1Backend.ts:38–40</a>）。所以 draw 里<strong>没有</strong>这些事：遍历场景；计算世界矩阵（worldMatrix 由上层算好，放在 item 里）；绑定输出目标（作用域的事）；清除（作用域入口的事）。</p>
+
+    <h2 id="s2">2. 一张图看全：draw 调用了谁</h2>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 380" role="img" aria-label="ForwardPass 调用 WebGL1Backend.draw；draw 按编号依次调用 SurfaceScope、ProgramManager、GeometryManager、WebGL1Uniforms、WebGL1State、VertexInputManager，最后发出 gl.draw">
+          <defs>
+            <marker id="g1-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+          </defs>
+          <text x="90" y="22" text-anchor="middle" class="small">第二层（Task 17）</text>
+          <text x="520" y="22" text-anchor="middle" class="small">第三层 backend：Backend 与它借用的对象</text>
+          <rect x="20" y="160" width="140" height="56" rx="6" class="box" />
+          <text x="90" y="184" text-anchor="middle" class="title">ForwardPass</text>
+          <text x="90" y="204" text-anchor="middle" class="small">决定画什么、先后</text>
+          <line x1="160" y1="188" x2="216" y2="188" class="line" marker-end="url(#g1-tip)" />
+          <text x="188" y="178" text-anchor="middle" class="small halo">draw()</text>
+          <rect x="218" y="130" width="160" height="116" rx="6" class="box hl" />
+          <text x="298" y="160" text-anchor="middle" class="title">WebGL1Backend</text>
+          <text x="298" y="180" text-anchor="middle" class="title">.draw</text>
+          <text x="298" y="204" text-anchor="middle" class="small">只负责按顺序</text>
+          <text x="298" y="222" text-anchor="middle" class="small">调用右边这些</text>
+          <rect x="440" y="36" width="300" height="32" rx="5" class="box" />
+          <text x="452" y="57" class="small">② assertDrawable</text>
+          <text x="728" y="57" text-anchor="end" class="small">SurfaceScope</text>
+          <rect x="440" y="76" width="300" height="32" rx="5" class="box" />
+          <text x="452" y="97" class="small">④ programs.get</text>
+          <text x="728" y="97" text-anchor="end" class="small">ProgramManager</text>
+          <rect x="440" y="116" width="300" height="32" rx="5" class="box" />
+          <text x="452" y="137" class="small">⑤ geometries.get</text>
+          <text x="728" y="137" text-anchor="end" class="small">GeometryManager</text>
+          <rect x="440" y="156" width="300" height="32" rx="5" class="box" />
+          <text x="452" y="177" class="small">⑥ prepare　⑩ upload</text>
+          <text x="728" y="177" text-anchor="end" class="small">WebGL1Uniforms</text>
+          <rect x="580" y="196" width="160" height="28" rx="5" class="box" />
+          <text x="660" y="215" text-anchor="middle" class="small">CubeTextureManager</text>
+          <line x1="590" y1="188" x2="610" y2="196" class="line" />
+          <text x="560" y="214" text-anchor="end" class="small halo">取 cubemap</text>
+          <rect x="440" y="234" width="300" height="32" rx="5" class="box" />
+          <text x="452" y="255" class="small">⑧ useProgram　⑨ 深度、剔除</text>
+          <text x="728" y="255" text-anchor="end" class="small">WebGL1State</text>
+          <rect x="440" y="274" width="300" height="32" rx="5" class="box" />
+          <text x="452" y="295" class="small">⑪ vertexInputs.bind</text>
+          <text x="728" y="295" text-anchor="end" class="small">VertexInputManager</text>
+          <rect x="440" y="324" width="300" height="32" rx="5" class="box hl" />
+          <text x="452" y="345" class="small">⑬ drawElements / drawArrays</text>
+          <text x="728" y="345" text-anchor="end" class="small">gl</text>
+          <line x1="378" y1="160" x2="438" y2="52" class="line" marker-end="url(#g1-tip)" />
+          <line x1="378" y1="170" x2="438" y2="92" class="line" marker-end="url(#g1-tip)" />
+          <line x1="378" y1="180" x2="438" y2="132" class="line" marker-end="url(#g1-tip)" />
+          <line x1="378" y1="190" x2="438" y2="172" class="line" marker-end="url(#g1-tip)" />
+          <line x1="378" y1="210" x2="438" y2="250" class="line" marker-end="url(#g1-tip)" />
+          <line x1="378" y1="222" x2="438" y2="290" class="line" marker-end="url(#g1-tip)" />
+          <line x1="378" y1="236" x2="438" y2="340" class="line" marker-end="url(#g1-tip)" />
+          <text x="298" y="290" text-anchor="middle" class="small">①③⑦⑫⑭ 是 Backend</text>
+          <text x="298" y="306" text-anchor="middle" class="small">自己的检查</text>
+        </svg>
+      </div>
+      <figcaption>图 1 · draw 调用了谁。编号就是第 3 节的步骤编号。Backend 自己只做检查（①③⑦⑫⑭），其余每一步都交给一个专门的对象。这些对象都属于「当前这一代」（第 6 节）：ProgramManager、GeometryManager、CubeTextureManager、VertexInputManager 由 ResourceManager 组装，State、Uniforms、SurfaceScope 由 Backend 直接创建（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:258">createGeneration</a>）。</figcaption>
+    </figure>
+
+    <h2 id="s3">3. 逐行精读 draw</h2>
+    <p>先看完整的方法（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:192">WebGL1Backend.ts:192–231</a>）。行尾的编号对应下面的小节：</p>
+    <pre><code>draw(submission: DrawSubmission): void {
+  const generation = this.requireGeneration('draw')                         // ① 这一代能用吗
+  generation.scope.assertDrawable()                                         // ② 在某个作用域里吗
+  if (!(submission?.item?.geometry instanceof Geometry) || …)              // ③ 输入的形状对吗
+    throw new InvalidMaterialError('submission', 'invalid draw submission')
+  const { geometry, material } = submission.item
+  const program = generation.resources.programs.get(material.shaderModule)  // ④ 取 program
+  const buffers = generation.resources.geometries.get(geometry)             // ⑤ 取 buffer
+  const commands = generation.uniforms.prepare(program, submission)         // ⑥ uniform 预检
+  this.assertCurrentDraw(generation)                                        // ⑦ 检查点
+  generation.state.useProgram(program.program)                              // ⑧ 选用 program
+  this.applyDrawState(material, generation.state)                           // ⑨ 渲染状态
+  generation.uniforms.upload(commands)                                      // ⑩ 上传 uniform
+  generation.resources.vertexInputs.bind(geometry, buffers, program)        // ⑪ 顶点输入
+  this.assertCurrentDraw(generation)                                        // ⑫ 检查点
+  if (buffers.indexBuffer === null) this.gl.drawArrays(…)                  // ⑬ 发出 draw
+  else this.gl.drawElements(…)
+  this.assertCurrentDraw(generation)                                        // ⑭ 检查点
+}</code></pre>
+    <p>
+      读下面每一节时，先看代码摘录（逐行注释；「节选」表示省略了一部分，中文伪代码行是我的概括），再看表。表的行固定为：<strong>作用</strong>、<strong>所在层</strong>、<strong>为什么需要它</strong>、<strong>校验</strong>、<strong>状态变化</strong>、<strong>生命周期</strong>、<strong>和谁有关</strong>、<strong>如果挪位置</strong>。有两个词会反复出现：<strong>冷路径（cold path）</strong>指第一次用到某个资源、要真正创建 GPU 对象的那条路；<strong>热路径（hot path）</strong>指缓存命中、直接返回的那条路。
+    </p>
+
+    <h3 id="s3-1">3.1 ① requireGeneration：这一代能用吗</h3>
+    <pre><code>private requireGeneration(operation: string): Generation {                  // WebGL1Backend.ts:319–336
+  if (this.disposedValue) throw new WebGLBackendDisposedError(operation)    // Backend 已关闭
+  if (this.gl.isContextLost()) {                                            // 物理丢失：可能早于 DOM 事件
+    this.invalidateGeneration()                                             //   立刻作废这一代（有副作用）
+    throw new WebGLContextLostError(operation)
+  }
+  if (this.lifecycle.state === 'restoring' || this.lifecycle.state === 'restore-failed') {
+    throw new WebGLOperationError(operation, 'WebGL1Backend', this.lifecycle.state)
+  }
+  if (!this.generation.valid || !this.lifecycle.isReady) {
+    throw new WebGLContextLostError(operation)                              // 这一代已作废
+  }
+  return this.generation                                                    // 交出这一次 draw 要用的一代
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>确认 Backend 现在能画，并交出「这一次 draw 用哪一代的对象」。</td></tr>
+      <tr><th>所在层</th><td>第三层 Backend 自己。会碰 GL 的三个公开方法，第一行都是它：draw、withRenderSurface（:180）、resizeDrawingBuffer（:140）。dispose 不经过它，因为关闭必须在任何状态下都能做。</td></tr>
+      <tr><th>为什么需要它</th><td>后面每一步用的 State、Manager、Uniforms、Scope 都属于某一代。context 一丢，这一代的所有句柄一起作废（第 4 课第 6 节），必须在碰它们之前拦住。</td></tr>
+      <tr><th>校验</th><td>四种情况、三类错误：已关闭 → <code>WebGLBackendDisposedError</code>（调用者用错了）；context 丢失、或这一代已作废 → <code>WebGLContextLostError</code>（设备暂时不可用）；正在恢复、恢复失败 → <code>WebGLOperationError</code>，附上生命周期状态。错误里的操作名就是参数 <code>'draw'</code>。</td></tr>
+      <tr><th>状态变化</th><td>正常时什么都不改。发现物理丢失时有副作用：<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:312">invalidateGeneration</a> 换一个新的 epoch、把这一代标成 <code>valid = false</code>、清空 State 缓存，并让每个 Manager 丢掉记录、撤销它们在 CPU 资源上的订阅（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:158">WebGL1ResourceManager.ts:158–166</a>）。这一路不发任何 GL 命令：句柄已经没用了。</td></tr>
+      <tr><th>生命周期</th><td>「一代」的入口检查（第 6 节）。返回的那个对象会在 ⑦⑫⑭ 被拿来比较身份。</td></tr>
+      <tr><th>和谁有关</th><td>后面每一步都用它返回的 generation：这是数据依赖（data dependency）。② 的 Scope 还会通过 assertReady 钩子再调它一次（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:275">:275–277</a>）。</td></tr>
+      <tr><th>如果挪位置</th><td>挪不动：它返回的一代是后面每一步的输入。它做的检查其实不止做一次：② 会再做一遍；ResourceManager 的 getter、每个 Manager、State、Uniforms 也各自检查 context。这叫逐层防御（defense in depth）：每个零件单独拿出来用（比如卡片里、测试里）也得安全，而且 context 可能在任意两次 GL 调用之间丢失。放在第一行的意义是：一进门就用 <code>'draw'</code> 这个操作名报错，并把这一次 draw 钉在同一代上。</td></tr>
+    </table></div>
+
+    <h3 id="s3-2">3.2 ② scope.assertDrawable：在某个作用域里吗</h3>
+    <pre><code>assertDrawable(): void {                                                  // WebGL1SurfaceScope.ts:254–260
+  this.assertAvailable()        // 生命周期：assertReady 钩子（即 Backend.requireGeneration）、
+                                //   isCurrent 钩子（我还属于当前代吗）、gl.isContextLost()
+  if (!this.active) invalid('draw', 'requires an active surface scope')    // 栈是空的：不在任何作用域里
+  this.assertUnchanged()        // 栈里每一层：画布尺寸没变、目标没被释放、revision 没变
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>确认现在处在某个作用域里，而且从进入作用域到现在，目标和画布都没被动过。</td></tr>
+      <tr><th>所在层</th><td>第三层 backend 的 WebGL1SurfaceScope，每一代一个。</td></tr>
+      <tr><th>为什么需要它</th><td>draw 自己从不绑定输出目标：「画到哪里」完全由外面的 withRenderSurface 决定（第 6 课第 3 节：用作用域，不用全局开关）。不在作用域里就 draw，只能画到上一个人留下的目标上。</td></tr>
+      <tr><th>校验</th><td>三层：生命周期（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:282">:282–288</a>）；栈不空（:257）；<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:291">assertUnchanged</a> 逐层比较进入时记下的画布尺寸、目标的 revision 和 disposed。它检查的是<strong>所有</strong>活动的祖先，不只是最内层。</td></tr>
+      <tr><th>状态变化</th><td>无，只读。</td></tr>
+      <tr><th>生命周期</th><td>RenderTarget 是借来的：在使用时检查它还活着、没有被 resize（第 5 课第 5 节「借用方不拥有，但在使用时检查」）。注释写得很老实：它只能<strong>发现</strong>违规的 resize 或 dispose，拦不住，也撤销不了（:252）。</td></tr>
+      <tr><th>和谁有关</th><td>Scope 不认识 Backend 这个类，只拿到三个函数（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:24">:24–28</a>）：assertReady、isCurrent、resolveTarget。所以它可以单独构造：第 8 节卡片的准备代码就是用三个假钩子造出来的，单元测试也一样。</td></tr>
+      <tr><th>如果挪位置</th><td>挪到后面，结果仍然正确，因为 ⑦ 还会再查一次。但失败得晚：可能先编译了 shader、上传了 buffer，才发现这次根本不该画；报出来的还可能是别的错误（比如 shader 编译失败），把真正的原因「不在作用域里」盖住。便宜的检查放在最前，失败又早又准。</td></tr>
+    </table></div>
+
+    <h3 id="s3-3">3.3 ③ 检查 submission 的形状</h3>
+    <p>
+      TypeScript 的类型在运行时就消失了，JavaScript 调用者可以传任何东西进来。这里只检查形状（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:196">:196–203</a>）：geometry 是 Geometry、material 是 Material、view 是一个对象。数值不在这里检查：矩阵的长度和有限性由 ⑥ 的 Uniforms 检查，只查 shader 真正用到的那几个。抛出的是 InvalidMaterialError，这个选择值得商量（第 10.2 节）。
+    </p>
+
+    <h3 id="s3-4">3.4 ④ programs.get：取 program（第一次会编译）</h3>
+    <pre><code>// 先经过 Material 的 getter（Material.ts:376–381）：取 shader 的同时做借用检查
+get shaderModule(): ShaderModule {
+  this.assertUsable()                          // Material 自己没被释放
+  const shader = this.shaderModuleValue!
+  requireAlive(shader, 'ShaderModule')         // 借来的 shader 也还活着
+  return shader
+}
+
+get(shader: ShaderModule): WebGL1ProgramResource {                        // WebGL1ProgramManager.ts:80–198（节选）
+  this.assertAvailable('get program')                                     // Manager 没关闭、context 没丢
+  if (shader.disposed) throw new ResourceDisposedError('ShaderModule')
+  if (this.releasing.has(shader)) throw new WebGLOperationError(…)       // 正在释放时不许再取
+  const cached = this.entries.get(shader)
+  if (cached !== undefined) return cached.resource                        // 热路径：一次 Map 查找就返回
+  if (shader.language !== 'glsl-es-100') throw new UnsupportedShaderLanguageError(…)
+  this.checkError('preflight', shader.name)                               // 冷路径：先确认没有别人留下的 GL 错误
+  … 编译两个 shader → createProgram → attach → link → 查 LINK_STATUS → detach
+  … 反射：每个 active attribute 的 location、每个 active uniform 的 location
+  const resource = Object.freeze({ program, attributes, uniforms })
+  const unsubscribe = shader.onDispose(() => this.release(shader))        // 订阅 CPU 资源的释放
+  this.entries.set(shader, { resource, unsubscribe })                     // 全部成功才发布
+  return resource
+  // catch：context 丢了 → 丢掉记录、抛 ContextLost；否则删掉建了一半的 program，原错误抛出
+  // finally：context 还在就删掉两个临时 shader
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>把 CPU 的 ShaderModule 变成这个 context 里能用的 program，附带 attribute 和 uniform 的 location 表。</td></tr>
+      <tr><th>所在层</th><td>第三层 backend 的 WebGL1ProgramManager。ResourceManager 组装它，Backend 通过 getter 借用它（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:118">WebGL1ResourceManager.ts:118–122</a>）。</td></tr>
+      <tr><th>为什么需要它</th><td>编译和链接很贵，所以按 ShaderModule 的对象身份缓存（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:59">:59</a>）：同一个 shader 在一个 context 里只编译一次，而且第一次用到时才编译（懒创建，第 4 课）。</td></tr>
+      <tr><th>校验</th><td>Material 和 shader 都活着；Manager 可用；不在释放中；只接受 GLSL ES 1.00；preflight 查旧错误（第 2 课：把别人留下的错误先报出来，免得算到自己头上）；编译状态、链接状态；反射出的每一项都有效。</td></tr>
+      <tr><th>状态变化</th><td>热路径：无。冷路径：新建一个 program（两个临时 shader 用完即删）；entries 多一条；ShaderModule 上多一个订阅。<strong>它不绑定任何东西，也不调用 useProgram</strong>，所以不需要清空 State 缓存。</td></tr>
+      <tr><th>生命周期</th><td>订阅把「这个 GPU program」和「CPU ShaderModule 的寿命」绑在一起：shader 释放 → <a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:209">release</a> → 先通过 beforeDelete 让 VertexInputManager 删掉关联的 VAO，再删 program；如果它正是当前 program，先 <code>useProgram(null)</code>（:232–234）。</td></tr>
+      <tr><th>和谁有关</th><td>结果被三步用到：⑥ prepare（uniform location）、⑧ useProgram（program 句柄）、⑪ bind（attribute location）。三条都是数据依赖，所以它必须排在这三步之前。</td></tr>
+    </table></div>
+
+    <h3 id="s3-5">3.5 ⑤ geometries.get：取 buffer（第一次会上传）</h3>
+    <pre><code>get(geometry: Geometry): WebGL1GeometryResource {                        // WebGL1GeometryManager.ts:104–201（节选）
+  this.assertAvailable('get geometry')
+  if (geometry.disposed) throw new ResourceDisposedError('Geometry')
+  if (this.releasing.has(geometry)) throw new WebGLOperationError(…)
+  const cached = this.entries.get(geometry)
+  if (cached !== undefined) return cached.resource                        // 热路径
+  const indices = this.prepareIndices(geometry.copyIndices())             // 先做 CPU 预检：不能降级就一个 buffer 都不建
+  const mode = this.primitiveMode(geometry.topology)
+  this.checkError('preflight', 'Geometry')
+  const previousArray = gl.getParameter(gl.ARRAY_BUFFER_BINDING)          // 记下当前的两个 buffer 绑定
+  const previousElements = gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING)
+  try {
+    try {
+      … 每个 attribute 建一个 buffer 并上传；有索引就再建一个索引 buffer
+    } finally {
+      gl.bindBuffer(gl.ARRAY_BUFFER, previousArray)                       // context 还在就恢复原来的绑定：
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, previousElements)            //   EBO 属于当前 VAO，不恢复就改坏了别人的 VAO
+      this.hooks.invalidateState()                                        // 绕过 State 绑过 buffer：它的缓存不可信了
+    }
+    const resource = Object.freeze({ attributes, indexBuffer, indexType, drawCount, primitiveMode: mode })
+    const unsubscribe = geometry.onDispose(() => this.release(geometry))
+    this.entries.set(geometry, { resource, unsubscribe })                 // 全部成功才发布
+    return resource
+  } catch (error) {
+    … context 丢了：丢掉记录、抛 ContextLost；否则删掉本次建的 buffer、清空 State 缓存，原错误抛出
+  }
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>把 CPU Geometry 的数据上传成 buffer，并把 draw 需要的 primitiveMode、drawCount、indexType 一次算好、冻结起来（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:177">:177–183</a>）。</td></tr>
+      <tr><th>所在层</th><td>第三层 backend 的 WebGL1GeometryManager。</td></tr>
+      <tr><th>为什么需要它</th><td>静态几何只上传一次；draw 需要的参数在这里算好，⑬ 直接拿来用，热路径上不再做任何换算。</td></tr>
+      <tr><th>校验</th><td>可用、未释放、不在释放中；没有 32 位索引扩展时，最大的那个索引值 ≤ 65535 才能降成 Uint16（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:290">:290–305</a>，检查的是最大值，不是索引个数）；topology 能否映射；每个 GL 阶段一次 checkError。</td></tr>
+      <tr><th>状态变化</th><td>冷路径：新建 buffer；上传时<strong>临时</strong>改 ARRAY_BUFFER 和 ELEMENT_ARRAY_BUFFER 的绑定，结束时恢复；然后清空 State 缓存。失败时删掉本次建的 buffer，同样清空 State 缓存。</td></tr>
+      <tr><th>生命周期</th><td>订阅 geometry.onDispose → release：先 beforeDelete（解除顶点输入），再删 buffer（上次答疑讲的那条调用链）。</td></tr>
+      <tr><th>和谁有关</th><td>结果被 ⑪ bind（buffers）和 ⑬ draw（mode、count、indexType）用到。和 ④ 没有依赖，两者可以互换。清空 State 缓存用的是 ResourceManager 转交的钩子：Manager 也不认识 State 这个类，只拿到一个函数（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:262">WebGL1Backend.ts:262–266</a>）。</td></tr>
+    </table></div>
+
+    <h3 id="s3-6">3.6 ⑥ uniforms.prepare：uniform 预检（只验证，不写）</h3>
+    <pre><code>prepare(program, submission): readonly PreparedUniformUpload[] {         // WebGL1Uniforms.ts:95–163（节选）
+  this.assertContext()
+  const material = submission.item.material
+  const shader = material.shaderModule                                    // 又经过一次借用检查
+  const layout = this.reflect(program, shader.name)                       // 每个 program 只反射一次，WeakMap 缓存
+  const parameters = new Map(material.getParameterEntries())              // 参数的副本；借来的纹理在这里查存活
+  … 内建映射：同一个 uniform 名不能对应两个语义（:107–114）
+  … cubemap sampler 的数量不能超过纹理单元上限（:116–123）
+  let nextTextureUnit = 0
+  const uploads = layout.map((entry) => {                                 // 对每个 active uniform：
+    const parameter = 是内建语义 ? this.builtInParameter(semantic, submission)   // 内建值来自这一次的 submission
+                                 : parameters.get(entry.name)                   // 其余来自 Material
+    if (parameter === undefined) throw new InvalidMaterialError(…)        // 找不到值：拒绝这次 draw
+    if (类型对不上) throw new InvalidMaterialError(…)
+    if (parameter.type === 'cubeTexture') {
+      const unit = nextTextureUnit++
+      const resource = this.resolveCube(parameter.value)                  // 可能第一次上传 cubemap
+      return () => { activeTexture(unit); bindTexture(CUBE_MAP, resource.handle); uniform1i(location, unit) }
+    }
+    … Texture2D：明确报「不支持」
+    return this.numericUpload(entry.location, entry.name, parameter)     // 数值先复制、量化成 Float32Array，再装进闭包
+  })
+  this.assertContext()
+  return uploads                                                          // 一组还没执行的命令
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>给 program 的每个 active uniform 找到这一次 draw 的值、检查类型，生成一组上传命令（闭包，closure），但一条都不执行。</td></tr>
+      <tr><th>所在层</th><td>第三层 backend 的 WebGL1Uniforms（每一代一个，Backend 独占）。它不拥有 program，也不拥有 Material。</td></tr>
+      <tr><th>为什么需要它</th><td>这叫「先准备、后提交」（prepare / commit）：把所有可能因为数据出错的检查放在前面，全部通过才动 GL（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:60">:60–62</a>）。好处是失败语义简单：一次因为数据问题抛错的 draw，一个 uniform 都没写（卡片 C），正是第 6 课第 4 节说的「要么完整、要么不变」。要说清一点：即使边验证边上传、中途失败留下半套值，在这个项目里也不会被画出来，因为每一次成功的 draw 都会写全部 active uniform（缺一个就拒绝，:62）。所以拆开换来的是清楚的契约，而不是修掉一个看得见的 bug。</td></tr>
+      <tr><th>校验</th><td>context；内建映射不重名（:119–126）；sampler 数量（:134–143）；每个 active uniform 都有值（:156–158）、类型匹配（:160–162）；二维纹理和附件交给 resolve2D（10 月 12 日接通，:175–184）；uniform 数组不支持（:235–237），不会只上传第一个元素；数值数组长度对、量化成 Float32 之后仍是有限数（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:35">:35–54</a>）；normalMatrix 可逆（:307–309）；借来的纹理还活着（getParameterEntries 里的 copyParameter 调纹理自己的 assertUsable，<a data-src="src/rendering/resources/materialParameters.ts:126">materialParameters.ts:126</a>、<a data-src="src/rendering/resources/Texture2DSamplingSource.ts:59">Texture2DSamplingSource.ts:59</a>；块里用到的项也一样，:261–270）。</td></tr>
+      <tr><th>状态变化</th><td>不写任何 uniform。可能的副作用只在冷路径：反射缓存加一项；cubemap 第一次用到时由 CubeTextureManager 上传——临时改<strong>当前</strong>纹理单元上的 cubemap 绑定和四个 UNPACK 参数，结束时恢复（<a data-src="src/rendering/backend/webgl1/WebGL1TextureUploadSupport.ts:62">withTextureUploadState</a>），然后清空 State 缓存。注释对此很诚实：这不是「GPU 状态完全不变」的事务，保证的只是不会写一半 uniform（:102–104）。</td></tr>
+      <tr><th>生命周期</th><td>命令是一次性的：只能在本次 draw 里执行，不能跨 draw、跨 program、跨代复用（:194）。反射缓存用 WeakMap（:79）：program 对象被回收后，缓存项自动消失。</td></tr>
+      <tr><th>和谁有关</th><td>需要 ④ 的 program（反射信息、location），结果交给 ⑩ upload。它<strong>不</strong>需要 program 已被选用，所以可以放在 ⑧ 之前。</td></tr>
+    </table></div>
+    <p><strong>每个 uniform 的值从哪来：</strong></p>
+    <ul>
+      <li><strong>内建值</strong>来自这一次的 DrawSubmission，不来自 Material（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:272">:272–319</a>）：模型矩阵取自 <code>item.worldMatrix</code>（第 8 课讲它从哪来），视图矩阵、投影矩阵和相机位置取自 <code>view</code>。这就是第 3 课说的「Material 不知道 Camera」。</li>
+      <li><strong>其余的</strong>来自 Material 的参数；10 月 19 日起，本地参数里没有的，再去 Material 借用的参数块里找（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:149">WebGL1Uniforms.ts:149–154</a>）。active uniform 找不到值就拒绝这次 draw，类型对不上也拒绝。Material 里那个待办——「缺失的 active uniform 必须有明确策略，不能沿用上一个 Material 留在 Program 中的值」（<a data-src="src/rendering/resources/Material.ts:178">Material.ts:178–179</a>）——在这里有了答案。</li>
+      <li><strong>cubemap</strong> 按顺序分配纹理单元，通过 CubeTextureManager 取得 GPU 纹理（:164–173）。</li>
+    </ul>
+    <p>
+      <strong>法线矩阵。</strong>先把记号说清：M 是模型矩阵（local → world），V 是视图矩阵（world → view），都是 4×4、列主序；mat3(X) 表示取 X 左上角的 3×3；n<sub>local</sub> 是模型空间里的法线，n<sub>view</sub> 是视图空间里的法线。代码算的是（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:293">:293–298</a> 的注释）：
+    </p>
+    <pre><code>n_view = transpose(inverse(mat3(V · M))) · n_local     （shader 里还要再 normalize）</code></pre>
+    <p>
+      为什么要逆转置，而不是直接用 M？举个例子：M 把 x 方向拉长 2 倍，V 取单位矩阵。平面 x + y = 0 的法线是 (1, 1, 0)；拉长之后平面变成 x/2 + y = 0，真正的法线是 (0.5, 1, 0)。逆转置 diag(0.5, 1, 1) 乘 (1, 1, 0) 正好得到它；直接用 M 会得到 (2, 1, 0)，方向错了（卡片 D）。投影矩阵 P 不参与，相机的旋转必须参与，所以用的是 V · M 而不是 M（:296）。只有 shader 真的用到法线矩阵时才计算它，遇到不可逆的矩阵就报错（:307–309）。
+    </p>
+
+    <h3 id="s3-7">3.7 ⑦⑫⑭ assertCurrentDraw：三个检查点</h3>
+    <pre><code>private assertCurrentDraw(generation: Generation): void {                 // WebGL1Backend.ts:338–344
+  if (this.requireGeneration('continue draw') !== generation) {           // 还能用、而且还是同一代吗
+    throw new WebGLContextLostError('continue draw from an old generation')
+  }
+  generation.scope.assertDrawable()                                       // 作用域还有效吗
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>在三个关口确认：这一次 draw 手里的对象仍属于当前可用的那一代，作用域也还有效。</td></tr>
+      <tr><th>为什么在这三处</th><td>⑦ 在冷路径之后、提交状态之前：④⑤⑥ 可能发出了几十个 GL 调用，context 可能在其中任何一个之后丢失，冷路径内部的检查也不一定覆盖到最后一个调用；⑫ 在真正 draw 之前，最后确认一次；⑭ 在 draw 之后：如果 context 恰好在 draw 期间丢失，要报告 ContextLost，而不是假装画成功了。</td></tr>
+      <tr><th>「换了一代」会发生吗</th><td>恢复发生在 DOM 事件里，插不进一次同步执行的 draw 中间，所以「身份变了」这条主要是防御。真正会发生的是物理丢失：requireGeneration 查到 isContextLost，作废这一代并抛错。</td></tr>
+      <tr><th>状态变化</th><td>和 ① 一样：只有发现丢失时，才有作废这一代的副作用。</td></tr>
+    </table></div>
+
+    <h3 id="s3-8">3.8 ⑧ state.useProgram：选用 program</h3>
+    <pre><code>useProgram(program: WebGLProgram | null): void {                          // WebGL1State.ts:47–54
+  this.assertContextAvailable('use program')    // 丢失：清空缓存并抛错
+  if (this.programValue === program) return      // 缓存说已经是它：不发 GL 命令
+  this.gl.useProgram(program)
+  this.programValue = program
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>让 GL 的「当前 program」变成这一个。缓存说已经是它，就不发命令。</td></tr>
+      <tr><th>所在层</th><td>第三层 backend 的 WebGL1State（每一代一个，Backend 独占）。</td></tr>
+      <tr><th>为什么走 State</th><td>连续画很多用同一个 program 的物体时，可以省掉重复的 useProgram，这叫去重（deduplication）。缓存用 undefined 表示「不知道」、null 表示「确实没绑」，只在「明确等于」时才跳过（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:24">:24–25</a>；第 4 课第 5 节「缓存什么时候过期」）。不过在现在的代码里，这个去重在连续的 draw 之间从不生效，见 3.11 和卡片 H。</td></tr>
+      <tr><th>状态变化</th><td>GL 的 CURRENT_PROGRAM；State 的 programValue。</td></tr>
+      <tr><th>和谁有关</th><td><strong>⑩ upload 用的 uniform location 属于 ④ 的 program</strong>。WebGL 规定：uniform* 调用的 location 必须来自当前 program，否则产生 INVALID_OPERATION、这次调用什么也不做。所以 ⑧ 必须在 ⑩ 之前。这是整个 draw 里最硬的一条状态依赖（state dependency）。</td></tr>
+      <tr><th>如果挪到 ⑩ 之后</th><td>upload 执行时，当前 program 还是上一次 draw 留下的那个（第一次 draw 时是 null）。每一条 uniform 调用都因为「location 不属于当前 program」报 INVALID_OPERATION，什么也没写进去（卡片 G 在真实 GPU 上验证过）。接着 ⑧ 选用正确的 program，⑬ 用它上一次被使用时留下的 uniform 值去画——比如上一个物体的模型矩阵，物体就画到了别处。<strong>不会抛任何异常</strong>：draw 的热路径不调 getError，这个错误一直留在 GL 的错误标志里，直到下一个冷路径的 preflight 把它取出来，算到一个不相干的资源头上（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:98">WebGL1ProgramManager.ts:98–99</a>）。</td></tr>
+    </table></div>
+    <aside class="note">
+      <strong>更正：</strong>我整理笔记时一度以为「顺序反了，uniform 会写进上一个 program」。那是桌面 OpenGL 的行为：那里的 location 只是一个整数，按当前 program 解释，可能悄悄写进别人的 program。WebGL 把 location 做成属于某个 program 的对象，并且会检查这一点。卡片 G 的实测：A 是当前 program 时用 B 的 location 上传，A、B 的值都没变，调用日志里记着 INVALID_OPERATION。
+    </aside>
+
+    <h3 id="s3-9">3.9 ⑨ applyDrawState：渲染状态</h3>
+    <pre><code>private applyDrawState(material: Material, state: WebGL1State): void {    // WebGL1Backend.ts:289–310
+  for (const capability of [gl.BLEND, gl.STENCIL_TEST, gl.SCISSOR_TEST,
+    gl.POLYGON_OFFSET_FILL, gl.SAMPLE_ALPHA_TO_COVERAGE, gl.SAMPLE_COVERAGE]) {
+    gl.disable(capability)                       // 还没支持的功能：一律关掉，不继承别人留下的
+  }
+  gl.colorMask(true, true, true, true)           // 固定值：每次都设，不走缓存
+  gl.depthRange(0, 1)
+  gl.frontFace(gl.CCW)
+  gl.lineWidth(1)
+  state.setDepthState(material.state)            // Material 控制的：深度测试、深度写入、深度函数（经过 State 缓存）
+  state.setCullMode(material.state.cullMode)     // 剔除（经过 State 缓存）
+}</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>把这次 draw 需要的固定功能状态设好。</td></tr>
+      <tr><th>所在层</th><td>Backend 的私有方法，深度和剔除交给 State。</td></tr>
+      <tr><th>为什么分两类</th><td>Material 能控制的只有深度和剔除（Material 的 RenderState），这两样经过 State 缓存（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:121">State.ts:121–169</a>）。其余还不支持的功能，不能靠「希望没人开过」：对同一个 canvas 再调一次 <code>getContext('webgl')</code>，拿到的就是同一个 context（卡片 E 就是这样读像素的），任何拿到它的代码都可能留下 blend 或 scissor。类注释要求 context 由 Backend 独占（:40），这里等于不完全相信这个约定，每次都关掉。</td></tr>
+      <tr><th>校验</th><td><code>material.state</code> 的 getter 检查 Material 还活着（<a data-src="src/rendering/resources/Material.ts:298">Material.ts:298–302</a>）；State 的方法检查 context 没丢。RenderState 本身在 Material 构造时就验证并冻结了，这里不再验证。</td></tr>
+      <tr><th>状态变化</th><td>blend、stencil、scissor、polygon offset、两种 sample coverage 关闭；颜色掩码全开；深度范围 [0, 1]；逆时针为正面；线宽 1；深度测试、深度写入、深度函数和剔除按 Material 设置。</td></tr>
+      <tr><th>和谁有关</th><td>⑬ draw 用这些状态。它和 ⑧⑩⑪ 之间没有依赖，四者的先后可以随意换，只要都在 ⑬ 之前（⑧ 和 ⑩ 之间那条除外）。</td></tr>
+    </table></div>
+
+    <h3 id="s3-10">3.10 ⑩ uniforms.upload：执行命令</h3>
+    <pre><code>upload(commands: readonly PreparedUniformUpload[]): void {                // WebGL1Uniforms.ts:169–175
+  this.assertContext()
+  for (const command of commands) command()      // 依次执行 prepare 生成的闭包
+  this.assertContext()
+}
+// 一条数值命令长这样（:333–336）：值在 prepare 时就复制、量化好了
+return () => gl.uniformMatrix4fv(location, false, value)
+// 一条 cubemap 命令（:139–143）：选纹理单元、绑定纹理、告诉 sampler 用第几个单元
+return () => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_CUBE_MAP, resource.handle); gl.uniform1i(entry.location, unit) }</code></pre>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>作用</th><td>把 prepare 准备好的值写进当前 program，把 cubemap 绑到各自的纹理单元上。</td></tr>
+      <tr><th>状态变化</th><td>当前 program 的全部 active uniform；ACTIVE_TEXTURE 和用到的纹理单元上的 cubemap 绑定。这些绑定<strong>不恢复</strong>，因为这次 draw 正要用它们。State 不缓存纹理绑定，所以不需要清空它的缓存。</td></tr>
+      <tr><th>校验</th><td>只查 context。数据校验都已经在 ⑥ 做完，这里不会因为数据问题失败。验证过的那几个字节，就是写进去的那几个字节：中间没有第二次读取 Material。</td></tr>
+      <tr><th>和谁有关</th><td>必须在 ⑧ 之后（location 属于当前 program）；要用 ⑥ 生成的命令。和 ⑨⑪ 没有依赖：它不碰 VAO、buffer 和深度状态。注释特意写明「本方法不自行 useProgram」（:167）：选用 program 是 Backend 编排的事。</td></tr>
+    </table></div>
+
+    <h3 id="s3-11">3.11 ⑪ vertexInputs.bind：顶点输入</h3>
+    <p>
+      上次答疑细讲过两种策略（OES VAO、手动绑定）。放到 draw 里看，它做的是：先检查 Geometry 还活着（assertBindable）；按「(Geometry, 真实的 WebGLProgram)」查 VAO 缓存，命中就绑定一次（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:66">OES :66–73</a>）；没命中就先验证布局、再新建并配置 VAO，全部成功才缓存，失败就回滚。最后在 finally 里清空 State 缓存（:136–138），理由是「VAO 切换改变 EBO；配置过程还会临时改变全局 ARRAY_BUFFER」。
+    </p>
+    <p>
+      注意两点：finally 在<strong>命中缓存</strong>时也会执行（try 里的 return 同样要经过 finally）；而这个钩子接的是<strong>整份</strong> <code>state.invalidate()</code>，program、深度、剔除的缓存一起清掉。于是每一次 draw 结束前，State 缓存都被清空，下一次 draw 的 ⑧⑨ 一定重发全部命令（卡片 H 在真实 GPU 上数过）。
+    </p>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>状态变化</th><td>OES 策略：VAO 绑定（其中带着 EBO）；配置新 VAO 时临时改 ARRAY_BUFFER，完成后恢复。手动策略：默认 VAO 上的 attribute 指针和启用状态、EBO；ARRAY_BUFFER 停在最后一个 attribute 的 buffer 上。两种策略都在 finally 里清空整份 State 缓存。</td></tr>
+      <tr><th>生命周期</th><td>VAO 归 VertexInputManager 所有，buffer 和 program 都是借来的；Geometry 或 program 释放时，由 beforeDelete 先删 VAO。</td></tr>
+      <tr><th>和谁有关</th><td>要用 ④ 的 attribute location 和 ⑤ 的 buffer（数据依赖）；⑬ 要用它绑好的输入。它清空的缓存影响的是<strong>下一次</strong> draw 的 ⑧⑨：这是一条跨 draw 的关系。</td></tr>
+      <tr><th>如果挪位置</th><td>它只需要在 ⑤ 之后（数据依赖）、⑬ 之前；和 ⑧⑨⑩ 之间没有依赖。代码注释说「最后绑定 VAO/EBO，避免先前的 buffer 上传扰乱索引来源」（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:190">WebGL1Backend.ts:190</a>）。⑤ 的冷路径确实会临时改 EBO，但它会恢复，所以这更像一条保险：离 draw 越近，中间被别的代码改掉的机会越少。</td></tr>
+    </table></div>
+
+    <h3 id="s3-12">3.12 ⑬ 发出 draw</h3>
+    <pre><code>if (buffers.indexBuffer === null) {                                       // WebGL1Backend.ts:220–228
+  this.gl.drawArrays(buffers.primitiveMode, 0, buffers.drawCount)
+} else {
+  if (buffers.indexType === null) throw new WebGLOperationError('draw', 'Geometry', 'index buffer has no index type')
+  this.gl.drawElements(buffers.primitiveMode, buffers.drawCount, buffers.indexType, 0)
+}</code></pre>
+    <p>
+      参数全部来自 ⑤ 冻结的 GeometryResource，这里不做任何换算。draw 之后<strong>不</strong>调 getError：第 2 课讲过，getError 要同步等待 GPU，只能放在冷路径上。这一次 draw 如果产生了 GL 错误，会被下一个冷路径的 preflight 取出来，以 WebGLOperationError 抛出（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:324">WebGL1ProgramManager.ts:324–334</a>）。之后 ⑭ 再确认 context 没在 draw 期间丢失。draw 正常返回也不代表 GPU 已经执行完（<a data-src="src/rendering/backend/RenderBackend.ts:39">RenderBackend.ts:39</a>）：它只是把命令交给了浏览器。
+    </p>
+
+    <h2 id="s4">4. 顺序：哪些能换，哪些不能</h2>
+    <p>把 ④ 到 ⑪ 分成两组，顺序约束就清楚了：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 290" role="img" aria-label="准备组的三步可能失败，但不留下渲染状态；提交组的四步设置状态；组内只有 useProgram 到 upload 这一条不能调换">
+          <defs>
+            <marker id="g2-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+            <marker id="g2-tip-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip bad" /></marker>
+          </defs>
+          <rect x="20" y="40" width="240" height="210" rx="8" class="box" />
+          <text x="140" y="62" text-anchor="middle" class="title">准备：可能失败</text>
+          <text x="140" y="80" text-anchor="middle" class="small">不留下渲染状态</text>
+          <rect x="35" y="92" width="210" height="36" rx="5" class="box hl" />
+          <text x="140" y="115" text-anchor="middle">④ programs.get</text>
+          <rect x="35" y="140" width="210" height="36" rx="5" class="box hl" />
+          <text x="140" y="163" text-anchor="middle">⑤ geometries.get</text>
+          <rect x="35" y="188" width="210" height="36" rx="5" class="box hl" />
+          <text x="140" y="211" text-anchor="middle">⑥ uniforms.prepare</text>
+          <line x1="260" y1="145" x2="348" y2="145" class="line" marker-end="url(#g2-tip)" />
+          <text x="304" y="137" text-anchor="middle" class="small halo">④⑤⑥ 的结果</text>
+          <rect x="350" y="40" width="270" height="210" rx="8" class="box" />
+          <text x="485" y="62" text-anchor="middle" class="title">提交：设置本次状态</text>
+          <text x="485" y="80" text-anchor="middle" class="small">数据已经验证完</text>
+          <rect x="365" y="92" width="220" height="30" rx="5" class="box" />
+          <text x="475" y="112" text-anchor="middle">⑧ useProgram（要 ④）</text>
+          <rect x="365" y="132" width="220" height="30" rx="5" class="box" />
+          <text x="475" y="152" text-anchor="middle">⑨ applyDrawState</text>
+          <rect x="365" y="172" width="220" height="30" rx="5" class="box" />
+          <text x="475" y="192" text-anchor="middle">⑩ upload（要 ⑥）</text>
+          <rect x="365" y="212" width="220" height="30" rx="5" class="box" />
+          <text x="475" y="232" text-anchor="middle">⑪ bind（要 ④⑤）</text>
+          <path d="M 585 107 C 612 117, 612 177, 585 187" class="line bad" marker-end="url(#g2-tip-b)" />
+          <text x="610" y="151" class="small bad halo">当前 program</text>
+          <rect x="660" y="196" width="80" height="46" rx="6" class="box hl" />
+          <text x="700" y="216" text-anchor="middle">⑬ draw</text>
+          <text x="700" y="233" text-anchor="middle" class="small">（要 ⑤）</text>
+          <line x1="620" y1="219" x2="658" y2="219" class="line" marker-end="url(#g2-tip)" />
+          <text x="140" y="274" text-anchor="middle" class="small">组内可以互换（⑥ 要等 ④）</text>
+          <text x="485" y="274" text-anchor="middle" class="small">红线：唯一不能换的状态依赖</text>
+        </svg>
+      </div>
+      <figcaption>图 2 · 两组步骤。准备组可能失败（编译错误、上传失败、uniform 缺值），但不留下这次 draw 的渲染状态：冷路径临时改过的绑定都会恢复。提交组只设置状态、写 uniform、绑定输入，数据在准备组已经验证完。括号里是数据依赖：要用哪一步的结果。红线是唯一的状态依赖：upload 用的 uniform location 属于 ④ 的 program，而 WebGL 只接受当前 program 的 location，所以 ⑧ 必须在 ⑩ 之前（卡片 G）。两组之间「先准备、后提交」是一条软约束，见下表。</figcaption>
+    </figure>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 24%">调换</th><th style="width: 10%">硬 / 软</th><th>换了会怎样</th></tr>
+        <tr><td>① 挪到后面</td><td>硬</td><td>挪不动：后面每一步用的都是它返回的那一代。它的检查在 ② 里还会再做一次（3.1）。</td></tr>
+        <tr><td>② 挪到后面</td><td>软</td><td>⑦ 还会再查，结果仍然正确；只是失败得晚，报出来的还可能是别的错误（3.2）。</td></tr>
+        <tr><td>④ 挪到 ⑥⑧⑪ 之后</td><td>硬</td><td>不可能：这三步都要用 ④ 的结果。</td></tr>
+        <tr><td>⑤ 挪到 ⑪⑬ 之后</td><td>硬</td><td>不可能：bind 要 buffers，draw 要 mode、count、indexType。</td></tr>
+        <tr><td>⑥ 挪到 ⑩ 之后</td><td>硬</td><td>不可能：upload 执行的就是 prepare 生成的命令。</td></tr>
+        <tr><td><strong>⑧ 挪到 ⑩ 之后</strong></td><td><strong>硬</strong></td><td>每条 uniform 调用都报 INVALID_OPERATION、什么也没写；这次 draw 带着这个 program 上一次留下的值去画，而且不抛异常（3.8、卡片 G）。</td></tr>
+        <tr><td>④⑤⑥ 挪到 ⑧⑨ 之后</td><td>软</td><td>冷路径会恢复自己改过的绑定，所以仍然能画对。代价有两个：一是冷路径失败时（编译错误、上传失败），这次失败的 draw 已经改掉了 program 和深度状态——下一次 draw 会重新设置，不会画错，但「抛错的 draw 什么也没改」这条性质没了；二是冷路径会清空 State 缓存，刚设好的状态没用上就作废了。代码注释写的是「必须」（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:189">WebGL1Backend.ts:189</a>、<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:104">WebGL1Uniforms.ts:104</a>），严格说是「应该」。而且在现在的代码里，⑪ 每次都会清空缓存（卡片 H），第二个代价其实不存在。</td></tr>
+        <tr><td>⑨ 和 ⑧、⑩、⑪ 互换</td><td>自由</td><td>它们之间没有依赖，只要都在 ⑬ 之前。</td></tr>
+        <tr><td>⑪ 挪到 ⑩ 之前</td><td>自由</td><td>upload 不碰 VAO 和 buffer，结果相同。</td></tr>
+        <tr><td>⑧⑨⑩⑪ 挪到 ⑬ 之后</td><td>硬</td><td>draw 发出时状态还没设好，用的是上一次 draw 留下的状态。</td></tr>
+      </table>
+    </div>
+
+    <h2 id="s5">5. 状态与生命周期总表</h2>
+    <p><strong>每一步会改哪些状态。</strong>「冷」表示只在冷路径（第一次）发生；「临时」表示改了、结束前又恢复；「设置」表示为这次 draw 改掉、不恢复；空格表示不碰。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 22%">状态</th><th>④ program</th><th>⑤ buffer</th><th>⑥ prepare</th><th>⑧ use</th><th>⑨ 状态</th><th>⑩ upload</th><th>⑪ bind</th><th>⑬ draw</th></tr>
+        <tr><td>Manager 的缓存表</td><td>冷：加一条</td><td>冷：加一条</td><td>冷：反射、cubemap 各加一条</td><td></td><td></td><td></td><td>冷：VAO 加一条（OES）</td><td></td></tr>
+        <tr><td>CPU 资源上的订阅</td><td>冷：加一个</td><td>冷：加一个</td><td>冷：cubemap 加一个</td><td></td><td></td><td></td><td></td><td></td></tr>
+        <tr><td>State 缓存</td><td></td><td>冷：清空</td><td>冷：清空</td><td>设置</td><td>设置</td><td></td><td><strong>每次清空</strong></td><td></td></tr>
+        <tr><td>当前 program</td><td></td><td></td><td></td><td>设置</td><td></td><td></td><td></td><td></td></tr>
+        <tr><td>ARRAY_BUFFER、ELEMENT_ARRAY_BUFFER</td><td></td><td>冷：临时</td><td></td><td></td><td></td><td></td><td>设置</td><td></td></tr>
+        <tr><td>VAO、attribute 指针</td><td></td><td></td><td></td><td></td><td></td><td></td><td>设置</td><td></td></tr>
+        <tr><td>当前单元的 cubemap 绑定、UNPACK 参数</td><td></td><td></td><td>冷：临时</td><td></td><td></td><td></td><td></td><td></td></tr>
+        <tr><td>ACTIVE_TEXTURE、各单元的 cubemap 绑定</td><td></td><td></td><td></td><td></td><td></td><td>设置</td><td></td><td></td></tr>
+        <tr><td>深度、剔除、blend 等固定功能</td><td></td><td></td><td></td><td></td><td>设置</td><td></td><td></td><td></td></tr>
+        <tr><td>program 里的 uniform 值</td><td></td><td></td><td></td><td></td><td></td><td>设置</td><td></td><td></td></tr>
+        <tr><td>目标里的像素</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td>写入</td></tr>
+      </table>
+    </div>
+    <p>这张表就是「先准备、后提交」的另一种说法：准备组（④⑤⑥）留下的只有缓存表、订阅和 State 缓存的失效，GL 状态要么不碰，要么临时改了又恢复；真正改 GL 状态的只有提交组（⑧⑨⑩⑪）和 ⑬。</p>
+    <p><strong>每一步和哪段生命周期有关：</strong></p>
+    <div class="table-scroll">
+      <table>
+        <tr><th style="width: 24%">生命周期</th><th style="width: 32%">在哪一步检查或建立</th><th>说明</th></tr>
+        <tr><td>这一代</td><td>① ⑦ ⑫ ⑭ 检查（② 里再查一次）</td><td>丢失时整代作废；恢复时换成新的一代（第 6 节）。</td></tr>
+        <tr><td>借来的 CPU 资源还活着</td><td>④ Material、ShaderModule；⑤ Geometry；⑥ Material 和它的纹理；⑨ Material；⑪ Geometry</td><td>借用方在使用时检查（第 5 课第 5 节）。任何一个已释放，就抛 ResourceDisposedError，这次 draw 不做任何提交。</td></tr>
+        <tr><td>借来的 RenderTarget</td><td>② ⑦ ⑫ ⑭（都经过 assertDrawable）</td><td>没被释放、revision 没变。</td></tr>
+        <tr><td>GPU 副本跟着 CPU 资源走</td><td>④ ⑤ ⑥ 的冷路径建立订阅</td><td>CPU 资源释放 → Manager 的 release → 先 beforeDelete，再删 GPU 对象（第 4 课、上次答疑）。丢失时整代的订阅一起撤销。</td></tr>
+        <tr><td>上传命令</td><td>⑥ 创建，⑩ 用完即弃</td><td>一次性，不能跨 draw、跨 program、跨代复用。</td></tr>
+        <tr><td>VAO</td><td>⑪ 冷路径创建</td><td>归 VertexInputManager 所有；按 (Geometry, program) 缓存。</td></tr>
+      </table>
+    </div>
+
+    <h2 id="s6">6. 一代：丢失与恢复的时间线</h2>
+    <pre><code>interface Generation {                         // WebGL1Backend.ts:24–31
+  readonly token: object                       // 这一代的身份
+  readonly state: WebGL1State
+  readonly resources: WebGL1ResourceManager
+  readonly uniforms: WebGL1Uniforms
+  readonly scope: WebGL1SurfaceScope
+  valid: boolean                               // 丢失后变成 false，再也不会变回 true
+}</code></pre>
+    <p>
+      <a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:258">createGeneration</a> 一次性创建这四样，并且每一代都重新探测一次能力（:259）：恢复后的 context 可能落在另一块 GPU 上（比如笔记本切换了显卡），能力未必和原来相同。新一代的 Manager 都是空的，不会立刻把全部 CPU 资源重新上传，下一次 draw 用到什么才上传什么（:257）。
+    </p>
+    <p>
+      <strong>为什么要比较「代」，而不是只看 <code>gl.isContextLost()</code>？</strong>恢复之后，context 又好了，isContextLost 变回 false，但旧一代对象手里的句柄已经全部作废。所以 Scope 的 isCurrent 钩子比较的是「创建我的那一代，还是不是当前代」（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:21">WebGL1SurfaceScope.ts:21</a>、<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:279">WebGL1Backend.ts:279–280</a>）。下面这张图把三样东西分开画：Backend 对外报告的 <code>ready</code>、lifecycle 的状态机、以及「当前这一代」：
+    </p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 290" role="img" aria-label="三条时间线：物理丢失之后 ready 立即变成 false；lifecycle.state 要等 lost 事件才变成 lost；这一代在第一次被查到丢失时作废；restored 事件之后 restore 建出候选的新一代，核对通过才发布，否则进入 restore-failed">
+          <defs>
+            <marker id="g3-tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip" /></marker>
+            <marker id="g3-tip-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="tip bad" /></marker>
+          </defs>
+          <line x1="130" y1="44" x2="740" y2="44" class="line" marker-end="url(#g3-tip)" />
+          <text x="740" y="30" text-anchor="end" class="small">时间</text>
+          <line x1="220" y1="38" x2="220" y2="50" class="line" />
+          <text x="220" y="30" text-anchor="middle" class="small">物理丢失</text>
+          <line x1="310" y1="38" x2="310" y2="50" class="line" />
+          <text x="310" y="30" text-anchor="middle" class="small">首次查到</text>
+          <line x1="410" y1="38" x2="410" y2="50" class="line" />
+          <text x="410" y="30" text-anchor="middle" class="small">lost 事件</text>
+          <line x1="530" y1="38" x2="530" y2="50" class="line" />
+          <text x="530" y="30" text-anchor="middle" class="small">restored 事件</text>
+          <line x1="640" y1="38" x2="640" y2="50" class="line" />
+          <text x="640" y="30" text-anchor="middle" class="small">发布 B</text>
+          <line x1="220" y1="50" x2="220" y2="190" class="line dash" />
+          <line x1="310" y1="50" x2="310" y2="190" class="line dash" />
+          <line x1="410" y1="50" x2="410" y2="190" class="line dash" />
+          <line x1="530" y1="50" x2="530" y2="190" class="line dash" />
+          <line x1="640" y1="50" x2="640" y2="190" class="line dash" />
+          <text x="20" y="82" class="small">当前这一代</text>
+          <text x="20" y="130" class="small">ready（对外）</text>
+          <text x="20" y="178" class="small">lifecycle.state</text>
+          <rect x="130" y="62" width="180" height="32" rx="4" class="box ok" />
+          <text x="220" y="83" text-anchor="middle">A 有效</text>
+          <rect x="310" y="62" width="330" height="32" rx="4" class="box bad" />
+          <text x="475" y="83" text-anchor="middle">A 已作废（valid = false，换了 epoch）</text>
+          <rect x="640" y="62" width="100" height="32" rx="4" class="box ok" />
+          <text x="690" y="83" text-anchor="middle">B 有效</text>
+          <rect x="130" y="110" width="90" height="32" rx="4" class="box ok" />
+          <text x="175" y="131" text-anchor="middle">true</text>
+          <rect x="220" y="110" width="420" height="32" rx="4" class="box bad" />
+          <text x="430" y="131" text-anchor="middle">false</text>
+          <rect x="640" y="110" width="100" height="32" rx="4" class="box ok" />
+          <text x="690" y="131" text-anchor="middle">true</text>
+          <rect x="130" y="158" width="280" height="32" rx="4" class="box ok" />
+          <text x="270" y="179" text-anchor="middle">'ready'</text>
+          <rect x="410" y="158" width="120" height="32" rx="4" class="box bad" />
+          <text x="470" y="179" text-anchor="middle">'lost'</text>
+          <rect x="530" y="158" width="110" height="32" rx="4" class="box" />
+          <text x="585" y="179" text-anchor="middle">'restoring'</text>
+          <rect x="640" y="158" width="100" height="32" rx="4" class="box ok" />
+          <text x="690" y="179" text-anchor="middle">'ready'</text>
+          <line x1="585" y1="190" x2="585" y2="226" class="line bad dash" marker-end="url(#g3-tip-b)" />
+          <rect x="470" y="228" width="270" height="44" rx="5" class="box bad" />
+          <text x="605" y="246" text-anchor="middle" class="title bad">'restore-failed'</text>
+          <text x="605" y="263" text-anchor="middle" class="small">核对不通过：丢掉 B</text>
+        </svg>
+      </div>
+      <figcaption>图 3 · 一次丢失、一次恢复的三条时间线。从物理丢失那一刻起，<code>ready</code> 就是 false：它每次都直接查 gl.isContextLost()（卡片 F）；lifecycle 的状态要等 lost 事件才变。「当前这一代」在第一次被查到丢失时作废（ready 的 getter 或任何一次 requireGeneration，:116、:322）；要是那之前没人查，就由 lost 事件的 onLost（:78）作废。restored 事件到来后，restore（:82–94）先记下 epoch，再建候选的新一代 B；建好之后 epoch 没变、Backend 没关闭、context 还在，才把 B 发布为当前代，lifecycle 最后才回到 ready。核对不通过就丢掉 B，进入 restore-failed。lifecycle 只在 lost 或 restore-failed 状态下接受 restored 事件（<a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:228">WebGLContextLifecycle.ts:228</a>）。</figcaption>
+    </figure>
+    <p>
+      <strong>图 3 最下面那条时间线，现在有真实浏览器的测试。</strong><a data-src="tests/browser/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:41">WebGLContextLifecycle.test.ts</a>（2026-09-28 新增）用 WEBGL_lose_context 让 context 真的丢失、再恢复，等浏览器真正派发 lost、restored 事件，不用 dispatchEvent 伪造（:5–11）；它记下每个回调被调用时的状态：onLost 时已经是 lost、isReady 为 false；restore 和 onReady 执行时都还是 restoring；全部跑完才回到 ready（:91–104）。它只验证 lifecycle 这一条线：测试不创建 Backend，也不证明 GPU 资源已经重建，那部分仍归 WebGL1Backend 的浏览器测试（:36–38）。
+    </p>
+    <p>
+      <strong>epoch 为什么是对象？</strong>注释写着「对象身份令牌，不是会不断增长的计数器」（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:51">:51–52</a>）。每次状态变化就换一个新的 <code>{}</code>，比较时只看是不是同一个对象：不用考虑溢出，也不会和别处的数字碰巧相等。第 8 课的版本号碰撞，就是两个来源的数字碰巧相等。每一代的 token 也是同样的身份令牌（identity token）。
+    </p>
+
+    <h2 id="s7">7. 作用域的栈：嵌套时每一帧记下了什么</h2>
+    <p>withRenderSurface 把工作交给 <a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:191">WebGL1SurfaceScope.run</a>（:191–244），顺序是：</p>
+    <ol>
+      <li>先确认可用、外层作用域都没被动过（:192–193）；</li>
+      <li>验证并复制描述（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:83">snapshot</a>），检查回调是函数；</li>
+      <li>记下这一层：目标、目标的 revision、drawing buffer 的尺寸（:201–206）；</li>
+      <li>用 getParameter 读出真实的 FRAMEBUFFER_BINDING 和 VIEWPORT（:208）；</li>
+      <li>入栈（:212）；</li>
+      <li>try：解析目标（第一次会创建 FBO，而创建 FBO 会改变当前绑定，所以第 4 步必须在它之前，:184）→ 检查 → 绑定 → 入口清除 → 检查 → 执行回调 → 检查回调返回 undefined → 再检查（:215–226）；</li>
+      <li>finally：出栈，恢复第 4 步读到的状态（:230–241）。</li>
+    </ol>
+    <p>嵌套两层时，栈里是这样的：</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 760 250" role="img" aria-label="外层进入时捕获画布状态并入栈；内层进入时捕获外层目标状态并入栈；内层退出时恢复外层目标，不再清除；外层退出时恢复画布">
+          <text x="95" y="24" text-anchor="middle" class="small">① 外层进入</text>
+          <text x="285" y="24" text-anchor="middle" class="small">② 内层进入</text>
+          <text x="475" y="24" text-anchor="middle" class="small">③ 内层退出</text>
+          <text x="665" y="24" text-anchor="middle" class="small">④ 外层退出</text>
+          <rect x="20" y="150" width="150" height="50" rx="5" class="box hl" />
+          <text x="95" y="171" text-anchor="middle" class="small">外层帧</text>
+          <text x="95" y="189" text-anchor="middle" class="small">记下：画布</text>
+          <rect x="210" y="150" width="150" height="50" rx="5" class="box hl" />
+          <text x="285" y="171" text-anchor="middle" class="small">外层帧</text>
+          <text x="285" y="189" text-anchor="middle" class="small">记下：画布</text>
+          <rect x="210" y="94" width="150" height="50" rx="5" class="box ok" />
+          <text x="285" y="115" text-anchor="middle" class="small">内层帧</text>
+          <text x="285" y="133" text-anchor="middle" class="small">记下：外层目标</text>
+          <rect x="400" y="150" width="150" height="50" rx="5" class="box hl" />
+          <text x="475" y="171" text-anchor="middle" class="small">外层帧</text>
+          <text x="475" y="189" text-anchor="middle" class="small">记下：画布</text>
+          <rect x="590" y="150" width="150" height="50" rx="5" class="box" />
+          <text x="665" y="181" text-anchor="middle" class="small">栈空</text>
+          <text x="95" y="226" text-anchor="middle" class="small">绑外层目标，清一次</text>
+          <text x="285" y="226" text-anchor="middle" class="small">绑内层目标，清一次</text>
+          <text x="475" y="226" text-anchor="middle" class="small">恢复外层目标，不清</text>
+          <text x="665" y="226" text-anchor="middle" class="small">恢复画布</text>
+          <line x1="20" y1="205" x2="740" y2="205" class="line dash" />
+        </svg>
+      </div>
+      <figcaption>图 4 · 嵌套作用域的栈。每一帧记下的是「进入这一层之前」的真实状态，所以内层退出时恢复成外层的目标，而不是画布；清除只在进入时做一次（卡片 A）。每一帧还记着目标的 revision 和 drawing buffer 尺寸，draw 前后逐层核对（assertUnchanged）。</figcaption>
+    </figure>
+    <div class="table-scroll"><table class="fn">
+      <tr><th>校验</th><td>描述只认 surface、clear 两个字段，多一个字段也报错；数值必须是有限的 Float32，深度在 [0, 1]，stencil 是 32 位有符号整数；目标没被释放；回调是函数，同步返回 undefined（不能是 async 函数）；目标确实有深度、stencil 附件，才能清它们（:331–337）。</td></tr>
+      <tr><th>状态变化</th><td>进入：FRAMEBUFFER 绑定和 viewport（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:207">bindSurface</a>，每次都发命令，不走缓存）；清除时临时打开写掩码、关闭 scissor 和 dithering，清完恢复（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:320">clearAttachments</a>，卡片 B）；目标里的像素被清掉。退出：恢复进入前的 FRAMEBUFFER 和 viewport；不回滚像素。</td></tr>
+      <tr><th>生命周期</th><td>目标是借来的：不 retain，也不 dispose。退出时如果这一代已经不是当前代，或者 context 丢了，只清空 State 缓存，不拿旧快照去绑（:266–279）；进入前的 framebuffer 已被删除，就报错，而不是悄悄换成画布。</td></tr>
+      <tr><th>错误</th><td>操作失败、恢复成功：原错误原样抛出；操作成功、恢复失败：抛恢复错误；两者都失败：AggregateError 里依次放操作错误和恢复错误（:236–238）。</td></tr>
+    </table></div>
+
+    <h2 id="s8">8. 先预测、再运行：跑真实的项目代码</h2>
+    <p>准备代码里的 <code>pixel</code>、<code>makeTriangle</code> 和 <code>IDENTITY</code> 是课程写的小工具，项目里没有它们；其余都是项目的真实类。卡片 E、F、H 的 Backend 会在自己的 canvas 上创建 context，它发出的 gl 调用不经过沙盒，调用日志里看不到。</p>
+    <details>
+      <summary>每张卡片之前都会先运行的准备代码</summary>
+      <pre><code id="prelude-view"></code></pre>
+    </details>
+    <div id="predict-0019"></div>
+    <p>下面六张卡片不画到沙盒的画布上，所以不显示画布像素。</p>
+    <div id="predict-0019b"></div>
+    <script>
+      ;(function () {
+        const prelude = [
+          'const R = window.RTeachRendering                      // 打包进来的真实项目代码',
+          'const hooks = { invalidateState: () => undefined }',
+          'const state = new R.WebGL1State(gl)',
+          'const programs = new R.WebGL1ProgramManager(gl, hooks)',
+          'const targets = new R.WebGL1RenderTargetManager(gl, R.detectWebGL1Capabilities(gl), hooks)',
+          'const scope = new R.WebGL1SurfaceScope(gl, state, {',
+          '  assertReady: () => undefined,',
+          '  isCurrent: () => true,',
+          '  resolveTarget: (target) => targets.get(target)',
+          '})',
+          '// 以下三个是课程写的小工具',
+          "const pixel = (x, y) => { const p = new Uint8Array(4); gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p); return Array.from(p).join(',') }",
+          'const makeTriangle = () => new R.Geometry({ attributes: { position: new R.VertexAttribute({ data: new Float32Array([-0.5, -0.5, 0, 0.5, -0.5, 0, 0, 0.5, 0]), itemSize: 3 }) } })',
+          'const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]'
+        ].join('\n')
+        document.getElementById('prelude-view').textContent = prelude
+
+        if (!window.RTeachRendering) {
+          document.getElementById('predict-0019').textContent =
+            '没有加载到 assets/rendering-bundle.js，卡片无法运行。按 MAINTENANCE.md「真实代码打包」重新构建一次。'
+          return
+        }
+
+        const RED_SHADER = [
+          'const shader = new R.ShaderModule({',
+          "  name: 'red', language: 'glsl-es-100',",
+          "  vertexSource: 'attribute vec3 position; uniform mat4 uModel; uniform mat4 uView; uniform mat4 uProjection; void main() { gl_Position = uProjection * uView * uModel * vec4(position, 1.0); }',",
+          "  fragmentSource: 'precision mediump float; void main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }',",
+          "  builtInUniforms: { modelMatrix: 'uModel', viewMatrix: 'uView', projectionMatrix: 'uProjection' }",
+          '})',
+          'const submission = {',
+          '  item: { geometry: makeTriangle(), material: new R.Material({ shaderModule: shader }), worldMatrix: IDENTITY },',
+          '  view: { viewMatrix: IDENTITY, projectionMatrix: IDENTITY, cameraWorldPosition: [0, 0, 0] }',
+          '}'
+        ]
+
+        RTeach.predict({
+          mount: document.getElementById('predict-0019'),
+          storageKey: 'lesson-0019',
+          prelude,
+          items: [
+            {
+              title: 'A · 外层清成红色，内层在离屏目标上清成蓝色：内层退出之后，画布中心是什么颜色？',
+              code: [
+                "const target = new R.RenderTarget({ width: 8, height: 8, colors: [{ format: 'rgba8' }] })",
+                "scope.run({ surface: { kind: 'default-framebuffer' }, clear: { color: [1, 0, 0, 1] } }, () => {",
+                "  log('外层清除之后，画布中心：', pixel(80, 50))",
+                "  scope.run({ surface: { kind: 'render-target', target }, clear: { color: [0, 0, 1, 1] } }, () => {",
+                "    log('内层（离屏目标）：', pixel(4, 4))",
+                '  })',
+                "  log('内层退出之后，画布中心：', pixel(80, 50))",
+                '})'
+              ].join('\n'),
+              pixel: [80, 50],
+              choices: ['红色：外层只在进入时清过一次', '黑色：内层退出时把外层又清了一次', '蓝色：内层的清除落到了画布上'],
+              answer: 0,
+              explain: '清除只在进入作用域时执行一次：绑定目标之后、执行回调之前（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:218">WebGL1SurfaceScope.ts:218–219</a>）。内层退出时 finally 只恢复外层的绑定和 viewport，不会再清一次外层（<a data-src="src/rendering/backend/RenderSurface.ts:33">RenderSurface.ts:33–34</a>）。调用日志里能看到：内层进入时 bindFramebuffer 到离屏目标、clear，退出时 bindFramebuffer(null) 和 viewport 恢复成 160×100，没有第二次 clear。'
+            },
+            {
+              title: 'B · 进入作用域前写掩码全是 false：入口清除还能清成绿色吗？退出后写掩码是什么？',
+              code: [
+                'gl.colorMask(false, false, false, false)          // 模拟上一次 draw 留下的写掩码',
+                "scope.run({ surface: { kind: 'default-framebuffer' }, clear: { color: [0, 1, 0, 1] } }, () => {",
+                "  log('入口清除之后，画布中心：', pixel(80, 50))",
+                '})',
+                "log('退出之后的 COLOR_WRITEMASK：', gl.getParameter(gl.COLOR_WRITEMASK).join(','))"
+              ].join('\n'),
+              pixel: [80, 50],
+              choices: ['能清成绿色，退出后写掩码恢复成全 false', '清不掉：写掩码挡住了清除', '能清成绿色，但写掩码被留成了全 true'],
+              answer: 0,
+              explain: 'gl.clear 受写掩码限制。clearAttachments 先读出真实的 COLOR_WRITEMASK，临时 colorMask(true, true, true, true)，清完在 finally 里恢复原值（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:339">WebGL1SurfaceScope.ts:339–390</a>）。scissor 和 dithering 也是同样的处理。所以清除一定是整个附件，而且不会改变作用域外面看到的状态。'
+            }
+          ]
+        })
+
+        RTeach.predict({
+          mount: document.getElementById('predict-0019b'),
+          storageKey: 'lesson-0019-b',
+          canvas: false,
+          prelude,
+          items: [
+            {
+              title: 'C · shader 用到 uColor 和 uScale，Material 只给了 uColor：prepare 失败之后，uColor 被上传了吗？',
+              code: [
+                'const shader = new R.ShaderModule({',
+                "  name: 'two-uniforms', language: 'glsl-es-100',",
+                "  vertexSource: 'attribute vec3 position; void main() { gl_Position = vec4(position, 1.0); }',",
+                "  fragmentSource: 'precision mediump float; uniform vec3 uColor; uniform float uScale; void main() { gl_FragColor = vec4(uColor * uScale, 1.0); }'",
+                '})',
+                "const material = new R.Material({ shaderModule: shader, parameters: { uColor: { type: 'vec3', value: [1, 0, 0] } } })   // 故意漏掉 uScale",
+                'const program = programs.get(shader)',
+                "const uniforms = new R.WebGL1Uniforms(gl, 8, () => { throw new Error('这张卡片不用 cubemap') })",
+                'const submission = { item: { geometry: makeTriangle(), material, worldMatrix: IDENTITY }, view: { viewMatrix: IDENTITY, projectionMatrix: IDENTITY, cameraWorldPosition: [0, 0, 0] } }',
+                "try { uniforms.prepare(program, submission) } catch (error) { log('prepare 抛出：', error.name) }",
+                'gl.useProgram(program.program)',
+                "log('uColor 在 program 里的值：', Array.from(gl.getUniform(program.program, program.uniforms.get('uColor'))).join(', '))"
+              ].join('\n'),
+              choices: ['没有：prepare 只验证、生成命令，一条都没执行', '传了：uColor 排在前面，已经上传', '传了一半：只写进了第一个分量'],
+              answer: 0,
+              explain: 'prepare 找不到 uScale 的值就抛 InvalidMaterialError（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:156">WebGL1Uniforms.ts:156–158</a>），而上传命令只在 upload 时才执行（:197–203）。所以 uColor 还是 program 链接后的初始值 0，调用日志里也找不到任何 uniform3fv。这就是「先准备、后提交」：因为数据问题失败的 draw，一个 uniform 都不写（第 3.6 节）。'
+            },
+            {
+              title: 'D · 模型矩阵把 x 方向放大 2 倍：上传的法线矩阵，第一个元素是多少？',
+              code: [
+                'const shader = new R.ShaderModule({',
+                "  name: 'normals', language: 'glsl-es-100',",
+                "  vertexSource: 'attribute vec3 position; attribute vec3 normal; uniform mat4 uModel; uniform mat4 uView; uniform mat4 uProjection; uniform mat3 uNormalMatrix; varying vec3 vNormal; void main() { vNormal = uNormalMatrix * normal; gl_Position = uProjection * uView * uModel * vec4(position, 1.0); }',",
+                "  fragmentSource: 'precision mediump float; varying vec3 vNormal; void main() { gl_FragColor = vec4(normalize(vNormal), 1.0); }',",
+                "  builtInUniforms: { modelMatrix: 'uModel', viewMatrix: 'uView', projectionMatrix: 'uProjection', normalMatrix: 'uNormalMatrix' }",
+                '})',
+                'const program = programs.get(shader)',
+                "const uniforms = new R.WebGL1Uniforms(gl, 8, () => { throw new Error('这张卡片不用 cubemap') })",
+                'const scaleX2 = [2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]   // 列主序：x 方向放大 2 倍',
+                'const submission = { item: { geometry: makeTriangle(), material: new R.Material({ shaderModule: shader }), worldMatrix: scaleX2 }, view: { viewMatrix: IDENTITY, projectionMatrix: IDENTITY, cameraWorldPosition: [0, 0, 0] } }',
+                'const commands = uniforms.prepare(program, submission)',
+                'gl.useProgram(program.program)',
+                'uniforms.upload(commands)',
+                "const n = gl.getUniform(program.program, program.uniforms.get('uNormalMatrix'))",
+                "log('uNormalMatrix =', Array.from(n).map((v) => Number(v.toFixed(3))).join(', '))"
+              ].join('\n'),
+              choices: ['0.5：法线要用逆转置，x 方向反而缩小', '2：和模型矩阵一样放大 2 倍', '1：法线矩阵只保留旋转、不管缩放'],
+              answer: 0,
+              explain: '这里 V 是单位矩阵，M = diag(2, 1, 1)，逆转置就是 diag(0.5, 1, 1)（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:292">WebGL1Uniforms.ts:292–314</a>）。第 3.6 节的例子：平面 x + y = 0 的法线 (1, 1, 0)，x 拉长 2 倍后变成 (0.5, 1, 0)，正是 diag(0.5, 1, 1) 乘它的结果。法线矩阵只在 shader 真的用到它时才计算，内建值来自这一次的 submission，没有写回共享的 Material。'
+            },
+            {
+              title: 'E · 在作用域外调用 backend.draw，会发生什么？',
+              note: '这张卡片的 Backend 在自己的 canvas 上创建 context，它发出的 gl 调用不经过沙盒，调用日志里看不到；下面用 surfaceCanvas.getContext 再取一次同一个 context 来读像素。',
+              code: [
+                "const surfaceCanvas = document.createElement('canvas')",
+                'surfaceCanvas.width = 32',
+                'surfaceCanvas.height = 32',
+                "const backend = new R.WebGL1Backend(surfaceCanvas, 'lesson-19', { antialias: false })",
+                "const own = surfaceCanvas.getContext('webgl')    // 同一个 canvas 再取一次：拿到的就是 Backend 那个 context",
+                ...RED_SHADER,
+                "try { backend.draw(submission) } catch (error) { log('作用域外 draw：', error.name) }",
+                "backend.withRenderSurface({ surface: { kind: 'default-framebuffer' }, clear: { color: [0, 0, 1, 1], depth: 1 } }, () => {",
+                '  backend.draw(submission)',
+                '  const p = new Uint8Array(4)',
+                '  own.readPixels(16, 16, 1, 1, own.RGBA, own.UNSIGNED_BYTE, p)',
+                "  log('作用域内 draw 之后，中心像素：', Array.from(p).join(','))",
+                '})',
+                'backend.dispose()'
+              ].join('\n'),
+              choices: ['抛出 WebGLOperationError：draw 只能在活动的作用域里调用', '画到画布上：没有作用域就用默认目标', '什么也不做，静默返回'],
+              answer: 0,
+              explain: 'draw 的第二步就是 scope.assertDrawable()（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:194">WebGL1Backend.ts:194</a>），没有活动作用域就报错（<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:257">WebGL1SurfaceScope.ts:257</a>）。这样「画到哪里」永远由作用域明确决定，不会因为忘了切目标而画到上一个物体的目标上。作用域里的 draw 走完第 3 节的全部步骤，中心像素是红色的三角形（255,0,0,255）。'
+            },
+            {
+              title: 'F · 刚调用 loseContext()，webglcontextlost 事件还没派发：backend.ready 是什么？',
+              note: '这张卡片的 Backend 也在自己的 canvas 上创建 context，调用日志里看不到它的 gl 调用。',
+              code: [
+                "const surfaceCanvas = document.createElement('canvas')",
+                "const backend = new R.WebGL1Backend(surfaceCanvas, 'lesson-19-lost')",
+                "const own = surfaceCanvas.getContext('webgl')",
+                "log('丢失之前 ready =', backend.ready)",
+                "own.getExtension('WEBGL_lose_context').loseContext()   // 事件要等到之后的任务才派发",
+                "log('刚调用 loseContext，ready =', backend.ready)",
+                "try { backend.withRenderSurface({ surface: { kind: 'default-framebuffer' } }, () => undefined) } catch (error) { log('进入作用域：', error.name) }",
+                'backend.dispose()'
+              ].join('\n'),
+              choices: ['false：ready 直接查 gl.isContextLost()，不等事件', 'true：要等 DOM 事件派发之后才会变', '抛错：丢失期间不能读 ready'],
+              answer: 0,
+              explain: 'ready 的 getter 每次都直接查 gl.isContextLost()，查到了就立即作废这一代（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:113">WebGL1Backend.ts:113–119</a>）。事件派发得晚，但 Backend 不等它：进入作用域的 requireGeneration 同样先查 isContextLost（:322–325），所以抛出的是 WebGLContextLostError——第 6 课「设备暂时不可用」那一类。对照图 3 的前两条时间线。'
+            },
+            {
+              title: 'G · 把 ⑧ 挪到 ⑩ 之后：当前 program 是 A，却执行了为 B 准备的上传命令。uColor 写进了哪里？',
+              note: '这张卡片直接调用 gl.useProgram，模拟「上一次 draw 留下的当前 program」和「⑧ 被挪到 ⑩ 之后」；项目里没有这样的代码。',
+              code: [
+                'const make = (name) => new R.ShaderModule({',
+                "  name, language: 'glsl-es-100',",
+                "  vertexSource: 'attribute vec3 position; void main() { gl_Position = vec4(position, 1.0); }',",
+                "  fragmentSource: 'precision mediump float; uniform vec3 uColor; void main() { gl_FragColor = vec4(uColor, 1.0); }'",
+                '})',
+                "const shaderA = make('A')                                   // 上一次 draw 用的 shader",
+                "const shaderB = make('B')                                   // 这一次 draw 要用的 shader",
+                'const programA = programs.get(shaderA)',
+                'const programB = programs.get(shaderB)',
+                "const uniforms = new R.WebGL1Uniforms(gl, 8, () => { throw new Error('这张卡片不用 cubemap') })",
+                "const material = new R.Material({ shaderModule: shaderB, parameters: { uColor: { type: 'vec3', value: [1, 0, 0] } } })",
+                'const submission = { item: { geometry: makeTriangle(), material, worldMatrix: IDENTITY }, view: { viewMatrix: IDENTITY, projectionMatrix: IDENTITY, cameraWorldPosition: [0, 0, 0] } }',
+                'const commands = uniforms.prepare(programB, submission)     // ⑥',
+                'gl.useProgram(programA.program)                             // 上一次 draw 留下的当前 program',
+                'uniforms.upload(commands)                                   // ⑩ 被挪到了 ⑧ 前面',
+                'gl.useProgram(programB.program)                             // ⑧ 挪到了后面',
+                "const read = (p) => Array.from(gl.getUniform(p.program, p.uniforms.get('uColor'))).join(', ')",
+                "log('B 的 uColor：', read(programB))",
+                "log('A 的 uColor：', read(programA))"
+              ].join('\n'),
+              choices: ['哪里都没写：location 属于 B，当前 program 是 A，GL 报 INVALID_OPERATION', '写进了 A：uniform 总是写进当前 program', '写进了 B：location 记得自己属于哪个 program'],
+              answer: 0,
+              explain: 'WebGL 规定：uniform* 用的 location 必须来自当前 program，否则产生 INVALID_OPERATION，这次调用什么也不做。上面的证据里，uniform3fv 那一行就是这个错误；A、B 的 uColor 都还是 0, 0, 0。放回 draw 里看：⑩ 挪到 ⑧ 前面，这次 draw 会用 B 上一次被使用时留下的值去画——画错了，却没有异常。这个 INVALID_OPERATION 一直留在错误标志里，直到下一个冷路径的 preflight 把它取出来，算到一个不相干的资源头上（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:98">WebGL1ProgramManager.ts:98–99</a>）。「写进 A」是桌面 OpenGL 上可能发生的事：那里的 location 只是一个整数。'
+            },
+            {
+              title: 'H · 同一个材质连续画两次：第二次 draw 还会调用 gl.useProgram 吗？',
+              note: '这张卡片的 Backend 在自己的 canvas 上创建 context。计数器是课程加的：把同一个 context 上的 useProgram、depthFunc 各包一层，项目里没有这段代码。',
+              code: [
+                "const surfaceCanvas = document.createElement('canvas')",
+                'surfaceCanvas.width = 32',
+                'surfaceCanvas.height = 32',
+                "const backend = new R.WebGL1Backend(surfaceCanvas, 'lesson-19-cache', { antialias: false })",
+                "const own = surfaceCanvas.getContext('webgl')                // 同一个 context",
+                'let useProgramCalls = 0',
+                'let depthFuncCalls = 0',
+                'const realUseProgram = own.useProgram.bind(own)',
+                'const realDepthFunc = own.depthFunc.bind(own)',
+                'own.useProgram = (program) => { useProgramCalls += 1; realUseProgram(program) }   // 课程加的计数器',
+                'own.depthFunc = (func) => { depthFuncCalls += 1; realDepthFunc(func) }',
+                ...RED_SHADER,
+                "backend.withRenderSurface({ surface: { kind: 'default-framebuffer' }, clear: { color: [0, 0, 1, 1], depth: 1 } }, () => {",
+                '  backend.draw(submission)',
+                "  log('第一次 draw 之后：useProgram', useProgramCalls, '次，depthFunc', depthFuncCalls, '次')",
+                '  backend.draw(submission)',
+                "  log('第二次 draw 之后：useProgram', useProgramCalls, '次，depthFunc', depthFuncCalls, '次')",
+                '})',
+                'backend.dispose()'
+              ].join('\n'),
+              choices: ['会：第一次 draw 的 ⑪ 在 finally 里把整份 State 缓存清空了', '不会：State 缓存记得当前就是这个 program', '会：每次 draw 开始时，State 都会先清空缓存'],
+              answer: 0,
+              explain: 'useProgram 和 depthFunc 每次 draw 都各调一次。原因在 ⑪：顶点输入的 bind 不管有没有命中 VAO 缓存，finally 里都会调用 invalidateState（<a data-src="src/rendering/backend/webgl1/WebGL1OESVertexInputManager.ts:136">WebGL1OESVertexInputManager.ts:136–138</a>；命中时的 return 也要经过 finally），而这个钩子接的是整份 state.invalidate()（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:262">WebGL1Backend.ts:262–266</a>）。所以 ⑧⑨ 的去重在连续的 draw 之间从不生效。命中缓存时真正变了的只有 EBO（它跟着 VAO 走），State 为这种情况专门留了 invalidateVertexInputState（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:76">WebGL1State.ts:76–86</a>），可是钩子只有「全部清空」这一种粒度（第 10.2 节）。'
+            }
+          ]
+        })
+      })()
+    </script>
+
+    <h2 id="s9">9. 检查题</h2>
+    <p>凭记忆作答，错了回到对应小节重读。</p>
+    <div class="quiz" data-quiz="lesson-0019"></div>
+    <script>
+      RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0019"]'), [
+        {
+          q: '把 useProgram 挪到 upload 之后，会发生什么？',
+          opts: ['uniform 调用全部报 INVALID_OPERATION、什么也没写；这次 draw 用旧值去画，不抛异常', 'uniform 写进了上一次 draw 留下的那个 program', '抛出 WebGLOperationError，draw 中止'],
+          answer: 0,
+          why: '第 3.8 节、卡片 G。WebGL 只接受当前 program 的 location，而 upload 自己从不 useProgram（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:194">WebGL1Uniforms.ts:194–195</a>）。「写进上一个 program」是桌面 OpenGL 上可能发生的事。'
+        },
+        {
+          q: '第一次上传 buffer（冷路径）为什么放在设置渲染状态之前？',
+          opts: ['先准备、后提交：失败时不留下副作用；其实换了顺序也能画对', '换了顺序 GL 状态会错，一定画不对', 'geometries.get 必须在 useProgram 之前调用，否则会报错'],
+          answer: 0,
+          why: '第 4 节的表：这是软约束。冷路径会恢复自己改过的绑定。'
+        },
+        {
+          q: '作用域为什么要在解析目标之前捕获真实绑定？',
+          opts: ['第一次创建 FBO 会改变当前绑定，晚了就捕获不到入口状态', '为了少调用一次 getParameter', '因为解析目标可能很慢'],
+          answer: 0,
+          why: '<a data-src="src/rendering/backend/webgl1/WebGL1SurfaceScope.ts:184">WebGL1SurfaceScope.ts:184</a>，第 7 节第 4、6 步。'
+        },
+        {
+          q: 'WebGL1Uniforms 把工作拆成 prepare 和 upload，换来的是什么？',
+          opts: ['因为数据问题失败的 draw，一个 uniform 都不写', '上传命令可以在下一帧重复使用', '上传可以放到另一个线程去做'],
+          answer: 0,
+          why: '第 3.6 节、卡片 C。命令只能在本次 draw 内使用（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:194">WebGL1Uniforms.ts:194</a>）。'
+        },
+        {
+          q: '一个 active uniform 在 Material 里找不到值，现在会怎样？',
+          opts: ['拒绝这次 draw，抛 InvalidMaterialError', '沿用 program 里上一次的值', '上传 0'],
+          answer: 0,
+          why: '<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:156">WebGL1Uniforms.ts:156–158</a>。正因为每一次成功的 draw 都写全部 active uniform，失败留下的半套值才不会被画出来（第 3.6 节）。'
+        },
+        {
+          q: 'draw 之后为什么还要再 assertCurrentDraw 一次？',
+          opts: ['context 可能恰好在 draw 期间丢失，要报告丢失而不是假装成功', '为了清理这次 draw 用过的状态', '为了检查 draw 有没有产生 GL 错误'],
+          answer: 0,
+          why: '第 3.7 节。draw 之后不调 getError，GL 错误留给下一个冷路径的 preflight（第 3.12 节）。'
+        },
+        {
+          q: '同一个材质连续画两次，第二次 draw 为什么还会调用 gl.useProgram？',
+          opts: ['第一次 draw 的 ⑪ 在 finally 里清空了整份 State 缓存', '每次 draw 开始时，State 都会先清空缓存', 'useProgram 从来不经过 State 缓存'],
+          answer: 0,
+          why: '卡片 H、第 3.11 节。效果等于 State 注释里警告过的做法：「不应在每次调用开头无条件 invalidate，否则……失去去重意义」（<a data-src="src/rendering/backend/webgl1/WebGL1State.ts:110">WebGL1State.ts:110</a>）。'
+        },
+        {
+          q: '上层怎样知道 context 已经丢了、不该再画？',
+          opts: ['看 backend.ready：它直接查 gl.isContextLost()', '等 webglcontextlost 事件派发之后再判断', '每次 draw 前自己调用 getError'],
+          answer: 0,
+          why: '卡片 F、图 3：从物理丢失那一刻起 ready 就是 false，不等事件。'
+        }
+      ])
+    </script>
+
+    <h2 id="s10">10. 架构视角</h2>
+    <h3>10.1 对照 three.js 的新渲染器</h3>
+    <ul>
+      <li><strong>入口清除是同一种形状。</strong>three.js 新渲染器的 WebGL 后端在 <a data-src="node_modules/three/src/renderers/webgl-fallback/WebGLBackend.js:445">beginRender</a> 里先设 viewport、再绑定 framebuffer，然后按 renderContext 里的清除值清一次（<a data-src="node_modules/three/src/renderers/webgl-fallback/WebGLBackend.js:478">:478–479</a>）。本项目把清除并进作用域入口，走的是同一条路；WebGPU 的 render pass 也是在开始时指定清除。</li>
+      <li><strong>收尾不在 finally 里。</strong>它的 Renderer 先调 <code>backend.beginRender</code>（<a data-src="node_modules/three/src/renderers/common/Renderer.js:1472">Renderer.js:1472</a>），中间画完再调 <code>finishRender</code>（<a data-src="node_modules/three/src/renderers/common/Renderer.js:1490">:1490</a>），两者之间没有 try/finally：中间有代码抛错，收尾就不会执行。本项目的作用域用 finally 保证恢复（图 4），这是第 6 课「用作用域，不用全局开关」的延续。</li>
+    </ul>
+
+    <h3>10.2 审查视角：三处值得讨论，一处已经修好</h3>
+    <ol>
+      <li>
+        <strong>每次 draw 都无条件设十个状态。</strong><a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:289">applyDrawState</a> 每次都 disable 六个功能，再设颜色掩码、深度范围、正面方向和线宽，不走缓存。好处是绝不继承别人留下的状态；代价是每次 draw 多十次 gl 调用。<strong>想一想：</strong>要不要把它们也挪进 State、只在变化时才设？要承担什么风险（提示：如果有人绕过 State 改了状态呢）？
+      </li>
+      <li>
+        <strong>失效钩子只有一种粒度，State 的去重在 draw 路径上从不生效。</strong>⑪ 每次都调用整份 <code>state.invalidate()</code>（卡片 H），所以 ⑧ 的 useProgram、⑨ 的深度和剔除每次都重发。命中 VAO 缓存时真正需要作废的只有 EBO，State 为此留了 <a data-src="src/rendering/backend/webgl1/WebGL1State.ts:76">invalidateVertexInputState</a>；可是 VertexInputManager 只拿到一个钩子，而它的注释要求接完整的 invalidate（<a data-src="src/rendering/backend/webgl1/WebGL1VertexInputManager.ts:43">WebGL1VertexInputManager.ts:43–53</a>），因为冷路径还改了 ARRAY_BUFFER。HW2 每帧只有几次 draw，性能上无所谓；问题在于一段看起来在工作的缓存，实际上从不命中。<strong>想一想：</strong>是给钩子分出两种粒度，还是干脆承认 State 在 draw 路径上不需要缓存、删掉它？各自的风险在哪？
+      </li>
+      <li>
+        <strong>submission 形状不对，报的是 InvalidMaterialError。</strong><a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:196">:196–203</a>：geometry 不是 Geometry、view 不是对象，都抛 <code>InvalidMaterialError('submission', …)</code>，消息是「Material field submission is invalid: invalid draw submission」。按第 6 课的分类，它确实属于「调用者用错了」；但类名和消息都指向 Material，排查的人会先去查材质。<strong>想一想：</strong>该换成哪种错误，还是新加一个？
+      </li>
+      <li>
+        <strong>已经修好（2026-09-28）：ResourceManager 的空 catch 删掉了。</strong>改之前是 <code>try { … } catch (error) {} finally { … }</code>：清理错误被吞掉，和上方注释「本方法不吞错」（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:181">WebGL1ResourceManager.ts:181</a>）矛盾。某个 Manager 清理失败时，Backend.dispose 照常返回、把 <code>cleanupComplete</code> 设成 true，之后再调 dispose 直接 return，失败那一步之后的 Manager 永远不会被清理。现在只剩 <code>try { … } finally { this.disposing = false }</code>（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:190">:190–201</a>）：错误一路传到 Backend.dispose，<code>cleanupComplete</code> 保持 false；再调一次 dispose，ResourceManager 从 <code>disposalIndex</code> 记住的那一步接着清，已经完成的步骤不重复（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:241">WebGL1Backend.ts:241–255</a>；测试 <a data-src="tests/unit/rendering/backend/webgl1/WebGL1ResourceManager.test.ts:314">WebGL1ResourceManager.test.ts:314</a>，原来失败，现在通过）。留在这里作对照：多一个空的 catch，失败就再也没法重试。
+      </li>
+    </ol>
+
+    <h2 id="s11">11. 延伸阅读</h2>
+    <p>
+      <strong>首选（一手来源，约 15 分钟）：</strong>HW2 设计文档的 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-26-hw2-complete-webgl1-architecture-design.md:1518">§23 WebGL1Backend</a> 和实施计划的 <a data-main="codex-workspace/codex-dual-webgl-backend-refactor/2026-08-28-hw2-complete-webgl1-architecture-implementation-plan.md:740">Task 15</a>。对照第 3 节读，看实现和设计有哪些地方一样、哪些地方改了（清除并进作用域就是改动之一）。
+    </p>
+    <p>
+      补充：三个单元测试文件的用例标题就是一份行为清单——<a data-src="tests/unit/rendering/backend/webgl1/WebGL1SurfaceScope.test.ts:178">WebGL1SurfaceScope.test.ts</a>、<a data-src="tests/unit/rendering/backend/webgl1/WebGL1Uniforms.test.ts:144">WebGL1Uniforms.test.ts</a>、<a data-src="tests/unit/rendering/backend/webgl1/WebGL1Backend.test.ts:97">WebGL1Backend.test.ts</a>；真实 GPU 上的验收在 <a data-src="tests/browser/rendering/backend/webgl1/WebGL1Backend.test.ts:157">浏览器端的 WebGL1Backend.test.ts</a>，包括丢失、恢复之后重新画出正确的像素；lifecycle 状态机本身的真实事件测试在 <a data-src="tests/browser/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:41">WebGLContextLifecycle.test.ts</a>（第 6 节）。
+    </p>
+
+    <aside class="ask">
+      做完告诉我：热身题和检查题各错了哪几题、八张卡片猜对了几张；10.2 的前三个问题可以直接在对话里回答。读的过程中哪一步还是没讲清楚，直接指出来，我在对话里接着讲。
+    </aside>
+
+    <div class="nav">
+      <a href="0007-core-resource-errors.html">← 第 7 课：core 精读</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0008-transform-and-scenenode.html">第 8 课：Transform 与 SceneNode →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 19 课（提前）· 2026-09-26 初版，2026-09-27 重写，2026-09-28 按代码改动更新</footer>
+  </body>
+</html>

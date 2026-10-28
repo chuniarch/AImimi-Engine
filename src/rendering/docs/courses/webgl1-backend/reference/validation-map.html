@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>校验地图</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+  </head>
+  <body>
+    <p class="kicker">速查 · 第 40 课起「带阴影的三角形」系列使用</p>
+    <h1>校验地图：哪里校验，校验之后可以放心什么</h1>
+    <p class="lede">这一页不讲每条规则怎么写，只回答两件事：每个位置检查哪一类东西；检查通过以后，下游的代码可以不再担心什么。读源码时遇到一串 <code>require…</code>、<code>assert…</code>、<code>throw</code>，先在这里找到它属于哪一行，就知道它在守什么，细节可以跳过。</p>
+
+    <h2>一条主线：谁能知道，谁就检查</h2>
+    <p>同一个错误，越早发现越好；但很多事早的时候还不知道。所以检查分三层，每一层只检查它<strong>此刻能知道</strong>的事（第 31 课第 8 节）：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>层</th><th>什么时候</th><th>只看什么</th><th>通过之后可以放心</th><th>这时还不知道的</th></tr>
+        <tr><td>① 构造时</td><td><code>new Geometry(…)</code>、<code>new Material(…)</code> 这些 CPU 对象被创建、被修改的那一刻</td><td>对象自己</td><td>这个对象自洽；值已经复制并冻结，外面再改原数组也影响不到它</td><td>它会和谁配在一起；跑在哪块显卡上</td></tr>
+        <tr><td>② 每帧提取时</td><td><code>Renderer.render</code> 开头，<code>RenderListBuilder.build</code></td><td>这一帧的组合：场景、相机、物体的世界矩阵</td><td>这一帧交给 Pass 的值都是冻结的、有限的；相机矩阵可逆</td><td>shader 要的东西 Geometry、Material 给没给；设备支不支持</td></tr>
+        <tr><td>③ 上 GPU 时</td><td>第一次用到某个资源时（建 GPU 对象）；每次进 scope、每次 draw</td><td>跨资源的配合、设备能力、GL 的回答</td><td>这次 draw 的每个 active uniform 和 attribute 都有值、类型对；用到的 GPU 对象在当前 context 上完整可用</td><td>—</td></tr>
+      </table>
+    </div>
+    <p>例子：<code>new Material({ parameters: { uColor: … } })</code> 时只能确认 uColor 是合法的 vec3；这个材质配的 shader 里到底有没有 <code>uniform vec3 uColor</code>，要等第一次 draw、program 链接好以后才知道。所以「名字对不对得上」不可能在构造时检查，只能在第 ③ 层。</p>
+
+    <h2>每一处在守什么</h2>
+    <p>源码位置相对 <code>src/rendering/</code>。「之后放心」一栏是下游代码依赖的前提；「留给」一栏是这一处故意不管、交给后面哪一层的事。</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>位置</th><th>层</th><th>检查什么（一句话）</th><th>之后放心</th><th>留给</th></tr>
+        <tr><td><code>resources/VertexAttribute</code></td><td>①</td><td>数据是支持的 TypedArray，itemSize 合法</td><td>数据是自己的副本</td><td>shader 用不用这个属性 → 顶点输入</td></tr>
+        <tr><td><code>resources/Geometry</code></td><td>①</td><td>有 position、至少一个顶点、各属性顶点数一致、索引不越界</td><td>上传和绘制不会读越界</td><td>设备支不支持 32 位索引 → GeometryManager</td></tr>
+        <tr><td><code>resources/ShaderModule</code></td><td>①</td><td>名字、语言、两段源码非空，内建映射合法</td><td>文本层面完整</td><td>能不能编译、链接 → ProgramManager</td></tr>
+        <tr><td><code>resources/ParameterBlock</code>（10 月 19 日录入；第 45 课）</td><td>①</td><td>label 非空；名字和值的种类构造时定死，值按 Material 同一套规则复制（<code>resources/materialParameters</code>）；set 只能替换已有的名字、种类不变，先检查、复制再替换</td><td>块里永远是完整合法的一组值；读出去的是副本</td><td>shader 里有没有这些名字 → Uniforms（只问 active uniform，块里多余的项被忽略）；什么时候写块 → 生产者的约定（运行时不拦）</td></tr>
+        <tr><td><code>resources/Material</code></td><td>①</td><td>shader 存活；参数名和类型合法、数值有限、长度对；纹理存活；不占内建 uniform 名；渲染状态合法；借用的块存活，块与块、块与本地参数、块与内建名都不重名；setParameter 不许写块提供的名字</td><td>参数是副本；每个名字只有一个来源，后端找值不需要优先级</td><td>shader 里有没有这个 uniform、类型一不一致、缺不缺值 → Uniforms</td></tr>
+        <tr><td><code>resources/RenderTarget</code></td><td>①</td><td>label 必填；尺寸是正整数；格式和过滤在允许列表里</td><td>描述冻结；改尺寸会让 revision 加 1</td><td>设备能不能建（浮点、尺寸上限、FBO 完整性）→ RenderTargetManager</td></tr>
+        <tr><td><code>resources/Texture2D</code>、<code>CubeTexture</code></td><td>①</td><td>来源已经加载、尺寸和格式组合合法</td><td>像素是快照</td><td>WebGL1 的非 2 的幂、sRGB、浮点限制 → 纹理 Manager</td></tr>
+        <tr><td><code>scene/SceneNode</code>、<code>Transform</code>、<code>Mesh</code></td><td>①</td><td>树没有环、一个节点只有一个父；变换是有限的 Float32；Mesh 引用的资源存活</td><td>遍历不会死循环</td><td>资源中途被释放 → Mesh 的 getter 每次用时再查</td></tr>
+        <tr><td><code>scene/cameras/PerspectiveCamera</code></td><td>①</td><td>0 &lt; fovY &lt; π、aspect &gt; 0、0 &lt; near &lt; far</td><td>投影矩阵有限、不退化</td><td>相机的世界矩阵可不可逆 → RenderListBuilder</td></tr>
+        <tr><td><code>frame/RenderListBuilder</code></td><td>②</td><td>view 的形状、Scene 没被释放、相机世界矩阵可逆、矩阵是 16 个有限数</td><td>本帧的 ViewState、RenderItem 冻结；每个 Pass 看到同一份</td><td>—</td></tr>
+        <tr><td><code>Renderer</code>、<code>passes/RenderPipeline</code></td><td>②</td><td>状态（运行中、关闭中、已释放）、不可重入、同一个 Pass 不进两次；Backend 没准备好就整帧跳过</td><td>一帧要么完整走完，要么一个 Pass 都不跑</td><td>—</td></tr>
+        <tr><td><code>backend/webgl1/WebGL1SurfaceScope</code></td><td>③ 每次进门</td><td>目的地描述合法、目标存活、清屏值在范围内；scope 里不许改尺寸或释放；读的不是正在写的目标</td><td>出门一定绑回进门前的目标和 viewport</td><td>—</td></tr>
+        <tr><td><code>WebGL1Backend.draw</code></td><td>③ 每次 draw</td><td>当前这一代、已就绪、在 scope 里、提交的形状对</td><td>下面各 Manager 收到的是同一代的有效输入</td><td>—</td></tr>
+        <tr><td>各个 Manager（Program、Geometry、Texture、RenderTarget）</td><td>③ 第一次用到</td><td>设备能力（扩展、尺寸上限）、GL 错误、编译链接结果、FBO 完整性；失败时回滚</td><td>缓存表里只有完整可用的 GPU 对象，没有半成品</td><td>—</td></tr>
+        <tr><td><code>WebGL1Uniforms.prepare</code></td><td>③ 每次 draw</td><td>每个 active uniform 都有值（内建、材质参数、借用的块三处找）、类型一致、sampler 数不超上限、没有 uniform 数组</td><td>upload 不会写到一半失败</td><td>—</td></tr>
+        <tr><td>顶点输入（<code>WebGL1VertexInputSupport</code>）</td><td>③ 每次 draw</td><td>shader 的每个 active attribute 在 Geometry 里都有、itemSize 是 1–4、不超属性上限</td><td>draw 读到的都是绑好的缓冲</td><td>—</td></tr>
+        <tr><td><code>WebGLContextLifecycle</code></td><td>随时</td><td>context 丢失、恢复</td><td>旧一代的 GPU 对象不会被误用；恢复后从 CPU 对象重新建</td><td>—</td></tr>
+      </table>
+    </div>
+
+    <h2>报错类型说明了什么</h2>
+    <p>看错误名就知道是哪一类问题、该改哪里（第 6 课第 4 节）：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>错误</th><th>意思</th><th>该改什么</th></tr>
+        <tr><td><code>Invalid…Error</code>（Material、ParameterBlock、Geometry、RenderTarget、RenderView……）</td><td>输入写错了</td><td>传进来的数据</td></tr>
+        <tr><td><code>ResourceDisposedError</code></td><td>用了已经释放的资源</td><td>谁拥有、谁释放的安排</td></tr>
+        <tr><td><code>Unsupported…Error</code></td><td>这台设备或这种组合做不到</td><td>换一种格式或做法</td></tr>
+        <tr><td><code>ShaderCompilationError</code>、<code>ProgramLinkError</code>、<code>IncompleteFramebufferError</code>、<code>WebGLOperationError</code></td><td>GL 拒绝了</td><td>shader 源码、格式组合</td></tr>
+        <tr><td><code>WebGLContextLostError</code></td><td>设备丢了</td><td>不用改，等恢复</td></tr>
+        <tr><td><code>RenderExecutionError</code>、<code>RenderTargetUnavailableError</code></td><td>调用的时机或顺序违规：重入、scope 里改尺寸、读写同一个目标</td><td>Pass 的编排</td></tr>
+      </table>
+    </div>
+    <p class="nav"><a href="../index.html">课程首页</a> <a href="../lessons/0040-shadow-one-function.html">第 40 课</a></p>
+  </body>
+</html>

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>可取消的请求：速查</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <style>table.wrapcode td code { white-space: normal; word-break: break-word; }</style>
+  </head>
+  <body>
+    <p class="kicker">速查 · 来自第 23 课</p>
+    <h1>可取消的请求：速查</h1>
+    <p class="lede">AbortController 和 AbortSignal 的全部用法、设计一个可取消函数时要问的五个问题，以及第 23 课实验台里踩过的坑。</p>
+
+    <h2>两个对象</h2>
+    <p>controller 是<strong>开关</strong>，signal 是它自带的<strong>灯</strong>。只有开关能把灯按亮；拿到灯的人只能看它，或者登记「灯亮时叫我」。</p>
+    <div class="table-scroll">
+      <table class="wrapcode">
+        <tr><th style="width: 40%">写法</th><th style="width: 42%">意思</th><th>支持版本</th></tr>
+        <tr><td><code>new AbortController()</code></td><td>新建一个开关，自带一盏灯</td><td>66 / 57 / 12.1</td></tr>
+        <tr><td><code>controller.signal</code></td><td>这个开关的灯，每次取都是同一个对象</td><td>同上</td></tr>
+        <tr><td><code>controller.abort(原因)</code></td><td>按开关：灯亮，记下原因，当场执行所有 abort 监听。只有第一次有效</td><td>带原因：98 / 97 / 15.4</td></tr>
+        <tr><td><code>signal.aborted</code></td><td>灯亮了没有</td><td>66 / 57 / 11.1</td></tr>
+        <tr><td><code>signal.reason</code></td><td>按开关时写的原因；不带原因按的，是浏览器生成的 AbortError</td><td>98 / 97 / 15.4</td></tr>
+        <tr><td><code>signal.throwIfAborted()</code></td><td>灯亮着就把原因抛出；没亮就什么也不做</td><td>100 / 97 / 15.4</td></tr>
+        <tr><td><code>signal.addEventListener('abort', fn, { once: true })</code></td><td>灯亮时执行 fn，最多一次，执行完自动摘掉。灯已经亮过，再挂就永远等不到</td><td>once：55 / 50 / 10</td></tr>
+        <tr><td><code>signal.removeEventListener('abort', fn)</code></td><td>摘掉监听，必须传登记时的同一个函数对象</td><td>—</td></tr>
+        <tr><td><code>fetch(url, { signal })</code></td><td>fetch 从发请求到读完正文，一直盯着这盏灯；灯一亮就中止，失败值是 <code>signal.reason</code></td><td>—</td></tr>
+        <tr><td><code>AbortSignal.any([灯1, 灯2])</code></td><td>任何一盏亮，合成的灯就亮（基线 2022 时不能用）</td><td>116 / 124 / 17.4</td></tr>
+      </table>
+    </div>
+    <p>支持版本依次是 Chrome / Firefox / Safari，来自 <a href="https://github.com/mdn/browser-compat-data">MDN browser-compat-data</a>（2026-10-06 查）。</p>
+
+    <h2>设计一个可取消的函数：五个问题</h2>
+    <ol class="steps">
+      <li><strong>平台自己认 signal 吗？</strong>认的话（比如 fetch），把调用者的 signal 直接交给它，到此为止。</li>
+      <li><strong>有没有第二个「该停了」的理由？</strong>有（超时、兄弟任务失败），就自己建一个开关，两个理由都来按它，按的时候写清原因：调用者的取消用 <code>controller.abort(callerSignal.reason)</code> 转发，超时写成超时错误。</li>
+      <li><strong>调用之前就取消了怎么办？</strong>进门先 <code>throwIfAborted()</code>。</li>
+      <li><strong>失败时抛什么？</strong>开关被按过，就抛 <code>controller.signal.reason</code>，不去猜错误叫什么名字；没被按过，才是真出错。</li>
+      <li><strong>什么时候收拾？</strong>等整件事结束（包括读完正文）再摘监听、停计时器。所以要把读正文放进同一个函数，比如传一个 <code>read</code> 进来。</li>
+    </ol>
+
+    <h2>骨架</h2>
+    <pre><code>async function fetchWithTimeout&lt;T&gt;(url: string, options: { timeout?: number; signal?: AbortSignal },
+                                     read: (response: Response) =&gt; Promise&lt;T&gt;): Promise&lt;T&gt; {
+  const { timeout = 6000, signal: callerSignal } = options
+  callerSignal?.throwIfAborted()
+  const controller = new AbortController()
+  const timerId = setTimeout(() =&gt; controller.abort(new TimeoutError()), timeout) // 换成你项目的超时错误
+  const forwardAbort = (): void =&gt; controller.abort(callerSignal?.reason)
+  callerSignal?.addEventListener('abort', forwardAbort, { once: true })
+  try {
+    const response = await fetch(url, { signal: controller.signal })
+    clearTimeout(timerId) // 超时只管响应头
+    return await read(response)
+  } catch (error) {
+    if (controller.signal.aborted) throw controller.signal.reason
+    throw error // 需要的话，把 TypeError 换成你项目的网络错误
+  } finally {
+    clearTimeout(timerId)
+    callerSignal?.removeEventListener('abort', forwardAbort)
+  }
+}</code></pre>
+    <p>本项目的完整版（带注释、项目的错误类）见 <a href="../lessons/0023-designing-fetch-with-timeout.html#s8">第 23 课第 8 节</a>。</p>
+
+    <h2>踩过的坑（第 23 课实验台）</h2>
+    <ul>
+      <li><strong>只给 fetch 自己的开关，忘了转发</strong>：超时有了，调用者的取消却丢了（第 3 版）。</li>
+      <li><strong>转发时 <code>abort()</code> 不带原因</strong>：照样能停下，但调用者收到的是浏览器新造的 AbortError，不是自己写的原因。</li>
+      <li><strong>先取消、后调用</strong>：监听永远等不到事件，请求照常发出（第 4 版）。</li>
+      <li><strong>从不收拾</strong>：每次请求都在调用者的 signal 上留下一个监听；计时器在函数结束后还会按一次开关（第 5 版）。</li>
+      <li><strong>计时器管到正文结束</strong>：大文件在慢网络上被误杀（第 5 版）。</li>
+      <li><strong>在返回 Response 时就收拾</strong>：读正文期间的取消传不进来（第 6 版错误示范）。</li>
+    </ul>
+
+    <h2>出处</h2>
+    <ul>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal#implementing_an_abortable_api">MDN · AbortSignal：Implementing an abortable API</a>（进门检查、用 reason 失败、once、正常结束后摘监听）</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/AbortController">MDN · AbortController</a></li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/addEventListener">MDN · addEventListener（options.once）</a></li>
+      <li><a href="https://developer.chrome.com/blog/abortable-fetch">Jake Archibald · Abortable fetch</a>（2017，早于 reason）</li>
+    </ul>
+  </body>
+</html>

@@ -1,0 +1,639 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 41 课 · 只做一次与每帧做</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/code-view.js"></script>
+    <script src="../assets/shadow-raw.js"></script>
+    <script src="../assets/shadow-41.js"></script>
+  </head>
+  <body>
+    <p class="kicker">系列「带阴影的三角形：从一个函数到 src/rendering」2/7 · 约 25 分钟</p>
+    <h1>只做一次与每帧做：GPU 对象按描述对象查表</h1>
+    <p class="lede">
+      第 40 课的函数每调用一次，就把 program、阴影图、buffer 全部重建一遍。这一课切第一刀：把「只需要做一次的建造」和「每帧都要做的绘制」分开。先用最直接的办法（一个 setup、一个 drawFrame），再用两个需求把它逼成「用到时才建，按描述对象查表」——拆出来的三个小类，就是 <code>backend/webgl1</code> 里各个 Manager 的形状。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— HW1 的阴影图、HW2 的 Mary 模型、FFT 的十几张中间纹理，都是「建一次、用很多帧」。可是后端是通用代码，不知道你的场景里会有什么；它只能在第一次见到某样东西时把它建出来，以后再见到时认出它。这一课回答：怎样「认出来」。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 第 40 课的七段代码（①–⑦）；② JavaScript 的 <code>Map</code>：可以拿任何值当 key，<code>set(key, value)</code> 存、<code>get(key)</code> 取，没有就返回 <code>undefined</code>。拿对象当 key 时它怎样比较，第 5 节当场演示。第 4、18、31 课从真实代码讲过这张表；这一课不读真实代码，而是从第 40 课的函数出发，看它为什么会长出来。<br />
+      <strong>这一课讲的</strong>：第一版 setup 与 drawFrame；两个需求让第一版接不住；第二版：用到时才建、按描述对象查表；表的 key 为什么是对象本身；什么时候从表里删；顺手得到的名字核对；对照 <code>src/rendering</code>。<br />
+      <strong>在一帧里的位置和寿命</strong>：Manager 在 draw 的时候被问「这个东西的 GPU 版本是什么」（上 GPU 的那一层）；它活一个 context 的一代，context 丢失就整套作废。<br />
+      <strong>页面会用到你的显卡</strong>：四块 480 × 300 的画布。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">灯转的时候，什么不用重做</a></li>
+        <li><a href="#s2">第一版：setup 和 drawFrame</a></li>
+        <li><a href="#s3">两个需求，第一版接不住</a></li>
+        <li><a href="#s4">第二版：用到时才建，按描述对象查表</a></li>
+        <li><a href="#s5">表的 key：为什么是对象本身</a></li>
+        <li><a href="#s6">什么时候从表里删</a></li>
+        <li><a href="#s7">顺手得到的：名字能核对了</a></li>
+        <li><a href="#s8">对照 src/rendering</a></li>
+        <li><a href="#s9">检查题</a></li>
+        <li><a href="#s10">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 灯转的时候，什么不用重做</h2>
+    <p>第 40 课最后一道检查题问过：灯转动时，哪几段不需要重新执行。把三种变化放在一起看：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>第 40 课的段</th><th>灯转了</th><th>三角形换了形状</th><th>context 丢失又恢复</th></tr>
+        <tr><td>① 场景数据（JS 里的数）</td><td>不用重做</td><td>三角形的顶点变了</td><td>不用重做：数据在 JS 里，没丢</td></tr>
+        <tr><td>② 编译 program</td><td>不用重做</td><td>不用重做</td><td>要重建：旧 program 作废</td></tr>
+        <tr><td>③ 建阴影图</td><td>不用重做</td><td>不用重做</td><td>要重建</td></tr>
+        <tr><td>④ 上传顶点</td><td>不用重做</td><td>三角形的 buffer 要换</td><td>要重建</td></tr>
+        <tr><td>⑤ 矩阵、⑥ 第一遍、⑦ 第二遍</td><td colspan="3">每帧都做</td></tr>
+      </table>
+    </div>
+    <p>②③④ 是<strong>建造</strong>：把 JS 里的数据变成显卡上的对象。它们什么时候要重做，不由「过了一帧」决定，而由「数据变了没有」和「context 还是不是原来那个」决定。⑤⑥⑦ 是<strong>每帧的绘制</strong>。这一课只把这两类分开，其余（① 的数据怎样组织、⑥⑦ 的两遍怎样拆）留给后面几课。</p>
+
+    <h2 id="s2">2. 第一版：setup 和 drawFrame</h2>
+    <p>最直接的办法：②③④ 搬进 <code>setup</code>，页面加载时调用一次，把建好的 GPU 对象装进一个对象交回来；⑤⑥⑦ 留在 <code>drawFrame</code>，每帧调用，只用 setup 交回来的东西。</p>
+    <div id="cv-v1"></div>
+    <details>
+      <summary>setup 和 drawFrame 用到的五个小函数（从第 40 课原样搬出来）</summary>
+      <p>建造代码一行没改，只是从大函数里拿出来，有了名字：<code>makeProgram</code> 是 ②，<code>makeShadowMap</code> 是 ③，<code>makeBuffer</code> 是 ④，<code>frameMatrices</code> 是 ⑤，<code>drawPositions</code> 是 ⑥⑦ 里反复出现的「绑 buffer、设指针、draw」。只多了两行：<code>makeProgram</code> 挂上 shader 后马上 <code>deleteShader</code>（program 删除时 shader 跟着删，不然第 6 节删 program 会留下 shader）；<code>makeShadowMap</code> 最后绑回屏幕。</p>
+      <pre id="helpers"></pre>
+    </details>
+    <div class="gl-stage">
+      <canvas width="480" height="300" id="a-canvas"></canvas>
+      <div class="gl-controls">
+        <label>灯偏离正上方的角度 <input type="range" min="-60" max="60" value="35" id="a-angle" /></label>
+        <span id="a-angle-text">35°</span>
+        <button type="button" id="a-burst">连续画 60 帧</button>
+        <button type="button" id="a-lose">模拟 context 丢失再恢复</button>
+      </div>
+      <p class="gl-readout" id="a-readout"></p>
+    </div>
+    <p>拖滑块、点「连续画 60 帧」，看读数里的「累计新建」：不管画多少帧，program 一直是 2 个、阴影图 1 张、buffer 2 个。备课时在无界面 Chrome（软件渲染 SwiftShader）里实测：</p>
+    <ul>
+      <li>setup 一次：GL 命令 45 条、查询 7 次（4 次查编译结果、2 次查链接结果、1 次查 framebuffer 完整），新建 program 2、shader 4（随即标记删除）、纹理 1、深度缓冲 1、framebuffer 1、buffer 2。</li>
+      <li>之后每帧：GL 命令 37 条、查询 10 次，新建 0 个。连画 60 帧：新建 0 个。</li>
+      <li>画面和第 40 课逐像素比较，480 × 300 个像素全部相同。</li>
+    </ul>
+    <p>每帧那 10 次查询是什么？点代码上方的「每帧按名字查位置」：drawFrame 每帧都用字符串问一遍 uniform 和 attribute 的位置。位置在链接以后就不会变，所以这其实也是「只需要做一次」的事——第二版会顺手把它挪走。</p>
+    <p class="lab-note">读数下面那行计数是课程写的：页面先拿到 context，再给它的每个方法套一层计数（项目源码里没有这层）。「GL 命令」指不返回答案的调用，「查询」指 <code>get*</code>、<code>is*</code>、<code>check*</code> 这类要等显卡回答的调用（第 39 课）。</p>
+
+    <h2 id="s3">3. 两个需求，第一版接不住</h2>
+    <p><strong>需求一：运行中把三角形换成大的。</strong>HW1 的界面上会有「换遮挡物」这类开关；HW2 的 Mary 模型是异步加载完才出现的，第一帧时还没有。第一版里，三角形的 buffer 是 <code>built.triangleBuffer</code> 这个固定的字段，只在 setup 里建过一次。要换，就得另写一个函数：删掉旧 buffer、上传新顶点、塞回 <code>built</code>。以后换别的东西（换阴影图尺寸、换 shader），每一种都要再写一个。还有个问题没人回答：换回小的时候，刚才删掉的要不要重新上传？</p>
+    <p><strong>需求二：context 丢失。</strong>点上面画布的「模拟 context 丢失再恢复」。恢复以后 drawFrame 照常调用，画面却只剩深色背景 (20, 23, 31)，<code>getError</code> 报 INVALID_OPERATION。因为 <code>built</code> 里的 program、纹理、buffer 都属于丢失前的那一代 context，恢复以后全部作废（<a href="https://developer.mozilla.org/en-US/docs/Web/API/HTMLCanvasElement/webglcontextrestored_event">MDN 的 webglcontextrestored 页</a>原话：丢失前建的纹理、buffer 不再有效，要重新创建；第 4、13 课实测过）。</p>
+    <p>第一版也能补：恢复时再调一次 setup。可是 setup 只会建写在它里面的那些东西——如果运行中已经把三角形换成了大的，setup 重建出来的还是小的。<strong>「现在场景里有什么」应该由数据说了算，而不是由 setup 说了算。</strong></p>
+    <p>把两个需求合起来看：显卡上的对象只是 JS 数据的一份<strong>副本</strong>。需要有人做四件事：</p>
+    <ol>
+      <li>第一次用到某份数据时，建它的 GPU 副本；</li>
+      <li>记住「哪个 GPU 对象是照哪份数据建的」，下次直接拿；</li>
+      <li>某份数据不再用了，删掉它的副本；</li>
+      <li>context 丢失时，把所有副本作废；下次用到时，照数据重建。</li>
+    </ol>
+
+    <h2 id="s4">4. 第二版：用到时才建，按描述对象查表</h2>
+    <p>第二版先把「数据」写成几个普通的 JS 对象，叫<strong>描述对象</strong>：只写「是什么」（源码、顶点、尺寸），不含任何 GPU 对象。页面加载时建一次，之后一直拿着同一批对象。然后给三类 GPU 对象各写一个小类，每个类里一张 <code>Map</code>：key 是描述对象，value 是照它建出来的 GPU 对象。</p>
+    <figure class="diagram">
+      <div class="scroll">
+        <svg viewBox="0 0 640 330" role="img" aria-label="三栏。左栏是 JS 里的六个描述对象，页面一直拿着。中栏是三个 Manager 各自的表，key 是左栏的对象本身。右栏是照描述建出来的 GPU 对象，属于这个 context 的这一代。drawWithManagers 每帧对左栏的对象调用 get：表里有就直接返回右栏的对象；没有就先建，再登记。context 丢失时右栏全部作废，中栏整张扔掉，换一套空表；左栏不受影响，下一帧照它重建。">
+          <defs>
+            <marker id="f41a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="tip" /></marker>
+          </defs>
+          <text x="95" y="20" text-anchor="middle" class="title">描述对象（JS）</text>
+          <text x="95" y="35" text-anchor="middle" class="small">页面一直拿着</text>
+          <text x="320" y="20" text-anchor="middle" class="title">Manager 的表（Map）</text>
+          <text x="320" y="35" text-anchor="middle" class="small">key 是左边的对象本身</text>
+          <text x="545" y="20" text-anchor="middle" class="title">GPU 对象</text>
+          <text x="545" y="35" text-anchor="middle" class="small">属于这个 context 的这一代</text>
+
+          <rect x="20" y="50" width="150" height="26" rx="4" class="box" /><text x="30" y="67">depthShader</text>
+          <rect x="20" y="84" width="150" height="26" rx="4" class="box" /><text x="30" y="101">mainShader</text>
+          <rect x="20" y="128" width="150" height="26" rx="4" class="box" /><text x="30" y="145">shadowTarget</text>
+          <rect x="20" y="172" width="150" height="26" rx="4" class="box" /><text x="30" y="189">floorGeometry</text>
+          <rect x="20" y="206" width="150" height="26" rx="4" class="box hl" /><text x="30" y="223">triangleGeometry</text>
+          <rect x="20" y="240" width="150" height="26" rx="4" class="box" /><text x="30" y="257">bigTriangle…</text>
+
+          <rect x="240" y="46" width="160" height="68" rx="4" class="box" /><text x="250" y="62" class="small">programs.entries</text>
+          <text x="250" y="80">depthShader →</text><text x="250" y="104">mainShader →</text>
+          <rect x="240" y="124" width="160" height="34" rx="4" class="box" /><text x="250" y="140" class="small">renderTargets.entries</text>
+          <text x="250" y="153">shadowTarget →</text>
+          <rect x="240" y="168" width="160" height="102" rx="4" class="box" /><text x="250" y="184" class="small">geometries.entries</text>
+          <text x="250" y="200">floor… →</text><text x="250" y="226">triangle… →</text><text x="250" y="258" class="small">（换上过大的才有）</text>
+
+          <line x1="170" y1="63" x2="238" y2="76" class="line" marker-end="url(#f41a)" />
+          <line x1="170" y1="97" x2="238" y2="100" class="line" marker-end="url(#f41a)" />
+          <line x1="170" y1="141" x2="238" y2="149" class="line" marker-end="url(#f41a)" />
+          <line x1="170" y1="185" x2="238" y2="196" class="line" marker-end="url(#f41a)" />
+          <line x1="170" y1="219" x2="238" y2="222" class="line accent" marker-end="url(#f41a)" />
+          <line x1="170" y1="253" x2="238" y2="254" class="line dash" marker-end="url(#f41a)" />
+
+          <rect x="470" y="62" width="150" height="24" rx="4" class="box" /><text x="480" y="78">program（深度）</text>
+          <rect x="470" y="92" width="150" height="24" rx="4" class="box" /><text x="480" y="108">program（主）</text>
+          <rect x="470" y="128" width="150" height="34" rx="4" class="box" /><text x="480" y="142" class="small">framebuffer + 纹理</text><text x="480" y="156" class="small">+ 深度缓冲</text>
+          <rect x="470" y="186" width="150" height="24" rx="4" class="box" /><text x="480" y="202">buffer</text>
+          <rect x="470" y="214" width="150" height="24" rx="4" class="box hl" /><text x="480" y="230">buffer</text>
+          <rect x="470" y="244" width="150" height="24" rx="4" class="box" stroke-dasharray="4 3" /><text x="480" y="260" class="small">buffer（大三角形）</text>
+
+          <line x1="400" y1="76" x2="468" y2="74" class="line" marker-end="url(#f41a)" />
+          <line x1="400" y1="100" x2="468" y2="104" class="line" marker-end="url(#f41a)" />
+          <line x1="400" y1="149" x2="468" y2="145" class="line" marker-end="url(#f41a)" />
+          <line x1="400" y1="196" x2="468" y2="198" class="line" marker-end="url(#f41a)" />
+          <line x1="400" y1="222" x2="468" y2="226" class="line accent" marker-end="url(#f41a)" />
+          <line x1="400" y1="254" x2="468" y2="256" class="line dash" marker-end="url(#f41a)" />
+
+          <path d="M462 54 L462 276 L628 276 L628 54 Z" class="line bad dash" />
+          <text x="545" y="292" text-anchor="middle" class="bad">context 丢失：这一栏全部作废</text>
+          <text x="320" y="292" text-anchor="middle" class="small">丢失时整张扔掉，换一套空表</text>
+          <text x="95" y="292" text-anchor="middle" class="small">不受影响，下一帧照它重建</text>
+          <text x="320" y="318" text-anchor="middle">每帧 get(描述)：表里有 → 直接返回；没有 → 建、登记、返回</text>
+        </svg>
+      </div>
+      <figcaption>图 1　第二版的三栏。蓝色那一行是正在用的三角形；虚线那一行只有把大三角形换上去过才会出现。左栏不含任何 GPU 对象，所以 context 丢失不影响它。</figcaption>
+    </figure>
+    <p>三个 Manager 的代码几乎一样：<code>get</code> 先查表，查到就返回；查不到才调用第 2 节那几个建造函数，建完登记，再返回。<code>release</code> 从表里删掉并删除 GPU 对象。</p>
+    <div id="cv-managers"></div>
+    <p>每帧的绘制改成「用到什么就向 Manager 要什么」。它不再调用任何 <code>create*</code>，也不知道东西是这一帧刚建的还是早就建好的：</p>
+    <div id="cv-draw"></div>
+    <div class="gl-stage">
+      <canvas width="480" height="300" id="b-canvas"></canvas>
+      <div class="gl-controls">
+        <label>灯偏离正上方的角度 <input type="range" min="-60" max="60" value="35" id="b-angle" /></label>
+        <span id="b-angle-text">35°</span>
+        <button type="button" id="b-small">三角形：小</button>
+        <button type="button" id="b-big">三角形：大</button>
+        <button type="button" id="b-release">不再用大三角形（换回小的，再 release）</button>
+        <button type="button" id="b-lose">模拟 context 丢失再恢复</button>
+      </div>
+      <p class="gl-readout" id="b-readout"></p>
+    </div>
+    <p>按顺序试一遍。下面是备课时实测的每一步（读数里「这一次」指按下按钮后画的那一帧）：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>操作</th><th>这一次新建</th><th>这一次删除</th><th>表里条目<br />program / 几何 / 目标</th><th>GL 命令 / 查询</th></tr>
+        <tr><td>页面加载，第 1 帧</td><td>program 2、纹理 1、深度缓冲 1、framebuffer 1、buffer 2</td><td>shader 4（挂上后标记删除）</td><td>2 / 2 / 1</td><td>87 / 25</td></tr>
+        <tr><td>第 2 帧起（拖滑块）</td><td>0</td><td>0</td><td>2 / 2 / 1</td><td>42 / 0</td></tr>
+        <tr><td>三角形：大</td><td>buffer 1</td><td>0</td><td>2 / 3 / 1</td><td>45 / 0</td></tr>
+        <tr><td>三角形：小</td><td>0（小的一直在表里）</td><td>0</td><td>2 / 3 / 1</td><td>42 / 0</td></tr>
+        <tr><td>不再用大三角形</td><td>0</td><td>buffer 1</td><td>2 / 2 / 1</td><td>43 / 0（release 的 1 条加一帧 42 条）</td></tr>
+        <tr><td>换成大的，再模拟丢失并恢复</td><td>和第 1 帧一样全部重建</td><td>shader 4</td><td>2 / 2 / 1（新的一套表，只有地面和大三角形）</td><td>87 / 25；getError 0</td></tr>
+      </table>
+    </div>
+    <p>最后一行要看画面：恢复以后画的是<strong>大</strong>三角形，和丢失前逐像素相同。重建不靠任何人记住「刚才换过形状」——页面恢复时只做了一件事，<code>managers = createManagers(gl)</code> 换一套空表；下一帧 drawWithManagers 照常向表要 <code>d.triangleGeometry</code>，那时它指向的就是大三角形的描述。</p>
+    <p>还有一处变化：第 2 帧起每帧 0 次查询。uniform 和 attribute 的位置在 <code>ProgramManager.get</code> 第一次建 program 时查好、存进表里了。每帧命令从 37 条变成 42 条，是因为 <code>setUniforms</code> 每画一个物体就把这个 program 的所有 uniform 都设一遍（第 7 节说为什么值得）。</p>
+
+    <h2 id="s5">5. 表的 key：为什么是对象本身</h2>
+    <p><code>Map</code> 拿对象当 key 时，比的是「是不是同一个对象」，不看里面的内容（<a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map#key_equality">MDN · Map · Key equality</a>）。在 Node 里跑：</p>
+<pre>const table = new Map()
+const a = { name: 'triangle' }
+const b = { name: 'triangle' }   // 内容和 a 一样，但是另一个对象
+table.set(a, 'buffer A')
+table.get(a)   // → 'buffer A'
+table.get(b)   // → undefined</pre>
+    <p>为什么不用别的当 key？下面这块画布可以把第二版的 GeometryManager 换成两种别的写法，其余代码不动：</p>
+    <div class="gl-stage">
+      <canvas width="480" height="300" id="c-canvas"></canvas>
+      <div class="gl-controls">
+        <label><input type="radio" name="c-mode" value="object" checked /> 按对象查表（第二版原样）</label>
+        <label><input type="radio" name="c-mode" value="name" /> 按名字查表</label>
+        <label><input type="radio" name="c-mode" value="fresh" /> 每帧新建描述对象</label>
+      </div>
+      <div class="gl-controls">
+        <label>灯 <input type="range" min="-60" max="60" value="35" id="c-angle" /></label>
+        <button type="button" id="c-small">三角形：小</button>
+        <button type="button" id="c-big">三角形：大</button>
+        <button type="button" id="c-burst">连续画 60 帧</button>
+      </div>
+      <p class="gl-readout" id="c-readout"></p>
+    </div>
+    <pre id="c-code"></pre>
+    <p class="lab-note">上面两段变体是课程写的，项目源码里没有。切换写法时页面会丢掉旧画布、换一块新的，从第 1 帧重新开始。</p>
+    <ul>
+      <li><strong>按名字查表</strong>：两个三角形的描述都叫 <code>'triangle'</code>（名字是给人看的，没人保证唯一）。点「三角形：大」，表里已经有 <code>'triangle'</code>，直接返回小三角形的 buffer：新建 0 个，画面和小三角形逐像素相同，不报错。真实代码的注释专门写了这一条：program 的「cache key 是完整 CPU 对象身份，不是 name」（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:52">WebGL1ProgramManager.ts:52</a>）；RenderTarget 的 label「不是唯一标识」（<a data-src="src/rendering/resources/RenderTarget.ts:420">RenderTarget.ts:420</a>）。</li>
+      <li><strong>按内容查表</strong>（没放进实验）：每次 get 都把顶点数组整个读一遍算出 key。名字撞车的问题没有了，代价是每帧每个物体都要读一遍全部顶点；Mary 这种几万个顶点的模型，读一遍比查一次 Map 贵得多。</li>
+      <li><strong>每帧新建描述对象</strong>：drawWithManagers 本身没改，只是每帧传进去一个新的三角形描述（内容相同）。点「连续画 60 帧」：切换写法时已经画了 1 帧（表里 2 条），再画 60 帧，表里的几何涨到 62 条，buffer 一共新建 62 个——每画一帧多一条。第 40 课的泄漏又回来了，只是这次藏在表里。</li>
+    </ul>
+    <p>所以用对象本身当 key，又快又不会认错，但它对描述对象提出了两个要求：</p>
+    <ol>
+      <li><strong>一直是同一个对象。</strong>描述要建一次、长期拿着，不能在每帧的代码里现做。</li>
+      <li><strong>建过以后内容不再变。</strong>如果有人改了 <code>triangleGeometry.positions</code> 里的数，表里那份 buffer 就过时了，而 Manager 只看「是不是同一个对象」，发现不了。</li>
+    </ol>
+    <p>谁来保证这两条？描述对象现在是谁都能改的普通对象，什么也保证不了。第 42 课把它们做成 <code>resources/</code> 里的类，由 <code>scene/</code> 拿着。</p>
+
+    <h2 id="s6">6. 什么时候从表里删</h2>
+    <p>表里的 GPU 对象会一直留着，直到有人对它的描述调用 <code>release</code>。第 4 节画布上的「不再用大三角形」按钮就是页面手动调用了 <code>managers.geometries.release(大三角形的描述)</code>：表里少一条，<code>deleteBuffer</code> 一次。</p>
+    <p>该由谁来调用？由知道「这份数据以后不用了」的那一方——数据的主人。Manager 不知道，后端也不知道。第 42 课让描述对象自己在被丢弃时通知：每个 Manager 第一次建它的副本时，顺便登记一个「它被丢弃时叫我」，于是数据的主人只需要丢弃数据，不用知道它在几个 context 里有几份副本。</p>
+    <p>context 丢失是另一回事：不调用 release。旧 context 的对象已经作废，对它们调 <code>delete*</code> 没有意义；正确做法是整张表扔掉，恢复后换一套新的 Manager（第 4 节最后一行）。</p>
+
+    <h2 id="s7">7. 顺手得到的：名字能核对了</h2>
+    <p>第 40 课把 JS 里查位置的 <code>'uLightVP'</code> 拼成 <code>'uLigthVP'</code>，画面变暗，<code>getError</code> 仍是 0，没有任何地方报错。第二版里，<code>ProgramManager</code> 链接以后把这个 program 的全部 active uniform 存成了表，于是 <code>setUniforms</code> 可以反过来核对：<strong>shader 里的每个 uniform，这一次都必须有值。</strong></p>
+    <p>下面这块画布运行的是第二版的 drawWithManagers，只改了一处：⑦ 里给值的 <code>uLightVP: lightVP</code> 写成了 <code>uLigthVP: lightVP</code>。和第 40 课一样，课程用 <code>new Function</code> 把函数源码里这一处替换掉再运行。</p>
+    <div class="gl-stage">
+      <canvas width="480" height="300" id="d-canvas"></canvas>
+      <p class="gl-readout" id="d-readout"></p>
+    </div>
+    <p>这一次在第一帧就抛错，错误里直接写着缺的是哪个名字。画布上看到的是：第一遍已经画进阴影图，第二遍清屏以后、画地面之前就停了。真实代码在同一个方向上核对（<a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:157">WebGL1Uniforms.ts:157</a>：「active uniform has no value for this draw」）。值由谁给、名字由谁定，是第 45 课的主题。</p>
+
+    <h2 id="s8">8. 对照 src/rendering</h2>
+    <p>小引擎的每一块，在真实代码里的位置（第 4、15、16、18 课逐行讲过）：</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>小引擎</th><th>真实代码</th></tr>
+        <tr><td><code>ProgramManager.get</code>：查表命中就返回</td><td><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:89">WebGL1ProgramManager.ts:89</a>（:89–90；表的声明 :59，key 是 <code>ShaderModule</code>）</td></tr>
+        <tr><td>第一次：编译、链接；把 uniform 位置存进表</td><td>编译链接 :105–125；反射 attribute 和 uniform :141–172</td></tr>
+        <tr><td>登记</td><td>:181（登记前一行 :180 订阅了 CPU 对象的释放，第 42 课）</td></tr>
+        <tr><td><code>release</code></td><td><a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:209">WebGL1ProgramManager.ts:209</a></td></tr>
+        <tr><td><code>GeometryManager.get</code></td><td><a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:104">WebGL1GeometryManager.ts:104</a>（查表 :113–114，上传 :143–163，登记 :185–186）</td></tr>
+        <tr><td><code>RenderTargetManager.get</code></td><td><a data-src="src/rendering/backend/webgl1/WebGL1RenderTargetManager.ts:78">WebGL1RenderTargetManager.ts:78</a>（多了 revision 比较 :82–84：描述改了尺寸就重建，第 42 课）</td></tr>
+        <tr><td><code>createManagers(gl)</code></td><td><a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:44">WebGL1ResourceManager.ts:44</a>：一个 context 的一代一个，组装六个 Manager（:74–120）</td></tr>
+        <tr><td>丢失时整套换新</td><td><a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:171">WebGL1ResourceManager.ts:171</a> <code>invalidateForContextLoss</code>：只丢记录、不发删除命令；恢复后建新的一代（第 13、18 课）</td></tr>
+        <tr><td>drawWithManagers 里的 <code>programs.get</code>、<code>geometries.get</code></td><td><a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:208">WebGL1Backend.ts:208</a>–209：每次 draw 向 Manager 要 program 和 buffer</td></tr>
+        <tr><td><code>setUniforms</code> 的核对</td><td><a data-src="src/rendering/backend/webgl1/WebGL1Uniforms.ts:157">WebGL1Uniforms.ts:157</a></td></tr>
+      </table>
+    </div>
+    <p>真实的 Manager 比小引擎多做的事，一句话一条：</p>
+    <ul>
+      <li>建到一半失败，把这次已经建了的删掉，不把半成品登记进表（<a data-src="src/rendering/backend/webgl1/WebGL1ProgramManager.ts:184">ProgramManager :184–197</a>、<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:189">GeometryManager :189–199</a>）。</li>
+      <li>上传 buffer 以后把原来的绑定恢复原样，不打乱别人的状态（<a data-src="src/rendering/backend/webgl1/WebGL1GeometryManager.ts:133">GeometryManager :133–171</a>）。</li>
+      <li>删 program、buffer 之前先让引用它们的顶点输入（VAO）放手（<code>beforeDelete</code> 钩子，第 18 课）。</li>
+      <li>正在 release 的时候又被 get，直接报错，不重复删除（<code>releasing</code> 集合）。</li>
+    </ul>
+    <aside class="note">
+      <strong>这里的检查</strong>：各个 Manager 在第一次 get 时检查设备能力（扩展、尺寸上限）、编译链接结果、framebuffer 完整性和 GL 错误；失败就回滚。<strong>之后可以放心</strong>：表里只有完整可用的 GPU 对象，没有建到一半的。见 <a href="../reference/validation-map.html">校验地图</a>「各个 Manager」一行。
+    </aside>
+    <p><strong>架构视角：three.js 也是这样一张表。</strong>three.js r177 的顶点 buffer 存在一个 <code>WeakMap</code> 里，key 是 BufferAttribute 对象本身（<a data-src="node_modules/three/src/renderers/webgl/WebGLAttributes.js:3">WebGLAttributes.js:3</a>）；几何体按每个对象独有的 <code>id</code> 登记，并在第一次见到它时订阅它的 <code>dispose</code> 事件（<a data-src="node_modules/three/src/renderers/webgl/WebGLGeometries.js:54">WebGLGeometries.js:54–56</a>）。program 是例外：three.js 的 shader 是按材质的设置拼出来的，所以它把设置拼成一个字符串当 key，不同材质只要设置相同就共用一个 program（<a data-src="node_modules/three/src/renderers/webgl/WebGLPrograms.js:591">WebGLPrograms.js:591–600</a>）——这正是第 5 节说的「按内容查表」，代价是每次要算这个字符串。本项目的 shader 源码是手写的 <code>ShaderModule</code>，想共用一个 program，就让几个材质引用同一个 <code>ShaderModule</code> 对象。</p>
+
+    <h2 id="s9">9. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0041"></div>
+
+    <h2 id="s10">10. 延伸阅读</h2>
+    <ul>
+      <li><strong>首选（约 5 分钟）</strong>：<a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map#key_equality">MDN · Map · Key equality</a> 和同页「Using the Map object」的例子——对象当 key 时按身份比较，<code>myMap.get({})</code> 拿不到 <code>keyObj</code> 存的值。这是第二版那张表成立的前提。</li>
+      <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/HTMLCanvasElement/webglcontextrestored_event">MDN · webglcontextrestored</a>：恢复以后旧纹理、buffer 都无效，要重新创建。</li>
+      <li><a href="0018-resource-manager.html">第 18 课</a>：真实的 WebGL1ResourceManager 怎样把六个 Manager 组成一代、按什么顺序关闭。</li>
+      <li><a href="0031-frame-overview.html">第 31 课</a>第 2 节：用物体当 key 缓存、却没复制数据时会出什么错（第 42 课接着讲）。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：检查题错了哪几题；四块画布里，有没有哪一步的读数和你预想的不一样。看不懂的代码，把行号贴给我。下一课从第 5 节末尾那两个要求开始：谁来保证描述对象「一直是同一个、内容不再变」。
+    </aside>
+
+    <div class="nav">
+      <a href="0040-shadow-one-function.html">← 第 40 课：一个函数画完</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0042-what-to-draw-as-data.html">第 42 课：画什么写成数据 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 41 课 · 2026-10-16</footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+        const S = RTeach.shadow41
+
+        // 把 toString() 的结果去掉公共缩进（第一行没有缩进，从第二行算）
+        function dedent(text) {
+          const lines = text.split('\n')
+          const indents = lines.slice(1).filter((l) => l.trim()).map((l) => l.match(/^ */)[0].length)
+          const cut = indents.length ? Math.min(...indents) : 0
+          return [lines[0], ...lines.slice(1).map((l) => l.slice(Math.min(cut, l.match(/^ */)[0].length)))].join('\n')
+        }
+        const show = (...parts) => parts.map((p) => dedent(p.toString())).join('\n\n')
+        const ERRORS = { 0: '0（没有错误）', 1280: 'INVALID_ENUM', 1281: 'INVALID_VALUE', 1282: 'INVALID_OPERATION', 37442: 'CONTEXT_LOST_WEBGL' }
+
+        // ---------------- 代码视图 ----------------
+        const v1Code = show(S.setup, S.drawFrame)
+        const setupLines = dedent(S.setup.toString()).split('\n').length
+        window.__cv41 = {}
+        window.__cv41.v1 = RTeach.codeView({
+          mount: document.getElementById('cv-v1'),
+          caption: 'assets/shadow-41.js 里的 setup 和 drawFrame，页面显示的就是下面画布正在运行的代码。',
+          code: v1Code,
+          groups: [
+            { label: '只做一次（setup）', test: (line, i) => i < setupLines, note: '②③④：页面加载时调用一次' },
+            { label: '每帧（drawFrame）', test: (line, i) => i > setupLines, note: '⑤⑥⑦：每帧调用' },
+            { label: '写死的物体', test: (line) => /floor|triangle/i.test(line), note: '有哪些物体写在两个函数里，setup 一份、drawFrame 两遍各一份' },
+            { label: '每帧按名字查位置', test: (line) => /getUniformLocation|getAttribLocation/.test(line), note: '每帧 10 次查询都在这里；位置在链接后就不变' }
+          ]
+        })
+        document.getElementById('helpers').textContent = show(S.makeProgram, S.makeShadowMap, S.makeBuffer, S.frameMatrices, S.drawPositions)
+
+        window.__cv41.managers = RTeach.codeView({
+          mount: document.getElementById('cv-managers'),
+          caption: '第二版的三个 Manager 和 createManagers（assets/shadow-41.js）。',
+          code: show(S.ProgramManager, S.GeometryManager, S.RenderTargetManager, S.createManagers),
+          groups: [
+            { label: '查表', test: (line) => /entries\.get|cached/.test(line), note: '命中就直接返回，不发任何 GL 命令' },
+            { label: '建造（只在第一次）', test: (line) => /make(Program|Buffer|ShadowMap)\(|getActiveUniform|getUniformLocation|getAttribLocation|ACTIVE_UNIFORMS/.test(line), note: '调用的就是第 2 节那几个建造函数' },
+            { label: '登记', test: (line) => /entries\.set/.test(line) },
+            { label: '删除', test: (line) => /release\(|entries\.delete|\.delete[A-Z]/.test(line), note: 'release 由「知道这份数据不用了」的人调用（第 6 节）' },
+            { label: '表', test: (line) => /new Map\(\)/.test(line), note: 'key 是描述对象本身（第 5 节）' }
+          ]
+        })
+        window.__cv41.draw = RTeach.codeView({
+          mount: document.getElementById('cv-draw'),
+          caption: '第二版的描述对象、setUniforms 和每帧的 drawWithManagers。',
+          code: show(S.createDescriptions, S.setUniforms, S.drawWithManagers),
+          groups: [
+            { label: '向 Manager 要东西', test: (line) => /\.get\(d\./.test(line), note: '只说「我要这个」，不管它是刚建的还是早就建好的' },
+            { label: '描述对象', test: (line) => /(Shader|Target|Geometry): \{/.test(line), note: '只有源码、顶点、尺寸这些「是什么」，没有 GPU 对象' },
+            { label: 'uniform 按名字给值', test: (line) => /setUniforms\(|\bu[A-Z]\w+: /.test(line), note: '名字对不上会在 setUniforms 里抛错（第 7 节）' },
+            { label: '画到哪', test: (line) => /bindFramebuffer|viewport\(|clearColor|gl\.clear\(/.test(line), note: '第 44 课' }
+          ]
+        })
+
+        // ---------------- 课程写的计数 ----------------
+        function instrument(gl) {
+          const rawGetError = gl.getError.bind(gl)
+          const total = { create: {}, del: {} }
+          const frame = { cmd: 0, query: 0 }
+          for (const name of Object.getOwnPropertyNames(WebGLRenderingContext.prototype)) {
+            const desc = Object.getOwnPropertyDescriptor(WebGLRenderingContext.prototype, name)
+            if (typeof desc.value !== 'function' || name === 'getError' || name === 'isContextLost' || name === 'getExtension') continue
+            const original = gl[name].bind(gl)
+            gl[name] = (...args) => {
+              if (/^(get|is|check)/.test(name)) frame.query++
+              else frame.cmd++
+              if (name.startsWith('create')) total.create[name.slice(6)] = (total.create[name.slice(6)] || 0) + 1
+              if (name.startsWith('delete')) total.del[name.slice(6)] = (total.del[name.slice(6)] || 0) + 1
+              return original(...args)
+            }
+          }
+          return {
+            total,
+            frame,
+            startFrame() { frame.cmd = 0; frame.query = 0 },
+            error: () => ERRORS[rawGetError()] || String(rawGetError())
+          }
+        }
+        const NAMES = { Program: 'program', Texture: '纹理', Renderbuffer: '深度缓冲', Framebuffer: 'framebuffer', Buffer: 'buffer', Shader: 'shader' }
+        const list = (record) => {
+          const text = Object.keys(NAMES).filter((k) => record[k]).map((k) => NAMES[k] + ' ' + record[k]).join('、')
+          return text || '0 个'
+        }
+        function loseAndRestore(gl, canvas, onRestored) {
+          const ext = gl.getExtension('WEBGL_lose_context')
+          if (!ext) return false
+          canvas.addEventListener('webglcontextlost', (event) => event.preventDefault(), { once: true })
+          canvas.addEventListener('webglcontextrestored', onRestored, { once: true })
+          ext.loseContext()
+          setTimeout(() => ext.restoreContext(), 50)
+          return true
+        }
+
+        // ---------------- 画布 A：第一版 ----------------
+        {
+          const canvas = document.getElementById('a-canvas')
+          const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true })
+          const count = instrument(gl)
+          const angle = document.getElementById('a-angle')
+          const readout = document.getElementById('a-readout')
+          count.startFrame()
+          const built = S.setup(gl)
+          const setupLine = 'setup：GL 命令 ' + count.frame.cmd + ' 条、查询 ' + count.frame.query + ' 次。'
+          let frames = 0
+          let restored = false
+          function draw(times = 1) {
+            for (let i = 0; i < times; i++) {
+              count.startFrame()
+              S.drawFrame(gl, built, Number(angle.value))
+              frames++
+            }
+            readout.textContent =
+              setupLine + '\n已画 ' + frames + ' 帧。累计新建：' + list(count.total.create) + '；累计删除：' + list(count.total.del) + '。\n' +
+              '最后一帧：GL 命令 ' + count.frame.cmd + ' 条、查询 ' + count.frame.query + ' 次。getError：' + count.error() +
+              (restored ? '\ncontext 已经恢复，但 built 里还是丢失前那一代的对象。' : '')
+          }
+          angle.addEventListener('input', () => {
+            document.getElementById('a-angle-text').textContent = angle.value + '°'
+            draw()
+          })
+          document.getElementById('a-burst').addEventListener('click', () => draw(60))
+          document.getElementById('a-lose').addEventListener('click', () => {
+            const ok = loseAndRestore(gl, canvas, () => {
+              restored = true
+              draw()
+            })
+            if (!ok) readout.textContent = '这台浏览器没有 WEBGL_lose_context 扩展，无法模拟。'
+          })
+          draw()
+          window.__stageA = { gl, count, draw }
+        }
+
+        // ---------------- 画布 B：第二版 ----------------
+        {
+          const canvas = document.getElementById('b-canvas')
+          const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true })
+          const count = instrument(gl)
+          const angle = document.getElementById('b-angle')
+          const readout = document.getElementById('b-readout')
+          const d = S.createDescriptions()
+          const small = d.triangleGeometry
+          let managers = S.createManagers(gl)
+          let generation = 1
+          let frames = 0
+          let last = { create: {}, del: {} }
+          function snapshot() {
+            return { create: { ...count.total.create }, del: { ...count.total.del } }
+          }
+          function delta(before) {
+            const now = snapshot()
+            const minus = (a, b) => Object.fromEntries(Object.keys(a).map((k) => [k, a[k] - (b[k] || 0)]).filter(([, v]) => v))
+            return { create: minus(now.create, before.create), del: minus(now.del, before.del) }
+          }
+          function report(note) {
+            const sizes = [managers.programs.entries.size, managers.geometries.entries.size, managers.renderTargets.entries.size]
+            readout.textContent =
+              (note ? note + '\n' : '') +
+              '第 ' + generation + ' 代 context，已画 ' + frames + ' 帧；三角形：' + (d.triangleGeometry === small ? '小' : '大') + '。\n' +
+              '表里条目 program / 几何 / 目标：' + sizes.join(' / ') + '。\n' +
+              '这一次新建：' + list(last.create) + '；这一次删除：' + list(last.del) + '。\n' +
+              '累计新建：' + list(count.total.create) + '；累计删除：' + list(count.total.del) + '。\n' +
+              '这一次 GL 命令 ' + count.frame.cmd + ' 条、查询 ' + count.frame.query + ' 次。getError：' + count.error()
+          }
+          function draw(note, before = snapshot(), keepCount = false) {
+            if (!keepCount) count.startFrame()
+            S.drawWithManagers(gl, managers, d, Number(angle.value))
+            frames++
+            last = delta(before)
+            report(note)
+          }
+          angle.addEventListener('input', () => {
+            document.getElementById('b-angle-text').textContent = angle.value + '°'
+            draw()
+          })
+          document.getElementById('b-small').addEventListener('click', () => {
+            d.triangleGeometry = small
+            draw()
+          })
+          document.getElementById('b-big').addEventListener('click', () => {
+            d.triangleGeometry = d.bigTriangleGeometry
+            draw()
+          })
+          document.getElementById('b-release').addEventListener('click', () => {
+            d.triangleGeometry = small
+            const before = snapshot()
+            count.startFrame()
+            managers.geometries.release(d.bigTriangleGeometry)
+            draw('页面先调用 managers.geometries.release(大三角形的描述)，再画了一帧。「这一次」把两件事算在一起。', before, true)
+          })
+          document.getElementById('b-lose').addEventListener('click', () => {
+            const ok = loseAndRestore(gl, canvas, () => {
+              managers = S.createManagers(gl) // 恢复时唯一要做的事：换一套空表
+              generation++
+              draw('context 恢复了：页面换了一套新的 Manager（空表），然后照常画一帧。')
+            })
+            if (!ok) readout.textContent = '这台浏览器没有 WEBGL_lose_context 扩展，无法模拟。'
+          })
+          draw()
+          window.__stageB = { gl, count, d, get managers() { return managers } }
+        }
+
+        // ---------------- 画布 C：三种 key ----------------
+        class GeometryManagerByName extends S.GeometryManager {
+          get(geometry) {
+            // 只改了查表和登记的 key：用 geometry.name，不用对象本身
+            const cached = this.entries.get(geometry.name)
+            if (cached !== undefined) return cached
+            const buffer = S.makeBuffer(this.gl, geometry.positions)
+            const resource = { buffer, count: geometry.positions.length / 3 }
+            this.entries.set(geometry.name, resource)
+            return resource
+          }
+        }
+        function drawFresh(gl, managers, d, angle) {
+          // 每帧现做一个三角形描述：内容一样，但每次都是新对象
+          const fresh = { ...d, triangleGeometry: { ...d.triangleGeometry } }
+          S.drawWithManagers(gl, managers, fresh, angle)
+        }
+        document.getElementById('c-code').textContent =
+          '// 变体一：按名字查表\n' + dedent(GeometryManagerByName.toString()) + '\n\n// 变体二：每帧新建描述对象\n' + dedent(drawFresh.toString())
+        {
+          let canvas = document.getElementById('c-canvas')
+          let gl
+          let count
+          let managers
+          let d
+          let small
+          let frames
+          const angle = document.getElementById('c-angle')
+          const readout = document.getElementById('c-readout')
+          const mode = () => document.querySelector('input[name="c-mode"]:checked').value
+          function start() {
+            if (gl) {
+              const lose = gl.getExtension('WEBGL_lose_context')
+              if (lose) lose.loseContext()
+              const fresh = document.createElement('canvas')
+              fresh.width = 480
+              fresh.height = 300
+              fresh.id = 'c-canvas'
+              canvas.replaceWith(fresh)
+              canvas = fresh
+            }
+            gl = canvas.getContext('webgl', { preserveDrawingBuffer: true })
+            count = instrument(gl)
+            managers = S.createManagers(gl)
+            if (mode() === 'name') managers.geometries = new GeometryManagerByName(gl)
+            d = S.createDescriptions()
+            small = d.triangleGeometry
+            frames = 0
+            draw()
+          }
+          function draw(times = 1) {
+            for (let i = 0; i < times; i++) {
+              if (mode() === 'fresh') drawFresh(gl, managers, d, Number(angle.value))
+              else S.drawWithManagers(gl, managers, d, Number(angle.value))
+              frames++
+            }
+            const p = new Uint8Array(4)
+            gl.readPixels(258, 168, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p)
+            const orange = p[0] > 150 && p[2] < 60
+            const keys = [...managers.geometries.entries.keys()].map((k) => (typeof k === 'string' ? "'" + k + "'" : k.name + ' 的描述对象'))
+            readout.textContent =
+              '已画 ' + frames + ' 帧；传进去的三角形：' + (d.triangleGeometry.positions === S.SCENE.trianglePositions ? '小' : '大') + '。\n' +
+              '几何表里 ' + keys.length + ' 条' + (keys.length <= 4 ? '：' + keys.join('，') : '') + '。累计新建 buffer ' + (count.total.create.Buffer || 0) + ' 个。\n' +
+              '像素 (258, 168) 读到 (' + Array.from(p.slice(0, 3)).join(', ') + ')：' + (orange ? '橙色，画面上是大三角形' : '地面，画面上是小三角形') + '。'
+          }
+          for (const radio of document.querySelectorAll('input[name="c-mode"]')) radio.addEventListener('change', start)
+          angle.addEventListener('input', () => draw())
+          document.getElementById('c-small').addEventListener('click', () => {
+            d.triangleGeometry = small
+            draw()
+          })
+          document.getElementById('c-big').addEventListener('click', () => {
+            d.triangleGeometry = d.bigTriangleGeometry
+            draw()
+          })
+          document.getElementById('c-burst').addEventListener('click', () => draw(60))
+          start()
+          window.__stageC = { start, draw, get managers() { return managers }, get count() { return count } }
+        }
+
+        // ---------------- 画布 D：拼错一个名字 ----------------
+        {
+          const source = S.drawWithManagers.toString()
+          const wrong = 'uLightVP: lightVP,'
+          if (!source.includes(wrong)) throw new Error('第 7 节要替换的那一处在源码里找不到')
+          const typo = new Function('frameMatrices', 'setUniforms', 'drawPositions', 'SCENE', 'return ' + source.replace(wrong, 'uLigthVP: lightVP,'))(
+            S.frameMatrices, S.setUniforms, S.drawPositions, S.SCENE)
+          const canvas = document.getElementById('d-canvas')
+          const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true })
+          let message
+          try {
+            typo(gl, S.createManagers(gl), S.createDescriptions(), 35)
+            message = '没有抛错'
+          } catch (error) {
+            message = '第一帧就抛错：' + error.message
+          }
+          window.__typo41 = message
+          document.getElementById('d-readout').textContent = message + '\n（第 40 课同样拼错：不抛错，画面变暗，getError 0）'
+        }
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0041"]'), [
+          {
+            q: '第一版连续画 60 帧，一共新建了几个 program？',
+            opts: ['2 个，都是 setup 里建的', '62 个，每帧还多建 1 个', '0 个，由浏览器自动建好'],
+            answer: 0,
+            why: 'setup 只调用一次；drawFrame 里没有任何 create*（第 2 节读数：60 帧新建 0 个）。'
+          },
+          {
+            q: '第一版遇到 context 丢失再恢复，画面只剩背景、getError 报 INVALID_OPERATION，原因是：',
+            opts: ['built 里的对象属于丢失前那一代', 'setup 被浏览器自动又执行了一遍', '恢复以后 canvas 的尺寸变成了 0'],
+            answer: 0,
+            why: 'handle 属于建它的那一代 context；恢复后全部作废，drawFrame 却还在用它们（第 3 节）。'
+          },
+          {
+            q: '第二版把三角形换成大的，再换回小的，一共多建了几个 buffer？',
+            opts: ['1 个：小的那个一直在表里', '2 个：每换一次就新建一个', '0 个：原来的 buffer 被改写'],
+            answer: 0,
+            why: '大三角形第一次被要时建 1 个；小三角形的描述还是原来那个对象，表里查得到（第 4 节的表）。'
+          },
+          {
+            q: 'GeometryManager 改成按名字查表，点「三角形：大」以后：',
+            opts: ['画的还是小三角形，也不报错', '画成大三角形，多建一个 buffer', '抛错：表里已经有同名的几何'],
+            answer: 0,
+            why: '两个描述都叫 triangle，查表命中小三角形的 buffer，新建 0 个（第 5 节）。'
+          },
+          {
+            q: '每帧都新建一个内容相同的三角形描述传进 drawWithManagers，60 帧以后：',
+            opts: ['几何表里 61 条，buffer 建了 61 个', '几何表里 2 条，内容相同就会复用', '抛错：同一个形状不能登记两次'],
+            answer: 0,
+            why: 'Map 按对象身份比较，每个新对象都查不到；地面 1 条加三角形 60 条（第 5 节）。'
+          },
+          {
+            q: 'context 丢失时，第二版为什么不对表里的对象调 delete*，而是整套 Manager 换新的？',
+            opts: ['旧对象已经作废，删除也没有意义', '删除太慢，要留到下一帧再慢慢删', '描述对象也一起丢了，不知道删谁'],
+            answer: 0,
+            why: '描述对象在 JS 里，没丢；丢的是 GPU 那一栏。真实代码 invalidateForContextLoss 也只丢记录、不发删除命令（第 6、8 节）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>

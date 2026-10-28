@@ -1,0 +1,937 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>第 28 课 · 生命周期的边角</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="../assets/course.js"></script>
+    <script src="../assets/quiz.js"></script>
+    <script src="../assets/trace-lab.js"></script>
+    <script src="../assets/lifecycle-lab.js"></script>
+    <script src="../assets/lifecycle-edge-bundle.js"></script>
+  </head>
+  <body>
+    <p class="kicker">精读主线 · 详细篇 13 · backend ⑦ · 约 75 分钟</p>
+    <h1>生命周期的边角情况：回调出错、回调里关掉自己、旧一轮的错误</h1>
+    <p class="lede">
+      第 13 课第 2 节讲了 context 丢失、恢复的主线：两个事件，Backend 交来的五个回调，五个状态回答「现在能不能画」。那一节默认每个回调都正常返回。这一课回答剩下的问题：回调执行到一半抛错了怎么办？回调里有人回头调用这个对象（把它关掉，或者又派发一次丢失），外面那一轮还能不能把状态写成 ready？已经作废的那一轮抛出的错误该记在哪里？WebGLContextLifecycle 300 行，一大半是为这些问题写的。这一课先用真实浏览器看一次「恢复途中又丢了」，再用「架构师七步」把要应付的情况一格一格列出来，然后一版一版写出代码，最后读真实代码，看它和 Backend、各个 Manager 怎样配合。
+    </p>
+
+    <div class="mission">
+      <strong>和你的目标的关系</strong> —— 做 HW1、HW2 时，GPU 驱动重置、标签页切走太久、同时开太多 WebGL 页面，都可能让 context 丢失。这一课决定了那时候画面会怎样：是等浏览器恢复后自动接着画，还是停在「恢复失败」并留下原因，或者因为一个旧回调把状态写错，在已经失效的 context 上继续 draw。以后想在恢复失败时提示用户、或者自动退出 HW2，回调里就会出现这一课讲的重入。
+    </div>
+
+    <aside class="note">
+      <strong>默认你已经会的</strong>：① 第 13 课第 2 节：两个事件、五个回调、五个状态，以及 Backend.ready 怎样挡住渲染循环；② 第 14–18 课各自的「和 Lifecycle 的关系」：丢失时 State 只忘不发，各个 Manager 丢掉记录、不调 delete；恢复时建一套全新的一代；③ 第 18 课：ResourceManager 的 invalidateForContextLoss 先标记、再逐个通知六个 Manager；④ 第 31 课：一代 GPU 对象和 CPU 原件的关系。如果其中哪一条其实没懂，告诉我，我先补那一块。<br />
+      <strong>这一课从零讲的</strong>：回调的三种结局（正常、抛错、回头调用自己）各从哪里来；七步法；状态 × 事件 × 回调结局表；第 1、2 版和两种「核对」办法；号码牌（transitionVersion）；作废那一轮的错误（onSuppressedError）；通知自己失败（notificationError）；Backend 自己的第二层检查（epoch）；对照 three.js。<br />
+      <strong>版本</strong>：WebGLContextLifecycle.ts 从 1a06356 起没有改过；WebGL1Backend.ts 按 2026-10-14 的工作区版本讲。<br />
+      <strong>页面会用到你的显卡</strong>：第 1 节的卡片会让你浏览器里的一个 WebGL context 丢失两次、恢复两次。恢复由浏览器安排，可能要等几秒。
+    </aside>
+
+    <nav class="toc" aria-label="本课目录">
+      <ol>
+        <li><a href="#s1">原始输入：回调里到底在做什么，会怎样结束</a>：<a href="#s1-1">五个回调</a> <a href="#s1-2">三种结局</a> <a href="#s1-3">真实浏览器里的一次</a></li>
+        <li><a href="#s2">七步：先把要应付的情况列全</a>：<a href="#s2-1">职责</a> <a href="#s2-2">输入</a> <a href="#s2-3">状态</a> <a href="#s2-4">表</a> <a href="#s2-5">步骤</a> <a href="#s2-6">不变量</a> <a href="#s2-7">测试</a></li>
+        <li><a href="#s3">一版一版写出来</a>：<a href="#s3-1">第 1 版</a> <a href="#s3-2">第 2 版</a> <a href="#s3-3">核对什么</a> <a href="#s3-4">第 3 版</a> <a href="#s3-5">真实代码</a> <a href="#s3-6">自由组合</a></li>
+        <li><a href="#s4">和 Backend 怎样接：第二层号码牌</a></li>
+        <li><a href="#s5">和各个 Manager 的关系</a></li>
+        <li><a href="#s6">架构视角：对照 three.js r177</a></li>
+        <li><a href="#s7">审查视角</a></li>
+        <li><a href="#s8">检查题</a></li>
+        <li><a href="#s9">延伸阅读</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="s1">1. 原始输入：回调里到底在做什么，会怎样结束</h2>
+    <h3 id="s1-1">1.1 五个回调</h3>
+    <p>生命周期类自己不碰任何 GPU 对象，具体的事都由 Backend 在构造时交给它（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:78">WebGL1<wbr />Backend.ts:78–110</a>）：</p>
+<pre><code>// WebGL1Backend.ts:78–110（注释是课程加的）
+this.lifecycle = new WebGLContextLifecycle(canvas, {
+  // lost：这一代整体作废。State 忘掉缓存，ResourceManager 通知六个 Manager
+  // 丢掉记录、退订，不调 delete（:344–349，第 14–18 课）
+  onLost: () =&gt; {
+    this.invalidateGeneration()
+  },
+
+  // restored：建新的一代（重新探测能力，新建 State、ResourceManager……）
+  restore: () =&gt; {
+    const epoch = this.epoch
+    const candidate = this.createGeneration() // :259–305，探测可能抛错
+
+    // 第二层检查，第 4 节讲
+    if (this.disposedValue || epoch !== this.epoch || this.gl.isContextLost()) {
+      candidate.resources.invalidateForContextLoss()
+      candidate.resources.dispose()
+
+      throw new WebGLContextLostError('publish restored backend')
+    }
+
+    this.generation = candidate // 发布新的一代
+  },
+
+  // 收尾：再问一次有没有又丢
+  onReady: () =&gt; {
+    if (this.gl.isContextLost()) {
+      throw new WebGLContextLostError('finish restoration')
+    }
+  },
+
+  // 恢复失败的通知：现在是空的，失败只记在 lastFailure 里
+  onRestoreFailed: () =&gt; {
+    // 原始错误由 lifecycle.lastFailure 保存，不在 DOM listener 中继续抛出。
+  },
+
+  // 旧一轮的错误：存起来供诊断（3.5 节）
+  onSuppressedError: (error) =&gt; {
+    this.suppressedValue = error
+  }
+})</code></pre>
+
+    <h3 id="s1-2">1.2 每个回调可能怎样结束</h3>
+    <p>一个回调交出控制权以后，只有三种结局。每一种都能在项目里找到具体来源：</p>
+    <ul>
+      <li><strong>正常返回。</strong>第 13 课讲的都是这种。</li>
+      <li><strong>抛错。</strong>
+        <ul>
+          <li>restore：createGeneration 第一步就是 detectWebGL1Capabilities，它在查询前后各问一次 isContextLost，发现又丢了就抛 WebGLContextLostError（<a data-src="src/rendering/backend/webgl1/WebGL1Capabilities.ts:49">WebGL1<wbr />Capabilities.ts:49</a>、<a data-src="src/rendering/backend/webgl1/WebGL1Capabilities.ts:63">:63</a>；行号按 10 月 14 日深夜你刚加了 colorBufferFloat 的版本）。1.3 节在真实浏览器里制造了这种情况。</li>
+          <li>onReady：Backend 收尾时又发现丢了，主动抛错。</li>
+          <li>onLost：ResourceManager 先标记、再逐个通知六个 Manager（<a data-src="src/rendering/backend/webgl1/WebGL1ResourceManager.ts:171">WebGL1<wbr />ResourceManager.ts:171–179</a>）。其中一个抛错，onLost 就抛错，这是第 18 课审查视角的第 2 条。</li>
+        </ul>
+      </li>
+      <li><strong>回头调用自己（重入，reentrancy）</strong>：回调还没返回，就调用了 lifecycle 的 dispose，或者让 canvas 又派发了一次事件。
+        <ul>
+          <li>现在的五个回调都不会这样做，onRestoreFailed 还是空的。</li>
+          <li>以后很可能会有。第 13 课审查视角问过：恢复失败时，怎样让上层知道、提示用户或者退出 HW2？如果在 onRestoreFailed 里通知 Engine 退出 HW2，就会接上这条全程同步的链：Engine.clearScene → <code>this.session?.renderer.dispose()</code>（<a data-src="src/engine.ts:241">engine.ts:241</a>）→ <code>this.backend.dispose()</code>（<a data-src="src/rendering/Renderer.ts:126">Renderer.ts:126</a>）→ <code>this.lifecycle.dispose()</code>（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:249">WebGL1<wbr />Backend.ts:249</a>）。也就是说，lifecycle 还在 handleRestored 里面，自己就已经被关掉了。</li>
+          <li>「回调里又来一次 lost」在真实浏览器里不会同步发生：loseContext() 返回时事件还在排队（第 13 课 2.5 节）。它出现在测试里，或者手动调用 <code>canvas.dispatchEvent</code> 的时候。</li>
+        </ul>
+      </li>
+    </ul>
+
+    <h3 id="s1-3">1.3 真实浏览器里的一次：恢复途中又丢了</h3>
+    <p>下面这张卡片不用任何假对象：真实的 canvas、真实的 WebGL1Backend。在 Backend 之前，课程先在 canvas 上注册一个 restored 监听。浏览器派发 restored 时，按注册顺序它先执行，立刻再 <code>loseContext()</code> 一次，模拟「刚要恢复，GPU 又被收走了」。在 Backend 之后再注册两个监听，用来记下 Lifecycle 处理完每个事件时的样子：</p>
+    <div id="lab-real"></div>
+
+    <h2 id="s2">2. 七步：先把要应付的情况列全</h2>
+    <p>你读第 13 课时问过：「作为架构师应该怎样思考」。下面用这个类走一遍我当时给的七步。重点在第 4 步：<strong>表要按「当前状态 + 事件 + 回调结局」三样来填</strong>。我第一次给你的表只填了「回调全部正常」，漏了「lost 状态收到 restored，restore 抛错 → restore-failed」这一格，被你指了出来。</p>
+
+    <h3 id="s2-1">2.1 一句话职责</h3>
+    <p>把浏览器的两个事件，变成上层随时能问的「现在能不能画」；按固定顺序调用 Backend 的回调；回调出了什么事，都不能让状态说谎，也不能让异常逃出 DOM 监听器。</p>
+
+    <h3 id="s2-2">2.2 输入清单</h3>
+    <ul>
+      <li><strong>外部事件</strong>：webglcontextlost、webglcontextrestored。重复、乱序都可能出现，比如没有 lost 就来了 restored。</li>
+      <li><strong>调用者</strong>：Backend 调 dispose()；渲染循环问 isReady、state、lastFailure。</li>
+      <li><strong>每个回调的结局</strong>：正常、抛错、回头调用自己（dispose，或者又派发一次事件），也可以是「先回头调用、再抛错」。</li>
+    </ul>
+
+    <h3 id="s2-3">2.3 从上层要问的问题倒推状态</h3>
+    <p>第 13 课 2.4 节已经推过：ready、lost、restoring、restore-failed、disposed。五个状态里有四个都「不能画」，但再收到 restored 时该怎么办、上层看到它时该怎么做，各不相同。这一课新增的是第 4 列：<strong>每个状态下，失败记录 lastFailure 该是什么</strong>。</p>
+
+    <h3 id="s2-4">2.4 状态 × 事件 × 回调结局</h3>
+    <p>真正有动作的格子只有下面这些。lost 状态再来 lost、ready 状态来 restored、disposed 状态来任何事件，都直接忽略，一个回调也不调用。表里的结果不是我写的，是下面的卡片用真实代码一格一格跑出来的：</p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>当前状态</th><th>事件</th><th>回调结局</th><th>新状态</th><th>lastFailure</th><th>还发生了什么</th></tr></thead>
+        <tbody>
+          <tr><td>ready、restore-failed</td><td>lost</td><td>onLost 正常</td><td>lost</td><td>null</td><td>清掉上一轮的失败记录</td></tr>
+          <tr><td>ready、restore-failed</td><td>lost</td><td>onLost 抛错</td><td>lost</td><td>on-lost</td><td>不调 onRestoreFailed：这不是恢复失败</td></tr>
+          <tr><td>ready、restore-failed</td><td>lost</td><td>onLost 里 dispose 再抛错</td><td>disposed</td><td>null</td><td>错误交给 onSuppressedError</td></tr>
+          <tr><td>lost、restore-failed</td><td>restored</td><td>都正常</td><td>ready</td><td>null</td><td>restore、onReady 各一次</td></tr>
+          <tr><td>lost、restore-failed</td><td>restored</td><td>restore 抛错</td><td>restore-failed</td><td>restore</td><td>不调 onReady；调 onRestoreFailed</td></tr>
+          <tr><td>lost、restore-failed</td><td>restored</td><td>onReady 抛错</td><td>restore-failed</td><td>on-ready</td><td>调 onRestoreFailed</td></tr>
+          <tr><td>lost、restore-failed</td><td>restored</td><td>restore 里 dispose</td><td>disposed</td><td>null</td><td>不调 onReady</td></tr>
+          <tr><td>lost、restore-failed</td><td>restored</td><td>restore 里又 lost</td><td>lost</td><td>null</td><td>内层调一次 onLost；外层不调 onReady</td></tr>
+          <tr><td>lost、restore-failed</td><td>restored</td><td>restore 抛错，通知也抛错</td><td>restore-failed</td><td>restore + notificationError</td><td>两个错误都留着</td></tr>
+          <tr><td>lost、restore-failed</td><td>restored</td><td>restore 抛错，通知里 dispose 再抛错</td><td>disposed</td><td>restore</td><td>通知的错误交给 onSuppressedError</td></tr>
+          <tr><td>任何未关闭的状态</td><td>dispose()</td><td>（没有回调）</td><td>disposed</td><td>保留原来的</td><td>摘掉两个监听</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="lab-table"></div>
+
+    <h3 id="s2-5">2.5 每个转移里面的步骤</h3>
+    <p>格子定了，再定每个转移里面先做什么、后做什么。顺序都是从「回调执行时别人会看到什么」倒推出来的：</p>
+    <ul>
+      <li><strong>lost</strong>：① 已关闭就不理；② preventDefault，告诉浏览器「我想恢复」；③ 已经是 lost 就返回；④ <strong>先</strong>改状态、清旧记录，<strong>再</strong>调 onLost。这样 onLost 执行时，谁来问都会得到「不能画」。</li>
+      <li><strong>restored</strong>：① 只在 lost、restore-failed 时接受；② 改成 restoring、清旧记录；③ 调 restore；④ 调 onReady；⑤ 最后才写 ready。每一步失败都改成 restore-failed，记下是哪一步，再通知。</li>
+      <li><strong>每个回调返回以后</strong>：先确认「这一轮还算数」，才能接着往下走、才能写状态。这一条是这一课的核心，第 3 节一步步推出来。</li>
+    </ul>
+
+    <h3 id="s2-6">2.6 不变量</h3>
+    <p>不管事件和回调怎样组合，这五条都要成立。第 3 节每一版代码，都用它们来检验：</p>
+    <ol>
+      <li><strong>不说谎</strong>：isReady 为 true，当且仅当最近一次转换是一次完整成功的恢复（或者从构造起就没丢过），并且之后没有发生过更新的转换。</li>
+      <li><strong>关了就不再变</strong>：disposed 以后状态不再改变，也不再调用任何回调。</li>
+      <li><strong>记录属于当前这一轮</strong>：lastFailure 只描述当前这一轮。作废那一轮的错误不能写进来，也不能悄悄丢掉。</li>
+      <li><strong>异常不出监听器</strong>：任何回调抛出的异常，都不能从 DOM 事件监听器里逃出去。</li>
+      <li><strong>不重复</strong>：同一轮丢失只调用一次 onLost，同一轮恢复只调用一次 restore。</li>
+    </ol>
+
+    <h3 id="s2-7">2.7 按格子写测试</h3>
+    <p>最后一步：表里每一格、每种结局，都对应一个剧本测试。项目的单元测试（<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:83">WebGLContext<wbr />Lifecycle.test.ts</a>）是这样对上的：</p>
+    <ul>
+      <li>主线和收尾时 isReady 仍为 false：<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:83">:83</a>；忽略的事件与重复事件：<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:112">:112</a>。</li>
+      <li>restore 或 onReady 抛错：<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:133">:133</a>；通知自己也抛错：<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:155">:155</a>；onLost 抛错、下一轮清掉记录：<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:174">:174</a>。</li>
+      <li>restore 或 onReady 里 dispose：<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:193">:193</a>；restore 里又 lost：<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:207">:207</a>。</li>
+      <li>三种「dispose 后再抛错」（restore、onLost、onRestoreFailed）：<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:231">:231</a>、<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:259">:259</a>、<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:284">:284</a>；诊断出口自己抛错：<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:314">:314</a>；dispose 幂等：<a data-src="tests/unit/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:333">:333</a>。</li>
+      <li>真实浏览器里的整条时间线：<a data-src="tests/browser/rendering/backend/webgl1/WebGLContextLifecycle.test.ts:41">浏览器测试 :41</a>。</li>
+    </ul>
+    <p>对照 2.4 节的表，有几格没有找到对应的测试，第 7 节再说。</p>
+
+    <h2 id="s3">3. 一版一版写出来</h2>
+    <p>下面的卡片把生命周期类放在一个假的 canvas 上（就是一个 EventTarget：浏览器派发的两种事件本来就是普通 DOM 事件，类只用到 addEventListener 和 removeEventListener），按剧本一步一步派发事件。真实浏览器里事件是排队以后异步派发的；这里为了看清顺序，每一步都同步派发。每个回调被调用时，记录里会写出那一刻的状态。</p>
+
+    <h3 id="s3-1">3.1 第 1 版：一个布尔值，两个监听</h3>
+<pre><code>// 课程写的第 1 版（lifecycle-course.ts）
+class LifecycleV1 {
+  ready = true // true：可以 draw
+
+  constructor(canvas: EventTarget, private readonly callbacks: Callbacks) {
+    canvas.addEventListener('webglcontextlost', (event) =&gt; {
+      event.preventDefault() // 我想恢复：不调用的话，以后不会有 restored
+      this.callbacks.onLost() // 通知后端：这一代的缓存全部作废
+      this.ready = false // 标记：不能再 draw
+    })
+    canvas.addEventListener('webglcontextrestored', () =&gt; {
+      this.callbacks.restore() // 重新探测能力，建新的 State 和 Manager
+      this.callbacks.onReady() // 收尾
+      this.ready = true // 可以 draw 了
+    })
+  }
+}</code></pre>
+    <p>这就是第 13 课 2.2 节那十几行，包成了一个类。拿 2.6 节的不变量一条条检验：</p>
+    <div id="life-lab-1"></div>
+
+    <h3 id="s3-2">3.2 第 2 版：状态机、先改状态再通知、异常留在监听器里</h3>
+    <p>第 1 版违反了不变量 1（onLost 执行时还说可以画）和不变量 4（异常逃出监听器）。第 2 版改了四处，每处都用「← 」标出来（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/lifecycle-course.ts:37">lifecycle-course.ts:37–101</a>）：</p>
+<pre><code>// 课程写的第 2 版（节选）
+class LifecycleV2 {
+  // ← 改动：一个布尔值分不清丢了、正在恢复、恢复失败、已关闭，换成五个状态
+  state: State = 'ready'
+  // ← 新增：失败要留下记录，供上层查看（哪一步失败、原始错误是什么）
+  lastFailure: { phase: string; error: unknown } | null = null
+
+  // …构造函数注册两个监听；isReady 是 state === 'ready'
+  // ← 新增：dispose 时摘掉两个监听；以后的事件一概不处理
+
+  private readonly handleLost = (event: Event): void =&gt; {
+    if (this.state === 'disposed') return
+    event.preventDefault()
+    // ← 新增：重复的 lost 事件不再执行一次 onLost
+    if (this.state === 'lost') return
+    // ← 改动：先改状态，再调用回调。回调执行时看到的 isReady 已经是 false
+    this.state = 'lost'
+    this.lastFailure = null
+    try {
+      this.callbacks.onLost()
+    } catch (error) {
+      // ← 新增：把错误记下来，不让它逃出 DOM 监听器
+      this.lastFailure = { phase: 'on-lost', error }
+    }
+  }
+
+  private readonly handleRestored = (): void =&gt; {
+    // ← 新增：只有 lost、restore-failed 才接受恢复；其余一律忽略
+    if (this.state !== 'lost' &amp;&amp; this.state !== 'restore-failed') return
+    this.state = 'restoring' // 恢复期间 isReady 是 false
+    this.lastFailure = null
+    let phase = 'restore'
+    try {
+      this.callbacks.restore()
+      phase = 'on-ready'
+      this.callbacks.onReady()
+      this.state = 'ready' // 全部成功，最后才改成 ready
+    } catch (error) {
+      this.state = 'restore-failed' // 和 lost 分开：上层能看出恢复过、但失败了
+      this.lastFailure = { phase, error }
+      try {
+        this.callbacks.onRestoreFailed(error)
+      } catch {
+        // 通知自己也可能抛错；这一版先吞掉
+      }
+    }
+  }
+}</code></pre>
+    <p>第 2 版对「回调正常」和「回调抛错」两种结局都没问题。第三种结局，回调回头调用了自己，它没有考虑：</p>
+    <div id="life-lab-2"></div>
+
+    <h3 id="s3-3">3.3 回调返回以后，核对什么</h3>
+    <p>第 2 版的两个错误是同一个原因：外层的 handleRestored 调用回调时，回调里又发生了一次更新的转换（dispose，或者新的 lost）。回调一返回，外层不知道「自己这一轮已经过时了」，照样往下走，最后写下了 ready。这里没有多线程，也没有 async，只是一个函数在执行中途，调用了另一个会改状态的函数。</p>
+    <p>所以每个回调返回以后，都要先核对「这一轮还算不算数」。拿什么核对？最直接的办法是看状态：我写下的是 restoring，回来以后还是 restoring，就当作没人动过。课程按这个想法写了一版 LifecycleStateCheck（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/lifecycle-course.ts:109">lifecycle-course.ts:109–169</a>），只在第 2 版上加了四行：</p>
+<pre><code>// 课程写的「核对状态」版（节选，只列和第 2 版不同的四行）
+// handleLost 的 catch：
+if (this.state === 'lost') this.lastFailure = { phase: 'on-lost', error }
+// handleRestored：restore 返回后、onReady 返回后、catch 里各一次
+if (this.state !== 'restoring') return</code></pre>
+    <p>把 3.2 节那两个剧本换成它来跑：restore 里 dispose，最后是 disposed；restore 里又 lost，最后是 lost。两个都对了（可以在 3.6 节自己选来跑）。那还缺什么？状态只有五个值，中途发生了好几次转换、最后又回到同一个状态时，它就分不出来了。下面这个剧本：onLost 执行到一半，先同步来了一次 restored（restore 抛错，进入 restore-failed），又来了一次 lost（回到 lost，调了第二次 onLost），然后最外层的 onLost 才抛出它自己的错误。</p>
+    <div id="life-lab-sc"></div>
+
+    <h3 id="s3-4">3.4 第 3 版：给每一轮发一个号码牌</h3>
+    <p>状态会重复，可「第几次转换」不会。每次转换开始时把计数器加 1，并把新值抄进局部变量，这就是这一轮的号码牌。回调返回以后，核对号码牌是否还等于计数器：不等，就说明中途发生过更新的转换，不管现在的状态碰巧是什么。第 3 版（<a data-main="claude-workspace/webgl1-backend/teach/assets/build/lifecycle-course.ts:173">lifecycle-course.ts:173–243</a>）：</p>
+<pre><code>// 课程写的第 3 版（节选）
+class LifecycleV3 {
+  // ← 新增：每次转换（lost、开始恢复、dispose）加 1：现在是第几轮
+  private transitionVersion = 0
+
+  dispose(): void {
+    if (this.state === 'disposed') return
+    this.state = 'disposed'
+    this.transitionVersion++ // ← 新增：dispose 也算一次转换，正在进行的旧一轮作废
+    // …摘掉两个监听
+  }
+
+  private readonly handleLost = (event: Event): void =&gt; {
+    if (this.state === 'disposed') return
+    event.preventDefault()
+    if (this.state === 'lost') return
+    // ← 新增：先把成员加 1，再把新值抄进局部变量。局部变量是号码牌，之后不变
+    const version = ++this.transitionVersion
+    this.state = 'lost'
+    this.lastFailure = null
+    try {
+      this.callbacks.onLost()
+    } catch (error) {
+      // ← 改动：号码牌还对得上，这一轮才有资格记录失败
+      if (version === this.transitionVersion) this.lastFailure = { phase: 'on-lost', error }
+    }
+  }
+
+  private readonly handleRestored = (): void =&gt; {
+    if (this.state !== 'lost' &amp;&amp; this.state !== 'restore-failed') return
+    const version = ++this.transitionVersion // ← 新增：这一轮恢复的号码牌
+    this.state = 'restoring'
+    this.lastFailure = null
+    let phase = 'restore'
+    try {
+      this.callbacks.restore()
+      // ← 新增：号码牌对不上，这一轮已经作废：立刻退出，更不能写 ready
+      if (version !== this.transitionVersion) return
+      phase = 'on-ready'
+      this.callbacks.onReady()
+      if (version !== this.transitionVersion) return // ← 新增：同上
+      this.state = 'ready'
+    } catch (error) {
+      // ← 新增：作废那一轮的错误，不能写进现在的状态
+      if (version !== this.transitionVersion) return
+      this.state = 'restore-failed'
+      this.lastFailure = { phase, error }
+      try {
+        this.callbacks.onRestoreFailed(error)
+      } catch {
+        // 这一版先吞掉
+      }
+    }
+  }
+}</code></pre>
+    <div id="life-lab-3"></div>
+
+    <h3 id="s3-5">3.5 真实代码：在第 3 版之上多做了什么</h3>
+    <p>第 3 版把作废那一轮的错误直接 return 掉了，违反了不变量 3 的后半句（不能悄悄丢掉）。真实代码多了一个诊断出口 onSuppressedError：作废那一轮的错误被打包成一份冻结的快照交出去，标明 <code>stale: true</code>，以及「这一轮的号码」和「现在的号码」。它只用来记日志、做监控，不能改状态，也不能重试。另外两处补强：onRestoreFailed 通知自己也抛错时，两个错误都留着；诊断出口本身抛错时，也不让异常逃出监听器（<a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:169">WebGLContext<wbr />Lifecycle.ts:169–189</a>、<a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:227">:227–264</a>、<a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:281">:281–299</a>）：</p>
+<pre><code>// WebGLContextLifecycle.ts（节选；注释是课程加的，原文件里的注释更长）
+private readonly handleLost = (event: Event): void =&gt; {                // :169
+  if (this.stateValue === 'disposed') return
+  // 放在「重复 lost」判断之前：重复的 lost 事件也照样表示允许恢复
+  event.preventDefault()
+  if (this.stateValue === 'lost') return
+  const version = ++this.transitionVersion
+  this.stateValue = 'lost'
+  this.failureValue = null
+  try {
+    this.callbacks.onLost()
+  } catch (error: unknown) {
+    if (version === this.transitionVersion) {
+      // 本轮仍有效：记成当前失败
+      this.failureValue = Object.freeze({ phase: 'on-lost', error })
+    } else {
+      // 本轮已作废：交给诊断出口，不碰现在的状态
+      this.reportSuppressedError(error, 'on-lost', version)
+    }
+  }
+}
+
+private readonly handleRestored = (): void =&gt; {                        // :227
+  if (this.stateValue !== 'lost' &amp;&amp; this.stateValue !== 'restore-failed') return
+  const version = ++this.transitionVersion
+  this.stateValue = 'restoring'
+  this.failureValue = null
+  let phase: 'restore' | 'on-ready' = 'restore'
+  try {
+    this.callbacks.restore()
+    if (version !== this.transitionVersion) return
+    phase = 'on-ready'
+    this.callbacks.onReady()
+    if (version !== this.transitionVersion) return
+    this.stateValue = 'ready'
+  } catch (error: unknown) {
+    if (version !== this.transitionVersion) {
+      // 第 3 版在这里直接 return，错误就没了
+      this.reportSuppressedError(error, phase, version)
+      return
+    }
+    this.stateValue = 'restore-failed'
+    const failure: WebGLContextFailure = Object.freeze({ phase, error })
+    this.failureValue = failure
+    try {
+      this.callbacks.onRestoreFailed(error)
+    } catch (notificationError: unknown) {
+      if (version === this.transitionVersion) {
+        // 通知自己也失败了：两个错误都留着，不拿后一个覆盖最初的恢复错误
+        this.failureValue = Object.freeze({ ...failure, notificationError })
+      } else {
+        this.reportSuppressedError(notificationError, 'on-restore-failed', version)
+      }
+    }
+  }
+}
+
+// 作废那一轮的错误：包成冻结的诊断快照，交给 Backend 提供的观察者   // :281
+private reportSuppressedError(
+  error: unknown,
+  phase: WebGLContextSuppressedError['phase'],
+  capturedVersion: number
+): void {
+  try {
+    this.callbacks.onSuppressedError(
+      Object.freeze({
+        error,
+        phase,
+        stale: true,
+        capturedVersion,
+        currentVersion: this.transitionVersion
+      })
+    )
+  } catch {
+    // 诊断出口自己也不许抛错：抛出去就又逃出了 DOM 监听器
+  }
+}</code></pre>
+    <p>还有一处在类型上：回调写成 <code>onLost(): undefined</code>，不是 <code>(): void</code>（<a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:33">WebGLContext<wbr />Lifecycle.ts:33–50</a>），目的是让 async 函数过不了类型检查。async 函数返回 Promise，号码牌在 Promise 完成之前就核对完了，所有保护都会失效。所以这些回调必须同步执行完。第 30 课 RenderPass.execute 返回 undefined 也是同一个道理。</p>
+    <div id="life-lab-4"></div>
+
+    <h3 id="s3-6">3.6 自由组合</h3>
+    <p>任选一版、任选一个剧本运行，自己核对 2.6 节的五条不变量：</p>
+    <div id="life-play"></div>
+
+    <h2 id="s4">4. 和 Backend 怎样接：第二层号码牌</h2>
+    <p>回到 1.1 节 Backend 的 restore 回调。它在发布新的一代之前，又自己检查了一遍（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:83">WebGL1<wbr />Backend.ts:83–95</a>）：</p>
+<pre><code>// WebGL1Backend.ts:83–95（注释是课程加的）
+restore: () =&gt; {
+  const epoch = this.epoch                  // Backend 自己的号码牌：一个空对象
+  const candidate = this.createGeneration() // 先建好，先不发布
+
+  // 三种情况都不能发布：已经关了、中途换过一代、context 又丢了
+  if (this.disposedValue || epoch !== this.epoch || this.gl.isContextLost()) {
+    candidate.resources.invalidateForContextLoss() // 候选的一代先作废
+    candidate.resources.dispose()                  // 再关掉（里面还没有 GPU 对象）
+
+    throw new WebGLContextLostError('publish restored backend')
+  }
+
+  this.generation = candidate // 通过了才写字段
+},</code></pre>
+    <p>Lifecycle 已经有号码牌了，为什么 Backend 还要一个 epoch？因为两个号码牌保护的是不同的字段：</p>
+    <ul>
+      <li>transitionVersion 只保护 Lifecycle 自己的 stateValue、failureValue。它能阻止旧的一轮写 ready，管不到 Backend 里的 <code>this.generation</code>。</li>
+      <li>restore 回调里写 <code>this.generation = candidate</code> 的是 Backend 自己。要是这时 Backend 已经被关闭，或者 context 又丢了，这一代就不能发布。epoch 在 invalidateGeneration（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:344">:344–349</a>）和 dispose（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:248">:248</a>）里都会换成新对象。</li>
+    </ul>
+    <p>这是同一个规则用了两次：<strong>谁写字段，谁就在写之前核对自己的号码牌</strong>。Backend 用对象身份 <code>{}</code> 当号码牌，不用计数器（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:52">:52–53</a>），比较的是「是不是同一个对象」，效果一样。</p>
+    <p>1.3 节卡片里还有一处值得再看。loseContext() 刚返回、事件还没派发时，Lifecycle 的 state 还是 ready，Backend.ready 却已经是 false，调用 Backend 也会抛 WebGLContextLostError。这是因为 ready 和 requireGeneration 都会先问一次 <code>gl.isContextLost()</code>，发现丢了就自己作废这一代（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:114">:114–120</a>、<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:351">:351–368</a>）。Lifecycle 记录的是「已经观察到的事件」（<a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:1">WebGLContext<wbr />Lifecycle.ts:1</a> 的注释），Backend 还要再看一眼「物理上现在怎样」。restore-failed 期间，如果 context 本身没丢，requireGeneration 抛的是带状态名的 WebGLOperationError（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:359">:359–361</a>），上层能从错误里看出「恢复失败过」。</p>
+
+    <h2 id="s5">5. 和各个 Manager 的关系</h2>
+    <p>把第 14–18 课各节「和 Lifecycle 的关系」放到边角情况里看，每种出错各留下了什么：</p>
+    <ul>
+      <li><strong>restore 中途抛错，要不要回滚 GPU 对象？</strong>不用。createGeneration 只建 CPU 侧的管理对象：State、ResourceManager 和六个 Manager、Uniforms、SurfaceScope 的构造函数都不创建 GPU 对象，第一次 get 时才创建（第 18 课卡片「建好时 0 个」）。detectWebGL1Capabilities 第一步就抛错时，连这些对象也还没建。如果是 4 节那道检查没通过，候选的一代先 invalidate、再 dispose，里面也没有 GPU 对象要删。懒创建让「恢复到一半失败」没有东西需要回滚。</li>
+      <li><strong>restore-failed 期间，Backend 手里是哪一代？</strong>还是丢失前的旧一代，它的 valid 已经是 false（invalidateGeneration 设的），所以 ready 一直是 false。下一次 restored 会从头再建一代，不会复用失败那次的半成品。</li>
+      <li><strong>onLost 抛错，会留下什么？</strong>ResourceManager 先置 lost = true、再逐个通知（第 18 课审查第 2 条）。假设第 3 个 Manager 的 invalidateForContextLoss 抛错，后三个就收不到通知；Lifecycle 记下 <code>lastFailure = on-lost</code>，状态保持 lost。之后的恢复照样建全新的一代，旧的一代不会再被用来 draw。可是那三个没收到通知的 Manager，还订阅着 CPU 资源的 onDispose（第 4 课）。后果留作 7.2 节的想一想。</li>
+      <li><strong>恢复成功以后</strong>：新的一代每张表都是空的，第一帧从 CPU 原件重新编译、上传（第 31 课 5.4 节的卡片）。</li>
+    </ul>
+
+    <h2 id="s6">6. 架构视角：对照 three.js r177</h2>
+    <ul>
+      <li><strong>只有一个布尔值，而且恢复时的顺序相反。</strong>丢失时先 preventDefault，再把 <code>_isContextLost</code> 设为 true（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1013">WebGLRenderer.js:1013–1021</a>）。恢复时<strong>先</strong>把 <code>_isContextLost</code> 改回 false，<strong>再</strong>调用 initGLContext 重建（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:1023">:1023–1035</a>）。如果重建抛错，异常会逃出事件监听器，而 renderer 已经认为自己恢复好了，下一帧就在半成品上画。这正是 3.1 节第 1 版的两个问题，只是顺序反了过来。它也没有 restore-failed 状态，没有重入保护。</li>
+      <li><strong>丢失时不调用任何清理。</strong>onContextLost 只改一个布尔值，资源的作废推迟到 initGLContext 整体重建时，WebGLProperties、WebGLAttributes 这些表都会换成新的（<a data-src="node_modules/three/src/renderers/WebGLRenderer.js:403">WebGLRenderer.js:403–425</a>）。所以在 three.js 里，丢失到恢复之间没有「onLost 抛错」这一格。</li>
+      <li><strong>取舍。</strong>three.js 的做法简单，对绝大多数应用够用：context 丢失本来就少见，回调里重入就更少见了。本项目为此单独写了一个类，换来的是：恢复失败看得见、关闭以后不会被复活、旧回调改不了新状态，而且每种情况都有测试。代价是 300 行代码（一大半是注释）和 12 组单元测试（其中两组各跑两种情况），以及第 7 节要讨论的问题：这些保护里，有一部分现在还用不上。</li>
+    </ul>
+
+    <h2 id="s7">7. 审查视角</h2>
+    <h3 id="s7-1">7.1 对照表格找出来的</h3>
+    <ol>
+      <li><strong>表里有几格没有测试。</strong>按 2.4 节的表逐格对照单元测试，下面几格找不到对应的用例（我在测试文件里搜过 restore-failed、Once 等写法）：restore-failed 状态再收到 restored、这次恢复成功；restore-failed 状态收到 lost；dispose 以后保留最后一次 lastFailure（源码注释承诺了这一点，<a data-src="src/rendering/backend/webgl1/WebGLContextLifecycle.ts:114">:114</a>）；3.3 节那个「回到同一个状态」的剧本。第一格最重要：第 13 课说过「restore-failed 时再来一次 restored 可以再试」，这是唯一能从失败里走出来的路，却没有测试守着。1.3 节的卡片在真实浏览器里走的是另一条路：restore-failed 之后先来了 lost，又回到了 lost。</li>
+      <li><strong>大部分重入保护，现在的 Backend 还用不上。</strong>五个回调都不会回头调用 Lifecycle，onRestoreFailed 是空的，真实浏览器又是排队派发事件。真正会发生的，只有「restore 或 onReady 抛错」这一格（1.3 节）。号码牌和 onSuppressedError 防的是以后接上 Engine 通知（1.2 节那条链）、以及测试里手动派发事件的情况。它们不是错误，但读代码时要知道哪些路径现在是活的。</li>
+      <li><strong>上层只能轮询失败。</strong>Engine 用 getter 把 Backend 的 lastFailure 暴露出去（<a data-src="src/engine.ts:167">engine.ts:167–170</a>），没有人在失败时被主动通知。第 13 课审查视角问的「上层怎样知道该提示用户」，现在的答案是：每帧或定时去读 lastBackendFailure。</li>
+    </ol>
+
+    <h3 id="s7-2">7.2 想一想（直接在对话里回答）</h3>
+    <ol>
+      <li>如果把 Backend 的 onRestoreFailed 改成「通知 Engine 退出 HW2」，也就是在回调里同步走完 1.2 节那条链，对应 2.4 节表里的哪一格？最后的 state 和 lastFailure 是什么？要是这条链中途抛错（比如 ResourceManager.dispose 失败），错误会去哪里？</li>
+      <li>WebGLContextLifecycle 有一大半在处理现在的 Backend 不会触发的重入。如果由你决定，哪些留、哪些删？说出你的理由（提示：想想谁会在什么时候往回调里加代码，加的时候会不会想起这些规矩）。</li>
+      <li>5 节第三条：onLost 抛错以后，后三个 Manager 没收到通知，还订阅着 CPU 资源的 onDispose。恢复建了新的一代，之后某个 Geometry 被 dispose 了，那个旧 Manager 的监听器会做什么？会出错吗？要怎样验证你的猜想？</li>
+    </ol>
+
+    <h2 id="s8">8. 检查题</h2>
+    <div class="quiz" data-quiz="lesson-0028"></div>
+
+    <h2 id="s9">9. 延伸阅读</h2>
+    <ul>
+      <li><a href="https://registry.khronos.org/webgl/extensions/WEBGL_lose_context/">WEBGL_lose_context 扩展规范</a>：loseContext、restoreContext 的语义，以及为什么必须在 lost 事件里调用 preventDefault。1.3 节的卡片就是用它制造的两次丢失。</li>
+      <li>项目文档 device-and-state.zh-CN.md 里 ContextLifecycle 一节：和本课的 2.5、2.6 节对照着读。</li>
+      <li>本课程第 13 课第 2 节（主线）、第 18 课（ResourceManager 的 invalidateForContextLoss）、第 30 课 6.1 节（RenderPass.execute 为什么返回 undefined）。</li>
+    </ul>
+
+    <aside class="note">
+      做完告诉我：实验卡片和检查题各错了哪几题；7.2 的三个想一想，直接在对话里回答。读到哪一节接不上，告诉我是哪一节、哪一句。
+    </aside>
+
+    <div class="nav">
+      <a href="0031-frame-overview.html">← 第 31 课：一帧的全局图</a>
+      <a href="../index.html">课程首页</a>
+      <a href="0032-point-to-pixel.html">第 32 课：点落在哪个像素 →</a>
+    </div>
+    <footer>src/rendering 精读课 · 第 28 课 · 2026-10-14</footer>
+    <script>
+      ;(function () {
+        'use strict'
+        if (RTeach.linkSources) RTeach.linkSources(document.body)
+
+        const L = window.RTeachLifecycleEdge
+        const C = L.course
+        const err = (e) => (e && e.name ? e.name : 'Error') + '：' + (e && e.message ? e.message : String(e))
+
+        // ---------------- 1.3 真实浏览器：恢复途中又丢了 ----------------
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-real'),
+          storageKey: 'lesson-0028-real',
+          cards: [
+            {
+              title: '真实 Backend：刚要恢复，context 又丢了',
+              tags: ['真实 WebGL', '项目代码（工作区版本）'],
+              desc: '① 建 WebGL1Backend；② loseContext()；③ 等 lost 事件派发以后 restoreContext()；④ restored 一到，先注册的监听立刻再 loseContext()；⑤ 等排队的 lost 派发以后，再 restoreContext() 一次。每一步记下 Backend.ready、Lifecycle 的状态、lastFailure，以及这时调用 Backend（resizeDrawingBuffer）会怎样。',
+              note: '课程写的部分：在 Backend 之前、之后各注册的几个监听（一个负责第二次 loseContext，其余只记录），以及等待和记录的代码。Lifecycle 的状态是课程读了私有字段 backend.lifecycle.state 得到的，Backend 对外只有 ready 和 lastFailure。WebGL1Backend、WebGLContextLifecycle 都是项目代码。',
+              question: '第 1 次恢复时，restore 回调一开始就发现 context 又丢了。这一次 restored 派发处理完，Lifecycle 处在什么状态？',
+              choices: ['restore-failed，lastFailure 记着探测时发现了丢失', 'lost：Lifecycle 发现又丢了，直接退回 lost', 'ready：恢复流程走完了，下一帧才会发现'],
+              answer: 0,
+              explain:
+                '先注册的监听把 context 又弄丢了，isContextLost 立刻变成 true，可新的 lost 事件要排队。Lifecycle 接着处理 restored：restore 回调里的 detectWebGL1Capabilities 第一行就发现丢失，抛出 WebGLContextLostError: detect capabilities。Lifecycle 进入 restore-failed，记下 phase = restore。排队的 lost 随后派发：restore-failed → lost，清掉失败记录。第二次 restoreContext 以后才真正恢复。<br />这一格不需要任何人「回头调用」，是现在的项目在真实浏览器里就会走到的边角：2.4 节表里「restore 抛错」那一行。另外留意 loseContext() 刚返回的那一行：事件还没派发，Lifecycle 还是 ready，Backend.ready 却已经是 false（第 4 节）。<br />恢复要等多久，由浏览器决定。我在无界面 Chrome 里跑过两次：第一次运行时，两次恢复分别在 restoreContext() 之后 3 ms 和 4.3 秒到达；第二次运行时是 0.5 秒和 0.2 秒。',
+              run: async () => {
+                const lines = []
+                const canvas = document.createElement('canvas')
+                canvas.width = 8
+                canvas.height = 8
+                canvas.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none'
+                document.body.appendChild(canvas)
+                const start = performance.now()
+                const t = () => Math.round(performance.now() - start) + ' ms'
+                let backend = null
+                let lose = null
+                let loseAgain = true
+                try {
+                  // 先于 Backend 注册：restored 派发时它先执行
+                  canvas.addEventListener('webglcontextrestored', () => {
+                    if (!loseAgain) return
+                    loseAgain = false
+                    lose.loseContext()
+                    lines.push({ t: t(), text: '先注册的监听：restored 一到就再 loseContext()；isContextLost = ' + canvas.getContext('webgl').isContextLost(), kind: 'user' })
+                  })
+                  backend = new L.WebGL1Backend(canvas, 'lesson28')
+                  lose = canvas.getContext('webgl').getExtension('WEBGL_lose_context')
+                  if (!lose) return { lines: [{ text: '这个浏览器没有 WEBGL_lose_context，卡片停在这里。', kind: 'late' }] }
+                  const probe = () => {
+                    try {
+                      backend.resizeDrawingBuffer(8, 8, 1)
+                      return '可用'
+                    } catch (error) {
+                      return err(error)
+                    }
+                  }
+                  const show = (label, kind) => {
+                    const failure = backend.lastFailure
+                    lines.push({
+                      t: t(),
+                      text:
+                        label + '：ready = ' + backend.ready + '，state = ' + backend.lifecycle.state +
+                        '，lastFailure = ' + (failure ? failure.phase + ' / ' + err(failure.error) : 'null') +
+                        '；调用 Backend：' + probe(),
+                      kind: kind || ''
+                    })
+                  }
+                  // 后于 Backend 注册：同一次派发里，Lifecycle 已经处理完
+                  canvas.addEventListener('webglcontextrestored', () => show('restored 派发处理完', 'result'))
+                  canvas.addEventListener('webglcontextlost', () => show('lost 派发处理完', 'abort'))
+                  const wait = async (condition, limit) => {
+                    const until = performance.now() + limit
+                    while (!condition() && performance.now() < until) await new Promise((resolve) => setTimeout(resolve, 20))
+                    return condition()
+                  }
+                  show('构造完')
+                  lose.loseContext()
+                  show('loseContext() 刚返回', 'server')
+                  await wait(() => backend.lifecycle.state === 'lost', 3000)
+                  lose.restoreContext()
+                  show('第 1 次 restoreContext() 刚返回', 'server')
+                  await wait(() => !loseAgain && backend.lifecycle.state === 'lost', 15000)
+                  lose.restoreContext()
+                  show('第 2 次 restoreContext() 刚返回', 'server')
+                  const ok = await wait(() => backend.ready, 20000)
+                  if (!ok) lines.push({ t: t(), text: '等了 20 秒还没恢复：浏览器可能暂时不再恢复这个页面的 context，可以过一会儿刷新再试。', kind: 'late' })
+                  show('最后', 'result')
+                } catch (error) {
+                  lines.push({ text: '实验里抛出了没有预料到的错误：' + err(error), kind: 'late' })
+                } finally {
+                  if (backend) backend.dispose()
+                  const gl = canvas.getContext('webgl')
+                  const extension = gl && gl.getExtension('WEBGL_lose_context')
+                  if (extension && !gl.isContextLost()) extension.loseContext()
+                  canvas.remove()
+                }
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 2.4 状态 × 事件 × 回调结局 ----------------
+        const OUTCOME_LABEL = (outcome) => {
+          const parts = []
+          for (const [name, what] of Object.entries(outcome)) {
+            parts.push(
+              name + ' ' + { throw: '抛错', dispose: '里 dispose', 'dispose-throw': '里 dispose 再抛错', lost: '里又 lost' }[what]
+            )
+          }
+          return parts.length ? parts.join('，') : '回调都正常'
+        }
+        /** 用真实的 WebGLContextLifecycle 跑一格：先把它带到 prefix 状态，再派发一个事件，回调按 outcome 行事。 */
+        function runCell(prefix, event, outcome) {
+          const canvas = new EventTarget()
+          const called = []
+          const suppressed = []
+          let lifecycle = null
+          let probing = false
+          const behave = (name) => {
+            called.push(name)
+            if (!probing) {
+              if (name === 'restore' && prefix === 'restore-failed') throw new Error('准备阶段的 restore 失败')
+              return undefined
+            }
+            const what = outcome[name]
+            if (what === 'throw') throw new Error(name + ' 抛错')
+            if (what === 'dispose') lifecycle.dispose()
+            if (what === 'dispose-throw') {
+              lifecycle.dispose()
+              throw new Error(name + ' 关闭后抛错')
+            }
+            if (what === 'lost') canvas.dispatchEvent(new Event('webglcontextlost', { cancelable: true }))
+            return undefined
+          }
+          lifecycle = new L.WebGLContextLifecycle(canvas, {
+            onLost: () => behave('onLost'),
+            restore: () => behave('restore'),
+            onReady: () => behave('onReady'),
+            onRestoreFailed: () => behave('onRestoreFailed'),
+            onSuppressedError: (report) => {
+              suppressed.push(report.phase + '（' + report.capturedVersion + ' → ' + report.currentVersion + '）')
+              return undefined
+            }
+          })
+          const fire = (type) => canvas.dispatchEvent(new Event(type, { cancelable: true }))
+          if (prefix === 'lost' || prefix === 'restore-failed') fire('webglcontextlost')
+          if (prefix === 'restore-failed') fire('webglcontextrestored')
+          if (prefix === 'disposed') lifecycle.dispose()
+          called.length = 0
+          probing = true
+          if (event === 'dispose') lifecycle.dispose()
+          else fire(event === 'lost' ? 'webglcontextlost' : 'webglcontextrestored')
+          const failure = lifecycle.lastFailure
+          return {
+            state: lifecycle.state,
+            text:
+              '→ ' + lifecycle.state +
+              '；调用了 ' + (called.join('、') || '无') +
+              '；lastFailure = ' + (failure ? failure.phase + (failure.notificationError ? ' + notificationError' : '') : 'null') +
+              (suppressed.length ? '；onSuppressedError：' + suppressed.join('，') : '')
+          }
+        }
+        RTeach.traceLab.cards({
+          mount: document.getElementById('lab-table'),
+          storageKey: 'lesson-0028-table',
+          cards: [
+            {
+              title: '用真实代码跑出整张表',
+              tags: ['项目代码（WebGLContextLifecycle）', '只用 CPU'],
+              desc: '对 ready、lost、restore-failed、disposed 四个起始状态，分别派发 lost、restored、调用 dispose()；回调按「正常、抛错、回调里 dispose、dispose 后再抛错、回调里又 lost」等结局行事，一共 56 格。同一个状态和事件下，每种结局结果都一样的（被忽略的），合成一行。',
+              note: '课程写的部分：runCell（把真实的 WebGLContextLifecycle 带到起始状态、派发事件、让回调按指定结局行事）。restore-failed 这个起始状态，是先 lost、再 restored 并让那次 restore 抛错得到的。',
+              question: 'restore-failed 状态又收到 restored，这次 restore、onReady 都正常。最后是什么状态？',
+              choices: ['ready：restore-failed 可以再试一次', 'restore-failed：失败过一次就不再接受恢复', 'lost：要先回到 lost 才能再恢复'],
+              answer: 0,
+              explain:
+                'handleRestored 的第一行只接受 lost 和 restore-failed（WebGLContextLifecycle.ts:228），所以失败以后再来一次 restored，就是重试。这是唯一能从 restore-failed 走出来的路，可单元测试里没有这一格（第 7 节）。<br />顺便看几行：onLost 抛错时不调用 onRestoreFailed（丢失时清理失败，不等于恢复失败）；「通知里 dispose」那几行，lastFailure 保留着最初的 restore 错误；restore-failed 状态下 dispose，lastFailure 也保留下来。被忽略的组合里，lost 再来 lost 时 preventDefault 照样会调用（看 3.5 节代码）。',
+              run: async () => {
+                const lines = []
+                const outcomes = {
+                  lost: [{}, { onLost: 'throw' }, { onLost: 'dispose' }, { onLost: 'dispose-throw' }],
+                  restored: [
+                    {},
+                    { restore: 'throw' },
+                    { onReady: 'throw' },
+                    { restore: 'dispose' },
+                    { restore: 'dispose-throw' },
+                    { restore: 'lost' },
+                    { restore: 'throw', onRestoreFailed: 'throw' },
+                    { restore: 'throw', onRestoreFailed: 'dispose' },
+                    { restore: 'throw', onRestoreFailed: 'dispose-throw' }
+                  ],
+                  dispose: [{}]
+                }
+                let cells = 0
+                for (const prefix of ['ready', 'lost', 'restore-failed', 'disposed']) {
+                  for (const event of ['lost', 'restored', 'dispose']) {
+                    const results = outcomes[event].map((outcome) => ({ outcome, result: runCell(prefix, event, outcome) }))
+                    cells += results.length
+                    const header = prefix + ' + ' + (event === 'dispose' ? 'dispose()' : event)
+                    const allIgnored = results.every((r) => r.result.text === results[0].result.text) && results.length > 1
+                    if (allIgnored) {
+                      lines.push({ t: '', text: header + '：' + results.length + ' 种结局都一样 ' + results[0].result.text + '（忽略）', kind: 'muted' })
+                      continue
+                    }
+                    lines.push({ t: '', text: header, kind: 'server' })
+                    for (const { outcome, result } of results) {
+                      lines.push({ t: '', text: '　' + OUTCOME_LABEL(outcome) + ' ' + result.text, kind: result.state === 'ready' ? 'result' : '' })
+                    }
+                  }
+                }
+                lines.push({ t: '', text: '一共跑了 ' + cells + ' 格。', kind: 'result' })
+                return { lines }
+              }
+            }
+          ]
+        })
+
+        // ---------------- 3 一版一版：剧本 ----------------
+        const lifeVersions = {
+          v1: C.LifecycleV1,
+          v2: C.LifecycleV2,
+          sc: C.LifecycleStateCheck,
+          v3: C.LifecycleV3,
+          real: L.WebGLContextLifecycle
+        }
+        const versionLabel = { v1: '第 1 版', v2: '第 2 版', sc: '核对状态版', v3: '第 3 版', real: '真实代码' }
+        const scenarios = {
+          normal: { title: '正常丢失、恢复', steps: ['lost', 'restored'] },
+          restoreThrows: { title: '恢复失败', steps: ['lost', 'restored'], behaviors: { restore: { throw: '探测时 context 又丢了' } } },
+          doubleLost: { title: '重复的 lost', steps: ['lost', 'lost'] },
+          disposeInRestore: { title: '回调里关掉了自己', steps: ['lost', 'restored'], behaviors: { restore: { dispose: true } } },
+          lostInRestore: { title: '回调里又丢了', steps: ['lost', 'restored'], behaviors: { restore: { fireLost: true } } },
+          staleError: { title: '作废那一轮的错误', steps: ['lost'], behaviors: { onLost: { dispose: true, thenThrow: '清理缓存时出错' } } },
+          afterDispose: { title: '关掉以后又来事件', steps: ['dispose', 'lost', 'restored'] },
+          giveUp: {
+            title: '恢复失败后放弃',
+            steps: ['lost', 'restored'],
+            behaviors: { restore: { throw: '探测时 context 又丢了' }, onRestoreFailed: { dispose: true, thenThrow: '关闭时出错' } }
+          },
+          aba: {
+            title: '回到同一个状态',
+            steps: ['lost'],
+            behaviors: { onLost: [{ fire: ['restored', 'lost'], thenThrow: '第 1 轮清理缓存时出错' }], restore: { throw: '探测时又丢了' } }
+          }
+        }
+        const scenarioDesc = {
+          normal: '第 1 步 lost，第 2 步 restored；三个回调都正常返回。',
+          restoreThrows: '第 1 步 lost，第 2 步 restored；restore 回调抛出 Error「探测时 context 又丢了」。',
+          doubleLost: 'lost 连着来两次。',
+          disposeInRestore: '第 1 步 lost，第 2 步 restored；restore 回调里，应用调用了 dispose()。',
+          lostInRestore: '第 1 步 lost，第 2 步 restored；restore 回调执行到一半，context 又丢了，同步派发了一次新的 lost。',
+          staleError: '第 1 步 lost；onLost 回调里先调用 dispose()，接着抛出 Error「清理缓存时出错」。',
+          afterDispose: '先 dispose()，之后浏览器又派发 lost 和 restored。',
+          giveUp: '第 1 步 lost，第 2 步 restored；restore 抛错，onRestoreFailed 里应用决定放弃，调用 dispose()，接着抛出 Error「关闭时出错」。',
+          aba: '只有第 1 步 lost。第 1 次 onLost 执行到一半，先同步派发 restored（restore 抛错），再同步派发 lost（第 2 次 onLost 正常），最后第 1 次 onLost 抛出 Error「第 1 轮清理缓存时出错」。'
+        }
+        const LAB_NOTE =
+          '课程写的部分：lifecycleLab（假 canvas，按剧本同步派发事件，记录每个回调被调用时的状态）和剧本里回调的行为。第 1、2、3 版和核对状态版是课程写的（lifecycle-course.ts）；「真实代码」是项目的 WebGLContextLifecycle。'
+        const lifeCard = (version, scenario, rest) => ({
+          tags: [versionLabel[version], '剧本：' + scenarios[scenario].title],
+          desc: scenarioDesc[scenario],
+          note: LAB_NOTE,
+          run: () => RTeach.lifecycleLab.run(lifeVersions[version], scenarios[scenario]),
+          ...rest
+        })
+
+        RTeach.traceLab.cards({
+          mount: document.getElementById('life-lab-1'),
+          storageKey: 'lesson-0028-life-1',
+          cards: [
+            lifeCard('v1', 'normal', {
+              title: '第 1 版：onLost 被调用的那一刻',
+              question: 'onLost 被调用的那一刻，第 1 版的 ready 是多少？',
+              choices: ['true：还以为可以 draw', 'false：已经禁止 draw', 'undefined：还没有值'],
+              answer: 0,
+              explain: '第 1 版先调用 onLost，再写 ready = false。onLost 执行期间，任何人来问「能不能画」，得到的都是 true，违反不变量 1。onLost 正在清理缓存，这时如果有人 draw，用的就是一半已经作废的缓存。'
+            }),
+            lifeCard('v1', 'restoreThrows', {
+              title: '第 1 版：恢复失败',
+              question: 'restore 回调抛错时，第 1 版会怎样？',
+              choices: ['异常逃出监听器，ready 停在 false', '记下失败原因，进入恢复失败的状态', '吞掉这个错误，照样把它设成 ready'],
+              answer: 0,
+              explain: '异常从 DOM 事件监听器里逃了出去，浏览器把它当成未捕获的错误报告（记录里的 ⚠），违反不变量 4。ready 停在 false，可是没有任何地方记下「为什么」，上层也分不清这是「还在等恢复」还是「恢复失败了」。'
+            })
+          ]
+        })
+        RTeach.traceLab.cards({
+          mount: document.getElementById('life-lab-2'),
+          storageKey: 'lesson-0028-life-2',
+          cards: [
+            lifeCard('v2', 'restoreThrows', {
+              title: '第 2 版：恢复失败',
+              question: 'restore 回调抛错，第 2 版最后处在什么状态？',
+              choices: ['restore-failed，记下失败原因', 'lost，就像恢复从来没有发生过', '异常逃出监听器，状态没有改变'],
+              answer: 0,
+              explain: 'try/catch 把错误留在监听器里面，状态改成 restore-failed，lastFailure 记下 phase 和原始错误，再通知 onRestoreFailed。上层可以据此显示「恢复失败」。'
+            }),
+            lifeCard('v2', 'disposeInRestore', {
+              title: '第 2 版：回调里关掉了自己',
+              question: 'restore 回调里调用了 dispose()。第 2 版最后的 state 是什么？',
+              choices: ['ready：已经关闭的对象又能用了', 'disposed：关闭以后就不再改变', 'restore-failed：恢复被打断了'],
+              answer: 0,
+              explain: 'dispose() 把状态改成 disposed，摘掉了监听。可是 restore 回调一返回，外层的 handleRestored 并不知道这件事，照样调用 onReady，最后写下 ready，违反不变量 1、2：一个已经关闭、不再监听事件的对象，又报告自己「可以 draw」。'
+            }),
+            lifeCard('v2', 'lostInRestore', {
+              title: '第 2 版：回调里又丢了',
+              question: 'restore 执行到一半，context 又丢了。第 2 版最后的 state 是什么？',
+              choices: ['ready：新的那次丢失被盖掉了', 'lost：保留了新的那一次丢失', 'restoring：停在恢复的半路上'],
+              answer: 0,
+              explain: '内层的 lost 正确地把状态改成 lost、调用了 onLost。可是回到外层，handleRestored 接着调用 onReady，再写 ready，把这次更新的 lost 盖掉了。渲染循环会在一个已经丢失的 context 上 draw。'
+            })
+          ]
+        })
+        RTeach.traceLab.cards({
+          mount: document.getElementById('life-lab-sc'),
+          storageKey: 'lesson-0028-life-sc',
+          cards: [
+            lifeCard('sc', 'aba', {
+              title: '核对状态版：转了一圈回到 lost',
+              question: '核对状态版最后的 lastFailure 是什么？',
+              choices: ['第 1 次 onLost 的错误，被当成了现在这一轮的失败', 'null：它发现这一轮已经作废了', '恢复时 restore 抛的「探测时又丢了」'],
+              answer: 0,
+              explain: '状态依次是 lost → restoring → restore-failed → lost。最外层的 onLost 抛错时，核对状态版看到 state 还是 lost，就以为「这一轮还算数」，把第 1 轮的错误写成了当前的 lastFailure。可是现在这一轮（第 3 次转换）的 onLost 是正常完成的：记录在说谎，违反不变量 3。第 2 版也是同样的结果，它根本不核对。<br />状态只有五个值，转了一圈回到同一个值时，它就分不出「还是我这一轮」和「已经是后来的一轮」。这种情况在真实浏览器里极少见（要同步派发事件），可只核对状态的话，就得逐个证明它不会发生。换成号码牌，一条规则全部管住。'
+            }),
+            lifeCard('real', 'aba', {
+              title: '真实代码：同一个剧本',
+              question: '同样的剧本，真实代码怎样处理第 1 次 onLost 的错误？',
+              choices: ['交给 onSuppressedError，号码是 1，现在是 3', '写进 lastFailure：因为状态还是 lost', '悄悄丢掉，不留下任何记录'],
+              answer: 0,
+              explain: '第 1 次 lost 拿到号码 1；内层的 restored 是 2，内层的 lost 是 3。最外层的 onLost 抛错时，局部的 1 不等于成员的 3，所以这个错误不能写进 lastFailure，而是包成 { phase: on-lost, stale: true, capturedVersion: 1, currentVersion: 3 } 交给 onSuppressedError。lastFailure 是 null，和「第 3 轮的 onLost 正常完成」一致。'
+            })
+          ]
+        })
+        RTeach.traceLab.cards({
+          mount: document.getElementById('life-lab-3'),
+          storageKey: 'lesson-0028-life-3',
+          cards: [
+            lifeCard('v3', 'lostInRestore', {
+              title: '第 3 版：回调里又丢了',
+              question: '和 3.2 节同样的剧本，第 3 版最后的 state 是什么？',
+              choices: ['lost：保留了新的那一次丢失', 'ready：新的那次丢失被盖掉了', 'restoring：停在恢复的半路上'],
+              answer: 0,
+              explain: '恢复开始时号码牌是 2。内层的 lost 把成员加到 3。restore 返回后，外层核对：局部的 2 不等于 3，说明这一轮已经作废，立刻 return，不再调用 onReady，也不写 ready。'
+            }),
+            lifeCard('v3', 'disposeInRestore', {
+              title: '第 3 版：回调里关掉了自己',
+              question: 'restore 回调里调用了 dispose()。第 3 版会怎样？',
+              choices: ['disposed，onReady 不再被调用', 'ready，onReady 照常被调用了', 'disposed，但 onReady 照常调用'],
+              answer: 0,
+              explain: 'dispose 也算一次转换，号码牌加 1。外层核对不上，立刻退出：onReady 没被调用，状态保持 disposed。'
+            }),
+            lifeCard('v3', 'staleError', {
+              title: '第 3 版：作废那一轮的错误',
+              question: 'onLost 里先 dispose、再抛错。第 3 版怎样处理这个错误？',
+              choices: ['悄悄丢掉，没有任何记录', '写进了 lastFailure 里', '异常逃出了 DOM 监听器'],
+              answer: 0,
+              explain: '号码牌对不上，所以第 3 版不把它写进 lastFailure，这一点是对的：它属于作废的那一轮。可第 3 版也没有把它交给任何人，这个错误就消失了，违反不变量 3 的后半句。清理缓存时出错往往说明有 bug，悄悄吞掉会很难查。'
+            })
+          ]
+        })
+        RTeach.traceLab.cards({
+          mount: document.getElementById('life-lab-4'),
+          storageKey: 'lesson-0028-life-4',
+          cards: [
+            lifeCard('real', 'staleError', {
+              title: '真实代码：作废那一轮的错误',
+              question: '同样的剧本，项目的 WebGLContextLifecycle 怎样处理这个错误？',
+              choices: ['交给 onSuppressedError，标明是旧的', '写进 lastFailure，覆盖现在的诊断', '被悄悄地丢掉，没有留下任何记录'],
+              answer: 0,
+              explain: '错误被打包成冻结的快照交给 onSuppressedError：phase 是 on-lost，capturedVersion = 1 是这一轮的号码，currentVersion = 2 是 dispose 之后的号码。lastFailure 仍是 null，状态仍是 disposed。Backend 把它存进 lastSuppressedError，供日志和监控使用（<a data-src="src/rendering/backend/webgl1/WebGL1Backend.ts:107">WebGL1Backend.ts:107–109</a>）。'
+            }),
+            lifeCard('real', 'giveUp', {
+              title: '真实代码：恢复失败后放弃',
+              question: 'restore 抛错，onRestoreFailed 里先 dispose 再抛错。最后的 state 和 lastFailure 是什么？',
+              choices: ['disposed；lastFailure 还是 restore 的错误，通知的错误交给 onSuppressedError', 'restore-failed；lastFailure 带上了 notificationError', 'disposed；lastFailure 被清成了 null'],
+              answer: 0,
+              explain: '这就是 1.2 节「通知 Engine 退出 HW2」那条链的样子。restore 抛错：进入 restore-failed，lastFailure 记下 restore 的错误（号码 2），再通知。通知里 dispose：号码变成 3。通知接着抛错：局部的 2 不等于 3，所以不写成 notificationError，交给 onSuppressedError，phase 是 on-restore-failed。lastFailure 没被清掉：dispose 保留最后的诊断（WebGLContextLifecycle.ts:114）。<br />如果通知里没有 dispose、只是抛错，号码对得上，两个错误会一起留在 lastFailure（error + notificationError），见 2.4 节的表。'
+            })
+          ]
+        })
+
+        RTeach.traceLab.playground({
+          mount: document.getElementById('life-play'),
+          title: '任选一版 × 任选一个剧本',
+          selects: [
+            { id: 'version', options: Object.entries(versionLabel) },
+            { id: 'scenario', options: Object.entries(scenarios).map(([id, s]) => [id, s.title]) }
+          ],
+          describe: (values) => scenarioDesc[values.scenario],
+          run: (values) => RTeach.lifecycleLab.run(lifeVersions[values.version], scenarios[values.scenario])
+        })
+
+        // ---------------- 检查题 ----------------
+        RTeach.renderQuiz(document.querySelector('[data-quiz="lesson-0028"]'), [
+          {
+            q: 'lost 事件里，生命周期类为什么先改状态、再调用 onLost？',
+            opts: ['回调执行时 isReady 已是 false', '这样做能让回调执行得更快一点', '浏览器规定要在事件里先改状态'],
+            answer: 0,
+            why: '这样 onLost 执行期间，任何人问「能不能画」都会得到 false，不会在清理到一半的缓存上 draw（3.1 节第 1 版的卡片）。'
+          },
+          {
+            q: 'transitionVersion 防的是什么？',
+            opts: ['旧调用栈把状态写回去', '两个线程同时修改状态', 'GPU 资源被重复地创建'],
+            answer: 0,
+            why: '回调里同步发生了更新的转换（dispose 或新的 lost），外层的旧调用栈核对号码牌对不上，就不能再写状态（3.4 节）。这里没有多线程，也没有 async。'
+          },
+          {
+            q: '回调返回以后只核对「状态还是不是自己写下的那个」，为什么不够？',
+            opts: ['中途转了几次又回到同一个状态时，分不出是哪一轮', '状态是字符串，比较起来比数字慢', '核对状态会让回调被多调用一次'],
+            answer: 0,
+            why: '3.3 节的剧本：lost → restoring → restore-failed → lost，最外层看到的还是 lost，就把第 1 轮的错误记成了当前的失败。号码牌只增不减，不会「转回来」。'
+          },
+          {
+            q: '作废那一轮的错误，真实代码为什么不写进 lastFailure，也不直接丢掉？',
+            opts: ['它不属于当前这一轮，但它往往说明有 bug，要交给诊断出口留个记录', 'lastFailure 只能存一个错误，已经满了', '浏览器不允许在事件处理里保存错误对象'],
+            answer: 0,
+            why: '不变量 3：lastFailure 只描述当前这一轮；第 3 版直接丢掉，真实代码交给 onSuppressedError，并标明 stale、capturedVersion、currentVersion（3.5 节）。'
+          },
+          {
+            q: 'Lifecycle 已经有 transitionVersion，Backend 的 restore 回调为什么还要核对 epoch？',
+            opts: ['transitionVersion 只保护 Lifecycle 自己的字段；发布 this.generation 的是 Backend，要自己核对', 'transitionVersion 只在测试里生效，生产环境要靠 epoch', 'epoch 是为了统计恢复了多少次'],
+            answer: 0,
+            why: '谁写字段，谁就在写之前核对自己的号码牌（第 4 节）。Backend 关闭、换代或者 context 又丢了，候选的一代就不能发布，要先作废再关掉。'
+          },
+          {
+            q: 'restore 回调执行到一半失败了，为什么不需要回滚已经创建的 GPU 对象？',
+            opts: ['createGeneration 只建 CPU 侧的管理对象，GPU 对象第一次 get 时才创建', 'context 已经丢了，GPU 对象会被浏览器自动删除', 'Lifecycle 会在 restore-failed 时自动删除它们'],
+            answer: 0,
+            why: '第 5 节：懒创建让「恢复到一半失败」时，候选的一代里根本还没有 GPU 对象（第 18 课卡片：刚建好时 0 个）。'
+          },
+          {
+            q: '在现在的项目里、真实的浏览器中，下面哪种边角情况真的会发生？',
+            opts: ['restore 回调发现 context 又丢了而抛错，进入 restore-failed', 'onRestoreFailed 里调用 dispose，关掉 Lifecycle', 'restore 回调执行时同步收到一次新的 lost 事件'],
+            answer: 0,
+            why: '1.3 节的卡片在真实浏览器里走到了这一格。onRestoreFailed 现在是空的；浏览器的事件是排队派发的，不会在回调执行中同步到来（第 7 节第 2 条）。'
+          },
+          {
+            q: 'three.js 恢复时先把 _isContextLost 改成 false，再调用 initGLContext。这样的风险是？',
+            opts: ['重建失败时仍以为一切正常', '重建期间会多发一次网络请求', '丢失事件会被处理两次以上'],
+            answer: 0,
+            why: '如果 initGLContext 抛错，异常逃出监听器，而 renderer 已经认为自己恢复好了，下一帧就在半成品上画（第 6 节）。'
+          }
+        ])
+      })()
+    </script>
+  </body>
+</html>
