@@ -304,4 +304,163 @@ describe('WebGL1ProgramManager', () => {
 
     expect(() => f.manager.get(shader)).toThrow(ResourceDisposedError)
   })
+
+  /**
+   * [DESIGN-WEIGHT:3][webgl-bounded-error-collection]
+   *
+   * Given 两种尚未读取的错误，以两种顺序模拟驱动返回；When 进入创建入口；
+   * Then 一次报告两个码、停止创建，并允许错误读完后的下一次调用正常创建。
+   * 捕获“只读一个就抛出”和“读完却继续编译”两种错误实现，不规定驱动顺序。
+   */
+  it.each([
+    [0x0500, 0x0501],
+    [0x0501, 0x0500]
+  ])('preflight 一次报告全部遗留错误：%i、%i', (first, second) => {
+    const f = setup()
+    const shader = createShader()
+    let failure: unknown
+
+    f.calls.getError
+      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(second)
+      .mockReturnValueOnce(f.gl.NO_ERROR)
+
+    try {
+      f.manager.get(shader)
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(WebGLOperationError)
+    if (!(failure instanceof WebGLOperationError)) throw new Error('Expected WebGLOperationError')
+
+    expect(failure.details.operation).toBe('preflight')
+    expect(failure.details.reason).toMatch(/\b1280\b/)
+    expect(failure.details.reason).toMatch(/\b1281\b/)
+    expect(f.calls.getError).toHaveBeenCalledTimes(3)
+    expect(f.calls.createShader).not.toHaveBeenCalled()
+    expect(f.calls.createProgram).not.toHaveBeenCalled()
+
+    expect(f.manager.get(shader).program).toBeDefined()
+  })
+
+  /**
+   * [DESIGN-WEIGHT:3][webgl-bounded-error-collection]
+   *
+   * 用持续返回普通错误的异常驱动响应验证终止预算，而不是模拟正常 error flags。
+   * 捕获“未观察到 NO_ERROR 却宣称读完”及无界循环。
+   * fake 在第 65 次读取主动抛错，避免同步无限循环卡住整个测试进程。
+   */
+  it('达到读取上限仍无 NO_ERROR 时报告收集未完成，不编译', () => {
+    const f = setup()
+    let failure: unknown
+    let readCount = 0
+
+    f.calls.getError.mockImplementation(() => {
+      readCount += 1
+      if (readCount > 64) throw new Error('Test safety guard: unbounded getError loop')
+      return f.gl.INVALID_OPERATION
+    })
+
+    try {
+      f.manager.get(createShader())
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(WebGLOperationError)
+    if (!(failure instanceof WebGLOperationError)) throw new Error('Expected WebGLOperationError')
+
+    expect(failure.details.reason).toContain('NO_ERROR')
+    expect(f.calls.getError.mock.calls.length).toBeGreaterThan(1)
+    expect(f.calls.getError.mock.calls.length).toBeLessThanOrEqual(32)
+    expect(f.calls.createShader).not.toHaveBeenCalled()
+  })
+
+  /**
+   * Given 编译调用留下两个普通错误；Then 不发布 program，并回收已创建的 shader。
+   * 捕获“只在 preflight 批量读取，编译后的检查仍漏读”的实现。
+   */
+  it('编译后批量报告 GL 错误并回滚临时 shader', () => {
+    const f = setup()
+    let failure: unknown
+
+    f.calls.compileShader.mockImplementationOnce(() => {
+      f.calls.getError
+        .mockReturnValueOnce(0x0500)
+        .mockReturnValueOnce(0x0501)
+        .mockReturnValueOnce(f.gl.NO_ERROR)
+    })
+
+    try {
+      f.manager.get(createShader())
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(WebGLOperationError)
+    if (!(failure instanceof WebGLOperationError)) throw new Error('Expected WebGLOperationError')
+
+    expect(failure.details.operation).toBe('compile shader')
+    expect(failure.details.reason).toMatch(/\b1280\b/)
+    expect(failure.details.reason).toMatch(/\b1281\b/)
+    expect(f.calls.createProgram).not.toHaveBeenCalled()
+    expect(f.calls.deleteShader).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * [DESIGN-WEIGHT:3][webgl-resource-error-boundaries]
+   *
+   * Given 已缓存 program；When 新入口先读到普通错误，再在第二次读取期间 lost；
+   * Then lost 优先，旧缓存失效，即便物理 context 恢复也不能复用此 Manager。
+   * 捕获删掉读取后 assertAvailable() 的实现，不把 NO_ERROR 当作健康证明。
+   */
+  it('读取期间 lost 优先于 NO_ERROR，并使已有 program 缓存失效', () => {
+    const f = setup()
+    const cachedShader = createShader()
+    f.manager.get(cachedShader)
+    f.hooks.invalidateState.mockClear()
+    f.calls.getError.mockClear()
+
+    f.calls.getError.mockReturnValueOnce(0x0500).mockImplementationOnce(() => {
+      f.setLost(true)
+      return f.gl.NO_ERROR
+    })
+
+    expect(() => f.manager.get(createShader())).toThrow(WebGLContextLostError)
+    expect(f.hooks.invalidateState).toHaveBeenCalled()
+    expect(f.calls.getError).toHaveBeenCalledTimes(2)
+    expect(f.calls.deleteProgram).not.toHaveBeenCalled()
+
+    f.setLost(false)
+    expect(() => f.manager.get(cachedShader)).toThrow(WebGLContextLostError)
+    expect(f.calls.getError).toHaveBeenCalledTimes(2)
+  })
+
+  /** 捕获读取期间 Manager 已关闭却仍允许进入 GPU 创建的实现。 */
+  it('读取期间 Manager dispose 后停止，不创建 shader', () => {
+    const f = setup()
+
+    f.calls.getError.mockImplementationOnce(() => {
+      f.manager.dispose()
+      return f.gl.NO_ERROR
+    })
+
+    expect(() => f.manager.get(createShader())).toThrow(WebGLBackendDisposedError)
+    expect(f.calls.getError).toHaveBeenCalledTimes(1)
+    expect(f.calls.createShader).not.toHaveBeenCalled()
+  })
+
+  /** 捕获把批量读取搬到 cache hit、导致每次 draw 借用 program 都读取错误的实现。 */
+  it('program 缓存命中不读取或消费待处理的 GL 错误', () => {
+    const f = setup()
+    const shader = createShader()
+    const cached = f.manager.get(shader)
+    f.calls.getError.mockClear()
+    f.setError(f.gl.INVALID_OPERATION)
+
+    expect(f.manager.get(shader)).toBe(cached)
+    expect(f.calls.getError).not.toHaveBeenCalled()
+    expect(f.calls.createProgram).toHaveBeenCalledTimes(1)
+  })
 })

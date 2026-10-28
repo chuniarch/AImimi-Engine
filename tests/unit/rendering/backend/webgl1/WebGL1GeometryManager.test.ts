@@ -359,4 +359,164 @@ describe('WebGL1GeometryManager', () => {
     expect(f.calls.bindBuffer).toHaveBeenCalledTimes(1)
     expect(f.calls.deleteBuffer).not.toHaveBeenCalled()
   })
+
+  /**
+   * [DESIGN-WEIGHT:3][webgl-bounded-error-collection]
+   *
+   * Given 两种未读取的普通错误；When 进入静态 buffer 创建入口；
+   * Then 一次报告全部错误，不分配或上传 buffer，下一次干净调用才创建资源。
+   * 捕获单次读取及静默清空错误两种实现，两组顺序不规定真实驱动的返回顺序。
+   */
+  it.each([
+    [0x0500, 0x0501],
+    [0x0501, 0x0500]
+  ])('preflight 一次报告全部遗留错误：%i、%i', (first, second) => {
+    const f = setup()
+    const geometry = createGeometry()
+    let failure: unknown
+
+    f.calls.getError
+      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(second)
+      .mockReturnValueOnce(f.gl.NO_ERROR)
+
+    try {
+      f.manager.get(geometry)
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(WebGLOperationError)
+    if (!(failure instanceof WebGLOperationError)) throw new Error('Expected WebGLOperationError')
+
+    expect(failure.details.operation).toBe('preflight')
+    expect(failure.details.reason).toMatch(/\b1280\b/)
+    expect(failure.details.reason).toMatch(/\b1281\b/)
+    expect(f.calls.getError).toHaveBeenCalledTimes(3)
+    expect(f.calls.createBuffer).not.toHaveBeenCalled()
+    expect(f.calls.bufferData).not.toHaveBeenCalled()
+
+    expect(f.manager.get(geometry).drawCount).toBe(3)
+  })
+
+  /**
+   * [DESIGN-WEIGHT:3][webgl-bounded-error-collection]
+   *
+   * 异常响应持续返回错误，验证预算耗尽不是成功，也不能开始 buffer 上传。
+   * 捕获无界循环或达到上限后静默继续的实现；不宣称正常 GL 会不断返回该码。
+   * fake 在第 65 次读取主动抛错，避免同步无限循环卡住整个测试进程。
+   */
+  it('达到读取上限仍无 NO_ERROR 时报告收集未完成，不上传', () => {
+    const f = setup()
+    let failure: unknown
+    let readCount = 0
+
+    f.calls.getError.mockImplementation(() => {
+      readCount += 1
+      if (readCount > 64) throw new Error('Test safety guard: unbounded getError loop')
+      return f.gl.INVALID_OPERATION
+    })
+
+    try {
+      f.manager.get(createGeometry())
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(WebGLOperationError)
+    if (!(failure instanceof WebGLOperationError)) throw new Error('Expected WebGLOperationError')
+
+    expect(failure.details.reason).toContain('NO_ERROR')
+    expect(f.calls.getError.mock.calls.length).toBeGreaterThan(1)
+    expect(f.calls.getError.mock.calls.length).toBeLessThanOrEqual(32)
+    expect(f.calls.createBuffer).not.toHaveBeenCalled()
+  })
+
+  /**
+   * Given bufferData 留下两个普通错误；Then 全部报告且回收本次创建的 buffer。
+   * 捕获“只修改入口检查，上传后的检查仍只读一个”的实现。
+   */
+  it('上传后批量报告 GL 错误并回滚本次 buffer', () => {
+    const f = setup()
+    let failure: unknown
+
+    f.calls.bufferData.mockImplementationOnce(() => {
+      f.calls.getError
+        .mockReturnValueOnce(0x0500)
+        .mockReturnValueOnce(0x0501)
+        .mockReturnValueOnce(f.gl.NO_ERROR)
+    })
+
+    try {
+      f.manager.get(createGeometry())
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(WebGLOperationError)
+    if (!(failure instanceof WebGLOperationError)) throw new Error('Expected WebGLOperationError')
+
+    expect(failure.details.operation).toBe('upload buffer')
+    expect(failure.details.reason).toMatch(/\b1280\b/)
+    expect(failure.details.reason).toMatch(/\b1281\b/)
+    expect(f.calls.createBuffer).toHaveBeenCalledTimes(1)
+    expect(f.calls.deleteBuffer).toHaveBeenCalledTimes(1)
+    expect(f.gl.getParameter(f.gl.ARRAY_BUFFER_BINDING)).toBeNull()
+  })
+
+  /**
+   * [DESIGN-WEIGHT:3][webgl-resource-error-boundaries]
+   *
+   * Given 已有缓存 buffers；When 新入口先读到普通错误，再在第二次读取期间 lost；
+   * Then 丢弃旧代缓存且不删除旧代 handles，物理恢复也不能复用此 Manager。
+   * 捕获缺少读取后生命周期检查、把 NO_ERROR 当作恢复证明的实现。
+   */
+  it('读取期间 lost 优先于 NO_ERROR，并使已有 buffer 缓存失效', () => {
+    const f = setup()
+    const cachedGeometry = createGeometry()
+    f.manager.get(cachedGeometry)
+    f.hooks.invalidateState.mockClear()
+    f.calls.getError.mockClear()
+
+    f.calls.getError.mockReturnValueOnce(0x0500).mockImplementationOnce(() => {
+      f.setLost(true)
+      return f.gl.NO_ERROR
+    })
+
+    expect(() => f.manager.get(createGeometry())).toThrow(WebGLContextLostError)
+    expect(f.hooks.invalidateState).toHaveBeenCalled()
+    expect(f.calls.getError).toHaveBeenCalledTimes(2)
+    expect(f.calls.deleteBuffer).not.toHaveBeenCalled()
+
+    f.setLost(false)
+    expect(() => f.manager.get(cachedGeometry)).toThrow(WebGLContextLostError)
+    expect(f.calls.getError).toHaveBeenCalledTimes(2)
+  })
+
+  /** 捕获读取期间 Manager 关闭后，错误收集仍允许进入 buffer 创建的实现。 */
+  it('读取期间 Manager dispose 后停止，不创建 buffer', () => {
+    const f = setup()
+
+    f.calls.getError.mockImplementationOnce(() => {
+      f.manager.dispose()
+      return f.gl.NO_ERROR
+    })
+
+    expect(() => f.manager.get(createGeometry())).toThrow(WebGLBackendDisposedError)
+    expect(f.calls.getError).toHaveBeenCalledTimes(1)
+    expect(f.calls.createBuffer).not.toHaveBeenCalled()
+  })
+
+  /** 捕获把批量读取放到热路径、重复借用静态 buffers 时也消费错误的实现。 */
+  it('geometry 缓存命中不读取或消费待处理的 GL 错误', () => {
+    const f = setup()
+    const geometry = createGeometry()
+    const cached = f.manager.get(geometry)
+    f.calls.getError.mockClear()
+    f.setError(f.gl.INVALID_OPERATION)
+
+    expect(f.manager.get(geometry)).toBe(cached)
+    expect(f.calls.getError).not.toHaveBeenCalled()
+    expect(f.calls.bufferData).toHaveBeenCalledTimes(2)
+  })
 })

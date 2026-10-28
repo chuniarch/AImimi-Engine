@@ -320,17 +320,65 @@ export class WebGL1ProgramManager {
     return compiled
   }
 
-  /** 错误检查仅出现在创建冷路径；cache hit 不执行 getError。 */
+  /**
+   * 在资源创建、编译或上传的冷路径，有界地收集当前 GL 错误标志。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][webgl-bounded-error-collection]
+   *
+   * 每次读取前后都检查本 Manager 的生命周期：
+   * - 读取前禁止已关闭或已失效的 Manager 继续操作 context；
+   * - 读取后识别读取期间发生的 context lost，并执行已有缓存失效逻辑。
+   *
+   * 只有观察到 NO_ERROR，才能认为本次错误标志收集已经结束。
+   * 收集结束后：
+   * - 没有收集到错误：正常返回，调用者可以继续；
+   * - 收集到一个或多个错误：统一抛错，调用者不能继续本次操作。
+   *
+   * 读取错误标志不等于修复失败的 GL 操作，也不等于恢复 context。
+   * 错误码的返回顺序没有保证，本方法不把它解释为错误发生顺序。
+   *
+   * 最多执行 32 次 getError，包括用于确认结束的 NO_ERROR 读取。
+   * 这是项目的防御性预算，不是 WebGL 规定的错误数量。
+   * 预算耗尽仍未观察到 NO_ERROR 时，必须报告收集未完成。
+   *
+   * 保持现有冷路径调用位置；不要把此循环移到缓存命中或每次 draw 中。
+   * create-null、shader 编译状态和 program 链接状态仍由独立检查负责。
+   *
+   * @param operation - 当前检查点，例如 preflight 或 upload buffer。
+   * @param label - 当前资源的诊断标签。
+   * @throws WebGLOperationError 收集到普通 GL 错误，或收集预算耗尽。
+   * @throws WebGLContextLostError 读取前后发现 context 已失效。
+   * @throws WebGLBackendDisposedError 读取前后发现 Manager 已关闭。
+   */
   private checkError(operation: string, label: string): void {
-    this.assertAvailable(operation)
+    const maxErrorReads = 32
+    const errorCodes: number[] = []
 
-    const code = this.gl.getError()
+    for (let readIndex = 0; readIndex < maxErrorReads; readIndex += 1) {
+      this.assertAvailable(operation)
 
-    this.assertAvailable(operation)
+      const code = this.gl.getError()
 
-    if (code !== this.gl.NO_ERROR) {
-      throw new WebGLOperationError(operation, label, `GL error ${code}`)
+      this.assertAvailable(operation)
+
+      if (code === this.gl.NO_ERROR) {
+        if (errorCodes.length === 0) {
+          return
+        }
+
+        throw new WebGLOperationError(operation, label, `GL errors: ${errorCodes.join(', ')}`)
+      }
+
+      errorCodes.push(code)
     }
+
+    throw new WebGLOperationError(
+      operation,
+      label,
+      `GL error collection incomplete after ${maxErrorReads} reads: ` +
+        `NO_ERROR was not observed; collected GL errors: ${errorCodes.join(', ')}`
+    )
   }
 
   /** 物理 lost 可以早于 DOM 事件，因此不能只依赖 onLost 回调。 */
