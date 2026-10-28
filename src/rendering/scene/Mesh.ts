@@ -17,9 +17,20 @@ import { SceneNode } from '@/rendering/scene/SceneNode'
  *
  * 继承的 world matrix 就是本 Mesh 的 model matrix；不在 Material 中保存它，
  * 也不另建一份 Mesh 专属矩阵缓存。绘制提取阶段通过 copyWorldMatrixTo() 取得副本。
- * 本类不包含 draw、WebGL handle、shadow、renderOrder 或透明队列特例。
+ * 本类不包含 draw、WebGL handle、renderOrder 或透明队列特例。
  */
 export class Mesh extends SceneNode {
+  /**
+   * 是否参与阴影图生产；不表示是否接收阴影。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][mesh-cast-shadow-frame-snapshot]
+   * 默认 false。Builder 将值复制进 RenderItem，Pass 不回读可变 Mesh。
+   * 接收阴影由表面 shader 和借用的阴影参数块决定，本批不增加 receiveShadow。
+   * 运行时非法值在 RenderList 的帧边界拒绝。
+   */
+  public castShadow = false
+
   /** 借用原 Geometry 的身份，不持有独立副本。 */
   private readonly geometryValue: Geometry
 

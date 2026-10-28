@@ -17,6 +17,7 @@ function context(): RenderPassContext {
     frame: f.frame,
     view: built.viewState,
     renderList: built.renderList,
+    lights: built.lights,
     backend: new RecordingBackend()
   }
 }

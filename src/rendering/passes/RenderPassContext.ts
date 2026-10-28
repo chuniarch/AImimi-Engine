@@ -1,5 +1,6 @@
 import type { RenderBackend } from '@/rendering/backend/RenderBackend'
 import type { FrameSnapshot } from '@/rendering/frame/FrameSnapshot'
+import type { LightFrameSnapshot } from '@/rendering/frame/LightFrameSnapshot'
 import type { RenderList } from '@/rendering/frame/RenderList'
 import type { ViewState } from '@/rendering/frame/ViewState'
 
@@ -11,5 +12,7 @@ export interface RenderPassContext {
   readonly frame: FrameSnapshot
   readonly view: ViewState
   readonly renderList: RenderList
+  /** 同一帧所有 Pass 共用；数值冻结，shadow Resource 仅借用。 */
+  readonly lights: LightFrameSnapshot
   readonly backend: RenderBackend
 }

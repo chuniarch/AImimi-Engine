@@ -13,6 +13,8 @@ import type { Material } from '@/rendering/resources/Material'
  * 消费方仍须验证资源存活；该对象不取得生命周期所有权。
  */
 export interface RenderItem {
+  /** 本帧是否投影；后续修改 Mesh 不改变已提取的队列。 */
+  readonly castShadow: boolean
   readonly geometry: Geometry
   readonly material: Material
   /** local → world；同一 Material 被两个 Mesh 共享时，每个 item 仍有自己的矩阵。 */

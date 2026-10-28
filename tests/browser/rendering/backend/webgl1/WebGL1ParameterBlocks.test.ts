@@ -69,7 +69,7 @@ function fixture() {
   }
   function draw(material: Material): void {
     const submission: DrawSubmission = {
-      item: { geometry, material, worldMatrix: IDENTITY },
+      item: { geometry, material, worldMatrix: IDENTITY, castShadow: false },
       view: { viewMatrix: IDENTITY, projectionMatrix: IDENTITY, cameraWorldPosition: [0, 0, 0] }
     }
     backend.draw(submission)

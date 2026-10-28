@@ -1,6 +1,10 @@
 import { mat4 } from 'gl-matrix'
 import { ResourceDisposedError } from '@/rendering/core/errors'
 import { InvalidRenderViewError } from '@/rendering/core/errors/InvalidRenderViewError'
+import { DirectionalLight } from '@/rendering/scene/lights/DirectionalLight'
+import { Light } from '@/rendering/scene/lights/Light'
+import { createDirectionalLightSnapshot } from './createDirectionalLightSnapshot'
+import type { LightFrameSnapshot, LightSnapshot } from './LightFrameSnapshot'
 import { Mesh } from '@/rendering/scene/Mesh'
 import { Scene } from '@/rendering/scene/Scene'
 import { Camera } from '@/rendering/scene/cameras/Camera'
@@ -15,6 +19,7 @@ import type { ViewState } from './ViewState'
 export interface RenderListBuildResult {
   readonly viewState: ViewState
   readonly renderList: RenderList
+  readonly lights: LightFrameSnapshot
 }
 
 /**
@@ -28,6 +33,11 @@ export interface RenderListBuildResult {
  * 多次祖先缓存检查不等于重复矩阵计算；没有变更时 worldVersion 不增加。
  *
  * 提取同步进行，期间不得修改树或变换；本版不提供提取过程的用户钩子。
+ *
+ * [DESIGN-WEIGHT:3][frame-light-extraction-boundary]
+ * 同一轮遍历也复制可见灯光的数值与阴影设置，不限制灯数，不按零强度剔除。
+ * 任一灯的方向、资源或派生数值无效时，整次 build 失败，不返回部分队列。
+ * 灯光快照中只有 shadow Resource 身份是借用引用；Pass 不再读取可变 Light。
  */
 export class RenderListBuilder {
   /**
@@ -98,14 +108,24 @@ export class RenderListBuilder {
 
     const background: RenderItem[] = []
     const opaque: RenderItem[] = []
+    const lights: LightSnapshot[] = []
     const scratch = new Float32Array(16)
 
+    // 同一次可见遍历提取 Mesh 和 Light；隐藏父节点的整个子树都不参与。
     scene.traverseVisible((node) => {
+      if (node instanceof DirectionalLight) {
+        lights.push(createDirectionalLightSnapshot(node, viewState))
+        return
+      }
+      if (node instanceof Light) {
+        throw new InvalidRenderViewError('light', 'unsupported light type: ' + node.debugLabel)
+      }
       if (!(node instanceof Mesh)) return
 
       node.copyWorldMatrixTo(scratch)
 
       const renderItem: RenderItem = {
+        castShadow: node.castShadow,
         geometry: node.geometry,
         material: node.material,
         worldMatrix: copyMat4Snapshot(scratch, 'mesh.worldMatrix')
@@ -120,7 +140,8 @@ export class RenderListBuilder {
 
     return Object.freeze({
       viewState,
-      renderList: new RenderList(background, opaque)
+      renderList: new RenderList(background, opaque),
+      lights: Object.freeze(lights)
     })
   }
 }

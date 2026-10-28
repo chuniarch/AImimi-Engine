@@ -162,7 +162,7 @@ function fixture() {
   /** 只准备 CPU DrawSubmission；GPU program、纹理和 buffer 由 Backend 获取。 */
   function submission(drawMaterial: Material): DrawSubmission {
     return {
-      item: { geometry, material: drawMaterial, worldMatrix: IDENTITY },
+      item: { geometry, material: drawMaterial, worldMatrix: IDENTITY, castShadow: false },
       view: {
         viewMatrix: IDENTITY,
         projectionMatrix: IDENTITY,

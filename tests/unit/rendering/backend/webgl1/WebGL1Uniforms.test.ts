@@ -92,7 +92,8 @@ function setup(
     item: {
       geometry,
       material,
-      worldMatrix: IDENTITY
+      worldMatrix: IDENTITY,
+      castShadow: false
     },
     view: {
       viewMatrix: IDENTITY,

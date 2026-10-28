@@ -60,7 +60,7 @@ function setup(
     attributes: { position: new VertexAttribute({ data: new Float32Array(9), itemSize: 3 }) }
   })
   const submission: DrawSubmission = {
-    item: { geometry, material, worldMatrix: IDENTITY },
+    item: { geometry, material, worldMatrix: IDENTITY, castShadow: false },
     view: { viewMatrix: IDENTITY, projectionMatrix: IDENTITY, cameraWorldPosition: [0, 0, 0] }
   }
   const manager = new WebGL1ProgramManager(fake.gl, { invalidateState: () => {} })

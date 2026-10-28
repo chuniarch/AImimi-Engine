@@ -1,9 +1,15 @@
+import { InvalidRenderViewError } from '@/rendering/core/errors/InvalidRenderViewError'
+import { requireBoolean } from '@/rendering/core/validation'
 import { copyMat4Snapshot } from './copyMat4Snapshot'
 import type { RenderItem } from './RenderItem'
 
-/** 复制包装与矩阵，保留原 Geometry/Material 身份。 */
+/** 复制包装、投影标记与矩阵，保留原 Geometry/Material 身份。 */
 function snapshotItem(item: RenderItem): RenderItem {
   return Object.freeze({
+    castShadow: requireBoolean(
+      item.castShadow,
+      () => new InvalidRenderViewError('item.castShadow', 'must be a boolean')
+    ),
     geometry: item.geometry,
     material: item.material,
     worldMatrix: copyMat4Snapshot(item.worldMatrix, 'item.worldMatrix')

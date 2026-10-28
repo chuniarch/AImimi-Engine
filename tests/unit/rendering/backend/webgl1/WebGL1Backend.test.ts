@@ -59,7 +59,7 @@ function createFixture(indexed = false) {
   })
   const material = new Material({ shaderModule: shader })
   const submission: DrawSubmission = {
-    item: { geometry, material, worldMatrix: IDENTITY },
+    item: { geometry, material, worldMatrix: IDENTITY, castShadow: false },
     view: {
       viewMatrix: IDENTITY,
       projectionMatrix: IDENTITY,

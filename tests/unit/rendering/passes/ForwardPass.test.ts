@@ -27,6 +27,7 @@ describe('ForwardPass', () => {
       frame: f.frame,
       view: built.viewState,
       renderList: built.renderList,
+      lights: built.lights,
       backend
     })
 
@@ -62,6 +63,7 @@ describe('ForwardPass', () => {
       frame: f.frame,
       view: built.viewState,
       renderList: built.renderList,
+      lights: built.lights,
       backend
     })
 
@@ -96,6 +98,7 @@ describe('ForwardPass', () => {
         frame: f.frame,
         view: built.viewState,
         renderList: built.renderList,
+        lights: built.lights,
         backend
       })
     ).toThrow(failure)

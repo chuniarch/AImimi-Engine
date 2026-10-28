@@ -37,7 +37,8 @@ export class Renderer {
    * [DESIGN-WEIGHT:3][renderer-one-frame-extraction]
    *
    * ready=false 时不读取场景；否则提取一次，
-   * 并向全部 Pass 传入同一个 context。
+   * 并向全部 Pass 传入同一个 context，包括同一份冻结灯光快照。
+   * ShadowMapPass 和后续消费者不能各自重新读取 Light，以免跨 Pass 混用两帧状态。
    *
    * FrameSnapshot 显式复制六个标量，
    * 防止外部修改原对象影响后续 Pass。
@@ -65,12 +66,13 @@ export class Renderer {
         pixelRatio: source.pixelRatio
       })
 
-      const { renderList, viewState } = this.renderListBuilder.build(view)
+      const { renderList, viewState, lights } = this.renderListBuilder.build(view)
 
       const context: RenderPassContext = Object.freeze({
         frame,
         view: viewState,
         renderList,
+        lights,
         backend: this.backend
       })
 

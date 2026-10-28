@@ -134,7 +134,8 @@ describe('RenderListBuilder', () => {
       {
         geometry: f.geometry,
         material: mesh.material,
-        worldMatrix: matrix
+        worldMatrix: matrix,
+        castShadow: false
       }
     ]
 
