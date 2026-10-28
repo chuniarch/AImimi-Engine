@@ -49,13 +49,13 @@ engine
   .init()
   .then(async () => {
     // ----- Games202 Homework 场景切换 -----
-    // return engine.loadScene(loadGames202Scenes)
+    return engine.loadScene(loadGames202Scenes)
     // ----- 加载 wave -----
     // simple waves
     // loadWater
     // return engine.loadScene(loadWater)
     // fft ocean
-    return engine.loadScene(loadFFTOceanSceneV4)
+    // return engine.loadScene(loadFFTOceanSceneV4)
   })
   .then(() => {
     engine.start()

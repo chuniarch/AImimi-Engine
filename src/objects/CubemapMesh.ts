@@ -1,4 +1,5 @@
 import { AttributeData } from '@/objects/types/Mesh'
+import { VertexAttributeSemantic } from '@/rendering/resources/VertexAttributeSemantic'
 import { Mesh } from './Mesh'
 import { Transform } from './utils/Transform'
 
@@ -29,7 +30,8 @@ export class CubemapMesh extends Mesh {
     ]
     const verticesAttribs: AttributeData[] = [
       {
-        name: 'aVertexPosition',
+        /** 与 HW2 共用的背景 shader 使用同一个稳定位置语义。 */
+        name: VertexAttributeSemantic.Position,
         array: new Float32Array(cubemapVertices),
         size: 3,
         type: gl.FLOAT

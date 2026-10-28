@@ -2,8 +2,14 @@
 precision highp float;
 #endif
 
-attribute vec3 aVertexPosition;
-attribute vec3 aNormalPosition;
+/**
+ * PRT 模型位置输入，与 Geometry 的位置语义名称一致。
+ *
+ * @remarks
+ * [DESIGN-WEIGHT:3][hw2-shader-position-contract]
+ * backend 按名称绑定属性，因此 Geometry 与 shader 都必须使用 position。
+ */
+attribute vec3 position;
 
 uniform mat4 uModelMatrix;
 uniform mat4 uViewMatrix;
@@ -35,5 +41,5 @@ void main() {
 
   vColor = max(vec3(r, g, b), vec3(0.0));
 
-  gl_Position = uProjectionMatrix * uViewMatrix * uModelMatrix * vec4(aVertexPosition, 1.0);
+  gl_Position = uProjectionMatrix * uViewMatrix * uModelMatrix * vec4(position, 1.0);
 }

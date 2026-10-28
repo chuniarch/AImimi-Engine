@@ -37,6 +37,7 @@ export const ShaderPaths = {
 
   // ==================== PRT ====================
   // Spherical Harmonics
+  /** 二阶 PRT 共用的 vertex shader，位置属性名称为 position。 */
   TWO_ORDER_SH_VERTEX: urlJoin(S, 'prt/sphericalHarmonics/order2/vertex.vert'),
   TWO_ORDER_SH_FRAGMENT: urlJoin(S, 'prt/sphericalHarmonics/order2/fragment.frag'),
   THREE_ORDER_SH_VERTEX: urlJoin(S, 'prt/sphericalHarmonics/order3/vertex.vert'),
@@ -78,6 +79,7 @@ export const ShaderPaths = {
   SKYBOX_VERTEX: urlJoin(S, 'environment/skybox/vertex.vert'),
   SKYBOX_FRAGMENT: urlJoin(S, 'environment/skybox/fragment.frag'),
   // HW2 Background Cubemap
+  /** HW2 与 HW4 共用的有限背景盒 vertex shader，位置属性名称为 position。 */
   CUBEMAP_BG_VERTEX: urlJoin(S, 'environment/cubemapBackground/vertex.vert'),
   CUBEMAP_BG_FRAGMENT: urlJoin(S, 'environment/cubemapBackground/fragment.frag'),
 

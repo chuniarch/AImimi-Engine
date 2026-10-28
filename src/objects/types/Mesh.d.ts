@@ -1,7 +1,9 @@
 /**
  * 通用 Mesh Renderer 当前支持的内置顶点属性名称。
+ * 共用背景 shader 的 CubemapMesh 使用 position，其余旧 shader 保留各自现有名称。
  */
 export type BuiltInVertexAttributeName =
+  | 'position'
   | 'aVertexPosition'
   | 'aNormalPosition'
   | 'aTextureCoord'
