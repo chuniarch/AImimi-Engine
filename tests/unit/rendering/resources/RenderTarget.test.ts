@@ -178,7 +178,7 @@ describe('RenderTarget CPU contract', () => {
     { ...descriptor(), colors: {} },
     { ...descriptor(), colors: new Array(1) },
     { ...descriptor(), colors: [null] },
-    { ...descriptor(), colors: [{ format: 'rgba32f' }] },
+    { ...descriptor(), colors: [{ format: 'rgba16f' }] },
     { ...descriptor(), colors: [{ format: 'rgba8', mip: 1 }] },
     { ...descriptor(), depth: null },
     { ...descriptor(), depth: [] },
@@ -452,3 +452,63 @@ function checkSamplerTypes(target: RenderTarget): void {
   target.descriptor.colors[0]!.sampler.minFilter = 'nearest'
 }
 void checkSamplerTypes
+
+/**
+ * CPU 接受浮点格式不等于当前设备支持浮点输出；设备判断留给 Manager。
+ *
+ * @remarks
+ * [DESIGN-WEIGHT:3][render-target-float-capability-gates]
+ * 这里使用真实 RenderTarget；如果遗漏 rgba32f 或擅自改默认 sampler，就会失败。
+ */
+describe('RenderTarget float descriptor', () => {
+  /** Given 浮点格式；When 构造；Then 默认 linear 与显式 nearest 各自保留。 */
+  it.each([
+    { sampler: undefined, expected: { minFilter: 'linear', magFilter: 'linear' } },
+    {
+      sampler: { minFilter: 'nearest', magFilter: 'nearest' },
+      expected: { minFilter: 'nearest', magFilter: 'nearest' }
+    }
+  ] as const)('接受 rgba32f 并保留 sampler %#', ({ sampler, expected }) => {
+    const target = new RenderTarget(
+      { width: 3, height: 5, colors: [{ format: 'rgba32f', sampler }] },
+      { label: 'gbuffer/float' }
+    )
+    expect(target.descriptor.colors[0]).toEqual({ format: 'rgba32f', sampler: expected })
+    expect(Object.isFrozen(target.descriptor)).toBe(true)
+    expect(Object.isFrozen(target.descriptor.colors)).toBe(true)
+    expect(Object.isFrozen(target.descriptor.colors[0])).toBe(true)
+    expect(Object.isFrozen(target.descriptor.colors[0]!.sampler)).toBe(true)
+    target.dispose()
+  })
+
+  /**
+   * Given 调用者可变输入；When 修改输入并 resize；Then 格式、过滤与地址不漂移。
+   * 此测试防止新增格式时绕过原来的快照与原子 resize 机制。
+   */
+  it('浮点快照隔离输入，resize 保留格式、标签和逻辑地址', () => {
+    const sampler = { minFilter: 'nearest' as const, magFilter: 'nearest' as const }
+    const colors = [{ format: 'rgba32f' as const, sampler }]
+    const target = new RenderTarget({ width: 8, height: 4, colors }, { label: 'gbuffer/main' })
+    const before = target.descriptor
+    const ref = target.getColorAttachment(0)
+    Reflect.set(colors[0]!, 'format', 'rgba8')
+    Reflect.set(sampler, 'minFilter', 'linear')
+
+    expect(Reflect.set(before.colors[0]!, 'format', 'rgba8')).toBe(false)
+    expect(Reflect.set(before.colors[0]!.sampler, 'magFilter', 'linear')).toBe(false)
+    target.resize(16, 8)
+    expect(target.descriptor.colors[0]).toEqual({
+      format: 'rgba32f',
+      sampler: { minFilter: 'nearest', magFilter: 'nearest' }
+    })
+    expect(before.width).toBe(8)
+    expect(target.descriptor.width).toBe(16)
+    expect(target.revision).toBe(1)
+    expect(target.label).toBe('gbuffer/main')
+    expect(ref).toEqual({ target, kind: 'color', index: 0 })
+    expect(ref).not.toHaveProperty('revision')
+    target.resize(16, 8)
+    expect(target.revision).toBe(1)
+    target.dispose()
+  })
+})

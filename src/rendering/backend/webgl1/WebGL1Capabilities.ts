@@ -17,6 +17,14 @@ export interface WebGL1Capabilities {
   readonly depthTexture: WEBGL_depth_texture | null
   readonly textureFloat: OES_texture_float | null
   readonly textureFloatLinear: OES_texture_float_linear | null
+  /**
+   * 浮点颜色附件的可渲染能力，不等同于浮点纹理上传或线性过滤能力。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][render-target-float-capability-gates]
+   * null 只阻止需要 rgba32f 的目标，不应禁用普通 rgba8 或 HW2 绘制。
+   */
+  readonly colorBufferFloat: WEBGL_color_buffer_float | null
   readonly maxVertexAttributes: number
   /** 片元阶段的纹理单元上限，来自 MAX_TEXTURE_IMAGE_UNITS。 */
   readonly maxTextureUnits: number
@@ -46,6 +54,8 @@ export function detectWebGL1Capabilities(gl: WebGLRenderingContext): WebGL1Capab
   const depthTexture = gl.getExtension('WEBGL_depth_texture')
   const textureFloat = gl.getExtension('OES_texture_float')
   const textureFloatLinear = gl.getExtension('OES_texture_float_linear')
+  // 在浮点纹理扩展之后取得可渲染能力；不能用 textureFloat 非空替代此查询。
+  const colorBufferFloat = gl.getExtension('WEBGL_color_buffer_float')
 
   const maxVertexAttributes: unknown = gl.getParameter(gl.MAX_VERTEX_ATTRIBS)
   const maxTextureUnits: unknown = gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS)
@@ -59,6 +69,7 @@ export function detectWebGL1Capabilities(gl: WebGLRenderingContext): WebGL1Capab
     depthTexture,
     textureFloat,
     textureFloatLinear,
+    colorBufferFloat,
     maxVertexAttributes: reqiurePositiveLimit(maxVertexAttributes, 'MAX_VERTEX_ATTRIBS'),
     maxTextureUnits: reqiurePositiveLimit(maxTextureUnits, 'MAX_TEXTURE_IMAGE_UNITS')
   })

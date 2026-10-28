@@ -48,6 +48,7 @@ function setup(withOES = true) {
     depthTexture: null,
     textureFloat: null,
     textureFloatLinear: null,
+    colorBufferFloat: null,
     maxTextureUnits: 8
   }
   const invalidateState = vi.fn(() => undefined)

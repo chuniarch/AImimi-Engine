@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
-import { RenderTarget, type RenderTargetAttachmentRef } from '@/rendering/resources/RenderTarget'
+import {
+  RenderTarget,
+  type RenderTargetAttachmentRef,
+  type ColorAttachmentSamplerInput
+} from '@/rendering/resources/RenderTarget'
+import type { WebGL1Capabilities } from '@/rendering/backend/webgl1/WebGL1Capabilities'
 import {
   IncompleteFramebufferError,
   RenderTargetUnavailableError,
@@ -26,21 +31,62 @@ function target(colors = 1, depth = true, label = 'test/render-target'): RenderT
   )
 }
 
-function setup(mrt = false) {
+/** 明确列出 Manager 消费的能力，缺失扩展使用 null，不用 undefined 蒙混过关。 */
+type TargetCapabilities = Pick<
+  WebGL1Capabilities,
+  'drawBuffers' | 'textureFloat' | 'textureFloatLinear' | 'colorBufferFloat'
+>
+
+function setup(mrt = false, overrides: Partial<TargetCapabilities> = {}) {
   const fake = createFakeWebGL1TextureContext()
   const invalidateState = vi.fn(() => undefined)
+  const capabilities: TargetCapabilities = {
+    drawBuffers: mrt ? fake.mrt : null,
+    textureFloat: null,
+    textureFloatLinear: null,
+    colorBufferFloat: null,
+    ...overrides
+  }
 
   return {
     ...fake,
     invalidateState,
-    manager: new WebGL1RenderTargetManager(
-      fake.gl,
-      {
-        drawBuffers: mrt ? fake.mrt : null
-      },
-      { invalidateState }
-    )
+    capabilities,
+    manager: new WebGL1RenderTargetManager(fake.gl, capabilities, { invalidateState })
   }
+}
+
+/** 只提供扩展协议；不让 fake 假装真正实现浮点光栅化或纹理过滤。 */
+function setupFloat(overrides: Partial<TargetCapabilities> = {}) {
+  return setup(true, {
+    textureFloat: {},
+    colorBufferFloat: {
+      RGBA32F_EXT: 0x8814,
+      FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE_EXT: 0x8211,
+      UNSIGNED_NORMALIZED_EXT: 0x8c17
+    },
+    ...overrides
+  })
+}
+
+/** GBuffer 基线输入；每个颜色槽显式 nearest，不借默认 linear 隐藏扩展需求。 */
+function floatTarget(
+  colors = 4,
+  sampler: ColorAttachmentSamplerInput | undefined = {
+    minFilter: 'nearest',
+    magFilter: 'nearest'
+  },
+  depth = true
+): RenderTarget {
+  return new RenderTarget(
+    {
+      width: 8,
+      height: 4,
+      colors: Array.from({ length: colors }, () => ({ format: 'rgba32f' as const, sampler })),
+      ...(depth ? { depth: { format: 'depth16' as const } } : {})
+    },
+    { label: 'gbuffer/main' }
+  )
 }
 
 describe('WebGL1RenderTargetManager', () => {
@@ -494,5 +540,316 @@ describe('WebGL1RenderTargetManager sampled colors', () => {
     expect(next).toBe(f.manager.get(cpu).colorTextures[0])
     expect(f.manager.get(cpu).width).toBe(16)
     expect(f.deleted).toContain(old)
+  })
+})
+
+/**
+ * 浮点目标的可观察 GL 协议与事务边界；不是 GPU 像素正确性测试。
+ *
+ * @remarks
+ * [DESIGN-WEIGHT:3][render-target-float-capability-gates]
+ * Given 合法 CPU 描述；When Manager 消费；Then 按当前设备能力分配或零分配拒绝。
+ * 预期枚举、尺寸和槽位独立写出，防止实现与测试复用同一个错误映射。
+ */
+describe('WebGL1RenderTargetManager float colors', () => {
+  /** 保护 FLOAT 类型、四个独立附件和缓存命中路径，遗漏逐槽分配就会失败。 */
+  it('创建四个 RGBA/FLOAT 颜色附件及 depth16，复用同一槽位进行采样', () => {
+    const f = setupFloat()
+    const cpu = floatTarget()
+    const gpu = f.manager.get(cpu)
+    expect(f.api.texImage2D.mock.calls).toEqual(
+      Array.from({ length: 4 }, () => [0x0de1, 0, 0x1908, 8, 4, 0, 0x1908, 0x1406, null])
+    )
+    expect(new Set(gpu.colorTextures).size).toBe(4)
+    expect(f.drawBuffers.get(gpu.framebuffer)).toEqual([0x8ce0, 0x8ce1, 0x8ce2, 0x8ce3])
+    gpu.colorTextures.forEach((texture, index) => {
+      expect(f.api.framebufferTexture2D).toHaveBeenCalledWith(
+        0x8d40,
+        0x8ce0 + index,
+        0x0de1,
+        texture,
+        0
+      )
+      expect(f.manager.resolveSampledColor(cpu.getColorAttachment(index))).toBe(texture)
+      expect(f.manager.resolveAttachment(cpu.getColorAttachment(index))).toBe(texture)
+    })
+    expect(f.api.renderbufferStorage).toHaveBeenCalledWith(0x8d41, 0x81a5, 8, 4)
+    expect(f.api.checkFramebufferStatus).toHaveBeenCalledTimes(1)
+    expect(f.manager.get(cpu)).toBe(gpu)
+    expect(f.api.createFramebuffer).toHaveBeenCalledTimes(1)
+    expect(f.api.createTexture).toHaveBeenCalledTimes(4)
+    expect(cpu.sceneReferenceCount).toBe(0)
+    f.manager.dispose()
+    expect(cpu.disposed).toBe(false)
+    cpu.dispose()
+  })
+
+  /** 缺上传、可渲染、MRT 或任一上限不足，都不得先分配再补报能力错误。 */
+  it.each([
+    'textureFloat',
+    'colorBufferFloat',
+    'drawBuffers',
+    'MAX_COLOR_ATTACHMENTS_WEBGL',
+    'MAX_DRAW_BUFFERS_WEBGL',
+    'MAX_TEXTURE_SIZE',
+    'MAX_RENDERBUFFER_SIZE'
+  ] as const)('缺少能力或超过 %s 时零分配拒绝', (reason) => {
+    const overrides: Partial<TargetCapabilities> =
+      reason === 'textureFloat' || reason === 'colorBufferFloat' || reason === 'drawBuffers'
+        ? { [reason]: null }
+        : {}
+    const f = setupFloat(overrides)
+    if (reason === 'MAX_COLOR_ATTACHMENTS_WEBGL') f.parameters.set(0x8cdf, 3)
+    if (reason === 'MAX_DRAW_BUFFERS_WEBGL') f.parameters.set(0x8824, 3)
+    if (reason === 'MAX_TEXTURE_SIZE') f.parameters.set(0x0d33, 4)
+    if (reason === 'MAX_RENDERBUFFER_SIZE') f.parameters.set(0x84e8, 4)
+    const cpu = floatTarget()
+    expect(() => f.manager.get(cpu)).toThrow(UnsupportedRenderFeatureError)
+    expect(f.api.createFramebuffer).not.toHaveBeenCalled()
+    expect(f.api.createTexture).not.toHaveBeenCalled()
+    expect(f.api.createRenderbuffer).not.toHaveBeenCalled()
+    expect(cpu.descriptor.width).toBe(8)
+    expect(cpu.revision).toBe(0)
+    f.manager.dispose()
+    cpu.dispose()
+  })
+
+  /** 前置检查期间 lost 的优先级高于无效 limit 或缺扩展，不允许分配半成品。 */
+  it('查询尺寸时丢失 context，仍报告 lost 而不是能力缺失', () => {
+    const f = setupFloat()
+    const cpu = floatTarget()
+    const getParameter = f.api.getParameter.getMockImplementation()!
+    f.api.getParameter.mockImplementation((name) => {
+      if (name === f.gl.MAX_TEXTURE_SIZE) {
+        f.setLost(true)
+        return null
+      }
+      return getParameter(name)
+    })
+    expect(() => f.manager.get(cpu)).toThrow(WebGLContextLostError)
+    expect(f.api.createFramebuffer).not.toHaveBeenCalled()
+    expect(f.api.createTexture).not.toHaveBeenCalled()
+    expect(f.api.createRenderbuffer).not.toHaveBeenCalled()
+    cpu.dispose()
+  })
+
+  /** 三种包含 linear 的设置均需要扩展，不能只检查 min 或只检查 mag。 */
+  it.each([
+    { minFilter: 'nearest', magFilter: 'linear' },
+    { minFilter: 'linear', magFilter: 'nearest' },
+    { minFilter: 'linear', magFilter: 'linear' },
+    {}
+  ] as const)('没有 float-linear 时拒绝显式或默认 linear %j', (sampler) => {
+    const f = setupFloat()
+    const cpu = floatTarget(1, sampler)
+    expect(() => f.manager.get(cpu)).toThrow(UnsupportedRenderFeatureError)
+    expect(f.api.createFramebuffer).not.toHaveBeenCalled()
+    expect(f.api.createTexture).not.toHaveBeenCalled()
+    expect(f.api.createRenderbuffer).not.toHaveBeenCalled()
+    cpu.dispose()
+  })
+
+  /** 有扩展时也必须尊重描述，而不是统一替换为 nearest 或 linear。 */
+  it.each([
+    { minFilter: 'nearest', magFilter: 'nearest', min: 0x2600, mag: 0x2600 },
+    { minFilter: 'nearest', magFilter: 'linear', min: 0x2600, mag: 0x2601 },
+    { minFilter: 'linear', magFilter: 'nearest', min: 0x2601, mag: 0x2600 },
+    { minFilter: 'linear', magFilter: 'linear', min: 0x2601, mag: 0x2601 }
+  ] as const)('支持 float-linear 时保留两种过滤 %j', ({ minFilter, magFilter, min, mag }) => {
+    const f = setupFloat({ textureFloatLinear: {} })
+    const cpu = floatTarget(1, { minFilter, magFilter })
+    f.manager.get(cpu)
+    expect(f.api.texParameteri).toHaveBeenCalledWith(0x0de1, 0x2801, min)
+    expect(f.api.texParameteri).toHaveBeenCalledWith(0x0de1, 0x2800, mag)
+    expect(f.api.texImage2D).toHaveBeenCalledWith(0x0de1, 0, 0x1908, 8, 4, 0, 0x1908, 0x1406, null)
+    cpu.dispose()
+  })
+
+  /** rgba8 的 linear 不能污染其他 nearest 浮点槽位的能力判断。 */
+  it('混合格式分别映射，不把 rgba8 linear 算成 float-linear 需求', () => {
+    const f = setupFloat()
+    const cpu = new RenderTarget(
+      {
+        width: 8,
+        height: 4,
+        colors: [
+          { format: 'rgba8' },
+          { format: 'rgba32f', sampler: { minFilter: 'nearest', magFilter: 'nearest' } }
+        ]
+      },
+      { label: 'mixed/target' }
+    )
+    f.manager.get(cpu)
+    expect(f.api.texImage2D.mock.calls.map((args) => args[7])).toEqual([0x1401, 0x1406])
+    expect(f.api.checkFramebufferStatus).toHaveBeenCalledTimes(1)
+    cpu.dispose()
+  })
+
+  /** nearest 浮点 NPOT 不要求线性扩展、MRT 或 renderbuffer，且必须保持完整采样条件。 */
+  it('单附件 NPOT nearest 可在没有 MRT/float-linear 的设备创建且不生成 mip', () => {
+    const f = setupFloat({ drawBuffers: null })
+    const cpu = floatTarget(1, { minFilter: 'nearest', magFilter: 'nearest' }, false)
+    cpu.resize(3, 5)
+    const gpu = f.manager.get(cpu)
+    expect([gpu.width, gpu.height, gpu.depthAttachment]).toEqual([3, 5, null])
+    expect(f.api.texImage2D).toHaveBeenCalledWith(0x0de1, 0, 0x1908, 3, 5, 0, 0x1908, 0x1406, null)
+    expect(f.api.texParameteri).toHaveBeenCalledWith(0x0de1, 0x2801, 0x2600)
+    expect(f.api.texParameteri).toHaveBeenCalledWith(0x0de1, 0x2800, 0x2600)
+    expect(f.api.texParameteri).toHaveBeenCalledWith(0x0de1, 0x2802, 0x812f)
+    expect(f.api.texParameteri).toHaveBeenCalledWith(0x0de1, 0x2803, 0x812f)
+    expect(f.api.createRenderbuffer).not.toHaveBeenCalled()
+    expect(f.api.generateMipmap).not.toHaveBeenCalled()
+    cpu.dispose()
+  })
+
+  /**
+   * @remarks
+   * [DESIGN-WEIGHT:3][render-target-gpu-replacement]
+   * Given 外部 FBO/RBO/纹理绑定；When 创建成功或某阶段失败；
+   * Then 恢复外部状态，失败只清理本事务已经取得的 handle。
+   */
+  it.each(['success', 'third-null', 'upload-error', 'incomplete'] as const)(
+    '%s 路径保持外部绑定且只清理本次半成品',
+    (failure) => {
+      const f = setupFloat()
+      const cpu = floatTarget()
+      const externalFbo = f.api.createFramebuffer()
+      const externalRbo = f.api.createRenderbuffer()
+      const externalTex = f.api.createTexture()
+      f.gl.bindFramebuffer(f.gl.FRAMEBUFFER, externalFbo)
+      f.gl.bindRenderbuffer(f.gl.RENDERBUFFER, externalRbo)
+      f.gl.activeTexture(f.gl.TEXTURE0 + 2)
+      f.gl.bindTexture(f.gl.TEXTURE_2D, externalTex)
+      f.mrt.drawBuffersWEBGL([0x8ce0])
+      const first: WebGLTexture = {}
+      const second: WebGLTexture = {}
+      if (failure === 'third-null') {
+        f.api.createTexture
+          .mockReturnValueOnce(first)
+          .mockReturnValueOnce(second)
+          .mockReturnValueOnce(null)
+        expect(() => f.manager.get(cpu)).toThrow(WebGLResourceCreationError)
+        expect(f.api.deleteTexture.mock.calls).toEqual([[first], [second]])
+      } else if (failure === 'upload-error') {
+        f.api.texImage2D.mockImplementationOnce(() => f.setError(f.gl.OUT_OF_MEMORY))
+        expect(() => f.manager.get(cpu)).toThrow(WebGLOperationError)
+        expect(f.api.deleteTexture).toHaveBeenCalledTimes(1)
+        expect(f.api.checkFramebufferStatus).not.toHaveBeenCalled()
+      } else if (failure === 'incomplete') {
+        f.api.checkFramebufferStatus.mockReturnValueOnce(0x8cd6)
+        let failureValue: unknown
+        try {
+          f.manager.get(cpu)
+        } catch (error) {
+          failureValue = error
+        }
+        expect(failureValue).toBeInstanceOf(IncompleteFramebufferError)
+        expect((failureValue as IncompleteFramebufferError).details).toMatchObject({
+          status: 0x8cd6,
+          targetLabel: 'gbuffer/main (RenderTarget revision 0)'
+        })
+        expect(f.api.deleteTexture).toHaveBeenCalledTimes(4)
+        expect(f.api.deleteRenderbuffer).toHaveBeenCalledTimes(1)
+      } else {
+        f.manager.get(cpu)
+        expect(f.deleted).toHaveLength(0)
+      }
+      expect(f.gl.getParameter(f.gl.FRAMEBUFFER_BINDING)).toBe(externalFbo)
+      expect(f.gl.getParameter(f.gl.RENDERBUFFER_BINDING)).toBe(externalRbo)
+      expect(f.gl.getParameter(f.gl.ACTIVE_TEXTURE)).toBe(f.gl.TEXTURE0 + 2)
+      expect(f.gl.getParameter(f.gl.TEXTURE_BINDING_2D)).toBe(externalTex)
+      expect(f.drawBuffers.get(externalFbo)).toEqual([0x8ce0])
+      for (const handle of [externalFbo, externalRbo, externalTex]) {
+        expect(f.deleted).not.toContain(handle)
+      }
+      expect(f.api.deleteFramebuffer).toHaveBeenCalledTimes(failure === 'success' ? 0 : 1)
+      // 失败不能缓存半成品；重试必须建立完整目标，而成功路径应命中原缓存。
+      const gpu = f.manager.get(cpu)
+      expect(f.manager.get(cpu)).toBe(gpu)
+      cpu.dispose()
+    }
+  )
+
+  /** 失败不回退旧尺寸；成功只删除一次旧存储，稳定地址必须解析新 revision。 */
+  it('浮点 replacement 失败保留旧对象但不返回旧纹理，成功后才替换并删除', () => {
+    const f = setupFloat()
+    const cpu = floatTarget()
+    const ref = cpu.getColorAttachment(2)
+    const old = f.manager.get(cpu)
+    cpu.resize(16, 8)
+    f.api.checkFramebufferStatus.mockReturnValueOnce(0x8cd6)
+    expect(() => f.manager.resolveSampledColor(ref)).toThrow(IncompleteFramebufferError)
+    for (const handle of [old.framebuffer, ...old.colorTextures, old.depthAttachment]) {
+      expect(f.deleted).not.toContain(handle)
+    }
+    const nextHandle = f.manager.resolveSampledColor(ref)
+    const next = f.manager.get(cpu)
+    expect([next.width, next.height, next.revision]).toEqual([16, 8, 1])
+    expect(nextHandle).toBe(next.colorTextures[2])
+    expect(nextHandle).not.toBe(old.colorTextures[2])
+    for (const handle of [old.framebuffer, ...old.colorTextures, old.depthAttachment]) {
+      expect(f.deleted.filter((deleted) => deleted === handle)).toHaveLength(1)
+    }
+    cpu.dispose()
+  })
+
+  /** label 不参与缓存；不同 context 的 Manager 也不能共享 GPU handle 或清理责任。 */
+  it('同名浮点目标与同一目标的跨 context 表示分别独立', () => {
+    const a = setupFloat()
+    const b = setupFloat()
+    const first = floatTarget()
+    const second = floatTarget()
+    const firstA = a.manager.get(first)
+    const secondA = a.manager.get(second)
+    const firstB = b.manager.get(first)
+    expect(firstA.framebuffer).not.toBe(secondA.framebuffer)
+    expect(firstA.colorTextures[0]).not.toBe(firstB.colorTextures[0])
+    a.manager.release(first)
+    expect(a.deleted).toContain(firstA.framebuffer)
+    expect(a.deleted).not.toContain(secondA.framebuffer)
+    expect(b.deleted).toHaveLength(0)
+    expect(b.manager.get(first)).toBe(firstB)
+    first.dispose()
+    first.dispose()
+    expect(b.api.deleteFramebuffer).toHaveBeenCalledTimes(1)
+    a.manager.dispose()
+    a.manager.dispose()
+    expect(second.disposed).toBe(false)
+    second.dispose()
+    expect(a.api.deleteFramebuffer).toHaveBeenCalledTimes(2)
+  })
+
+  /** Lost 不正常删除旧代对象；实际能力重新探测由 Capabilities 测试单独保护。 */
+  it('浮点重建中 lost 后旧 Manager 不复活，新 Manager 可按新能力重新创建', () => {
+    const f = setupFloat()
+    const cpu = floatTarget()
+    const old = f.manager.get(cpu)
+    cpu.resize(16, 8)
+    f.api.texImage2D.mockImplementationOnce(() => f.setLost(true))
+    expect(() => f.manager.get(cpu)).toThrow(WebGLContextLostError)
+    expect(f.deleted).toHaveLength(0)
+    f.setLost(false)
+    expect(() => f.manager.get(cpu)).toThrow(WebGLContextLostError)
+    const restored = new WebGL1RenderTargetManager(
+      f.gl,
+      {
+        ...f.capabilities,
+        colorBufferFloat: {
+          RGBA32F_EXT: 0x8814,
+          FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE_EXT: 0x8211,
+          UNSIGNED_NORMALIZED_EXT: 0x8c17
+        }
+      },
+      { invalidateState: f.invalidateState }
+    )
+    const fresh = restored.get(cpu)
+    expect(fresh.framebuffer).not.toBe(old.framebuffer)
+    expect([fresh.width, fresh.height, fresh.revision]).toEqual([16, 8, 1])
+    expect(f.deleted).toHaveLength(0)
+    f.manager.dispose()
+    restored.dispose()
+    cpu.dispose()
+    expect(f.api.deleteFramebuffer.mock.calls).toEqual([[fresh.framebuffer]])
+    for (const texture of old.colorTextures) expect(f.deleted).not.toContain(texture)
   })
 })

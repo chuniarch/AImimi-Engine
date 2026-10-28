@@ -9,8 +9,13 @@ import { InvalidRenderTargetError } from '@/rendering/core/errors'
  *
  * 类型和运行时验证共同使用此列表，避免两处定义发生漂移。
  * 增加条目只扩展 CPU 描述；对应 GPU 支持仍须由 Backend 实现和验证。
+ *
+ * [DESIGN-WEIGHT:3][render-target-float-capability-gates]
+ *
+ * rgba32f 在 CPU 层合法，不代表设备具备浮点上传、渲染或线性过滤能力。
+ * 因此构造过程不接收 gl；使用该目标的 Manager 根据实际 sampler 检查扩展。
  */
-const COLOR_ATTACHMENT_FORMATS = Object.freeze(['rgba8'] as const)
+const COLOR_ATTACHMENT_FORMATS = Object.freeze(['rgba8', 'rgba32f'] as const)
 
 /** 当前逻辑描述接受的深度附件格式；GPU 存储方式由 Backend 决定。 */
 const DEPTH_ATTACHMENT_FORMATS = Object.freeze(['depth16'] as const)
@@ -50,10 +55,11 @@ export type ColorAttachmentSampler = Readonly<Required<ColorAttachmentSamplerInp
  *
  * @remarks
  * width/height 使用像素单位，不是 CSS 尺寸；至少包含一个颜色附件。
- * rgba8 只规定存储格式，不自动执行 sRGB/线性颜色转换。
+ * rgba8 与 rgba32f 只规定存储格式，不自动执行 sRGB/线性颜色转换。
+ * rgba32f 可保存负数和大于 1 的数；是否可在当前设备渲染由 Manager 判断。
  * 多颜色附件可以被描述，是否有足够的 MRT 能力由具体 Backend 判断。
  *
- * TODO(render-target-subresources): 在环境烘焙或 FFT 接入前，一并设计浮点格式、
+ * TODO(render-target-subresources): 在环境烘焙或 FFT 接入前，继续设计更多存储格式、
  * cubemap face/mip 写入视图、更多采样选项和手工 mip 所有权，并补齐能力及恢复测试。
  * 当前不把尚未支持的 face、mip、HDR 字段作为无效占位参数。
  */

@@ -51,7 +51,10 @@ interface Entry {
  */
 export class WebGL1RenderTargetManager {
   private readonly gl: WebGLRenderingContext
-  private readonly capabilities: Pick<WebGL1Capabilities, 'drawBuffers'>
+  private readonly capabilities: Pick<
+    WebGL1Capabilities,
+    'drawBuffers' | 'textureFloat' | 'textureFloatLinear' | 'colorBufferFloat'
+  >
   private readonly hooks: WebGL1TextureManagerHooks
 
   private readonly entries = new Map<RenderTarget, Entry>()
@@ -60,7 +63,10 @@ export class WebGL1RenderTargetManager {
 
   constructor(
     gl: WebGLRenderingContext,
-    capabilities: Pick<WebGL1Capabilities, 'drawBuffers'>,
+    capabilities: Pick<
+      WebGL1Capabilities,
+      'drawBuffers' | 'textureFloat' | 'textureFloatLinear' | 'colorBufferFloat'
+    >,
     hooks: WebGL1TextureManagerHooks
   ) {
     this.gl = gl
@@ -187,7 +193,17 @@ export class WebGL1RenderTargetManager {
     return { target, kind, index }
   }
 
-  /** 能力检查必须先于任何 create*，避免已知不支持的请求产生半成品。 */
+  /**
+   * 检查本次布局实际需要的尺寸、MRT 和浮点能力；全部成功后才允许 create*。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][render-target-float-capability-gates]
+   *
+   * OES_texture_float 允许浮点纹理，WEBGL_color_buffer_float 允许浮点颜色输出，
+   * OES_texture_float_linear 则允许浮点线性过滤，三者不能互相替代。
+   * 只检查浮点槽位自己的 sampler：rgba8 的 linear 不构成浮点过滤需求。
+   * 不自动降格式、减少附件或改 sampler；实际 FBO 完整性仍由 create() 检查。
+   */
   private validate(descriptor: RenderTargetDescriptorSnapshot): void {
     const gl = this.gl
     const maximum = requireTextureLimit(gl, gl.MAX_TEXTURE_SIZE, 'MAX_TEXTURE_SIZE')
@@ -224,6 +240,32 @@ export class WebGL1RenderTargetManager {
         throw new UnsupportedRenderFeatureError(
           'MRT',
           'color attachment count exceeds device limits'
+        )
+      }
+    }
+
+    for (const color of descriptor.colors) {
+      if (color.format !== 'rgba32f') continue
+
+      if (this.capabilities.textureFloat === null) {
+        throw new UnsupportedRenderFeatureError(
+          'rgba32f render target',
+          'OES_texture_float is required'
+        )
+      }
+      if (this.capabilities.colorBufferFloat === null) {
+        throw new UnsupportedRenderFeatureError(
+          'rgba32f render target',
+          'WEBGL_color_buffer_float is required'
+        )
+      }
+
+      const requiresLinear =
+        color.sampler.minFilter === 'linear' || color.sampler.magFilter === 'linear'
+      if (requiresLinear && this.capabilities.textureFloatLinear === null) {
+        throw new UnsupportedRenderFeatureError(
+          'rgba32f linear filtering',
+          'OES_texture_float_linear is required'
         )
       }
     }
@@ -269,20 +311,20 @@ export class WebGL1RenderTargetManager {
           colors.push(texture)
           gl.bindTexture(gl.TEXTURE_2D, texture)
 
-          gl.texImage2D(
-            gl.TEXTURE_2D,
-            0,
-            gl.RGBA,
-            width,
-            height,
-            0,
-            gl.RGBA,
-            gl.UNSIGNED_BYTE,
-            null
-          )
+          /**
+           * @remarks
+           * [DESIGN-WEIGHT:3][render-target-float-capability-gates]
+           *
+           * WebGL1 的两种颜色存储都使用 RGBA internalformat/format，
+           * 通过 type 区分 uint8 与 float32；不能传入 WebGL2 的 RGBA32F。
+           * null 表示分配无 CPU 像素源的存储，不代表已生成可消费的画面。
+           */
+          const color = descriptor.colors[index]!
+          const type = color.format === 'rgba32f' ? gl.FLOAT : gl.UNSIGNED_BYTE
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, type, null)
 
-          // CPU Snapshot 已补齐 sampler；硬阴影的打包深度可显式选择 nearest。
-          const sampler = descriptor.colors[index]!.sampler
+          // 使用经过验证的原始过滤请求，不偷偷替调用者降级为 nearest。
+          const sampler = color.sampler
           gl.texParameteri(
             gl.TEXTURE_2D,
             gl.TEXTURE_MIN_FILTER,
