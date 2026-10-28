@@ -46,6 +46,9 @@ export default [
       // 静态资源不属于 ESLint 检查范围
       'public/**',
 
+      // 文档目录不做 ESLint 校验（含 Markdown 代码块示例）
+      '**/docs/**',
+
       // C++ 作业及其生成目录不属于当前 TypeScript 工程
       'prt/**',
       'lut-gen/**',
