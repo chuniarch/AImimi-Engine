@@ -1,20 +1,22 @@
-import { WebGLRenderer } from '@/renderers/WebGLRenderer'
-import { PerspectiveCamera } from 'three'
-import { OrbitControls } from 'three/examples/jsm/Addons.js'
-// import { GUI } from 'dat.gui'
-// import { Pane } from 'tweakpane'
+import type { PerspectiveCamera } from 'three'
+import type { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+
+import type { Engine } from '@/engine'
+import type { WebGLRenderer } from '@/renderers/WebGLRenderer'
 
 /**
- * 场景加载器需要的运行时上下文
+ * 渐进迁移期间提供给场景入口的上下文，不是新 Renderer 的输入。
  *
- * GUI 选型说明（per-scene 渐进迁移 dat.GUI → Tweakpane）：
- * - 老场景（HW1-4 / FFT Ocean v1-v3）继续用 `gui: GUI`
- * - 新场景（FFT Ocean v4+）用 `pane: Pane`
- * - 两者由 Engine 同时创建，scene loader 按需选用
+ * @remarks
+ * [DESIGN-WEIGHT:3][scene-context-legacy-boundary]
+ * renderer/camera/controls 保持旧类型，供尚未迁移的作业使用。
+ * HW2 通过 engine.setScene() 交接新的 CPU Scene/Camera，不使用这些旧绘制对象。
+ * Task 22 的入口负责取消过期加载和释放 GUI/Controller；Engine 不猜测 loader 返回值。
  */
 export interface SceneContext {
   gl: WebGLRenderingContext
   renderer: WebGLRenderer
   camera: PerspectiveCamera
   controls: OrbitControls
+  engine: Engine
 }
