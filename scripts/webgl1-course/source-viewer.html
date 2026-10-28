@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>课程引用文件快照</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+    <script src="sources.js"></script>
+    <style>
+      body {
+        max-width: 100%;
+        padding: 1.5rem;
+      }
+      pre {
+        overflow: auto;
+        padding: 1rem;
+      }
+      .line {
+        display: block;
+        min-height: 1.5em;
+        white-space: pre;
+      }
+      .line:target {
+        background: #fff3a6;
+        color: #172033;
+      }
+      .number {
+        display: inline-block;
+        width: 5em;
+        user-select: none;
+        color: #89909b;
+      }
+    </style>
+  </head>
+  <body>
+    <p><a href="../index.html">返回课程首页</a> · <a href="../MAINTENANCE.md">维护说明</a></p>
+    <h1 id="title">课程引用文件快照</h1>
+    <p>
+      这是发布时保存的文件，供本地和网页阅读。演示包可能来自更早版本；当前源码与课程中的行号可能存在差异。
+    </p>
+    <p id="status" role="status"></p>
+    <pre id="code"></pre>
+    <script>
+      const key = new URLSearchParams(location.search).get('file')
+      const record = Object.hasOwn(window.RTeachSources, key)
+        ? window.RTeachSources[key]
+        : undefined
+      document.getElementById('title').textContent = key || '未指定文件'
+      if (record === undefined) {
+        document.getElementById('status').textContent = '这份文件未包含在本次课程发布中。'
+      } else {
+        const lines = record.split('\n')
+        const fragment = document.createDocumentFragment()
+        lines.forEach((text, index) => {
+          const line = document.createElement('span')
+          line.className = 'line'
+          line.id = 'L' + (index + 1)
+          const number = document.createElement('a')
+          number.className = 'number'
+          number.href = '#' + line.id
+          number.textContent = String(index + 1)
+          line.append(number, document.createTextNode(text))
+          fragment.append(line)
+        })
+        document.getElementById('code').append(fragment)
+        const requested = /^#L([0-9]+)$/.exec(location.hash)
+        if (requested && Number(requested[1]) > lines.length) {
+          document.getElementById('status').textContent =
+            '课程引用行号超出当前快照范围，请按标识符查找对应代码。'
+        }
+        if (requested) document.getElementById('L' + requested[1])?.scrollIntoView()
+      }
+    </script>
+  </body>
+</html>
