@@ -1,3 +1,4 @@
+import type { RenderingErrorDetails } from '@/rendering/core/errors/RenderingError'
 import { InvalidMaterialError } from '@/rendering/core/errors'
 import { assertNonArrayObject } from '@/rendering/core/validation'
 import { RenderTarget, type RenderTargetAttachmentRef } from '@/rendering/resources/RenderTarget'
@@ -14,6 +15,17 @@ import { Texture2D } from '@/rendering/resources/Texture2D'
  * Material 只借用资源，不因保存此值而 retain、release 或 dispose 它。
  */
 export type Texture2DSamplingSource = Texture2D | RenderTargetAttachmentRef
+
+/** 同一采样规则可供材质或参数块使用；仅错误的领域与上下文不同。 */
+export type SamplingSourceErrorFactory = (
+  fieldName: string,
+  reason: string,
+  details?: RenderingErrorDetails
+) => Error
+
+/** 保持旧的两参数调用兼容，默认仍报告 InvalidMaterialError。 */
+const materialError: SamplingSourceErrorFactory = (fieldName, reason, details) =>
+  new InvalidMaterialError(fieldName, reason, details)
 
 /**
  * 验证二维采样来源；保留纹理身份，复制并冻结附件地址。
@@ -34,22 +46,22 @@ export type Texture2DSamplingSource = Texture2D | RenderTargetAttachmentRef
  * @param value - 可能来自 JavaScript 的任意值，不能只信任 TypeScript 类型。
  * @param fieldName - 调用者提供的诊断路径，例如 parameters.uShadowMap。
  * @returns 同一个活 Texture2D，或一个新的冻结附件包装。
- * @throws InvalidMaterialError 来源、目标类型、附件种类或索引不合法。
+ * @param createError - 非法输入的惰性领域错误工厂；省略时保持 Material 旧行为。
+ * @throws createError 返回的错误：来源、目标类型、附件种类或索引不合法。
  * @throws ResourceDisposedError 纹理或目标已开始释放。
  */
 export function copyTexture2DSamplingSource(
   value: unknown,
-  fieldName: string
+  fieldName: string,
+  createError: SamplingSourceErrorFactory = materialError
 ): Texture2DSamplingSource {
   if (value instanceof Texture2D) {
     value.assertUsable()
     return value
   }
 
-  assertNonArrayObject(
-    value,
-    () =>
-      new InvalidMaterialError(fieldName, 'must reference a Texture2D or a RenderTarget attachment')
+  assertNonArrayObject(value, () =>
+    createError(fieldName, 'must reference a Texture2D or a RenderTarget attachment')
   )
 
   // 只断言可读取字段；各字段仍是 unknown，不能把未验证输入断言为合法附件。
@@ -59,30 +71,30 @@ export function copyTexture2DSamplingSource(
   const index = input.index
 
   if (!(target instanceof RenderTarget))
-    throw new InvalidMaterialError(fieldName + '.target', 'must reference a RenderTarget')
+    throw createError(fieldName + '.target', 'must reference a RenderTarget')
 
   target.assertUsable()
 
   if (kind !== 'color' && kind !== 'depth')
-    throw new InvalidMaterialError(fieldName + '.kind', 'must be color or depth', {
+    throw createError(fieldName + '.kind', 'must be color or depth', {
       received: kind
     })
 
   if (typeof index !== 'number' || !Number.isSafeInteger(index) || index < 0)
-    throw new InvalidMaterialError(fieldName + '.index', 'must be a non-negative safe integer', {
+    throw createError(fieldName + '.index', 'must be a non-negative safe integer', {
       received: index
     })
 
   const descriptor = target.descriptor
   if (kind === 'color' && index >= descriptor.colors.length)
-    throw new InvalidMaterialError(fieldName + '.index', 'must name an existing color slot', {
+    throw createError(fieldName + '.index', 'must name an existing color slot', {
       received: index,
       colorCount: descriptor.colors.length,
       targetLabel: target.label
     })
 
   if (kind === 'depth' && (index !== 0 || descriptor.depth === undefined))
-    throw new InvalidMaterialError(fieldName + '.index', 'must name an existing depth[0]', {
+    throw createError(fieldName + '.index', 'must name an existing depth[0]', {
       received: index,
       targetLabel: target.label
     })

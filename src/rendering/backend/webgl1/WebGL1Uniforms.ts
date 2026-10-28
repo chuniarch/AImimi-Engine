@@ -8,6 +8,8 @@ import {
 } from '@/rendering/core/errors'
 import type { DrawSubmission } from '@/rendering/backend/RenderBackend'
 import type { MaterialParameter } from '@/rendering/resources/Material'
+import type { ParameterBlock } from '@/rendering/resources/ParameterBlock'
+import type { Texture2DSamplingSource } from '@/rendering/resources/Texture2DSamplingSource'
 import type { CubeTexture } from '@/rendering/resources/CubeTexture'
 import type { BuiltInUniformSemantic } from '@/rendering/resources/ShaderModule'
 import type { WebGL1ProgramResource } from './WebGL1ProgramManager'
@@ -70,17 +72,26 @@ export class WebGL1Uniforms {
   private readonly maxTextureUnits: number
   private readonly resolveCube: (texture: CubeTexture) => WebGL1CubeTextureResource
 
+  /** 由 Backend 分流 CPU 纹理与附件地址；结果只在本次 draw 内借用。 */
+  private readonly resolve2D: (source: Texture2DSamplingSource, uniformName: string) => WebGLTexture
+
   /** 只缓存元数据；真正的 GPU program 仍由 ProgramManager 拥有。 */
   private readonly layouts = new WeakMap<WebGLProgram, readonly ActiveUniform[]>()
 
+  /**
+   * 注入当前 generation 的两种解析器，不让 Uniforms 自己拥有 GPU cache。
+   * resolve2D 同时收到 uniformName，供附件反馈错误提供具体参数现场。
+   */
   constructor(
     gl: WebGLRenderingContext,
     maxTextureUnits: number,
-    resolveCube: (texture: CubeTexture) => WebGL1CubeTextureResource
+    resolveCube: (texture: CubeTexture) => WebGL1CubeTextureResource,
+    resolve2D: (source: Texture2DSamplingSource, uniformName: string) => WebGLTexture
   ) {
     this.gl = gl
     this.maxTextureUnits = maxTextureUnits
     this.resolveCube = resolveCube
+    this.resolve2D = resolve2D
   }
 
   /**
@@ -88,7 +99,7 @@ export class WebGL1Uniforms {
    *
    * @remarks
    * [DESIGN-WEIGHT:3][uniform-prepare-before-upload]
-   * cubemap 解析可能使 Manager 首次上传 GPU 资源，因此这不是“所有 GPU 状态
+   * 二维纹理、附件和 cubemap 解析可能创建 GPU 存储，因此这不是“所有 GPU 状态
    * 都不变”的事务。保证的是验证失败时不会部分写入本次 program 的 uniforms。
    * Backend 必须在 prepare 返回后重新应用 program/state，再调用 upload。
    */
@@ -102,6 +113,7 @@ export class WebGL1Uniforms {
     const shader = material.shaderModule
     const layout = this.reflect(program, shader.name)
     const parameters = new Map(material.getParameterEntries())
+    const blocks = material.blocks
     const builtIns = new Map<string, BuiltInUniformSemantic>()
 
     for (const [semantic, name] of Object.entries(shader.builtInUniforms)) {
@@ -113,15 +125,24 @@ export class WebGL1Uniforms {
       builtIns.set(name, semantic as BuiltInUniformSemantic)
     }
 
-    const samplerCount = layout.filter((entry) => entry.type === this.gl.SAMPLER_CUBE).length
+    /**
+     * [DESIGN-WEIGHT:3][uniform-sampler-unit-allocation]
+     * 两种 sampler 共用 fragment 单元预算；先统计，再调用任何纹理 resolver。
+     * 每个 active uniform 分配独立单元，即使两个参数借用同一个来源也不合并。
+     * 本批不提供 sampler 数组或通用 vertex texture 的能力协商。
+     */
+    const samplerCount = layout.filter(
+      (entry) => entry.type === this.gl.SAMPLER_2D || entry.type === this.gl.SAMPLER_CUBE
+    ).length
 
     if (samplerCount > this.maxTextureUnits) {
       throw new UnsupportedRenderFeatureError(
         'texture units',
-        'active cubemap uniforms exceed the fragment texture-unit limit'
+        'active sampler uniforms exceed the fragment texture-unit limit'
       )
     }
 
+    // 游标属于一次 prepare，不能跨 draw 延续；uniform1i 接收下标而非 TEXTURE0 枚举。
     let nextTextureUnit = 0
 
     const uploads = layout.map((entry): PreparedUniformUpload => {
@@ -129,7 +150,7 @@ export class WebGL1Uniforms {
 
       const parameter =
         semantic === undefined
-          ? parameters.get(entry.name)
+          ? (parameters.get(entry.name) ?? this.blockParameter(blocks, entry.name))
           : this.builtInParameter(semantic, submission)
 
       if (parameter === undefined) {
@@ -152,7 +173,14 @@ export class WebGL1Uniforms {
       }
 
       if (parameter.type === 'texture2D') {
-        throw new UnsupportedRenderFeatureError('sampler2D', 'Task 15 has no Texture2D GPU manager')
+        const unit = nextTextureUnit++
+        const handle = this.resolve2D(parameter.value, entry.name)
+
+        return () => {
+          this.gl.activeTexture(this.gl.TEXTURE0 + unit)
+          this.gl.bindTexture(this.gl.TEXTURE_2D, handle)
+          this.gl.uniform1i(entry.location, unit)
+        }
       }
 
       return this.numericUpload(entry.location, entry.name, parameter)
@@ -219,6 +247,26 @@ export class WebGL1Uniforms {
 
     this.layouts.set(program.program, result)
     return result
+  }
+
+  /**
+   * 只读取当前 active uniform 需要的块项。
+   * @remarks
+   * [DESIGN-WEIGHT:3][uniform-live-parameter-block]
+   * 每次 prepare 重新读取；不按 program 缓存块值，不合并或复制全部块项。
+   * Material 已保证名称只有一个来源，所以这不是“后者覆盖前者”。
+   * 返回值是本次读取的副本，后续 numericUpload 再量化并捕获到本次 draw 命令。
+   * 共享引用不保证跨 draw 的帧一致性；生产者必须在消费者绘制前完成更新。
+   */
+  private blockParameter(
+    blocks: readonly ParameterBlock[],
+    name: string
+  ): MaterialParameter | undefined {
+    for (const block of blocks) {
+      const parameter = block.get(name)
+      if (parameter !== undefined) return parameter
+    }
+    return undefined
   }
 
   /** 内建值属于本次 RenderItem/ViewState，不写回共享 Material。 */

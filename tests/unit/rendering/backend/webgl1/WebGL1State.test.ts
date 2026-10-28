@@ -11,7 +11,8 @@ const DEPTH_STATE: RenderState = {
   depthTest: true,
   depthWrite: true,
   depthFunction: 'less-equal',
-  cullMode: 'back'
+  cullMode: 'back',
+  dither: true
 }
 
 /**

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WebGL1ResourceManager } from '@/rendering/backend/webgl1/WebGL1ResourceManager'
 import type { WebGL1Capabilities } from '@/rendering/backend/webgl1/WebGL1Capabilities'
 import { WebGLBackendDisposedError, WebGLContextLostError } from '@/rendering/core/errors'
+import { DataTexture2D } from '@/rendering/resources/Texture2D'
 import { CubeTexture } from '@/rendering/resources/CubeTexture'
 import { Geometry } from '@/rendering/resources/Geometry'
 import { RenderTarget } from '@/rendering/resources/RenderTarget'
@@ -58,6 +59,7 @@ function setup(withOES = true) {
   const members = {
     vertexInputs: resources.vertexInputs,
     renderTargets: resources.renderTargets,
+    textures2D: resources.textures2D,
     cubeTextures: resources.cubeTextures,
     geometries: resources.geometries,
     programs: resources.programs
@@ -97,12 +99,18 @@ function cube(): CubeTexture {
   })
 }
 
-/** 让五个 Manager 都真正拥有或借用资源，避免空缓存让释放测试虚假通过。 */
+/** 让六个 Manager 都真正拥有或借用资源，避免空缓存让释放测试虚假通过。 */
 function populate(f: ReturnType<typeof setup>) {
   const cpu = {
     geometry: geometry(),
     shader: shader(),
     cube: cube(),
+    texture2D: new DataTexture2D({
+      label: 'manager-2d',
+      storage: { format: 'rgba', type: 'uint8' },
+      colorSpace: 'linear',
+      source: { width: 1, height: 1, data: new Uint8Array([1, 2, 3, 255]) }
+    }),
     target: new RenderTarget(
       {
         width: 4,
@@ -117,6 +125,7 @@ function populate(f: ReturnType<typeof setup>) {
     geometry: f.members.geometries.get(cpu.geometry),
     program: f.members.programs.get(cpu.shader),
     cube: f.members.cubeTextures.get(cpu.cube),
+    texture2D: f.members.textures2D.get(cpu.texture2D),
     target: f.members.renderTargets.get(cpu.target)
   }
   f.members.vertexInputs.bind(cpu.geometry, gpu.geometry, gpu.program)
@@ -266,7 +275,7 @@ describe('WebGL1ResourceManager coordination', () => {
    * spy 保留真实 dispose；既检查协调顺序，也检查真实 GPU 删除和 CPU 所有权。
    * 将顺序改成 geometries 在 vertexInputs 前，或重复释放，都应失败。
    */
-  it('固定顺序关闭五个 Manager，重复 dispose 不再删除，不释放 CPU 资源', () => {
+  it('固定顺序关闭六个 Manager，重复 dispose 不再删除，不释放 CPU 资源', () => {
     const f = setup()
     const { cpu } = populate(f)
     const order: string[] = []
@@ -284,6 +293,7 @@ describe('WebGL1ResourceManager coordination', () => {
     expect(order).toEqual([
       'vertexInputs',
       'renderTargets',
+      'textures2D',
       'cubeTextures',
       'geometries',
       'programs'
@@ -293,7 +303,7 @@ describe('WebGL1ResourceManager coordination', () => {
     expect(f.vertex.calls.deleteProgram).toHaveBeenCalledTimes(1)
     expect(f.texture.api.deleteFramebuffer).toHaveBeenCalledTimes(1)
     expect(f.texture.api.deleteRenderbuffer).toHaveBeenCalledTimes(1)
-    expect(f.texture.api.deleteTexture).toHaveBeenCalledTimes(2)
+    expect(f.texture.api.deleteTexture).toHaveBeenCalledTimes(3)
     for (const resource of Object.values(cpu)) expect(resource.disposed).toBe(false)
 
     // 关闭后 CPU 再释放，不应再次回调这些已经取消订阅的 Managers。
@@ -301,11 +311,13 @@ describe('WebGL1ResourceManager coordination', () => {
       vi.spyOn(f.members.geometries, 'release'),
       vi.spyOn(f.members.programs, 'release'),
       vi.spyOn(f.members.cubeTextures, 'release'),
+      vi.spyOn(f.members.textures2D, 'release'),
       vi.spyOn(f.members.renderTargets, 'release')
     ]
     for (const resource of Object.values(cpu)) resource.dispose()
     for (const release of releases) expect(release).not.toHaveBeenCalled()
     expect(() => f.resources.geometries).toThrow(WebGLBackendDisposedError)
+    expect(() => f.resources.textures2D).toThrow(WebGLBackendDisposedError)
   })
 
   /**
@@ -334,7 +346,7 @@ describe('WebGL1ResourceManager coordination', () => {
     f.resources.dispose()
 
     expect(vertexDispose).toHaveBeenCalledTimes(1)
-    expect(f.texture.api.deleteTexture).toHaveBeenCalledTimes(2)
+    expect(f.texture.api.deleteTexture).toHaveBeenCalledTimes(3)
     expect(f.vertex.calls.deleteBuffer).toHaveBeenCalledTimes(2)
     expect(f.vertex.calls.deleteProgram).toHaveBeenCalledTimes(1)
   })
@@ -363,7 +375,7 @@ describe('WebGL1ResourceManager coordination', () => {
    * 全部失效必须取消全部 CPU 订阅，且没有 GL delete。
    * 即使 gl.isContextLost() 后来变回 false，旧一代入口也不能复活。
    */
-  it.each([true, false])('context lost 使五个 Manager 全部失效，OES=%s', (withOES) => {
+  it.each([true, false])('context lost 使六个 Manager 全部失效，OES=%s', (withOES) => {
     const f = setup(withOES)
     const { cpu, gpu } = populate(f)
     const invalidations = Object.values(f.members).map((member) =>
@@ -373,6 +385,7 @@ describe('WebGL1ResourceManager coordination', () => {
       vi.spyOn(f.members.geometries, 'release'),
       vi.spyOn(f.members.programs, 'release'),
       vi.spyOn(f.members.cubeTextures, 'release'),
+      vi.spyOn(f.members.textures2D, 'release'),
       vi.spyOn(f.members.renderTargets, 'release')
     ]
     f.vertex.setLost(true)
@@ -388,6 +401,8 @@ describe('WebGL1ResourceManager coordination', () => {
     expect(() => f.members.programs.get(cpu.shader)).toThrow(WebGLContextLostError)
     expect(() => f.members.geometries.get(cpu.geometry)).toThrow(WebGLContextLostError)
     expect(() => f.members.cubeTextures.get(cpu.cube)).toThrow(WebGLContextLostError)
+    expect(() => f.resources.textures2D).toThrow(WebGLContextLostError)
+    expect(() => f.members.textures2D.get(cpu.texture2D)).toThrow(WebGLContextLostError)
     expect(() => f.members.renderTargets.get(cpu.target)).toThrow(WebGLContextLostError)
     expect(() => f.members.vertexInputs.bind(cpu.geometry, gpu.geometry, gpu.program)).toThrow(
       WebGLContextLostError
@@ -435,6 +450,8 @@ describe('WebGL1ResourceManager coordination', () => {
     const bGeometry = b.members.geometries.get(cpu.geometry)
     const bProgram = b.members.programs.get(cpu.shader)
     const bCube = b.members.cubeTextures.get(cpu.cube)
+    const b2D = b.members.textures2D.get(cpu.texture2D)
+    expect(b2D.handle).not.toBe(gpu.texture2D.handle)
     const bTarget = b.members.renderTargets.get(cpu.target)
     b.members.vertexInputs.bind(cpu.geometry, bGeometry, bProgram)
     expect(bGeometry).not.toBe(gpu.geometry)
@@ -447,6 +464,7 @@ describe('WebGL1ResourceManager coordination', () => {
     expect(b.members.geometries.get(cpu.geometry)).toBe(bGeometry)
     expect(b.members.programs.get(cpu.shader)).toBe(bProgram)
     expect(b.members.cubeTextures.get(cpu.cube)).toBe(bCube)
+    expect(b.members.textures2D.get(cpu.texture2D)).toBe(b2D)
     expect(b.members.renderTargets.get(cpu.target)).toBe(bTarget)
     expect(b.vertex.calls.deleteBuffer).not.toHaveBeenCalled()
     expect(b.texture.deleted).toEqual([])
@@ -496,6 +514,7 @@ describe('WebGL1ResourceManager coordination', () => {
     expect(next.programs.get(cpu.shader).program).not.toBe(gpu.program.program)
     expect(next.geometries.get(cpu.geometry)).not.toBe(gpu.geometry)
     expect(next.cubeTextures.get(cpu.cube).handle).not.toBe(gpu.cube.handle)
+    expect(next.textures2D.get(cpu.texture2D).handle).not.toBe(gpu.texture2D.handle)
     expect(next.renderTargets.get(cpu.target).framebuffer).not.toBe(gpu.target.framebuffer)
 
     next.dispose()
@@ -520,5 +539,43 @@ describe('WebGL1ResourceManager coordination', () => {
     expect(f.vertex.calls.deleteBuffer).not.toHaveBeenCalled()
     expect(f.vertex.calls.deleteProgram).not.toHaveBeenCalled()
     expect(f.texture.deleted).toEqual([])
+  })
+})
+
+/**
+ * @remarks
+ * [DESIGN-WEIGHT:3][webgl-resource-manager-disposal]
+ * Given 每个 Manager 均有实际资源；When 二维清理中断；Then 游标不越过该步。
+ * spy 只注入一次故障，第二次仍调用真实 Manager.dispose，而非用 mock 代替清理。
+ */
+describe('WebGL1ResourceManager Texture2D cleanup', () => {
+  it('二维 Manager 抛错后从同一步重试，之前成功的步骤不重复', () => {
+    const f = setup()
+    const { cpu, gpu } = populate(f)
+    expect(
+      f.texture.uploads.some(
+        ({ args }) => args[0] === f.gl.TEXTURE_2D && args[8] instanceof Uint8Array
+      )
+    ).toBe(true)
+    const vao = vi.spyOn(f.members.vertexInputs, 'dispose')
+    const targets = vi.spyOn(f.members.renderTargets, 'dispose')
+    const cubes = vi.spyOn(f.members.cubeTextures, 'dispose')
+    const failure = new Error('2d cleanup failure')
+    const textures = vi.spyOn(f.members.textures2D, 'dispose').mockImplementationOnce(() => {
+      throw failure
+    })
+
+    expect(() => f.resources.dispose()).toThrow(failure)
+    expect(cubes).not.toHaveBeenCalled()
+    expect(f.texture.deleted).not.toContain(gpu.texture2D.handle)
+    expect(() => f.resources.textures2D).toThrow(WebGLBackendDisposedError)
+
+    f.resources.dispose()
+    expect(vao).toHaveBeenCalledTimes(1)
+    expect(targets).toHaveBeenCalledTimes(1)
+    expect(textures).toHaveBeenCalledTimes(2)
+    expect(cubes).toHaveBeenCalledTimes(1)
+    expect(f.texture.deleted.filter((handle) => handle === gpu.texture2D.handle)).toHaveLength(1)
+    expect(cpu.texture2D.disposed).toBe(false)
   })
 })

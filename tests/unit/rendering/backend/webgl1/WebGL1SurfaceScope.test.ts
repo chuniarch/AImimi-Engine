@@ -478,3 +478,80 @@ describe('WebGL1SurfaceScope', () => {
     expect(errors[1]).toBeInstanceOf(RenderTargetUnavailableError)
   })
 })
+
+/**
+ * 采样反馈与祖先有效性是两项独立检查。
+ *
+ * @remarks
+ * [DESIGN-WEIGHT:3][surface-texture-feedback]
+ * Given 外层写 A、内层写 B；When 内层读 A；Then 允许。
+ * 把比较范围误写成整个栈，会错杀合法的两步渲染；漏掉栈顶比较则放过反馈环。
+ */
+describe('WebGL1SurfaceScope sampling boundary', () => {
+  it('只禁止读当前输出，嵌套返回后按恢复的栈顶重新检查', () => {
+    const h = harness()
+    const a = h.target()
+    const b = h.target()
+    const at = (target: RenderTarget): RenderSurfaceScopeDescriptor => ({
+      surface: { kind: 'render-target', target }
+    })
+
+    h.scope.run(at(a.target), () => {
+      expect(() => h.scope.assertCanSample(a.target, 'uShadow')).toThrow(
+        RenderTargetUnavailableError
+      )
+      expect(() => h.scope.assertCanSample(a.target, 'uShadow')).toThrow('uShadow')
+      expect(() => h.scope.assertCanSample(a.target, 'uShadow')).toThrow(a.target.label)
+      h.scope.run(at(b.target), () => {
+        expect(() => h.scope.assertCanSample(a.target, 'uShadow')).not.toThrow()
+        expect(() => h.scope.assertCanSample(b.target, 'uSelf')).toThrow(
+          RenderTargetUnavailableError
+        )
+      })
+      expect(() => h.scope.assertCanSample(a.target, 'uShadow')).toThrow(
+        RenderTargetUnavailableError
+      )
+    })
+    h.scope.run(SCREEN, () => {
+      expect(() => h.scope.assertCanSample(a.target, 'uShadow')).not.toThrow()
+    })
+  })
+
+  /** 没有 scope 或已 lost 时，不能只做 target 身份比较然后放行。 */
+  it('没有 scope 或物理 lost 时仍拒绝采样准备', () => {
+    const h = harness()
+    const source = h.target().target
+    expect(() => h.scope.assertCanSample(source, 'uMap')).toThrow(WebGLOperationError)
+    expect(() =>
+      h.scope.run(SCREEN, () => {
+        h.base.setLost(true)
+        expect(() => h.scope.assertCanSample(source, 'uMap')).toThrow(WebGLContextLostError)
+      })
+    ).toThrow(WebGLContextLostError)
+  })
+
+  /**
+   * Given 内层输出仍正常；When 外层被 resize/dispose；Then 不能继续内层 draw。
+   * 内层 finally 也会发现外层失效并聚合错误，因此在回调内独立检查采样错误类型。
+   */
+  it.each(['resize', 'dispose'] as const)('采样前仍检查所有祖先：%s', (operation) => {
+    const h = harness()
+    const a = h.target().target
+    const b = h.target().target
+    const source = h.target().target
+    let checked = false
+    expect(() =>
+      h.scope.run({ surface: { kind: 'render-target', target: a } }, () => {
+        h.scope.run({ surface: { kind: 'render-target', target: b } }, () => {
+          if (operation === 'resize') a.resize(32, 32)
+          else a.dispose()
+          expect(() => h.scope.assertCanSample(source, 'uMap')).toThrow(
+            RenderTargetUnavailableError
+          )
+          checked = true
+        })
+      })
+    ).toThrow()
+    expect(checked).toBe(true)
+  })
+})

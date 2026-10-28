@@ -9,6 +9,7 @@ import {
   WebGLOperationError
 } from '@/rendering/core/errors'
 import { Geometry } from '@/rendering/resources/Geometry'
+import { Texture2D } from '@/rendering/resources/Texture2D'
 import { Material } from '@/rendering/resources/Material'
 import { detectWebGL1Capabilities } from './WebGL1Capabilities'
 import {
@@ -267,10 +268,6 @@ export class WebGL1Backend implements RenderBackend {
 
     const token = {}
 
-    const uniforms = new WebGL1Uniforms(this.gl, capabilities.maxTextureUnits, (texture) =>
-      resources.cubeTextures.get(texture)
-    )
-
     const scope = new WebGL1SurfaceScope(this.gl, state, {
       assertReady: () => {
         this.requireGeneration('use render surface')
@@ -282,10 +279,41 @@ export class WebGL1Backend implements RenderBackend {
       resolveTarget: (target) => resources.renderTargets.get(target)
     })
 
+    /**
+     * [DESIGN-WEIGHT:3][texture2d-source-borrowing]
+     * 两条逻辑来源最终都解析成当前 context 的 WebGLTexture，但所有者不同：
+     * CPU Texture2D 由 textures2D 上传；附件由 renderTargets 分配、由生产者 draw 填充。
+     * 先创建 scope，再注入解析闭包；反馈检查必须早于附件 get 的分配/重建。
+     * 不把 handle 写回 Material，也不把本次解析结果跨 draw 缓存。
+     *
+     * [DESIGN-WEIGHT:3][attachment-content-rebuild]
+     * 恢复只创建新 generation；CPU 来源可重传，附件内容必须由生产者重画。
+     */
+    const uniforms = new WebGL1Uniforms(
+      this.gl,
+      capabilities.maxTextureUnits,
+      (texture) => resources.cubeTextures.get(texture),
+      (source, uniformName) => {
+        if (source instanceof Texture2D) return resources.textures2D.get(source).handle
+
+        scope.assertCanSample(source.target, uniformName)
+        return resources.renderTargets.resolveSampledColor(source)
+      }
+    )
+
     return { token, state, resources, uniforms, scope, valid: true }
   }
 
-  /** 未支持的 blend/stencil/scissor 等固定关闭，不继承上一位 GL 使用者的残留值。 */
+  /**
+   * 应用本次绘制的完整固定状态。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][draw-dither-state]
+   *
+   * 未支持的 blend/stencil/scissor 等固定关闭。DITHER 由 Material 明确选择：
+   * 编码深度的 draw 关闭，后续普通颜色 draw 可以重新开启。
+   * 不承诺 scope 退出恢复所有 GL 状态；下一笔 draw 重新应用自己的状态。
+   */
   private applyDrawState(material: Material, state: WebGL1State): void {
     const gl = this.gl
 
@@ -299,6 +327,10 @@ export class WebGL1Backend implements RenderBackend {
     ]) {
       gl.disable(capability)
     }
+
+    // 每笔 draw 显式提交；冷路径、clear 或前一笔数据绘制都不决定本次值。
+    if (material.state.dither) gl.enable(gl.DITHER)
+    else gl.disable(gl.DITHER)
 
     gl.colorMask(true, true, true, true)
     gl.depthRange(0, 1)

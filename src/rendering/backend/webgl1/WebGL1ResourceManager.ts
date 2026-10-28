@@ -1,5 +1,6 @@
 import { WebGLBackendDisposedError, WebGLContextLostError } from '@/rendering/core/errors'
 import type { WebGL1Capabilities } from './WebGL1Capabilities'
+import { WebGL1Texture2DManager } from './WebGL1Texture2DManager'
 import { WebGL1CubeTextureManager } from './WebGL1CubeTextureManager'
 import { WebGL1GeometryManager } from './WebGL1GeometryManager'
 import { WebGL1ProgramManager } from './WebGL1ProgramManager'
@@ -45,6 +46,7 @@ export class WebGL1ResourceManager {
 
   private readonly programsValue: WebGL1ProgramManager
   private readonly geometriesValue: WebGL1GeometryManager
+  private readonly textures2DValue: WebGL1Texture2DManager
   private readonly cubeTexturesValue: WebGL1CubeTextureManager
   private readonly renderTargetsValue: WebGL1RenderTargetManager
   private readonly vertexInputsValue: WebGL1VertexInputManager
@@ -102,6 +104,7 @@ export class WebGL1ResourceManager {
       }
     })
 
+    this.textures2DValue = new WebGL1Texture2DManager(gl, capabilities, hooks)
     this.cubeTexturesValue = new WebGL1CubeTextureManager(gl, capabilities, hooks)
     this.renderTargetsValue = new WebGL1RenderTargetManager(gl, capabilities, hooks)
 
@@ -109,6 +112,7 @@ export class WebGL1ResourceManager {
     this.disposalOrder = Object.freeze([
       this.vertexInputsValue,
       this.renderTargetsValue,
+      this.textures2DValue,
       this.cubeTexturesValue,
       this.geometriesValue,
       this.programsValue
@@ -127,7 +131,16 @@ export class WebGL1ResourceManager {
     return this.geometriesValue
   }
 
-  /** 借用 cubemap Manager；本阶段没有在此悄悄加入通用 Texture2D Manager。 */
+  /**
+   * 借用静态 CPU 二维纹理的 GPU Manager，不取得 CPU 来源的生命周期。
+   * RenderTarget 附件由 renderTargets 拥有，不能交给本 Manager 重复上传。
+   */
+  get textures2D(): WebGL1Texture2DManager {
+    this.assertAvailable()
+    return this.textures2DValue
+  }
+
+  /** 借用 cubemap Manager，与二维纹理共用当前 generation 的生命周期。 */
   get cubeTextures(): WebGL1CubeTextureManager {
     this.assertAvailable()
     return this.cubeTexturesValue
@@ -171,7 +184,7 @@ export class WebGL1ResourceManager {
    * @remarks
    * [DESIGN-WEIGHT:3][webgl-resource-manager-disposal]
    *
-   * vertexInputs → renderTargets → cubeTextures → geometries → programs。
+   * vertexInputs → renderTargets → textures2D → cubeTextures → geometries → programs。
    *
    * 某一步抛错：立即向调用者传播，停在该步，不删除后续依赖资源。
    * 下一次显式 dispose 从该步重试，已完成的步骤不重复执行。

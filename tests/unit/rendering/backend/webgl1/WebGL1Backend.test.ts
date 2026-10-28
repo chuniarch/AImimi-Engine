@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { WebGL1Backend } from '@/rendering/backend/webgl1/WebGL1Backend'
 import type { DrawSubmission } from '@/rendering/backend/RenderBackend'
 import {
+  RenderTargetUnavailableError,
+  ResourceDisposedError,
+  UnsupportedRenderFeatureError,
   ProgramLinkError,
   ShaderCompilationError,
   WebGLBackendDisposedError,
@@ -10,6 +13,9 @@ import {
   WebGLOperationError,
   WebGLResourceCreationError
 } from '@/rendering/core/errors'
+import { DataTexture2D } from '@/rendering/resources/Texture2D'
+import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import type { Texture2DSamplingSource } from '@/rendering/resources/Texture2DSamplingSource'
 import { Geometry } from '@/rendering/resources/Geometry'
 import { Material } from '@/rendering/resources/Material'
 import { ShaderModule } from '@/rendering/resources/ShaderModule'
@@ -95,6 +101,33 @@ afterEach(() => {
 })
 
 describe('WebGL1Backend failure boundaries', () => {
+  /**
+   * [DESIGN-WEIGHT:3][draw-dither-state]
+   * Given 两个材质共用 program；When false → 默认 true → false 连续 draw；
+   * Then 在真正 drawArrays 前提交各自状态，不能只在 clear 或 program 切换时更新。
+   * GL 边界替身只记录命令；实际 DITHER 状态另由浏览器测试验证。
+   */
+  it('每次 draw 显式应用材质 DITHER，且早于绘制命令', () => {
+    const f = createFixture()
+    const packed = new Material({ shaderModule: f.shader, state: { dither: false } })
+    cleanups.push(() => packed.dispose())
+
+    for (const material of [packed, f.material, packed]) {
+      f.fake.calls.enable.mockClear()
+      f.fake.calls.disable.mockClear()
+      f.fake.calls.drawArrays.mockClear()
+      f.backend.withRenderSurface({ surface: { kind: 'default-framebuffer' } }, () => {
+        f.backend.draw({ ...f.submission, item: { ...f.submission.item, material } })
+      })
+      const setter = material === packed ? f.fake.calls.disable : f.fake.calls.enable
+      const index = setter.mock.calls.findIndex(([capability]) => capability === f.fake.gl.DITHER)
+      expect(index).toBeGreaterThanOrEqual(0)
+      expect(setter.mock.invocationCallOrder[index]).toBeLessThan(
+        f.fake.calls.drawArrays.mock.invocationCallOrder[0]!
+      )
+    }
+  })
+
   /**
    * 改错触发点：把 null context 传给 Capabilities，或错误地报告为 createBuffer
    * 失败。只有真正没有取得 context 时才抛 ContextCreationError。
@@ -305,5 +338,211 @@ describe('WebGL1Backend failure boundaries', () => {
 
     expect(f.fake.calls.drawArrays).toHaveBeenCalledTimes(1)
     expect(f.backend.ready).toBe(true)
+  })
+})
+
+/** 为真实 Backend/Managers 准备 CPU 像素；资源仍由测试拥有。 */
+function samplingTexture(): DataTexture2D {
+  const texture = new DataTexture2D({
+    label: 'backend-2d',
+    storage: { format: 'rgba', type: 'uint8' },
+    colorSpace: 'linear',
+    source: { width: 1, height: 1, data: new Uint8Array([255, 0, 0, 255]) }
+  })
+  cleanups.push(() => texture.dispose())
+  return texture
+}
+
+/** 两个目标可同名；反馈检查和 GPU 缓存不得使用 label 作为身份。 */
+function samplingTarget(): RenderTarget {
+  const target = new RenderTarget(
+    {
+      width: 4,
+      height: 4,
+      colors: [{ format: 'rgba8' }],
+      depth: { format: 'depth16' }
+    },
+    { label: 'backend-target' }
+  )
+  cleanups.push(() => target.dispose())
+  return target
+}
+
+/** 只安排链接反射结果；实际解析、上传、绑定和 draw 使用正式对象。 */
+function useSamplingSource(
+  f: ReturnType<typeof createFixture>,
+  source: Texture2DSamplingSource
+): void {
+  f.fake.vertex.uniforms.splice(0, f.fake.vertex.uniforms.length, {
+    name: 'uMap',
+    type: f.fake.gl.SAMPLER_2D,
+    size: 1,
+    location: { id: 'uMap' }
+  })
+  f.material.setParameter('uMap', { type: 'texture2D', value: source })
+}
+
+/**
+ * @remarks
+ * [DESIGN-WEIGHT:3][texture2d-source-borrowing]
+ * Given 真实 CPU 资源与真实 Managers；When draw 消费二维来源；Then 观察 gl.* 协议。
+ * fake 不证明最终像素；四角颜色与过滤差异另由 browser suite 验收。
+ */
+describe('WebGL1Backend Texture2D integration', () => {
+  it('CPU 来源只上传一次，冷上传完成后重新应用 program/state 再 draw', () => {
+    const f = createFixture()
+    useSamplingSource(f, samplingTexture())
+    // 热 program/geometry 路径下换一个尚未上传的纹理，才能检测冷上传后的状态失效。
+    f.draw()
+    f.fake.vertex.calls.useProgram.mockClear()
+    f.fake.calls.depthFunc.mockClear()
+    f.fake.texture.api.texImage2D.mockClear()
+    useSamplingSource(f, samplingTexture())
+    f.draw()
+    f.draw()
+
+    expect(f.fake.texture.api.texImage2D).toHaveBeenCalledTimes(1)
+    const uploadOrder = f.fake.texture.api.texImage2D.mock.invocationCallOrder[0]!
+    expect(f.fake.vertex.calls.useProgram.mock.invocationCallOrder[0]!).toBeGreaterThan(uploadOrder)
+    expect(f.fake.calls.depthFunc.mock.invocationCallOrder[0]!).toBeGreaterThan(uploadOrder)
+    expect(f.fake.calls.uniform1i).toHaveBeenLastCalledWith({ id: 'uMap' }, 0)
+    expect(f.fake.calls.drawArrays).toHaveBeenCalledTimes(3)
+    expect(f.fake.readSurface()).toEqual({
+      framebuffer: f.fake.outerFramebuffer,
+      viewport: [3, 4, 8, 9]
+    })
+  })
+
+  /** 附件采样必须借用目标已有存储；另建 CPU texture 会使上传次数/handle 断言失败。 */
+  it('消费已创建的颜色附件，不二次上传，不改变 CPU 所有权', () => {
+    const f = createFixture()
+    const target = samplingTarget()
+    f.backend.withRenderSurface({ surface: { kind: 'render-target', target } }, () => {
+      f.backend.draw(f.submission)
+    })
+    const handle = f.fake.texture.api.framebufferTexture2D.mock.calls[0]![3]
+    // 生产者 program 已被反射过；消费者必须是新的 ShaderModule/Material。
+    const shader = new ShaderModule({
+      name: 'attachment-consumer',
+      language: 'glsl-es-100',
+      vertexSource: 'void main(){gl_Position=vec4(0.0);}',
+      fragmentSource:
+        'precision mediump float; uniform sampler2D uMap; void main(){gl_FragColor=texture2D(uMap,vec2(0.5));}'
+    })
+    const material = new Material({
+      shaderModule: shader,
+      parameters: { uMap: { type: 'texture2D', value: target.getColorAttachment(0) } }
+    })
+    cleanups.push(() => {
+      material.dispose()
+      shader.dispose()
+    })
+    f.fake.vertex.uniforms.splice(0, 0, {
+      name: 'uMap',
+      type: f.fake.gl.SAMPLER_2D,
+      size: 1,
+      location: { id: 'uMap' }
+    })
+    const submission = { ...f.submission, item: { ...f.submission.item, material } }
+    const uploadsBefore = f.fake.texture.api.texImage2D.mock.calls.length
+    f.fake.texture.api.bindTexture.mockClear()
+    for (let draw = 0; draw < 2; draw++) {
+      f.backend.withRenderSurface({ surface: { kind: 'default-framebuffer' } }, () => {
+        f.backend.draw(submission)
+      })
+    }
+    expect(f.fake.texture.api.bindTexture).toHaveBeenCalledWith(f.fake.gl.TEXTURE_2D, handle)
+    expect(f.fake.texture.api.texImage2D).toHaveBeenCalledTimes(uploadsBefore)
+    expect(target.sceneReferenceCount).toBe(0)
+    expect(target.disposed).toBe(false)
+  })
+
+  /** [DESIGN-WEIGHT:3][surface-texture-feedback] 外层暂停不等于当前仍在写外层。 */
+  it('内层 B 可读 A；返回 A 后自采样被拒绝且不追加 draw', () => {
+    const f = createFixture()
+    const a = samplingTarget()
+    const b = samplingTarget()
+    useSamplingSource(f, a.getColorAttachment(0))
+    f.backend.withRenderSurface({ surface: { kind: 'render-target', target: a } }, () => {
+      const outer = f.fake.readSurface()
+      f.backend.withRenderSurface({ surface: { kind: 'render-target', target: b } }, () => {
+        f.backend.draw(f.submission)
+      })
+      expect(f.fake.readSurface()).toEqual(outer)
+      expect(() => f.backend.draw(f.submission)).toThrow(RenderTargetUnavailableError)
+      expect(f.fake.calls.drawArrays).toHaveBeenCalledTimes(1)
+      expect(f.fake.calls.uniform1i).toHaveBeenCalledTimes(1)
+    })
+    expect(f.fake.readSurface()).toEqual({
+      framebuffer: f.fake.outerFramebuffer,
+      viewport: [3, 4, 8, 9]
+    })
+  })
+
+  /** 无法采样的深度 RBO 必须在分配前被拒绝，不能断言为 WebGLTexture。 */
+  it('depth16 采样拒绝，不分配目标、不上传 uniform、不 draw', () => {
+    const f = createFixture()
+    useSamplingSource(f, samplingTarget().getDepthAttachment()!)
+    expect(() => f.draw()).toThrow(UnsupportedRenderFeatureError)
+    expect(f.fake.calls.createFramebuffer).not.toHaveBeenCalled()
+    expect(f.fake.calls.uniform1i).not.toHaveBeenCalled()
+    expect(f.fake.calls.drawArrays).not.toHaveBeenCalled()
+    expect(f.fake.readSurface()).toEqual({
+      framebuffer: f.fake.outerFramebuffer,
+      viewport: [3, 4, 8, 9]
+    })
+  })
+
+  /** 来源可能在 Material 构造以后失效；不能直接沿用上一次 draw 的纹理。 */
+  it.each(['texture', 'attachment'] as const)(
+    '%s 已释放则拒绝下一次 draw 并恢复 surface',
+    (kind) => {
+      const f = createFixture()
+      const source = kind === 'texture' ? samplingTexture() : samplingTarget()
+      useSamplingSource(f, source instanceof RenderTarget ? source.getColorAttachment(0) : source)
+      f.draw()
+      source.dispose()
+      expect(() => f.draw()).toThrow(ResourceDisposedError)
+      expect(f.fake.calls.drawArrays).toHaveBeenCalledTimes(1)
+      expect(f.fake.calls.uniform1i).toHaveBeenCalledTimes(1)
+      expect(f.fake.readSurface()).toEqual({
+        framebuffer: f.fake.outerFramebuffer,
+        viewport: [3, 4, 8, 9]
+      })
+    }
+  )
+
+  /** [DESIGN-WEIGHT:3][attachment-content-rebuild] 新代重建 GPU 存储，不复活旧 handle。 */
+  it.each(['texture', 'attachment'] as const)('%s 在恢复后通过原逻辑来源解析新 handle', (kind) => {
+    const f = createFixture()
+    const source = kind === 'texture' ? samplingTexture() : samplingTarget()
+    useSamplingSource(f, source instanceof RenderTarget ? source.getColorAttachment(0) : source)
+    f.draw()
+    const oldHandle = f.fake.texture.api.bindTexture.mock.calls.at(-1)![1]
+    f.fake.loseContext()
+    expect(() => f.draw()).toThrow(WebGLContextLostError)
+    expect(f.fake.texture.api.deleteTexture).not.toHaveBeenCalled()
+    f.fake.restoreContext()
+    f.draw()
+    const nextHandle = f.fake.texture.api.bindTexture.mock.calls.at(-1)![1]
+    expect(nextHandle).not.toBe(oldHandle)
+    expect(f.fake.texture.api.createTexture).toHaveBeenCalledTimes(2)
+    expect(f.fake.calls.drawArrays).toHaveBeenCalledTimes(2)
+    expect(source.disposed).toBe(false)
+    // 本单测只证明重新解析/分配；恢复后的附件内容必须由 browser 测试的生产者重画。
+  })
+
+  /** 上传异常停在 prepare；即使 program 已创建，也不执行半批 uniform 或 draw。 */
+  it('冷上传失败传播领域错误并恢复外部 surface', () => {
+    const f = createFixture()
+    useSamplingSource(f, samplingTexture())
+    f.fake.texture.api.createTexture.mockReturnValueOnce(null)
+    expect(() => f.draw()).toThrow(WebGLResourceCreationError)
+    expect(f.fake.calls.uniform1i).not.toHaveBeenCalled()
+    expect(f.fake.calls.drawArrays).not.toHaveBeenCalled()
+    expect(f.fake.readSurface()).toEqual({
+      framebuffer: f.fake.outerFramebuffer,
+      viewport: [3, 4, 8, 9]
+    })
   })
 })

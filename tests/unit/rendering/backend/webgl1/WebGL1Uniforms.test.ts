@@ -11,6 +11,9 @@ import { VertexAttribute } from '@/rendering/resources/VertexAttribute'
 import { Material, type MaterialParameter } from '@/rendering/resources/Material'
 import { ShaderModule, type BuiltInUniformBindings } from '@/rendering/resources/ShaderModule'
 import { CubeTexture } from '@/rendering/resources/CubeTexture'
+import { DataTexture2D } from '@/rendering/resources/Texture2D'
+import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import type { Texture2DSamplingSource } from '@/rendering/resources/Texture2DSamplingSource'
 import type { DrawSubmission } from '@/rendering/backend/RenderBackend'
 import { createFakeWebGL1ResourceContext } from '../fakes/createFakeWebGL1ResourceContext'
 import { Mat4Tuple } from '@/rendering/core/math/tuples'
@@ -51,6 +54,7 @@ function setup(
     SAMPLER_CUBE: 0x8b60,
     TEXTURE0: 0x84c0,
     TEXTURE_CUBE_MAP: 0x8513,
+    TEXTURE_2D: 0x0de1,
     ...calls
   })
 
@@ -108,7 +112,10 @@ function setup(
     target: fake.gl.TEXTURE_CUBE_MAP
   }))
 
-  const uniforms = new WebGL1Uniforms(fake.gl, maxTextureUnits, resolveCube)
+  const resolve2D = vi.fn(
+    (_source: Texture2DSamplingSource, _uniformName: string): WebGLTexture => ({ id: '2d' })
+  )
+  const uniforms = new WebGL1Uniforms(fake.gl, maxTextureUnits, resolveCube, resolve2D)
 
   return {
     fake,
@@ -118,7 +125,8 @@ function setup(
     submission,
     program,
     uniforms,
-    resolveCube
+    resolveCube,
+    resolve2D
   }
 }
 
@@ -446,5 +454,150 @@ describe('WebGL1Uniforms draw input contract', () => {
     )
 
     expect(() => test.uniforms.upload([])).toThrow(WebGLContextLostError)
+  })
+})
+
+/** 静态 CPU 来源只供解析器辨认身份；本套测试不冒充真实上传验收。 */
+function texture2D(): DataTexture2D {
+  return new DataTexture2D({
+    label: 'uniform-2d',
+    storage: { format: 'rgba', type: 'uint8' },
+    colorSpace: 'linear',
+    source: { width: 1, height: 1, data: new Uint8Array([255, 0, 0, 255]) }
+  })
+}
+
+/**
+ * @remarks
+ * [DESIGN-WEIGHT:3][uniform-sampler-unit-allocation]
+ * 二维与 cube 共用预算，但每个 active sampler 独占一个 unit。
+ * 删除二维计数、把 enum 当下标、跨 draw 延续游标都会破坏下面的断言。
+ */
+describe('WebGL1Uniforms mixed samplers', () => {
+  it('2D/cube/2D 分配 0/1/2，同源不合并，下一次 prepare 从 0 开始', () => {
+    const source = texture2D()
+    const f = setup(
+      [
+        ['uA', 0x8b5e],
+        ['uCube', 0x8b60],
+        ['uB', 0x8b5e]
+      ],
+      {
+        uA: { type: 'texture2D', value: source },
+        uCube: { type: 'cubeTexture', value: cube() },
+        uB: { type: 'texture2D', value: source }
+      },
+      {},
+      3
+    )
+    for (let draw = 0; draw < 2; draw++) {
+      const commands = f.uniforms.prepare(f.program, f.submission)
+      expect(f.calls.uniform1i).not.toHaveBeenCalled()
+      f.uniforms.upload(commands)
+      expect(f.calls.activeTexture.mock.calls).toEqual([[0x84c0], [0x84c1], [0x84c2]])
+      expect(f.calls.bindTexture.mock.calls.map(([target]) => target)).toEqual([
+        0x0de1, 0x8513, 0x0de1
+      ])
+      expect(f.calls.uniform1i.mock.calls).toEqual([
+        [{ id: 'uA' }, 0],
+        [{ id: 'uCube' }, 1],
+        [{ id: 'uB' }, 2]
+      ])
+      f.calls.activeTexture.mockClear()
+      f.calls.bindTexture.mockClear()
+      f.calls.uniform1i.mockClear()
+    }
+    expect(f.resolve2D).toHaveBeenCalledWith(source, 'uA')
+    expect(f.resolve2D).toHaveBeenCalledWith(source, 'uB')
+  })
+
+  /** 超预算必须早于两个 resolver，不能先创建一部分纹理再发现预算不足。 */
+  it('三个混合 sampler 超过预算 2，解析器和上传均不执行', () => {
+    const source = texture2D()
+    const f = setup(
+      [
+        ['uA', 0x8b5e],
+        ['uCube', 0x8b60],
+        ['uB', 0x8b5e]
+      ],
+      {
+        uA: { type: 'texture2D', value: source },
+        uCube: { type: 'cubeTexture', value: cube() },
+        uB: { type: 'texture2D', value: source }
+      },
+      {},
+      2
+    )
+    expect(() => f.uniforms.prepare(f.program, f.submission)).toThrow(UnsupportedRenderFeatureError)
+    expect(f.resolve2D).not.toHaveBeenCalled()
+    expect(f.resolveCube).not.toHaveBeenCalled()
+    expect(f.calls.uniform1i).not.toHaveBeenCalled()
+    expect(() => f.uniforms.prepare(f.program, f.submission)).toThrow('texture units')
+  })
+
+  /** 附件保持逻辑地址，名称也传给 resolver 以构成反馈错误现场。 */
+  it('附件地址与 uniform 名一起交给二维 resolver', () => {
+    const target = new RenderTarget(
+      { width: 2, height: 2, colors: [{ format: 'rgba8' }] },
+      { label: 'uniform-target' }
+    )
+    const ref = target.getColorAttachment(0)
+    const f = setup([['uShadow', 0x8b5e]], { uShadow: { type: 'texture2D', value: ref } })
+    const commands = f.uniforms.prepare(f.program, f.submission)
+    expect(f.resolve2D).toHaveBeenCalledWith(ref, 'uShadow')
+    expect(f.calls.bindTexture).not.toHaveBeenCalled()
+    f.uniforms.upload(commands)
+    expect(f.calls.bindTexture).toHaveBeenCalledExactlyOnceWith(0x0de1, { id: '2d' })
+  })
+
+  /** 前面合法的标量也不能先上传；后续输入失败必须留在 prepare 边界。 */
+  it.each(['missing', 'mismatch', 'resolver'] as const)('%s 失败不上传半批 uniform', (failure) => {
+    const f = setup(
+      [
+        ['uScalar', 0x1406],
+        ['uMap', 0x8b5e]
+      ],
+      {
+        uScalar: { type: 'float', value: 1 },
+        ...(failure === 'missing'
+          ? {}
+          : {
+              uMap:
+                failure === 'mismatch'
+                  ? { type: 'cubeTexture' as const, value: cube() }
+                  : { type: 'texture2D' as const, value: texture2D() }
+            })
+      }
+    )
+    const injected = new Error('resolver failed')
+    if (failure === 'resolver')
+      f.resolve2D.mockImplementation(() => {
+        throw injected
+      })
+    expect(() => f.uniforms.prepare(f.program, f.submission)).toThrow(
+      failure === 'resolver' ? injected : InvalidMaterialError
+    )
+    expect(f.calls.uniform1f).not.toHaveBeenCalled()
+    expect(f.calls.uniform1i).not.toHaveBeenCalled()
+    expect(f.calls.bindTexture).not.toHaveBeenCalled()
+  })
+
+  /** 数组仍无 CPU 契约，不能仅绑定数组首元素；覆盖两种 sampler。 */
+  it.each([0x8b5e, 0x8b60])('拒绝 sampler 数组 type=%s', (type) => {
+    const f = setup([['uMaps[0]', type, 2]])
+    expect(() => f.uniforms.prepare(f.program, f.submission)).toThrow(UnsupportedRenderFeatureError)
+    expect(f.resolve2D).not.toHaveBeenCalled()
+    expect(f.resolveCube).not.toHaveBeenCalled()
+  })
+
+  /** Prepared 闭包不是跨 context 的缓存；lost 后不能绑定旧 handle。 */
+  it('prepare 成功后 lost，不执行二维绑定或 uniform 上传', () => {
+    const f = setup([['uMap', 0x8b5e]], { uMap: { type: 'texture2D', value: texture2D() } })
+    const commands = f.uniforms.prepare(f.program, f.submission)
+    f.fake.setLost(true)
+    expect(() => f.uniforms.upload(commands)).toThrow(WebGLContextLostError)
+    expect(f.calls.activeTexture).not.toHaveBeenCalled()
+    expect(f.calls.bindTexture).not.toHaveBeenCalled()
+    expect(f.calls.uniform1i).not.toHaveBeenCalled()
   })
 })

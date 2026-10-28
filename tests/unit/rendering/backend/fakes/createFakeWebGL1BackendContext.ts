@@ -1,4 +1,5 @@
 import { vi } from 'vitest'
+import { createFakeWebGL1TextureContext } from './createFakeWebGL1TextureContext'
 import { createFakeWebGL1VertexInputContext } from './createFakeWebGL1VertexInputContext'
 
 /**
@@ -6,32 +7,59 @@ import { createFakeWebGL1VertexInputContext } from './createFakeWebGL1VertexInpu
  *
  * @remarks
  * [DESIGN-WEIGHT:2][fake-webgl-state-versus-gpu]
- * 真实 Program/Geometry/VertexInput Manager 仍在测试中执行；这里只替代
+ * 合并顶点与纹理协议 fake；getParameter 按 pname 分派，lost/error 共享入口。
+ * FBO 创建、删除、绑定和 isFramebuffer 共用同一份生存状态，恢复后旧 FBO 失效。
+ * 真实 Program/Geometry/Texture/RenderTarget Managers 仍在测试中执行；这里只替代
  * 浏览器 context、canvas 事件和少量 GL 状态。它不能证明 shader 编译或像素正确。
  */
 export function createFakeWebGL1BackendContext() {
   const vertex = createFakeWebGL1VertexInputContext(false)
+  const texture = createFakeWebGL1TextureContext()
   const gl = vertex.gl
+  const vertexGetParameter = gl.getParameter.bind(gl)
+  const vertexGetError = gl.getError.bind(gl)
+  const vertexIsLost = gl.isContextLost.bind(gl)
+  const vertexParameters: readonly number[] = [
+    gl.CURRENT_PROGRAM,
+    gl.ARRAY_BUFFER_BINDING,
+    gl.ELEMENT_ARRAY_BUFFER_BINDING,
+    vertex.oes.VERTEX_ARRAY_BINDING_OES
+  ]
   const outerFramebuffer = { id: 'outer-framebuffer' } as unknown as WebGLFramebuffer
-  let framebuffer: WebGLFramebuffer | null = outerFramebuffer
+  const liveFramebuffers = new Set<WebGLFramebuffer>([outerFramebuffer])
+  texture.gl.bindFramebuffer(texture.gl.FRAMEBUFFER, outerFramebuffer)
   let viewport: readonly [number, number, number, number] = [3, 4, 8, 9]
-  const previousGetParameter = gl.getParameter.bind(gl)
 
   const calls = {
-    getExtension: vi.fn((_name: string): unknown => null),
+    getExtension: texture.api.getExtension,
+    isContextLost: vi.fn(() => vertexIsLost() || texture.gl.isContextLost()),
+    getError: vi.fn(() => {
+      const error = vertexGetError()
+      return error === 0 ? texture.gl.getError() : error
+    }),
+    createFramebuffer: vi.fn(() => {
+      const framebuffer = texture.api.createFramebuffer()
+      if (framebuffer !== null) liveFramebuffers.add(framebuffer)
+      return framebuffer
+    }),
+    deleteFramebuffer: vi.fn((framebuffer: WebGLFramebuffer) => {
+      texture.api.deleteFramebuffer(framebuffer)
+      liveFramebuffers.delete(framebuffer)
+    }),
+    uniform1i: vi.fn((_location: WebGLUniformLocation, _value: number): void => {}),
+    uniform1f: vi.fn((_location: WebGLUniformLocation, _value: number): void => {}),
     getParameter: vi.fn((pname: number): unknown => {
       if (pname === gl.MAX_VERTEX_ATTRIBS) return 8
       if (pname === gl.MAX_TEXTURE_IMAGE_UNITS) return 8
       if (pname === gl.MAX_VIEWPORT_DIMS) return new Int32Array([4096, 4096])
-      if (pname === gl.FRAMEBUFFER_BINDING) return framebuffer
       if (pname === gl.VIEWPORT) return new Int32Array(viewport)
-      return previousGetParameter(pname)
+      return vertexParameters.includes(pname)
+        ? vertexGetParameter(pname)
+        : texture.gl.getParameter(pname)
     }),
-    bindFramebuffer: vi.fn((_target: number, next: WebGLFramebuffer | null): void => {
-      framebuffer = next
-    }),
+    bindFramebuffer: texture.api.bindFramebuffer,
     isFramebuffer: vi.fn((value: WebGLFramebuffer | null): boolean => {
-      return value === outerFramebuffer
+      return value !== null && liveFramebuffers.has(value)
     }),
     viewport: vi.fn((x: number, y: number, width: number, height: number): void => {
       viewport = [x, y, width, height]
@@ -49,7 +77,9 @@ export function createFakeWebGL1BackendContext() {
     drawElements: vi.fn((_mode: number, _count: number, _type: number, _offset: number): void => {})
   }
 
-  Object.assign(gl, {
+  Object.assign(gl, texture.gl, {
+    SAMPLER_2D: 0x8b5e,
+    SAMPLER_CUBE: 0x8b60,
     MAX_VERTEX_ATTRIBS: 0x8869,
     MAX_TEXTURE_IMAGE_UNITS: 0x8872,
     MAX_VIEWPORT_DIMS: 0x0d3a,
@@ -64,6 +94,7 @@ export function createFakeWebGL1BackendContext() {
     FRONT: 0x0404,
     BACK: 0x0405,
     BLEND: 0x0be2,
+    DITHER: 0x0bd0,
     STENCIL_TEST: 0x0b90,
     SCISSOR_TEST: 0x0c11,
     POLYGON_OFFSET_FILL: 0x8037,
@@ -90,6 +121,7 @@ export function createFakeWebGL1BackendContext() {
     gl,
     calls,
     vertex,
+    texture,
     outerFramebuffer,
 
     /** 返回独立值，测试不读取替身的可变内部数组。 */
@@ -97,12 +129,16 @@ export function createFakeWebGL1BackendContext() {
       readonly framebuffer: WebGLFramebuffer | null
       readonly viewport: readonly [number, number, number, number]
     } {
-      return { framebuffer, viewport: [...viewport] as [number, number, number, number] }
+      return {
+        framebuffer: gl.getParameter(gl.FRAMEBUFFER_BINDING) as WebGLFramebuffer | null,
+        viewport: [...viewport] as [number, number, number, number]
+      }
     },
 
     /** 先改变物理状态，再发出可取消的浏览器 lost 事件。 */
     loseContext(): Event {
       vertex.setLost(true)
+      texture.setLost(true)
       const event = new Event('webglcontextlost', { cancelable: true })
       canvas.dispatchEvent(event)
       return event
@@ -111,6 +147,9 @@ export function createFakeWebGL1BackendContext() {
     /** 测试恢复后的新 generation；不模拟真实驱动自动重建 GPU handles。 */
     restoreContext(): void {
       vertex.setLost(false)
+      texture.setLost(false)
+      liveFramebuffers.clear()
+      texture.gl.bindFramebuffer(texture.gl.FRAMEBUFFER, null)
       canvas.dispatchEvent(new Event('webglcontextrestored'))
     }
   }

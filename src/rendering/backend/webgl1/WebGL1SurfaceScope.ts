@@ -260,6 +260,34 @@ export class WebGL1SurfaceScope {
   }
 
   /**
+   * 在附件被解析成 GPU 纹理前，验证本次采样不会形成反馈环。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][surface-texture-feedback]
+   * 先通过 assertDrawable 检查当前代、活动 scope 和所有祖先的生命周期/revision；
+   * 然后只比较栈顶：外层 A 暂停、内层写 B 时可以读取 A，返回 A 后不能读取 A。
+   * 本阶段每个 RenderTarget 独占其存储，因此 target 身份足以判断颜色槽位冲突。
+   * 不检查纹理格式或附件 index；这些由 RenderTargetManager 负责。
+   *
+   * @param target 采样地址指向的逻辑目标，不是 WebGLFramebuffer。
+   * @param uniformName 用于定位发生冲突的材质参数。
+   * @throws RenderTargetUnavailableError 当前 draw 试图读取自己的输出时抛出。
+   */
+  assertCanSample(target: RenderTarget, uniformName: string): void {
+    this.assertDrawable()
+
+    // assertDrawable 已确认存在活动 scope；不把暂停中的祖先当作当前输出。
+    const current = this.stack[this.stack.length - 1]!
+
+    if (current.target === target) {
+      throw new RenderTargetUnavailableError(
+        target.label,
+        'uniform ' + uniformName + ' cannot sample the current render target'
+      )
+    }
+  }
+
+  /**
    * 恢复入口状态；独立方法让恢复失败在 run 的 finally 内被显式收集。
    * 已删除的 framebuffer 不能重绑，也不能静默替换成默认输出。
    */

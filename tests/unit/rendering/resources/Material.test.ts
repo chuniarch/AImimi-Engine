@@ -89,7 +89,8 @@ describe('Material CPU contract', () => {
       depthTest: true,
       depthWrite: true,
       depthFunction: 'less-equal',
-      cullMode: 'back'
+      cullMode: 'back',
+      dither: true
     })
     expect(material.getParameterEntries()).toEqual([])
     expect(material.getParameter('missing')).toBeUndefined()
