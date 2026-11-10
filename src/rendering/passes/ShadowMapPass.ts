@@ -1,4 +1,8 @@
-import { InvalidDirectionalShadowError, ResourceDisposedError } from '@/rendering/core/errors'
+import {
+  CleanupFailureError,
+  InvalidDirectionalShadowError,
+  ResourceDisposedError
+} from '@/rendering/core/errors'
 import { assertNonArrayObject } from '@/rendering/core/validation'
 import type { DirectionalShadowSnapshot } from '@/rendering/frame/LightFrameSnapshot'
 import { Material } from '@/rendering/resources/Material'
@@ -115,7 +119,7 @@ export class ShadowMapPass implements RenderPass {
     this.busy = true
     try {
       this.invalidateResults(context)
-      this.assertBackendReady(context)
+      const epoch = this.assertBackendEpoch(context)
       this.depthMaterial.shaderModule.assertUsable()
       const jobs = this.prepareJobs(context)
       const casters = context.renderList.opaque.filter((item) => item.castShadow)
@@ -125,7 +129,8 @@ export class ShadowMapPass implements RenderPass {
         const target = shadow.target
         // 读取本帧 mapSize，而不是 GUI 可能已经改变的 shadow.settings.mapSize。
         // resize 必须发生在进入输出 scope 之前。
-        target.resize(snapshot.mapSize, snapshot.mapSize)
+        shadow.prepareSize(snapshot.mapSize)
+        this.assertBackendEpoch(context, epoch)
         const revision = target.revision
         context.backend.withRenderSurface(
           {
@@ -146,7 +151,7 @@ export class ShadowMapPass implements RenderPass {
         // withRenderSurface 返回才代表恢复成功；draw 完成还不够。
         shadow.assertUsable()
         target.assertUsable()
-        this.assertBackendReady(context)
+        this.assertBackendEpoch(context, epoch)
         if (target.revision !== revision) {
           throw new InvalidDirectionalShadowError(
             shadow.label,
@@ -154,7 +159,11 @@ export class ShadowMapPass implements RenderPass {
             'target changed during production'
           )
         }
-        shadow.publish(result.lightViewProjection, snapshot.bias, revision)
+        shadow.publish(result.lightViewProjection, snapshot.bias, revision, {
+          context,
+          snapshot,
+          epoch
+        })
       }
       return undefined
     } finally {
@@ -219,16 +228,27 @@ export class ShadowMapPass implements RenderPass {
   }
 
   /** ready=false 可能表示 lost 或关闭；不在此猜原因，也不发布成功结果。 */
-  private assertBackendReady(context: RenderPassContext): void {
-    if (!context.backend.ready) {
-      throw new InvalidDirectionalShadowError(this.name, 'backend', 'is not ready')
+  private assertBackendEpoch(context: RenderPassContext, expected?: object): object {
+    const epoch = context.backend.resourceEpoch
+    if (
+      !context.backend.ready ||
+      epoch === null ||
+      (expected !== undefined && expected !== epoch)
+    ) {
+      throw new InvalidDirectionalShadowError(
+        this.name,
+        'backend',
+        'is unavailable or changed during production'
+      )
     }
+    return epoch
   }
 
   /**
    * 仅释放自有 Material；不释放 shader/target/block，也不继续改写借用的结果。
    * 清理失败后禁止 execute，只允许显式重试 dispose。
-   * Resource 的 listener 抛错语义仍由 Resource 本身决定，不在此承诺修复它。
+   * [DESIGN-WEIGHT:3][cleanup-reentry]
+   * Material 禁止使用不代表清理完成；失败后仍保留自有 Material 供下次显式重试。
    */
   dispose(): void {
     if (this.state === 'disposed') return
@@ -237,6 +257,15 @@ export class ShadowMapPass implements RenderPass {
     this.busy = true
     try {
       this.depthMaterial.dispose()
+      if (this.depthMaterial.cleanupState !== 'complete') {
+        throw new CleanupFailureError(this.name, [
+          {
+            phase: 'owner-child',
+            label: 'depthMaterial',
+            cause: new Error('Material cleanup is still ' + this.depthMaterial.cleanupState)
+          }
+        ])
+      }
       this.previousShadows.clear()
       this.state = 'disposed'
     } finally {

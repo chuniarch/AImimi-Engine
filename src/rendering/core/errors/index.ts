@@ -5,6 +5,7 @@
  * 消费方从该入口导入具体领域错误，可以避免依赖错误实现文件的内部目录结构。
  */
 export * from './RenderingError'
+export * from './CleanupFailureError'
 export * from './InvalidShaderModuleError'
 export * from './InvalidCubeTextureError'
 export * from './InvalidMaterialError'
@@ -16,3 +17,7 @@ export * from './InvalidParameterBlockError'
 export * from './InvalidGBufferError'
 export * from './InvalidDirectionalShadowError'
 export * from './InvalidLightError'
+
+export * from './InvalidTextureResourceError'
+export * from './InvalidTextureViewError'
+export * from './InvalidDepthBufferResourceError'

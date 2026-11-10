@@ -1,155 +1,112 @@
 import { InvalidTextureSourceError } from '@/rendering/core/errors'
 import {
   Texture,
+  createTextureDescriptorSnapshot,
   type TextureOptions,
   type TextureValidationErrorFactory
-} from '@/rendering/resources/Texture'
+} from './Texture'
 import {
   copyTexturePixelSnapshot2D,
   createTexturePixelSnapshot2D,
   type TexturePixelSnapshot2D,
   type TexturePixelSource2D
-} from '@/rendering/resources/texturePixelSnapshot'
+} from './texturePixelSnapshot'
+import { textureImageDimensions } from './textureImageDimensions'
+import { textureDiagnosticLabel } from './textureResourceValidation'
 
-/**
- * 浏览器可以作为普通二维图片来源的对象。
- *
- * @remarks
- * 当前不纳入 HTMLCanvasElement、HTMLVideoElement 或 VideoFrame，因为本阶段资源
- * 是静态 Texture。需要动态上传时应单独引入 version/update 契约。
- */
+/** 静态浏览器来源；不纳入Canvas/Video或动态update协议。 */
 export type TextureImageSource = HTMLImageElement | ImageBitmap
-
-/** ImageTexture2D 的完整构造输入。 */
 export interface ImageTexture2DOptions extends TextureOptions {
   readonly source: TextureImageSource
 }
-
-/** DataTexture2D 的完整构造输入。 */
 export interface DataTexture2DOptions extends TextureOptions {
   readonly source: TexturePixelSource2D
 }
 
-/** 为无效 label 建立仍然可读的错误上下文。 */
-function getTextureDiagnosticLabel(label: unknown): string {
-  if (typeof label !== 'string' || label.trim().length === 0) {
-    return '<unnamed>'
-  }
-
-  return label
-}
-
-/**
- * 普通二维 Texture 的抽象分类节点。
- *
- * @remarks
- * Texture2D 本身没有 source 存储方式。ImageTexture2D 保存浏览器图片引用，
- * DataTexture2D 保存 TypedArray snapshot。
- */
+/** 2D source分类节点；具体子类必须先验证并提供真实固定尺寸。 */
 export abstract class Texture2D extends Texture {
-  protected constructor(options: TextureOptions, createError: TextureValidationErrorFactory) {
-    super(options, createError)
+  protected constructor(
+    options: TextureOptions,
+    createError: TextureValidationErrorFactory,
+    dimensions: Readonly<{ width: number; height: number }>
+  ) {
+    super(options, createError, {
+      dimension: '2d',
+      width: dimensions.width,
+      height: dimensions.height
+    })
   }
 }
 
 /**
- * 由已解码浏览器图片提供像素的二维纹理资源。
- *
- * @remarks
- * [DESIGN-WEIGHT:2][image-texture-borrowed-source]
- *
- * HTMLImageElement/ImageBitmap 不能像 TypedArray 一样通用地深拷贝，因此资源保存
- * 原始对象引用。ImageTexture2D.dispose() 只断开引用，不调用 ImageBitmap.close()；
- * source 的浏览器生命周期仍由创建它的调用者负责。
- *
- * 具体对象是否已加载、是否仍有效以及能否传给 texImage2D，由 backend manager
- * 在真正上传时验证。
+ * 已解码图片的静态逻辑资源；只借用图片，不接管close。
+ * [DESIGN-WEIGHT:3][source-texture-fixed-layout]
+ * 固定布局在构造完成前建立。首次实际上传仍由Manager验证真实浏览器对象、
+ * source当前可用性及其尺寸是否仍等于descriptor，不能让外部变化改写布局。
  */
 export class ImageTexture2D extends Texture2D {
-  protected override readonly resourceType: string = 'ImageTexture2D'
-
+  protected override readonly resourceType = 'ImageTexture2D'
   private sourceValue: TextureImageSource | null
 
   constructor(options: ImageTexture2DOptions) {
-    const textureLabel = getTextureDiagnosticLabel(options.label)
-
-    super(options, (reason) => {
-      return new InvalidTextureSourceError(textureLabel, reason)
-    })
-
-    if (options.source === null || typeof options.source !== 'object') {
-      throw new InvalidTextureSourceError(this.label, 'image source must be an object')
-    }
-
+    const label = textureDiagnosticLabel(options?.label)
+    const fail: TextureValidationErrorFactory = (reason) =>
+      new InvalidTextureSourceError(label, reason)
+    createTextureDescriptorSnapshot(options, fail)
+    const dimensions = textureImageDimensions(options.source, 'source', (field, reason) =>
+      fail(field + ': ' + reason)
+    )
+    super(options, fail, dimensions)
     this.sourceValue = options.source
   }
 
-  /** 获取构造时保存的浏览器图片引用。 */
+  /** 返回借用图片，资源关闭后不允许取出；不把它复制成CPU像素数组。 */
   get source(): TextureImageSource {
     this.assertUsable()
-
     return this.sourceValue!
   }
+  get width(): number {
+    return this.descriptor.width
+  }
+  get height(): number {
+    return this.descriptor.height
+  }
 
-  /**
-   * 断开图片引用，但不取得或终止外部图片对象的生命周期。
-   */
+  /** 不调用ImageBitmap.close；所有者仍负责图片本身。 */
   protected override disposeCPUData(): void {
     this.sourceValue = null
   }
 }
 
-/**
- * 由 Uint8Array 或 Float32Array 提供像素的二维纹理资源。
- *
- * @remarks
- * HDR/EXR loader 应先把文件解析为 Float32Array、width 和 height，再构造
- * DataTexture2D。ShaderModule 不参与文件格式解析。
- */
+/** 深复制像素source；descriptor尺寸来自同一份已验证snapshot。 */
 export class DataTexture2D extends Texture2D {
-  protected readonly resourceType = 'DataTexture2D'
-
+  protected override readonly resourceType = 'DataTexture2D'
   private sourceValue: TexturePixelSnapshot2D | null
 
   constructor(options: DataTexture2DOptions) {
-    const textureLabel = getTextureDiagnosticLabel(options.label)
-
-    super(options, (reason) => new InvalidTextureSourceError(textureLabel, reason))
-
-    this.sourceValue = createTexturePixelSnapshot2D(
-      options.source,
-      this.storage,
-      (reason) => new InvalidTextureSourceError(this.label, reason)
-    )
+    const label = textureDiagnosticLabel(options?.label)
+    const fail: TextureValidationErrorFactory = (reason) =>
+      new InvalidTextureSourceError(label, reason)
+    const snapshot = createTextureDescriptorSnapshot(options, fail)
+    const source = createTexturePixelSnapshot2D(options.source, snapshot.storage, fail)
+    super(options, fail, source)
+    this.sourceValue = source
   }
 
-  /** 获取像素宽度。 */
   get width(): number {
-    this.assertUsable()
-
-    return this.sourceValue!.width
+    return this.descriptor.width
   }
-
-  /** 获取像素高度。 */
   get height(): number {
-    this.assertUsable()
-
-    return this.sourceValue!.height
+    return this.descriptor.height
   }
 
-  /**
-   * 复制完整二维像素 source。
-   *
-   * @returns wrapper 和 TypedArray 都是新对象。
-   */
+  /** 每次复制wrapper和TypedArray，调用方不能通过返回值改内部像素。 */
   copySource(): TexturePixelSource2D {
     this.assertUsable()
-
     return copyTexturePixelSnapshot2D(this.sourceValue!)
   }
 
-  /** 断开内部 TypedArray snapshot。 */
-  protected disposeCPUData(): void {
+  protected override disposeCPUData(): void {
     this.sourceValue = null
   }
 }

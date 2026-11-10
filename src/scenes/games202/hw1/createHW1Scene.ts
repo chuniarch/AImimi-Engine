@@ -166,7 +166,7 @@ export async function createHW1Scene(signal: AbortSignal): Promise<HW1SceneBuild
     // 逐个登记：后续构造失败时，已经创建的 Pass 也进入回滚清单。
     passes.push(new ShadowMapPass({ depthShader }))
     passes.push(new HW1LightingPass(light.uuid, lightBlock))
-    passes.push(new ForwardPass())
+    passes.push(new ForwardPass((context) => shadow.prepareSampling(context)))
     signal.throwIfAborted()
     return Object.freeze({
       scene,

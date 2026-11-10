@@ -15,6 +15,8 @@ import type { RenderPassContext } from './RenderPassContext'
 export class ForwardPass implements RenderPass {
   public readonly name: string = 'ForwardPass'
 
+  constructor(private readonly prepareOpaque?: (context: RenderPassContext) => void) {}
+
   execute(context: RenderPassContext): undefined {
     context.backend.withRenderSurface(
       {
@@ -32,6 +34,7 @@ export class ForwardPass implements RenderPass {
           })
         }
 
+        this.prepareOpaque?.(context)
         for (const item of context.renderList.opaque) {
           context.backend.draw({
             item,

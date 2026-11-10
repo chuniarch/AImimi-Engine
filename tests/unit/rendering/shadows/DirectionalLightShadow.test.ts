@@ -43,12 +43,11 @@ describe('DirectionalLightShadow', () => {
     expect(value.settings.mapSize).toBe(512)
     expect(Object.isFrozen(value.settings)).toBe(true)
     expect(Object.isFrozen(value.settings.up)).toBe(true)
-    expect(value.target.descriptor).toEqual({
-      width: 512,
-      height: 512,
-      colors: [{ format: 'rgba8', sampler: { minFilter: 'nearest', magFilter: 'nearest' } }],
-      depth: { format: 'depth16' }
-    })
+    expect([value.target.width, value.target.height]).toEqual([512, 512])
+    const color = value.target.attachments.colors[0]!.texture
+    expect(color.descriptor.storage).toEqual({ format: 'rgba', type: 'uint8' })
+    expect(color.defaultSampler).toMatchObject({ minFilter: 'nearest', magFilter: 'nearest' })
+    expect(value.target.attachments.depth?.format).toBe('depth16')
     expect(value.block.get('uShadowMap')).toEqual({
       type: 'texture2D',
       value: value.target.getColorAttachment(0)
@@ -91,7 +90,7 @@ describe('DirectionalLightShadow', () => {
     })
     expect(value.target).toBe(target)
     expect(value.block).toBe(block)
-    expect(target.descriptor.width).toBe(512)
+    expect(target.width).toBe(512)
     expect(target.revision).toBe(0)
     expect(block.version).toBe(blockVersion)
     value.dispose()
@@ -162,7 +161,7 @@ describe('DirectionalLightShadow', () => {
   it('拒绝过时 revision，且失败不改变块值或版本', () => {
     const value = shadow()
     const revision = value.target.revision
-    value.target.resize(1024, 1024)
+    value.prepareSize(1024)
     const before = value.block.getEntries()
     const version = value.block.version
     expect(() => value.publish(IDENTITY, 0.1, revision)).toThrow(InvalidDirectionalShadowError)
@@ -236,5 +235,47 @@ describe('DirectionalLightShadow', () => {
     value[child].dispose()
     expect(() => value.publish(IDENTITY, 0, 0)).toThrow(ResourceDisposedError)
     value.dispose()
+  })
+})
+
+describe('DirectionalLightShadow cleanup progress', () => {
+  /** block 未断开借用前，target 不能越过该屏障；成功 block 不应在重试中重放。 */
+  it('block 失败保留 target，后续 target 失败只重试 target', () => {
+    const value = shadow()
+    const block = value.block
+    const target = value.target
+    let blockAttempts = 0
+    let targetAttempts = 0
+    block.onDispose(() => {
+      if (++blockAttempts === 1) throw new Error('block')
+    })
+    target.onDispose(() => {
+      if (++targetAttempts === 1) throw new Error('target')
+    })
+    expect(() => value.dispose()).toThrow()
+    expect(target.disposed).toBe(false)
+    expect(value.cleanupState).toBe('failed')
+    expect(() => value.dispose()).toThrow()
+    expect(block.cleanupState).toBe('complete')
+    expect(target.cleanupState).toBe('failed')
+    value.dispose()
+    expect(blockAttempts).toBe(2)
+    expect(targetAttempts).toBe(2)
+    expect(value.cleanupState).toBe('complete')
+  })
+
+  /** 防止只看 child.disposed，跳过仍在 failed 的子资源。 */
+  it('子资源已退出使用但清理失败，owner 仍继续完成它', () => {
+    const value = shadow()
+    const target = value.target
+    let attempts = 0
+    target.onDispose(() => {
+      if (++attempts === 1) throw new Error('target')
+    })
+    expect(() => target.dispose()).toThrow()
+    expect(target.disposed).toBe(true)
+    value.dispose()
+    expect(target.cleanupState).toBe('complete')
+    expect(value.cleanupState).toBe('complete')
   })
 })

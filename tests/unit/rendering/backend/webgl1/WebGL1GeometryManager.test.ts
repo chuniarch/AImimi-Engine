@@ -1,3 +1,4 @@
+import { CleanupFailureError } from '@/rendering/core/errors/CleanupFailureError'
 import { describe, expect, it, vi } from 'vitest'
 import { WebGL1GeometryManager } from '@/rendering/backend/webgl1/WebGL1GeometryManager'
 import {
@@ -289,13 +290,14 @@ describe('WebGL1GeometryManager', () => {
     f.manager.get(geometry)
 
     f.hooks.beforeDelete.mockImplementation(() => {
-      expect(cancel).toHaveBeenCalled()
+      expect(cancel).not.toHaveBeenCalled()
       return undefined
     })
 
     f.manager.dispose()
     f.manager.dispose()
 
+    expect(cancel).toHaveBeenCalledTimes(1)
     expect(f.calls.deleteBuffer).toHaveBeenCalledTimes(2)
     expect(geometry.disposed).toBe(false)
     expect(geometry.vertexCount).toBe(3)
@@ -313,7 +315,7 @@ describe('WebGL1GeometryManager', () => {
       throw failure
     })
 
-    expect(() => f.manager.dispose()).toThrow(failure)
+    expectCleanupCause(() => f.manager.dispose(), failure)
     expect(f.calls.deleteBuffer).not.toHaveBeenCalled()
 
     f.manager.dispose()
@@ -520,3 +522,83 @@ describe('WebGL1GeometryManager', () => {
     expect(f.calls.bufferData).toHaveBeenCalledTimes(2)
   })
 })
+
+describe('Geometry cleanup progress', () => {
+  /** 第二个 VBO 失败不能丢掉 EBO，也不能再次删除第一个成功 VBO。 */
+  it('逐 buffer 保存进度，失败后拒绝借用，重试只删除剩余对象', () => {
+    const f = setup()
+    const cpu = createGeometry(new Uint16Array([0, 1, 2]))
+    const gpu = f.manager.get(cpu)
+    const done: WebGLBuffer[] = []
+    const remove = f.calls.deleteBuffer.getMockImplementation()!
+    f.calls.deleteBuffer
+      .mockImplementationOnce((value) => {
+        done.push(value)
+        remove(value)
+      })
+      .mockImplementationOnce(() => {
+        throw new Error('second buffer')
+      })
+    expect(() => f.manager.release(cpu)).toThrow(CleanupFailureError)
+    expect(done).toEqual([gpu.attributes.get('position')!.buffer])
+    expect(() => f.manager.get(cpu)).toThrow()
+    f.manager.release(cpu)
+    expect(f.calls.deleteBuffer.mock.calls.map(([value]) => value)).toEqual([
+      gpu.attributes.get('position')!.buffer,
+      gpu.attributes.get('uv')!.buffer,
+      gpu.attributes.get('uv')!.buffer,
+      gpu.indexBuffer
+    ])
+    expect(f.hooks.beforeDelete).toHaveBeenCalledTimes(1)
+  })
+
+  /** 外部 release 进行中反调 Resource.dispose，内部 no-op 不能虚报完成。 */
+  it('跨层重入保留 Resource 的捕获任务，GPU 完成后才允许 CPU 完成', () => {
+    const f = setup()
+    const cpu = createGeometry()
+    f.manager.get(cpu)
+    f.hooks.beforeDelete.mockImplementationOnce(() => {
+      expect(() => cpu.dispose()).toThrow(CleanupFailureError)
+      expect(cpu.cleanupState).toBe('failed')
+      return undefined
+    })
+    f.manager.release(cpu)
+    cpu.dispose()
+    expect(cpu.cleanupState).toBe('complete')
+    expect(f.calls.deleteBuffer).toHaveBeenCalledTimes(2)
+  })
+
+  /** 整体关闭失败后 get 不能复活已部分删除的 Manager。 */
+  it('dispose 失败仍关闭，后续显式 dispose 可以继续', () => {
+    const f = setup()
+    const cpu = createGeometry()
+    f.manager.get(cpu)
+    f.calls.deleteBuffer.mockImplementationOnce(() => {
+      throw new Error('buffer')
+    })
+    expect(() => f.manager.dispose()).toThrow(CleanupFailureError)
+    expect(() => f.manager.get(cpu)).toThrow(WebGLBackendDisposedError)
+    f.manager.dispose()
+    expect(f.calls.deleteBuffer).toHaveBeenCalledTimes(3)
+  })
+})
+
+/** 清理错误统一包装，但最底层原始异常的身份必须完整保留。 */
+function expectCleanupCause(action: () => void, expected: unknown): void {
+  let failure: unknown
+  try {
+    action()
+  } catch (error) {
+    failure = error
+  }
+  expect(failure).toBeInstanceOf(CleanupFailureError)
+  const causes: unknown[] = []
+  const visit = (error: unknown): void => {
+    causes.push(error)
+    if (error instanceof CleanupFailureError) {
+      for (const entry of error.failures) visit(entry.cause)
+    }
+  }
+  visit(failure)
+  expect(causes).toContain(expected)
+}

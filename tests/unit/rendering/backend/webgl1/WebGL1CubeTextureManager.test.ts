@@ -1,3 +1,5 @@
+import { WebGL1ResourceGeneration } from '@/rendering/backend/webgl1/WebGL1ResourceGeneration'
+import { CleanupFailureError } from '@/rendering/core/errors/CleanupFailureError'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { CubeTexture, type CubeFaces } from '@/rendering/resources/CubeTexture'
 import type { TextureOptions } from '@/rendering/resources/Texture'
@@ -11,7 +13,7 @@ import {
   WebGLResourceCreationError
 } from '@/rendering/core/errors'
 import { WebGLOperationError } from '@/rendering/core/errors/WebGLOperationError'
-import { WebGL1CubeTextureManager } from '@/rendering/backend/webgl1/WebGL1CubeTextureManager'
+import { WebGL1TextureManager } from '@/rendering/backend/webgl1/WebGL1TextureManager'
 import { createFakeWebGL1TextureContext } from '../fakes/createFakeWebGL1TextureContext'
 
 /** 每一面用不同首像素，能发现面序颠倒；不依赖 Manager 的映射代码生成期望值。 */
@@ -40,13 +42,14 @@ function setup(float = false, linear = false) {
   const fake = createFakeWebGL1TextureContext()
   const invalidateState = vi.fn(() => undefined)
 
-  const manager = new WebGL1CubeTextureManager(
+  const manager = new WebGL1TextureManager(
     fake.gl,
     {
       textureFloat: float ? {} : null,
       textureFloatLinear: linear ? {} : null
     },
-    { invalidateState }
+    new WebGL1ResourceGeneration(fake.gl),
+    { invalidateState, assertAvailable: () => {}, beforeDelete: () => undefined }
   )
 
   return { ...fake, manager, invalidateState }
@@ -54,7 +57,7 @@ function setup(float = false, linear = false) {
 
 afterEach(() => vi.unstubAllGlobals())
 
-describe('WebGL1CubeTextureManager', () => {
+describe('WebGL1TextureManager', () => {
   /**
    * @remarks
    * [DESIGN-WEIGHT:3][cubemap-upload-transaction]
@@ -367,5 +370,54 @@ describe('WebGL1CubeTextureManager', () => {
 
     f.manager.dispose()
     expect(f.api.deleteTexture).not.toHaveBeenCalled()
+  })
+})
+
+describe('Texture cleanup progress', () => {
+  /** 真实 Resource 的捕获任务应能在删除失败后继续，而不是找不到已移出的 Entry。 */
+  it('Resource.dispose 失败后再次调用会完成 GPU 清理', () => {
+    const f = setup()
+    const cpu = cube()
+    const gpu = f.manager.get(cpu)
+    f.api.deleteTexture.mockImplementationOnce(() => {
+      throw new Error('delete texture')
+    })
+    expect(() => cpu.dispose()).toThrow(CleanupFailureError)
+    expect(cpu.cleanupState).toBe('failed')
+    cpu.dispose()
+    expect(cpu.cleanupState).toBe('complete')
+    expect(f.deleted.filter((value) => value === gpu.handle)).toHaveLength(1)
+  })
+
+  /** 直接 Manager.release 中触发 Resource.dispose 时，注册任务仍须存在。 */
+  it('同步重入不重复删除，也不让 Resource 提前 complete', () => {
+    const f = setup()
+    const cpu = cube()
+    const gpu = f.manager.get(cpu)
+    const remove = f.api.deleteTexture.getMockImplementation()!
+    f.api.deleteTexture.mockImplementationOnce((handle) => {
+      expect(() => cpu.dispose()).toThrow(CleanupFailureError)
+      expect(cpu.cleanupState).toBe('failed')
+      remove(handle)
+    })
+    f.manager.release(cpu)
+    cpu.dispose()
+    expect(cpu.cleanupState).toBe('complete')
+    expect(f.deleted.filter((value) => value === gpu.handle)).toHaveLength(1)
+  })
+
+  /** 关闭失败不恢复 get；正常返回的 dispose 才可让上层继续依赖清理。 */
+  it('整体关闭失败后继续剩余工作，running 重入必须报告未完成', () => {
+    const f = setup()
+    const cpu = cube()
+    f.manager.get(cpu)
+    f.api.deleteTexture.mockImplementationOnce(() => {
+      expect(() => f.manager.dispose()).toThrow(CleanupFailureError)
+      throw new Error('first delete')
+    })
+    expect(() => f.manager.dispose()).toThrow(CleanupFailureError)
+    expect(() => f.manager.get(cpu)).toThrow(WebGLBackendDisposedError)
+    f.manager.dispose()
+    expect(f.api.deleteTexture).toHaveBeenCalledTimes(2)
   })
 })

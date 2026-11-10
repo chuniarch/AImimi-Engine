@@ -141,7 +141,7 @@ describe('Light frame extraction and dispatch', () => {
     expect(next.lights[0]!.shadow!.mapSize).toBe(1024)
     expect(next.lights[0]!.shadow!.bias).toBe(0.006)
     expect(next.renderList.opaque[0]!.castShadow).toBe(false)
-    expect(shadow.target.descriptor.width).toBe(512)
+    expect(shadow.target.width).toBe(512)
     expect(shadow.sceneReferenceCount).toBe(0)
     renderer.dispose()
     shadow.dispose()

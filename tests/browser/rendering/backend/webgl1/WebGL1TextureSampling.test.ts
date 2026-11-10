@@ -8,7 +8,8 @@ import type { Mat4Tuple } from '@/rendering/core/math/tuples'
 import { requireNonNull } from '@/rendering/core/requireNonNull'
 import { Geometry } from '@/rendering/resources/Geometry'
 import { Material } from '@/rendering/resources/Material'
-import { RenderTarget, type ColorAttachmentFilter } from '@/rendering/resources/RenderTarget'
+import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
 import { ShaderModule } from '@/rendering/resources/ShaderModule'
 import { DataTexture2D, ImageTexture2D } from '@/rendering/resources/Texture2D'
 import type { Texture2DSamplingSource } from '@/rendering/resources/Texture2DSamplingSource'
@@ -139,13 +140,14 @@ function fixture() {
   )
 
   /** 每个材质借用一个真实 GLSL ES 1.00 shader；深度和剔除不干扰全屏像素。 */
-  function material(fragmentSource: string): Material {
+  function material(fragmentSource: string, requiresShaderTextureLod = false): Material {
     const shader = own(
       new ShaderModule({
         name: 'test/texture-sampling/shader',
         language: 'glsl-es-100',
         vertexSource: VERTEX_SOURCE,
-        fragmentSource
+        fragmentSource,
+        requiresShaderTextureLod
       })
     )
     return own(
@@ -172,17 +174,25 @@ function fixture() {
   }
 
   /** 输出初始 2×2 颜色存储；后续 resize 不替换这个逻辑目标的身份。 */
-  function target(filter: ColorAttachmentFilter = 'nearest'): RenderTarget {
+  function targetOwner(filter: 'nearest' | 'linear' = 'nearest'): RenderTargetBundle {
     return own(
-      new RenderTarget(
-        {
-          width: 2,
-          height: 2,
-          colors: [{ format: 'rgba8', sampler: { minFilter: filter, magFilter: filter } }]
-        },
-        { label: 'test/texture-sampling/target' }
-      )
+      new RenderTargetBundle({
+        width: 2,
+        height: 2,
+        label: 'test/texture-sampling/target',
+        colors: [
+          {
+            storage: { format: 'rgba', type: 'uint8' },
+            colorSpace: 'data',
+            defaultSampler: { minFilter: filter, magFilter: filter }
+          }
+        ]
+      })
     )
+  }
+
+  function target(filter: 'nearest' | 'linear' = 'nearest'): RenderTarget {
+    return targetOwner(filter).target
   }
 
   /** 写入目标；不在函数内采样，便于单独证明生产端已经正常。 */
@@ -214,7 +224,20 @@ function fixture() {
     )
   }
 
-  return { canvas, gl, backend, own, target, producer, submission, produce, consumer, consume }
+  return {
+    canvas,
+    gl,
+    backend,
+    own,
+    target,
+    targetOwner,
+    material,
+    producer,
+    submission,
+    produce,
+    consumer,
+    consume
+  }
 }
 
 /**
@@ -428,11 +451,12 @@ describe('WebGL1 texture sampling real GPU', () => {
    */
   it('同一逻辑引用跨 resize 后采样重新生产的新内容', () => {
     const f = fixture()
-    const output = f.target()
+    const owner = f.targetOwner()
+    const output = owner.target
     const consumer = f.consumer(output.getColorAttachment(0))
     f.produce(output)
     f.consume(consumer, () => expectScreenPattern(f.gl))
-    output.resize(4, 4)
+    owner.resize(4, 4)
     f.produce(output, true)
     f.consume(consumer, () => expectScreenPattern(f.gl, SWAPPED_COLORS))
   })

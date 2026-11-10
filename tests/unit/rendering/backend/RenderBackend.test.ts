@@ -1,10 +1,10 @@
-import { describe, expect, expectTypeOf, it } from 'vitest'
+import { onTestFinished, describe, expect, expectTypeOf, it } from 'vitest'
 
 import type { DrawSubmission, RenderBackend } from '@/rendering/backend/RenderBackend'
 import type { RenderSurfaceScopeDescriptor } from '@/rendering/backend/RenderSurface'
 import type { RenderItem } from '@/rendering/frame/RenderItem'
 import type { ViewState } from '@/rendering/frame/ViewState'
-import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
 import { Mat4Tuple } from '@/rendering/core/math/tuples'
 
 /**
@@ -57,10 +57,14 @@ describe('RenderBackend boundary contract', () => {
 
   /** 描述只借用目标；不 retain，也不把已释放目标自动替换为屏幕。 */
   it('scope descriptor 不取得目标生命周期所有权', () => {
-    const target = new RenderTarget(
-      { width: 16, height: 8, colors: [{ format: 'rgba8' }] },
-      { label: 'test/backend-surface' }
-    )
+    const owner = new RenderTargetBundle({
+      width: 16,
+      height: 8,
+      label: 'test/backend-surface',
+      colors: [{ storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'data' }]
+    })
+    onTestFinished(() => owner.dispose())
+    const target = owner.target
 
     const descriptor: RenderSurfaceScopeDescriptor = {
       surface: { kind: 'render-target', target },
@@ -69,7 +73,7 @@ describe('RenderBackend boundary contract', () => {
 
     expect(target.sceneReferenceCount).toBe(0)
 
-    target.resize(32, 16)
+    owner.resize(32, 16)
     target.dispose()
 
     expect(descriptor.surface.kind).toBe('render-target')

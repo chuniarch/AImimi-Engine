@@ -1,5 +1,6 @@
-import { describe, expect, it, onTestFinished } from 'vitest'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { WebGL1Backend } from '@/rendering/backend/webgl1/WebGL1Backend'
+import { RenderTargetUnavailableError } from '@/rendering/core/errors'
 import { Resource } from '@/rendering/core/Resource'
 import type { Mat4Tuple } from '@/rendering/core/math/tuples'
 import { RenderList } from '@/rendering/frame/RenderList'
@@ -12,7 +13,7 @@ import { GBufferPass } from '@/rendering/passes/GBufferPass'
 import type { RenderPassContext } from '@/rendering/passes/RenderPassContext'
 import { Geometry } from '@/rendering/resources/Geometry'
 import { Material } from '@/rendering/resources/Material'
-import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
 import { ShaderModule } from '@/rendering/resources/ShaderModule'
 import { DataTexture2D } from '@/rendering/resources/Texture2D'
 import { VertexAttribute } from '@/rendering/resources/VertexAttribute'
@@ -79,15 +80,13 @@ function fixture() {
     })
   )
   const result = own(
-    new RenderTarget(
-      {
-        width: 1,
-        height: 1,
-        colors: [{ format: 'rgba8' }]
-      },
-      { label: 'test/gbuffer/comparison' }
-    )
-  )
+    new RenderTargetBundle({
+      width: 1,
+      height: 1,
+      label: 'test/gbuffer/comparison',
+      colors: [{ storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'data' }]
+    })
+  ).target
   const checker = own(
     new Material({
       shaderModule: own(
@@ -190,7 +189,7 @@ function fixture() {
       expect(Array.from(pixel)).toEqual([255, 255, 255, 255])
     })
   }
-  return { gl, pass: producer, material, item, context, expectOutput }
+  return { backend, gl, pass: producer, material, item, context, expectOutput }
 }
 
 describe('GBufferPass real GPU', () => {
@@ -264,4 +263,36 @@ describe('GBufferPass real GPU', () => {
       [0, 0, 0, 0]
     ])
   })
+})
+
+it('rejects the old GBuffer frame after WebGL recovery and reads freshly produced pixels', async () => {
+  const f = fixture()
+  const extension = f.gl.getExtension('WEBGL_lose_context')
+  if (extension === null) throw new Error('GPU verification requires WEBGL_lose_context')
+  const first = f.context([f.item(f.material())])
+  f.pass.execute(first)
+  expect(f.pass.getOutput(first).target).toBe(f.pass.target)
+  const canvas = f.gl.canvas
+  let lost = false
+  canvas.addEventListener(
+    'webglcontextlost',
+    () => {
+      lost = true
+    },
+    { once: true }
+  )
+  extension.loseContext()
+  await vi.waitFor(() => expect(lost).toBe(true), { timeout: 5000 })
+  extension.restoreContext()
+  await vi.waitFor(() => expect(f.backend.ready).toBe(true), { timeout: 5000 })
+  // No getOutput call during loss. Ready alone would permit the stale frame.
+  expect(() => f.pass.getOutput(first)).toThrow(RenderTargetUnavailableError)
+  const next = f.context([f.item(f.material())])
+  f.pass.execute(next)
+  f.expectOutput(next, [
+    [0.25, 0.5, 0.75, 1],
+    [5, 0, 0, 0],
+    [-6 / 7, 3 / 7, 2 / 7, 0],
+    [-2, 1, -5, 1]
+  ])
 })

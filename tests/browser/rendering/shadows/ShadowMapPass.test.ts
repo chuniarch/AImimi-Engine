@@ -410,7 +410,7 @@ describe('ShadowMapPass → ForwardPass real GPU', () => {
 
     // When 配置先更新，实际存储到下一帧由 ShadowMapPass 在输出 scope 外调整。
     f.shadow.setMapSize(63)
-    expect(target.descriptor.width).toBe(128)
+    expect(target.width).toBe(128)
     f.light.transform.setPosition([2, 0, 4])
     expectVisibility(f.render('resize/63-light-right'), BLACK, WHITE)
 
@@ -419,8 +419,8 @@ describe('ShadowMapPass → ForwardPass real GPU', () => {
     expect(f.shadow.block).toBe(block)
     expect(f.receiverMaterial.blocks[0]).toBe(block)
     expect(block.get('uShadowMap')).toEqual(address)
-    expect(target.descriptor.width).toBe(63)
-    expect(target.descriptor.height).toBe(63)
+    expect(target.width).toBe(63)
+    expect(target.height).toBe(63)
     expect(target.revision).toBe(revision + 1)
 
     f.light.transform.setPosition([-2, 0, 4])

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { onTestFinished, describe, expect, it, vi } from 'vitest'
 
 import { EngineError } from '@/errors/EngineError/BaseError'
 import {
@@ -14,7 +14,8 @@ import {
   type MaterialParameter,
   type RenderStateInput
 } from '@/rendering/resources/Material'
-import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
+import { resolveTextureSamplingSource } from '@/rendering/resources/textureSamplingSource'
 import { ShaderModule, type WebGLShaderLanguage } from '@/rendering/resources/ShaderModule'
 import { DataTexture2D, ImageTexture2D } from '@/rendering/resources/Texture2D'
 import { Scene } from '@/rendering/scene/Scene'
@@ -492,16 +493,19 @@ describe('InvalidMaterialError', () => {
 
 describe('Material attachment sampling contract', () => {
   /** 创建两个槽的真实目标，不依赖尚未实现的 WebGL sampler 绑定。 */
-  function createTarget(): RenderTarget {
-    return new RenderTarget(
-      {
-        width: 16,
-        height: 16,
-        colors: [{ format: 'rgba8' }, { format: 'rgba8' }],
-        depth: { format: 'depth16' }
-      },
-      { label: 'shadow/main' }
-    )
+  function createTargetOwner(): RenderTargetBundle {
+    const owner = new RenderTargetBundle({
+      width: 16,
+      height: 16,
+      label: 'shadow/main',
+      colors: Array.from({ length: 2 }, () => ({
+        storage: { format: 'rgba', type: 'uint8' },
+        colorSpace: 'data'
+      })),
+      depth: true
+    })
+    onTestFinished(() => owner.dispose())
+    return owner
   }
 
   /**
@@ -511,8 +515,8 @@ describe('Material attachment sampling contract', () => {
    * 每次返回新地址包装，但共享同一个 RenderTarget，防止错误的深复制或可变别名。
    */
   it('构造、setter、getter 与 entries 隔离附件包装，保留 target 身份', () => {
-    const target = createTarget()
-    const other = createTarget()
+    const target = createTargetOwner().target
+    const other = createTargetOwner().target
     const input = { target, kind: 'color' as const, index: 0 }
     const material = new Material({
       shaderModule: createShader(),
@@ -543,18 +547,30 @@ describe('Material attachment sampling contract', () => {
     other.dispose()
   })
 
-  /** CPU 层只证明地址存在；depth16 是 renderbuffer 的设备限制由后续 Backend 拒绝。 */
-  it('允许保存存在的深度地址，并通过同一地址观察 resize', () => {
-    const target = createTarget()
+  it('拒绝 depth16 采样，颜色槽仍随 owner resize 解析', () => {
+    const owner = createTargetOwner()
+    const target = owner.target
+    const shaderModule = createShader()
+    expect(
+      () =>
+        new Material({
+          shaderModule,
+          parameters: { uDepth: { type: 'texture2D', value: target.getDepthAttachment()! } }
+        })
+    ).toThrow(InvalidMaterialError)
+    const ref = target.getColorAttachment(0)
     const material = new Material({
-      shaderModule: createShader(),
-      parameters: { uDepth: { type: 'texture2D', value: target.getDepthAttachment()! } }
+      shaderModule,
+      parameters: { uMap: { type: 'texture2D', value: ref } }
     })
-    target.resize(32, 32)
-    expect(material.getParameter('uDepth')!.value).toEqual({ target, kind: 'depth', index: 0 })
-    expect(target.descriptor.width).toBe(32)
+    const before = resolveTextureSamplingSource(ref, '2d', 'uMap').texture
+    owner.resize(32, 32)
+    expect(material.getParameter('uMap')!.value).toEqual(ref)
+    expect(resolveTextureSamplingSource(ref, '2d', 'uMap').texture).not.toBe(before)
+    expect(before.disposed).toBe(true)
+    expect(target.width).toBe(32)
     material.dispose()
-    target.dispose()
+    shaderModule.dispose()
   })
 
   /**
@@ -565,10 +581,11 @@ describe('Material attachment sampling contract', () => {
    */
   it('二维纹理与附件可以互换，替换和 dispose 都不接管目标', () => {
     const texture = createDataTexture()
-    const target = createTarget()
+    const owner = createTargetOwner()
+    const target = owner.target
     const scene = new Scene()
     scene.retain(texture)
-    scene.retain(target)
+    scene.retain(owner)
     const material = new Material({
       shaderModule: createShader(),
       parameters: { uMap: { type: 'texture2D', value: texture } }
@@ -579,7 +596,7 @@ describe('Material attachment sampling contract', () => {
     expect(material.getParameter('uMap')!.value).toBe(texture)
     material.setParameter('uMap', { type: 'texture2D', value: target.getColorAttachment(1) })
     material.dispose()
-    for (const resource of [texture, target]) {
+    for (const resource of [texture, owner]) {
       expect(resource.sceneReferenceCount).toBe(1)
       expect(resource.disposed).toBe(false)
     }
@@ -594,8 +611,8 @@ describe('Material attachment sampling contract', () => {
    * Given 合法旧值；When 新地址越界或已释放；Then 构造报领域错误，setter 保留旧值和顺序。
    */
   it('非法或已释放附件的 setter 不破坏旧值和参数顺序', () => {
-    const target = createTarget()
-    const dead = createTarget()
+    const target = createTargetOwner().target
+    const dead = createTargetOwner().target
     const deadRef = dead.getColorAttachment(0)
     dead.dispose()
     const shader = createShader()
@@ -624,7 +641,7 @@ describe('Material attachment sampling contract', () => {
 
   /** Given 地址曾经有效；When owner 释放目标；Then 两种公开读取 API 都重新检查生命周期。 */
   it('目标释放后 getter 与 entries 均拒绝继续提供采样值', () => {
-    const target = createTarget()
+    const target = createTargetOwner().target
     const material = new Material({
       shaderModule: createShader(),
       parameters: {

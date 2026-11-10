@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { onTestFinished, describe, expect, it, vi } from 'vitest'
 import {
   InvalidParameterBlockError,
   RenderingError,
@@ -8,7 +8,7 @@ import { ParameterBlock, type ParameterBlockOptions } from '@/rendering/resource
 import type { MaterialParameter } from '@/rendering/resources/Material'
 import { DataTexture2D } from '@/rendering/resources/Texture2D'
 import { CubeTexture } from '@/rendering/resources/CubeTexture'
-import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
 import { Scene } from '@/rendering/scene/Scene'
 
 /** 真实 CPU 纹理；本组不创建 WebGL context，也不把逻辑引用伪造成 GPU handle。 */
@@ -186,10 +186,14 @@ describe('ParameterBlock fixed layout and snapshots', () => {
       colorSpace: 'linear',
       source: { kind: 'data', faces: [face, face, face, face, face, face] }
     })
-    const target = new RenderTarget(
-      { width: 2, height: 2, colors: [{ format: 'rgba8' }] },
-      { label: 'target' }
-    )
+    const owner = new RenderTargetBundle({
+      width: 2,
+      height: 2,
+      label: 'target',
+      colors: [{ storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'data' }]
+    })
+    onTestFinished(() => owner.dispose())
+    const target = owner.target
     const ref = { ...target.getColorAttachment(0) }
     const block = new ParameterBlock({
       label: 'maps',

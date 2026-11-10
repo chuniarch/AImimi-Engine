@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { CleanupFailureError } from '@/rendering/core/errors'
+
 import type { SceneSetup } from '@/engine/SceneSetup'
 import { Resource } from '@/rendering/core/Resource'
 import { ResourceDisposedError } from '@/rendering/core/errors'
@@ -15,6 +17,23 @@ import {
 } from '@/scenes/games202/hw2/HW2SceneController'
 import type { HW2SceneBuildResult } from '@/scenes/games202/hw2/createHW2Scene'
 import type { HW2ScenePreset } from '@/scenes/games202/hw2/types/HW2ScenePreset'
+
+/**
+ * C0 保留 Scene → Resource → 原始 listener 失败的两层诊断，不能用宽松 toThrow
+ * 取代原始 cause 身份/类型断言；场景交接和安装语义仍由下面各用例独立检查。
+ */
+function readCleanupListenerCause(cause: unknown): unknown {
+  expect(cause).toBeInstanceOf(CleanupFailureError)
+  const sceneFailure = cause as CleanupFailureError
+  expect(sceneFailure.failures).toHaveLength(1)
+  expect(sceneFailure.failures[0]!.phase).toBe('scene-reference')
+  const resourceFailure = sceneFailure.failures[0]!.cause
+  expect(resourceFailure).toBeInstanceOf(CleanupFailureError)
+  const failures = (resourceFailure as CleanupFailureError).failures
+  expect(failures).toHaveLength(1)
+  expect(failures[0]!.phase).toBe('listener')
+  return failures[0]!.cause
+}
 
 /** 手动决定加载完成顺序，不使用 setTimeout 猜测网络时序。 */
 function deferred<T>() {
@@ -289,10 +308,13 @@ describe('HW2SceneController', () => {
     host.rejectInstall = installationFailure
     const pending = controller.applyPreset(preset('next'))
     const rejected = expect(pending).rejects.toMatchObject({
-      errors: [installationFailure, cleanupFailure]
+      errors: [installationFailure, expect.any(CleanupFailureError)]
     })
     calls[0]!.work.resolve(next)
     await rejected
+    const failure = await pending.catch((cause: unknown) => cause)
+    expect((failure as AggregateError).errors[0]).toBe(installationFailure)
+    expect(readCleanupListenerCause((failure as AggregateError).errors[1])).toBe(cleanupFailure)
     expect(next.scene.disposed).toBe(true)
     controller.dispose()
   })
@@ -307,7 +329,14 @@ describe('HW2SceneController', () => {
     })
     const first = controller.applyPreset(preset('A'))
     const second = controller.applyPreset(preset('B'))
-    const rejected = expect(first).rejects.toBe(failure)
+    const rejected = first.then(
+      () => {
+        throw new Error('Expected stale cleanup to reject')
+      },
+      (cause: unknown) => {
+        expect(readCleanupListenerCause(cause)).toBe(failure)
+      }
+    )
     calls[0]!.work.resolve(a)
     await rejected
 

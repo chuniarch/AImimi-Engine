@@ -1,4 +1,8 @@
-import { WebGLContextLostError } from '@/rendering/core/errors'
+import {
+  CleanupFailureError,
+  WebGLBackendDisposedError,
+  WebGLContextLostError
+} from '@/rendering/core/errors'
 import type { Geometry } from '@/rendering/resources/Geometry'
 import type { WebGL1GeometryResource } from './WebGL1GeometryManager'
 import type { WebGL1ProgramResource } from './WebGL1ProgramManager'
@@ -32,6 +36,11 @@ export class WebGL1ManualVertexInputManager implements WebGL1VertexInputManager 
   /** 用于 program 释放前判断是否需要结束当前输入绑定。 */
   private currentProgram: WebGLProgram | null = null
 
+  private closing = false
+  private busy = false
+  /** 部分修改或解绑失败时，仍需保守重置全部位置。 */
+  private resetPending = false
+
   constructor(gl: WebGLRenderingContext, maxAttributes: number, hooks: WebGL1VertexInputHooks) {
     this.gl = gl
     this.hooks = hooks
@@ -52,17 +61,22 @@ export class WebGL1ManualVertexInputManager implements WebGL1VertexInputManager 
     gpuGeometry: WebGL1GeometryResource,
     program: WebGL1ProgramResource
   ): void {
+    if (this.closing) throw new WebGLBackendDisposedError('bind vertex input')
+    this.assertNotBusy()
+    this.busy = true
     // 输入验证失败时不碰旧配置；开始修改 GL 后失败才执行保守清理。
     let changed = false
 
     try {
       this.support.assertBindable(geometry)
+      if (this.resetPending) this.resetBindings(true)
       this.support.checkError('prepare manual vertex input')
 
       const bindings = this.support.resolve(gpuGeometry, program)
       const nextEnabled = new Set(bindings.map((binding) => binding.location))
 
       changed = true
+      this.resetPending = true
 
       const previous = this.initialized
         ? this.enabled
@@ -86,6 +100,7 @@ export class WebGL1ManualVertexInputManager implements WebGL1VertexInputManager 
       this.initialized = true
       this.currentGeometry = geometry
       this.currentProgram = program.program
+      this.resetPending = false
     } catch (error) {
       if (!this.support.disposed && this.support.contextLost) {
         this.invalidateForContextLoss()
@@ -99,11 +114,15 @@ export class WebGL1ManualVertexInputManager implements WebGL1VertexInputManager 
 
       throw error
     } finally {
+      this.busy = false
       this.hooks.invalidateState()
     }
   }
 
-  /** 禁用受管理的位置并清空当前 buffer 绑定，不删除 CPU/GPU 资源。 */
+  /**
+   * 禁用受管理的位置并清空 buffer 绑定，不删除 CPU/GPU 资源。
+   * 清理失败统一保留原始 cause；lost 则放弃旧代责任，不重试旧句柄。
+   */
   unbind(): void {
     if (this.support.disposed) return
 
@@ -112,28 +131,37 @@ export class WebGL1ManualVertexInputManager implements WebGL1VertexInputManager 
       return
     }
 
+    this.assertNotBusy()
+    this.busy = true
     try {
       this.resetBindings(false)
-      this.support.checkError('unbind manual vertex input')
+    } catch (cause: unknown) {
+      if (this.support.contextLost) {
+        this.invalidateForContextLoss()
+        return
+      }
+      throw new CleanupFailureError('WebGL1ManualVertexInputManager', [
+        { phase: 'gpu-dependency', label: 'unbind vertex input', cause }
+      ])
     } finally {
+      this.busy = false
       this.hooks.invalidateState()
     }
   }
 
   /** 当前输入借用了该 Geometry 时先解绑，其他 Geometry 不受影响。 */
   releaseGeometry(geometry: Geometry): void {
-    if (this.currentGeometry === geometry) {
+    if (this.currentGeometry === geometry || this.resetPending) {
       this.unbind()
     }
   }
 
   /** 放弃布局元数据，并在必要时解绑；不调用 deleteProgram。 */
   releaseProgram(program: WebGLProgram): void {
-    this.support.forgetProgram(program)
-
-    if (this.currentProgram === program) {
+    if (this.currentProgram === program || this.resetPending) {
       this.unbind()
     }
+    this.support.forgetProgram(program)
   }
 
   /** lost 期间不执行 disable/bind，只丢弃 CPU 侧跟踪状态。 */
@@ -142,6 +170,7 @@ export class WebGL1ManualVertexInputManager implements WebGL1VertexInputManager 
     this.currentGeometry = null
     this.currentProgram = null
     this.initialized = false
+    this.resetPending = false
     this.support.invalidateForContextLoss()
     this.hooks.invalidateState()
   }
@@ -150,11 +179,11 @@ export class WebGL1ManualVertexInputManager implements WebGL1VertexInputManager 
   dispose(): void {
     if (this.support.disposed) return
 
-    try {
-      this.unbind()
-    } finally {
-      this.support.dispose()
-    }
+    this.assertNotBusy()
+    this.closing = true
+    this.unbind()
+    // 只有解绑与错误检查都成功，才关闭 Support；失败后必须还能继续清理。
+    this.support.dispose()
   }
 
   /**
@@ -166,20 +195,37 @@ export class WebGL1ManualVertexInputManager implements WebGL1VertexInputManager 
    */
   private resetBindings(forceAll: boolean): void {
     const locations =
-      forceAll || !this.initialized
+      forceAll || this.resetPending || !this.initialized
         ? Array.from({ length: this.support.maxAttributes }, (_, index) => index)
         : this.enabled
 
+    this.resetPending = true
     for (const location of locations) {
       this.gl.disableVertexAttribArray(location)
     }
 
     this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER, null)
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, null)
+    this.support.checkError('reset manual vertex input')
 
+    // GL error 也会阻止提交；保留 currentGeometry/currentProgram 供下一次重试。
     this.enabled.clear()
     this.currentGeometry = null
     this.currentProgram = null
     this.initialized = true
+    this.resetPending = false
+  }
+
+  /** 正常返回不能越过尚未结束的同步解绑屏障。 */
+  private assertNotBusy(): void {
+    if (this.busy) {
+      throw new CleanupFailureError('WebGL1ManualVertexInputManager', [
+        {
+          phase: 'gpu-dependency',
+          label: 'vertex input',
+          cause: new Error('Vertex input operation is already running')
+        }
+      ])
+    }
   }
 }

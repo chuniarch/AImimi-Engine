@@ -13,6 +13,8 @@ export function createFakeWebGL1Context() {
   const constants = {
     MAX_VERTEX_ATTRIBS: 0x8869,
     MAX_TEXTURE_IMAGE_UNITS: 0x8872,
+    MAX_VERTEX_TEXTURE_IMAGE_UNITS: 0x8b4c,
+    MAX_COMBINED_TEXTURE_IMAGE_UNITS: 0x8b4d,
     FRAMEBUFFER_BINDING: 0x8ca6,
     VIEWPORT: 0x0ba2,
     ARRAY_BUFFER: 0x8892,
@@ -29,7 +31,9 @@ export function createFakeWebGL1Context() {
   const extensions = new Map<string, unknown>()
   const limits = new Map<number, unknown>([
     [constants.MAX_VERTEX_ATTRIBS, 8],
-    [constants.MAX_TEXTURE_IMAGE_UNITS, 8]
+    [constants.MAX_TEXTURE_IMAGE_UNITS, 8],
+    [constants.MAX_VERTEX_TEXTURE_IMAGE_UNITS, 0],
+    [constants.MAX_COMBINED_TEXTURE_IMAGE_UNITS, 8]
   ])
   let lost = false
   let framebuffer: WebGLFramebuffer | null = null

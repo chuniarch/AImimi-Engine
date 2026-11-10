@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
+import { CleanupFailureError } from '@/rendering/core/errors'
+
 import { EngineError } from '@/errors/EngineError/BaseError'
 import { SceneHandoffError } from '@/errors/EngineError/SceneHandoffError'
 import { EngineSceneSlot } from '@/engine/EngineSceneSlot'
@@ -7,6 +9,23 @@ import { Resource } from '@/rendering/core/Resource'
 import { Group } from '@/rendering/scene/Group'
 import { Scene } from '@/rendering/scene/Scene'
 import { PerspectiveCamera } from '@/rendering/scene/cameras/PerspectiveCamera'
+
+/**
+ * C0 保留 Scene → Resource → 原始 listener 失败的两层诊断，不能用宽松 toThrow
+ * 取代原始 cause 身份/类型断言；场景交接和安装语义仍由下面各用例独立检查。
+ */
+function readCleanupListenerCause(cause: unknown): unknown {
+  expect(cause).toBeInstanceOf(CleanupFailureError)
+  const sceneFailure = cause as CleanupFailureError
+  expect(sceneFailure.failures).toHaveLength(1)
+  expect(sceneFailure.failures[0]!.phase).toBe('scene-reference')
+  const resourceFailure = sceneFailure.failures[0]!.cause
+  expect(resourceFailure).toBeInstanceOf(CleanupFailureError)
+  const failures = (resourceFailure as CleanupFailureError).failures
+  expect(failures).toHaveLength(1)
+  expect(failures[0]!.phase).toBe('listener')
+  return failures[0]!.cause
+}
 
 /** 使用真实 CPU 资源，观察 Scene 引用计数最终是否触发一次清理。 */
 class CountedResource extends Resource {
@@ -225,8 +244,9 @@ describe('EngineSceneSlot 场景所有权', () => {
     expect(slot.lastCleanupFailure).toEqual({
       operation: 'replace',
       sceneUuid: previous.scene.uuid,
-      cause: failure
+      cause: expect.any(CleanupFailureError)
     })
+    expect(readCleanupListenerCause(slot.lastCleanupFailure?.cause)).toBe(failure)
     expect(Object.isFrozen(slot.lastCleanupFailure)).toBe(true)
     expect(resource.cpuDisposals).toBe(0)
 
@@ -288,7 +308,7 @@ describe('EngineSceneSlot 场景所有权', () => {
 
     expect(slot.current).toBeNull()
     expect(slot.lastCleanupFailure?.operation).toBe('clear')
-    expect(slot.lastCleanupFailure?.cause).toBe(failure)
+    expect(readCleanupListenerCause(slot.lastCleanupFailure?.cause)).toBe(failure)
     slot.dispose()
   })
 
@@ -349,7 +369,9 @@ describe('EngineSceneSlot 场景所有权', () => {
     expect(() => slot.setScene(next.scene, next.camera)).not.toThrow()
 
     expect(slot.current?.scene).toBe(next.scene)
-    expect(slot.lastCleanupFailure?.cause).toBeInstanceOf(SceneHandoffError)
+    expect(readCleanupListenerCause(slot.lastCleanupFailure?.cause)).toBeInstanceOf(
+      SceneHandoffError
+    )
     slot.dispose()
   })
 
@@ -408,7 +430,7 @@ describe('EngineSceneSlot 场景所有权', () => {
     expect(slot.current).toBeNull()
     expect(slot.disposed).toBe(true)
     expect(slot.lastCleanupFailure?.operation).toBe('dispose')
-    expect(slot.lastCleanupFailure?.cause).toBe(failure)
+    expect(readCleanupListenerCause(slot.lastCleanupFailure?.cause)).toBe(failure)
   })
 
   /** 新领域错误保持项目统一的错误分类与冻结诊断约定。 */

@@ -1,4 +1,6 @@
+import { assertTextureOperation } from './WebGL1TextureUploadSupport'
 import {
+  CleanupFailureError,
   ProgramLinkError,
   ResourceDisposedError,
   ShaderCompilationError,
@@ -28,6 +30,10 @@ export interface WebGL1ProgramResource {
 interface ProgramEntry {
   readonly resource: WebGL1ProgramResource
   readonly unsubscribe: () => void
+  /** 停止借用与清理完成分开；失败后仍保留该记录。 */
+  closing: boolean
+  dependencyReleased: boolean
+  unbound: boolean
 }
 
 /** 同步的内部协作点；不是应用层事件系统。 */
@@ -87,6 +93,8 @@ export class WebGL1ProgramManager {
     }
 
     const cached = this.entries.get(shader)
+    if (cached?.closing)
+      throw new WebGLOperationError('get resource', 'ShaderModule', 'cleanup is pending')
     if (cached !== undefined) return cached.resource
 
     if (shader.language !== 'glsl-es-100') {
@@ -177,8 +185,14 @@ export class WebGL1ProgramManager {
         uniforms
       })
 
-      const unsubscribe = shader.onDispose(() => this.release(shader))
-      this.entries.set(shader, { resource, unsubscribe })
+      const unsubscribe = shader.onDispose(() => this.releaseFromResource(shader))
+      this.entries.set(shader, {
+        resource,
+        unsubscribe,
+        closing: false,
+        dependencyReleased: false,
+        unbound: false
+      })
 
       return resource
     } catch (error) {
@@ -206,38 +220,97 @@ export class WebGL1ProgramManager {
    * releasing 防止 beforeDelete 同步重入造成重复删除。
    * beforeDelete 抛错时保留 entry，不冒险越过依赖清理屏障。
    */
+
   release(shader: ShaderModule): void {
     const entry = this.entries.get(shader)
-
     if (entry === undefined || this.releasing.has(shader)) return
-
     if (this.gl.isContextLost() || this.lostValue) {
       this.invalidateForContextLoss()
       return
     }
-
     this.releasing.add(shader)
-
+    entry.closing = true
     try {
-      this.hooks.beforeDelete?.(entry.resource.program)
-
-      if (this.gl.isContextLost() || this.lostValue) {
-        this.invalidateForContextLoss()
-        return
+      if (!entry.dependencyReleased) {
+        if (
+          !this.cleanupStep('gpu-dependency', 'vertex input', () => {
+            this.hooks.beforeDelete?.(entry.resource.program)
+          })
+        )
+          return
+        entry.dependencyReleased = true
       }
 
+      if (!entry.unbound) {
+        if (
+          !this.cleanupStep('gpu-dependency', 'unbind program', () => {
+            if (this.gl.getParameter(this.gl.CURRENT_PROGRAM) === entry.resource.program) {
+              this.gl.useProgram(null)
+            }
+          })
+        )
+          return
+        entry.unbound = true
+      }
+      if (
+        !this.cleanupStep('gpu-delete', 'program', () => {
+          this.gl.deleteProgram(entry.resource.program)
+        })
+      )
+        return
+
+      // 完成之前保留订阅：直接 release 中重入 Resource.dispose 也能观察到任务。
       entry.unsubscribe()
       this.entries.delete(shader)
-
-      if (this.gl.getParameter(this.gl.CURRENT_PROGRAM) === entry.resource.program) {
-        this.gl.useProgram(null)
-      }
-
-      this.gl.deleteProgram(entry.resource.program)
-      this.hooks.invalidateState()
     } finally {
       this.releasing.delete(shader)
+      this.hooks.invalidateState()
     }
+  }
+
+  /** release 的 no-op 不等于完成；Resource 捕获任务必须确认剩余记录为空。 */
+  private releaseFromResource(shader: ShaderModule): void {
+    this.release(shader)
+    if (this.lostValue || this.gl.isContextLost()) {
+      this.invalidateForContextLoss()
+      return
+    }
+    if (this.releasing.has(shader) || this.entries.has(shader)) {
+      throw new CleanupFailureError('ShaderModule', [
+        {
+          phase: 'gpu-dependency',
+          label: 'cleanup completion',
+          cause: new Error('GPU cleanup is still pending or running')
+        }
+      ])
+    }
+  }
+
+  /**
+   * 冷路径清理步骤：成功返回后才能推进进度，lost 则放弃旧代责任。
+   * [DESIGN-WEIGHT:3][cleanup-dependency-barrier]
+   */
+  private cleanupStep(
+    phase: 'gpu-dependency' | 'gpu-delete',
+    label: string,
+    action: () => void
+  ): boolean {
+    if (this.lostValue || this.gl.isContextLost()) {
+      this.invalidateForContextLoss()
+      return false
+    }
+    try {
+      assertTextureOperation(this.gl, 'begin cleanup ' + label, 'ShaderModule')
+      action()
+      assertTextureOperation(this.gl, 'cleanup ' + label, 'ShaderModule')
+    } catch (cause) {
+      if (this.lostValue || this.gl.isContextLost()) {
+        this.invalidateForContextLoss()
+        return false
+      }
+      throw new CleanupFailureError('ShaderModule', [{ phase, label, cause }])
+    }
+    return true
   }
 
   /** lost 时只取消订阅、丢弃记录；不能向失效 context 发 delete 命令。 */
@@ -251,21 +324,27 @@ export class WebGL1ProgramManager {
   }
 
   /**
-   * 先取消全部 CPU 订阅，再逐项释放；不释放 CPU ShaderModule。
+   * 先关闭服务，逐项清理成功后取消订阅；不释放 CPU ShaderModule。
    *
    * @remarks
    * 若 beforeDelete 抛错，get 仍被禁止；再次 dispose 可重试剩余条目。
-   * 本方法不改变 Resource 基类尚未定义的 listener 异常传播语义。
+   * 捕获的 Resource 清理任务可以在失败后继续；成功步骤不重放。
    */
   dispose(): void {
-    if (this.disposing) return
+    if (this.disposing || this.releasing.size > 0) {
+      throw new CleanupFailureError('WebGL1ProgramManager', [
+        {
+          phase: 'gpu-dependency',
+          label: 'dispose',
+          cause: new Error('A cleanup operation is still running')
+        }
+      ])
+    }
 
     this.disposedValue = true
     this.disposing = true
 
     try {
-      for (const entry of this.entries.values()) entry.unsubscribe()
-
       for (const shader of [...this.entries.keys()]) this.release(shader)
     } finally {
       this.disposing = false

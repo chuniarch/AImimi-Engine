@@ -25,6 +25,16 @@ export interface WebGL1Capabilities {
    * null 只阻止需要 rgba32f 的目标，不应禁用普通 rgba8 或 HW2 绘制。
    */
   readonly colorBufferFloat: WEBGL_color_buffer_float | null
+  /**
+   * 非零 mip 的 FBO 挂接能力，独立于 mip 存储分配和 shader LOD。
+   * @remarks
+   * [DESIGN-WEIGHT:3][texture-write-view-subresource]
+   * null 不禁止 base-level 目标；实际组合仍须通过 framebuffer completeness。
+   */
+  readonly fboRenderMipmap: OES_fbo_render_mipmap | null
+  readonly shaderTextureLod: EXT_shader_texture_lod | null
+  readonly maxVertexTextureUnits: number
+  readonly maxCombinedTextureUnits: number
   readonly maxVertexAttributes: number
   /** 片元阶段的纹理单元上限，来自 MAX_TEXTURE_IMAGE_UNITS。 */
   readonly maxTextureUnits: number
@@ -57,12 +67,32 @@ export function detectWebGL1Capabilities(gl: WebGLRenderingContext): WebGL1Capab
   // 在浮点纹理扩展之后取得可渲染能力；不能用 textureFloat 非空替代此查询。
   const colorBufferFloat = gl.getExtension('WEBGL_color_buffer_float')
 
+  const fboRenderMipmap = gl.getExtension('OES_fbo_render_mipmap')
+
+  const shaderTextureLod = gl.getExtension('EXT_shader_texture_lod')
   const maxVertexAttributes: unknown = gl.getParameter(gl.MAX_VERTEX_ATTRIBS)
   const maxTextureUnits: unknown = gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS)
 
+  const maxVertexTextureUnits: unknown = gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS)
+  const maxCombinedTextureUnits: unknown = gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS)
   if (gl.isContextLost()) throw new WebGLContextLostError('detect capabilities')
+  if (
+    typeof maxVertexTextureUnits !== 'number' ||
+    !Number.isSafeInteger(maxVertexTextureUnits) ||
+    maxVertexTextureUnits < 0
+  )
+    throw new UnsupportedRenderFeatureError(
+      'MAX_VERTEX_TEXTURE_IMAGE_UNITS',
+      'must report a non-negative safe integer'
+    )
 
   return Object.freeze({
+    shaderTextureLod,
+    maxVertexTextureUnits,
+    maxCombinedTextureUnits: reqiurePositiveLimit(
+      maxCombinedTextureUnits,
+      'MAX_COMBINED_TEXTURE_IMAGE_UNITS'
+    ),
     vertexArrayObject,
     elementIndexUint,
     drawBuffers,
@@ -70,6 +100,7 @@ export function detectWebGL1Capabilities(gl: WebGLRenderingContext): WebGL1Capab
     textureFloat,
     textureFloatLinear,
     colorBufferFloat,
+    fboRenderMipmap,
     maxVertexAttributes: reqiurePositiveLimit(maxVertexAttributes, 'MAX_VERTEX_ATTRIBS'),
     maxTextureUnits: reqiurePositiveLimit(maxTextureUnits, 'MAX_TEXTURE_IMAGE_UNITS')
   })

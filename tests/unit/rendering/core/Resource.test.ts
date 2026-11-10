@@ -372,3 +372,78 @@ describe('Resource', () => {
     expect(() => unsubscribe()).not.toThrow()
   })
 })
+
+describe('Resource bounded cleanup retry', () => {
+  /** A/C 的真实成功进度必须保留；失败 B 不能阻止 C，也不能提前释放 CPU。 */
+  it('独立任务继续，重试只执行失败任务，CPU 最后成功一次', () => {
+    const resource = new TestResource()
+    const events: string[] = []
+    let attempts = 0
+    resource.onDispose(() => {
+      events.push('A')
+    })
+    resource.onDispose(() => {
+      events.push('B')
+      if (++attempts === 1) throw new Error('B')
+    })
+    resource.onDispose(() => {
+      events.push('C')
+    })
+    expect(() => resource.dispose()).toThrow()
+    expect(events).toEqual(['A', 'B', 'C'])
+    expect(resource.cleanupState).toBe('failed')
+    expect(resource.disposed).toBe(true)
+    expect(resource.cpuDisposeCount).toBe(0)
+    resource.dispose()
+    resource.dispose()
+    expect(events).toEqual(['A', 'B', 'C', 'B'])
+    expect(resource.cleanupState).toBe('complete')
+    expect(resource.cpuDisposeCount).toBe(1)
+  })
+
+  /** 防止 tryDispose 将 running/failed 都当作已完成。 */
+  it('同步重入不递归，tryDispose 在 running 返回 false', () => {
+    const resource = new TestResource()
+    resource.onDispose(() => {
+      expect(resource.cleanupState).toBe('running')
+      resource.dispose()
+      expect(resource.tryDispose()).toBe(false)
+    })
+    resource.dispose()
+    expect(resource.cleanupState).toBe('complete')
+  })
+
+  /** 模拟 Manager 自行退订后删除失败，捕获责任不得随注册关系一起消失。 */
+  it('捕获后的退订不能取消失败任务', () => {
+    const resource = new TestResource()
+    let attempts = 0
+    const unsubscribe = resource.onDispose(() => {
+      unsubscribe()
+      if (++attempts === 1) throw undefined
+    })
+    expect(() => resource.dispose()).toThrow()
+    unsubscribe()
+    resource.dispose()
+    expect(attempts).toBe(2)
+    expect(resource.cleanupState).toBe('complete')
+  })
+
+  /** 子类 CPU 清理发生部分故障时，已完成的外部任务不应重放。 */
+  it('CPU 失败后只重试 CPU 阶段', () => {
+    class CPUFailure extends TestResource {
+      protected override disposeCPUData(): void {
+        super.disposeCPUData()
+        if (this.cpuDisposeCount === 1) throw new Error('CPU')
+      }
+    }
+    const resource = new CPUFailure()
+    let listenerCount = 0
+    resource.onDispose(() => {
+      listenerCount++
+    })
+    expect(() => resource.dispose()).toThrow()
+    expect(resource.tryDispose()).toBe(true)
+    expect(listenerCount).toBe(1)
+    expect(resource.cpuDisposeCount).toBe(2)
+  })
+})

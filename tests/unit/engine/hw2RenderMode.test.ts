@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { CleanupFailureError } from '@/rendering/core/errors'
+
 import { Engine } from '@/engine'
 import type { SceneSetup } from '@/engine/SceneSetup'
 import { EngineOperationError } from '@/errors/EngineError/EngineOperationError'
@@ -15,6 +17,23 @@ import { ForwardPass } from '@/rendering/passes/ForwardPass'
 import type { RenderPass } from '@/rendering/passes/RenderPass'
 import { Scene } from '@/rendering/scene/Scene'
 import { PerspectiveCamera } from '@/rendering/scene/cameras/PerspectiveCamera'
+
+/**
+ * C0 保留 Scene → Resource → 原始 listener 失败的两层诊断，不能用宽松 toThrow
+ * 取代原始 cause 身份/类型断言；场景交接和安装语义仍由下面各用例独立检查。
+ */
+function readCleanupListenerCause(cause: unknown): unknown {
+  expect(cause).toBeInstanceOf(CleanupFailureError)
+  const sceneFailure = cause as CleanupFailureError
+  expect(sceneFailure.failures).toHaveLength(1)
+  expect(sceneFailure.failures[0]!.phase).toBe('scene-reference')
+  const resourceFailure = sceneFailure.failures[0]!.cause
+  expect(resourceFailure).toBeInstanceOf(CleanupFailureError)
+  const failures = (resourceFailure as CleanupFailureError).failures
+  expect(failures).toHaveLength(1)
+  expect(failures[0]!.phase).toBe('listener')
+  return failures[0]!.cause
+}
 
 /** 只替换设备和旧平台边界；新 Renderer/Pipeline/Builder 与 CPU 场景保持真实。 */
 const hooks = vi.hoisted(() => ({
@@ -73,7 +92,21 @@ vi.mock('@/utils/platform', () => ({ getClampedDPR: () => 2 }))
 
 /** 可控设备端口；不模拟 Scene、矩阵或新 Renderer 的行为。 */
 class Device implements RenderBackend {
-  ready = true
+  private epoch = {}
+  private readyValue = true
+  get resourceEpoch(): object | null {
+    return this.ready ? this.epoch : null
+  }
+  generateMipmaps(): void {
+    throw new Error('mipmap generation is unsupported by this test backend')
+  }
+  get ready(): boolean {
+    return this.readyValue
+  }
+  set ready(ready: boolean) {
+    if (ready && !this.readyValue) this.epoch = {}
+    this.readyValue = ready
+  }
   lastFailure: WebGLContextFailure | null = null
   lastSuppressedError = null
   scopes = 0
@@ -599,7 +632,7 @@ describe('Engine HW2 模式接线', () => {
     f.engine.setScene(setupOf(a))
     expect(() => f.engine.setScene(setupOf(b))).not.toThrow()
     expect(f.engine.currentSceneBinding?.scene).toBe(b.scene)
-    expect(f.engine.lastSceneCleanupFailure?.cause).toBe(failure)
+    expect(readCleanupListenerCause(f.engine.lastSceneCleanupFailure?.cause)).toBe(failure)
     f.engine.dispose()
   })
 
@@ -615,7 +648,9 @@ describe('Engine HW2 模式接线', () => {
     expect(() => f.engine.setScene(setupOf(b))).not.toThrow()
     expect(f.engine.currentSceneBinding?.scene).toBe(b.scene)
     expect(f.devices[0]!.disposals).toBe(0)
-    expect(f.engine.lastSceneCleanupFailure?.cause).toBeInstanceOf(EngineOperationError)
+    expect(readCleanupListenerCause(f.engine.lastSceneCleanupFailure?.cause)).toBeInstanceOf(
+      EngineOperationError
+    )
     f.engine.dispose()
   })
 

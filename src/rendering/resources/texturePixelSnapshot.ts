@@ -1,4 +1,4 @@
-import type { TextureFormat, TextureStorageDescriptor } from '@/rendering/resources/Texture'
+import type { TextureFormat, TextureStorageDescriptor } from '@/rendering/resources/textureTypes'
 
 /** 当前 CPU pixel texture 支持的像素数组类型。 */
 export type TexturePixelArray = Uint8Array | Float32Array

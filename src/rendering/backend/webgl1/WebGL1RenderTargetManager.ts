@@ -1,4 +1,7 @@
+import type { RenderTarget } from '@/rendering/resources/RenderTarget'
+import type { TextureWriteView } from '@/rendering/resources/TextureWriteView'
 import {
+  CleanupFailureError,
   IncompleteFramebufferError,
   RenderTargetUnavailableError,
   UnsupportedRenderFeatureError,
@@ -6,449 +9,528 @@ import {
   WebGLContextLostError,
   WebGLResourceCreationError
 } from '@/rendering/core/errors'
-import { requireNonNull } from '@/rendering/core/requireNonNull'
+import type { WebGL1Capabilities } from './WebGL1Capabilities'
+import type { WebGL1TextureManager, WebGL1TextureResource } from './WebGL1TextureManager'
+import type {
+  WebGL1DepthBufferManager,
+  WebGL1DepthBufferResource
+} from './WebGL1DepthBufferManager'
 import {
-  RenderTarget,
-  type RenderTargetAttachmentRef,
-  type RenderTargetDescriptorSnapshot
-} from '@/rendering/resources/RenderTarget'
-import type { WebGL1Capabilities } from '@/rendering/backend/webgl1/WebGL1Capabilities'
-import {
-  assertTextureOperation,
-  requireTextureLimit,
-  withTextureUploadState,
-  type WebGL1TextureManagerHooks
-} from '@/rendering/backend/webgl1/WebGL1TextureUploadSupport'
+  WebGL1ResourceGeneration,
+  guardWebGL1ResourceContext,
+  preserveWebGLContextLoss,
+  type WebGL1StorageManagerHooks
+} from './WebGL1ResourceGeneration'
+import { assertTextureOperation, requireTextureLimit } from './WebGL1TextureUploadSupport'
+import { validateWebGL1TextureStorage } from './WebGL1TextureStorageSupport'
 
-/** 当前 context 的完整 FBO；深度明确是 renderbuffer，不能交给 sampler2D。 */
+export interface WebGL1FramebufferColor {
+  readonly view: TextureWriteView
+  readonly storage: WebGL1TextureResource
+}
+/** 当前同步操作借用的固定附件 FBO；没有采样、viewport 或生产完成语义。 */
 export interface WebGL1RenderTargetResource {
+  readonly target: RenderTarget
+  readonly generation: symbol
   readonly framebuffer: WebGLFramebuffer
-  readonly colorTextures: readonly WebGLTexture[]
-  readonly depthAttachment: WebGLRenderbuffer | null
+  readonly colors: readonly WebGL1FramebufferColor[]
+  readonly depth: WebGL1DepthBufferResource | null
   readonly width: number
   readonly height: number
   readonly revision: number
 }
-
 interface Entry {
-  readonly resource: WebGL1RenderTargetResource
-  readonly unsubscribe: () => void
+  readonly target: RenderTarget
+  readonly label: string
+  unsubscribe: () => void
+  closing: boolean
+  busy: boolean
+  current: Group | null
+  building: Group | null
+  readonly retired: Set<Group>
+}
+interface Group {
+  readonly entry: Entry
+  readonly revision: number
+  readonly width: number
+  readonly height: number
+  readonly colors: WebGL1FramebufferColor[]
+  depth: WebGL1DepthBufferResource | null
+  framebuffer: WebGLFramebuffer | null
+  record: WebGL1RenderTargetResource | null
+  phase: 'building' | 'current' | 'retiring'
+  busy: boolean
 }
 
 /**
- * 管理逻辑 RenderTarget 在单个 context 中的 GPU 表示，不执行 Pass。
- *
+ * 仅拥有 FBO；附件存储由两个独立 owner 唯一分配和删除。
  * @remarks
- * [DESIGN-WEIGHT:3][render-target-gpu-replacement]
- *
- * revision 不同：建立完整 replacement → 发布新 entry → 删除旧对象。
- * 失败仍向调用者抛错，不把旧尺寸对象作为新版本返回，也不修改 CPU revision。
- * 本类不会 resize canvas、设置 viewport 或自动重新生成目标中的画面。
- *
- * Owner 不得在 surface 作用域中 resize/release/dispose 该作用域仍借用的目标。
- * get() 的绑定检查只识别当前 FBO，不能识别嵌套作用域保存的其他 FBO。
- * 完整的活动 scope 生命周期约束由 Backend 与 SurfaceScope 落实。
+ * [DESIGN-WEIGHT:3][framebuffer-reverse-dependency-barrier]
+ * 反向索引以具体 GPU record 为键。building、current、retired 和失败回滚都保留边，
+ * 只有 FBO 删除成功或整个 generation 失效才拆边；不 retain/dispose CPU 附件。
  */
 export class WebGL1RenderTargetManager {
-  private readonly gl: WebGLRenderingContext
-  private readonly capabilities: Pick<
-    WebGL1Capabilities,
-    'drawBuffers' | 'textureFloat' | 'textureFloatLinear' | 'colorBufferFloat'
-  >
-  private readonly hooks: WebGL1TextureManagerHooks
-
   private readonly entries = new Map<RenderTarget, Entry>()
-  private disposed = false
-  private lost = false
+  private readonly textureUsers = new Map<WebGL1TextureResource, Set<Group>>()
+  private readonly depthUsers = new Map<WebGL1DepthBufferResource, Set<Group>>()
+  private closing = false
+  private disposing = false
 
   constructor(
-    gl: WebGLRenderingContext,
-    capabilities: Pick<
-      WebGL1Capabilities,
-      'drawBuffers' | 'textureFloat' | 'textureFloatLinear' | 'colorBufferFloat'
-    >,
-    hooks: WebGL1TextureManagerHooks
+    private readonly gl: WebGLRenderingContext,
+    private readonly capabilities: WebGL1Capabilities,
+    private readonly generation: WebGL1ResourceGeneration,
+    private readonly textures: WebGL1TextureManager,
+    private readonly depths: WebGL1DepthBufferManager,
+    private readonly hooks: WebGL1StorageManagerHooks
   ) {
-    this.gl = gl
-    this.capabilities = capabilities
-    this.hooks = hooks
+    this.gl = guardWebGL1ResourceContext(gl, generation)
   }
 
-  /** 返回与当前 CPU revision 一致的完整资源，不能返回半成品或旧尺寸兜底。 */
   get(target: RenderTarget): WebGL1RenderTargetResource {
-    this.assertReady()
+    this.assertAvailable()
     target.assertUsable()
-
-    const old = this.entries.get(target)
-    const revision = target.revision
-    if (old?.resource.revision === revision) return old.resource
-
-    /**
-     * @remarks
-     * [DESIGN-WEIGHT:2][render-target-diagnostic-label]
-     * 名称定位逻辑用途，revision 定位本次存储配置；二者仅用于诊断。
-     * entries 仍按 target 对象身份缓存，不能因同名而合并不同目标。
-     */
-    const label = target.label + ' (RenderTarget revision ' + revision + ')'
-    let next: WebGL1RenderTargetResource | undefined
-
-    try {
-      assertTextureOperation(this.gl, 'begin render target creation', label)
-
-      if (
-        old !== undefined &&
-        this.gl.getParameter(this.gl.FRAMEBUFFER_BINDING) === old.resource.framebuffer
-      ) {
-        throw new RenderTargetUnavailableError(
-          label,
-          'cannot rebuild the currently bound framebuffer; leave its surface scope first'
-        )
-      }
-
-      this.validate(target.descriptor)
-      next = this.create(target.descriptor, revision, label)
-      assertTextureOperation(this.gl, 'finish render target creation', label)
-
+    let entry = this.entries.get(target)
+    if (entry?.busy) throw this.unavailable(entry, 'target operation is already running')
+    if (entry?.closing) {
+      this.release(target)
+      this.assertAvailable()
       target.assertUsable()
-
-      const unsubscribe = old?.unsubscribe ?? target.onDispose(() => this.release(target))
-      this.entries.set(target, { resource: next, unsubscribe })
-    } catch (error: unknown) {
-      if (this.lost || this.gl.isContextLost()) {
-        this.invalidateForContextLoss()
-        throw new WebGLContextLostError('create render target')
+      entry = undefined
+    }
+    if (!entry) {
+      entry = {
+        target,
+        label: target.label,
+        unsubscribe: () => {},
+        closing: false,
+        busy: false,
+        current: null,
+        building: null,
+        retired: new Set()
       }
-      if (next !== undefined) this.deleteResource(next)
-      throw error
-    } finally {
-      this.hooks.invalidateState()
+      this.entries.set(target, entry)
+      entry.unsubscribe = target.onDispose(() => this.release(target))
     }
-
-    if (old !== undefined) this.deleteResource(old.resource)
-    this.hooks.invalidateState()
-    return next
-  }
-
-  /**
-   * 解析逻辑地址到当前 revision 的 GPU 附件；仅限 Backend 内部使用。
-   *
-   * @remarks
-   * [DESIGN-WEIGHT:3][render-target-attachment-borrowing]
-   * 先验证 ref，后调用 get，非法地址不能顺便分配 GPU 存储。
-   * color 返回 texture；depth 返回 renderbuffer，并不意味着它能被纹理采样。
-   */
-  resolveAttachment(ref: RenderTargetAttachmentRef): WebGLTexture | WebGLRenderbuffer {
-    this.assertReady()
-    const address = this.validateAttachment(ref)
-    const resource = this.get(address.target)
-    return address.kind === 'color'
-      ? resource.colorTextures[address.index]!
-      : resource.depthAttachment!
-  }
-
-  /**
-   * 为 sampler2D 借用当前颜色附件，不上传像素、不创建第二份纹理。
-   *
-   * @remarks
-   * [DESIGN-WEIGHT:3][render-target-attachment-borrowing]
-   *
-   * 先验证地址，再拒绝 depth16，最后才 get，避免分配不可采样的目标。
-   * ref 不保存 revision：resize 后相同槽位解析为新 handle，旧 handle 不可跨 draw 缓存。
-   * 本函数不验证读写反馈环；调用者须先由 SurfaceScope 检查当前输出目标。
-   * 新建存储不意味着旧内容已恢复，生产者需要重新绘制。
-   */
-  resolveSampledColor(ref: RenderTargetAttachmentRef): WebGLTexture {
-    this.assertReady()
-    const address = this.validateAttachment(ref)
-    if (address.kind === 'depth') {
-      throw new UnsupportedRenderFeatureError(
-        'sample depth attachment ' + address.target.label,
-        'depth16 is a renderbuffer, not a sampleable texture'
-      )
-    }
-    return this.get(address.target).colorTextures[address.index]!
-  }
-
-  /** 捕获并验证地址，不执行 GPU 分配；两个解析入口共享同一组边界判断。 */
-  private validateAttachment(ref: RenderTargetAttachmentRef): RenderTargetAttachmentRef {
-    if (ref === null || typeof ref !== 'object' || Array.isArray(ref)) {
-      throw new RenderTargetUnavailableError('attachment', 'invalid target reference')
-    }
-    const { target, kind, index } = ref
-    if (!(target instanceof RenderTarget)) {
-      throw new RenderTargetUnavailableError('attachment', 'invalid target reference')
-    }
-    target.assertUsable()
-
-    const descriptor = target.descriptor
-    if (
-      !Number.isSafeInteger(index) ||
-      index < 0 ||
-      (kind === 'color' && index >= descriptor.colors.length) ||
-      (kind === 'depth' && (index !== 0 || descriptor.depth === undefined)) ||
-      (kind !== 'color' && kind !== 'depth')
-    ) {
-      throw new RenderTargetUnavailableError(target.label, 'invalid kind or attachment index')
-    }
-    return { target, kind, index }
-  }
-
-  /**
-   * 检查本次布局实际需要的尺寸、MRT 和浮点能力；全部成功后才允许 create*。
-   *
-   * @remarks
-   * [DESIGN-WEIGHT:3][render-target-float-capability-gates]
-   *
-   * OES_texture_float 允许浮点纹理，WEBGL_color_buffer_float 允许浮点颜色输出，
-   * OES_texture_float_linear 则允许浮点线性过滤，三者不能互相替代。
-   * 只检查浮点槽位自己的 sampler：rgba8 的 linear 不构成浮点过滤需求。
-   * 不自动降格式、减少附件或改 sampler；实际 FBO 完整性仍由 create() 检查。
-   */
-  private validate(descriptor: RenderTargetDescriptorSnapshot): void {
-    const gl = this.gl
-    const maximum = requireTextureLimit(gl, gl.MAX_TEXTURE_SIZE, 'MAX_TEXTURE_SIZE')
-    const maximumDepth =
-      descriptor.depth === undefined
-        ? maximum
-        : requireTextureLimit(gl, gl.MAX_RENDERBUFFER_SIZE, 'MAX_RENDERBUFFER_SIZE')
-
-    if (
-      descriptor.width > Math.min(maximum, maximumDepth) ||
-      descriptor.height > Math.min(maximum, maximumDepth)
-    ) {
-      throw new UnsupportedRenderFeatureError('render target size', 'exceeds device limits')
-    }
-
-    if (descriptor.colors.length > 1) {
-      const extension = this.capabilities.drawBuffers
-      if (extension === null) {
-        throw new UnsupportedRenderFeatureError('MRT', 'WEBGL_draw_buffers is required')
-      }
-
-      const colors = requireTextureLimit(
-        gl,
-        extension.MAX_COLOR_ATTACHMENTS_WEBGL,
-        'MAX_COLOR_ATTACHMENTS_WEBGL'
-      )
-      const draws = requireTextureLimit(
-        gl,
-        extension.MAX_DRAW_BUFFERS_WEBGL,
-        'MAX_DRAW_BUFFERS_WEBGL'
-      )
-
-      if (descriptor.colors.length > Math.min(colors, draws)) {
-        throw new UnsupportedRenderFeatureError(
-          'MRT',
-          'color attachment count exceeds device limits'
-        )
-      }
-    }
-
-    for (const color of descriptor.colors) {
-      if (color.format !== 'rgba32f') continue
-
-      if (this.capabilities.textureFloat === null) {
-        throw new UnsupportedRenderFeatureError(
-          'rgba32f render target',
-          'OES_texture_float is required'
-        )
-      }
-      if (this.capabilities.colorBufferFloat === null) {
-        throw new UnsupportedRenderFeatureError(
-          'rgba32f render target',
-          'WEBGL_color_buffer_float is required'
-        )
-      }
-
-      const requiresLinear =
-        color.sampler.minFilter === 'linear' || color.sampler.magFilter === 'linear'
-      if (requiresLinear && this.capabilities.textureFloatLinear === null) {
-        throw new UnsupportedRenderFeatureError(
-          'rgba32f linear filtering',
-          'OES_texture_float_linear is required'
-        )
-      }
-    }
-  }
-
-  /**
-   * 私有构建事务：失败只清理本次新建对象，旧 cache entry 不在此函数可修改范围内。
-   *
-   * @remarks
-   * [DESIGN-WEIGHT:3][render-target-gpu-replacement]
-   * drawBuffers 状态属于具体 FBO；只在新 FBO 上设置，不改外层 FBO 的配置。
-   * 临时绑定结束恢复真实 framebuffer/renderbuffer；viewport 从始至终不修改。
-   */
-  private create(
-    descriptor: RenderTargetDescriptorSnapshot,
-    revision: number,
-    label: string
-  ): WebGL1RenderTargetResource {
-    const gl = this.gl
-    const previousFramebuffer = gl.getParameter(gl.FRAMEBUFFER_BINDING) as WebGLFramebuffer | null
-    const previousRenderbuffer = gl.getParameter(
-      gl.RENDERBUFFER_BINDING
-    ) as WebGLRenderbuffer | null
-
-    let framebuffer: WebGLFramebuffer | null = null
-    let depth: WebGLRenderbuffer | null = null
-    const colors: WebGLTexture[] = []
-    const { width, height } = descriptor
-
+    entry.busy = true
     try {
-      return withTextureUploadState(gl, gl.TEXTURE_2D, () => {
-        framebuffer = requireNonNull(
-          gl.createFramebuffer(),
-          () => new WebGLResourceCreationError('framebuffer', label)
-        )
-        gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer)
-
-        for (let index = 0; index < descriptor.colors.length; index++) {
-          const texture = requireNonNull(
-            gl.createTexture(),
-            () => new WebGLResourceCreationError('color-texture', label + ' color ' + index)
-          )
-          colors.push(texture)
-          gl.bindTexture(gl.TEXTURE_2D, texture)
-
-          /**
-           * @remarks
-           * [DESIGN-WEIGHT:3][render-target-float-capability-gates]
-           *
-           * WebGL1 的两种颜色存储都使用 RGBA internalformat/format，
-           * 通过 type 区分 uint8 与 float32；不能传入 WebGL2 的 RGBA32F。
-           * null 表示分配无 CPU 像素源的存储，不代表已生成可消费的画面。
-           */
-          const color = descriptor.colors[index]!
-          const type = color.format === 'rgba32f' ? gl.FLOAT : gl.UNSIGNED_BYTE
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, type, null)
-
-          // 使用经过验证的原始过滤请求，不偷偷替调用者降级为 nearest。
-          const sampler = color.sampler
-          gl.texParameteri(
-            gl.TEXTURE_2D,
-            gl.TEXTURE_MIN_FILTER,
-            sampler.minFilter === 'nearest' ? gl.NEAREST : gl.LINEAR
-          )
-          gl.texParameteri(
-            gl.TEXTURE_2D,
-            gl.TEXTURE_MAG_FILTER,
-            sampler.magFilter === 'nearest' ? gl.NEAREST : gl.LINEAR
-          )
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-
-          gl.framebufferTexture2D(
-            gl.FRAMEBUFFER,
-            gl.COLOR_ATTACHMENT0 + index,
-            gl.TEXTURE_2D,
-            texture,
-            0
-          )
-
-          assertTextureOperation(gl, 'allocate color attachment ' + index, label)
-        }
-
-        if (descriptor.depth !== undefined) {
-          depth = requireNonNull(
-            gl.createRenderbuffer(),
-            () => new WebGLResourceCreationError('depth-renderbuffer', label)
-          )
-          gl.bindRenderbuffer(gl.RENDERBUFFER, depth)
-          gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, width, height)
-          gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth)
-        }
-
-        if (this.capabilities.drawBuffers !== null) {
-          this.capabilities.drawBuffers.drawBuffersWEBGL(
-            colors.map((_texture, index) => gl.COLOR_ATTACHMENT0 + index)
-          )
-        }
-
-        assertTextureOperation(gl, 'configure framebuffer attachments', label)
-        const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER)
-        assertTextureOperation(gl, 'check framebuffer completeness', label)
-
-        if (status !== gl.FRAMEBUFFER_COMPLETE) throw new IncompleteFramebufferError(status, label)
-
-        return Object.freeze({
-          framebuffer,
-          colorTextures: Object.freeze(colors),
-          depthAttachment: depth,
+      this.drain(entry)
+      if (entry.current?.revision === target.revision) {
+        this.assertGroup(entry.current)
+        return entry.current.record!
+      }
+      const old = entry.current
+      if (old && this.gl.getParameter(this.gl.FRAMEBUFFER_BINDING) === old.framebuffer)
+        throw this.unavailable(entry, 'cannot rebuild a bound framebuffer')
+      const revision = target.revision,
+        attachments = target.attachments
+      const width = target.width,
+        height = target.height
+      this.preflight(attachments.colors, attachments.depth, entry.label)
+      this.assertEntry(entry, revision)
+      const group: Group = {
+        entry,
+        revision,
+        width,
+        height,
+        colors: [],
+        depth: null,
+        framebuffer: null,
+        record: null,
+        phase: 'building',
+        busy: true
+      }
+      entry.building = group
+      try {
+        this.withBindings(entry.label, () => {
+          for (const view of attachments.colors) {
+            this.assertBuilding(group)
+            const storage = this.textures.get(view.texture)
+            // 此处与下一次可重入调用之间必须先登记边，包含尚无 FBO handle 的组。
+            group.colors.push(Object.freeze({ view, storage }))
+            this.addUser(this.textureUsers, storage, group)
+            this.assertBuilding(group)
+          }
+          if (attachments.depth) {
+            group.depth = this.depths.get(attachments.depth)
+            this.addUser(this.depthUsers, group.depth, group)
+            this.assertBuilding(group)
+          }
+          group.framebuffer = this.gl.createFramebuffer()
+          this.generation.assertCurrent('create framebuffer')
+          assertTextureOperation(this.gl, 'create framebuffer', entry.label)
+          if (group.framebuffer === null)
+            throw new WebGLResourceCreationError('framebuffer', entry.label)
+          this.assertBuilding(group)
+          this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, group.framebuffer)
+          assertTextureOperation(this.gl, 'bind framebuffer', entry.label)
+          this.assertBuilding(group)
+          const faces = [
+            'positive-x',
+            'negative-x',
+            'positive-y',
+            'negative-y',
+            'positive-z',
+            'negative-z'
+          ]
+          for (let i = 0; i < group.colors.length; i++) {
+            const { view, storage } = group.colors[i]!
+            this.gl.framebufferTexture2D(
+              this.gl.FRAMEBUFFER,
+              this.gl.COLOR_ATTACHMENT0 + i,
+              view.kind === '2d'
+                ? this.gl.TEXTURE_2D
+                : this.gl.TEXTURE_CUBE_MAP_POSITIVE_X + faces.indexOf(view.face),
+              storage.handle,
+              view.mipLevel
+            )
+            assertTextureOperation(this.gl, 'attach color', entry.label)
+            this.assertBuilding(group)
+          }
+          if (group.depth) {
+            this.gl.framebufferRenderbuffer(
+              this.gl.FRAMEBUFFER,
+              this.gl.DEPTH_ATTACHMENT,
+              this.gl.RENDERBUFFER,
+              group.depth.handle
+            )
+            assertTextureOperation(this.gl, 'attach depth', entry.label)
+            this.assertBuilding(group)
+          }
+          if (group.colors.length > 1) {
+            this.generation.assertCurrent('draw buffers')
+            this.capabilities.drawBuffers!.drawBuffersWEBGL(
+              group.colors.map((_, i) => this.gl.COLOR_ATTACHMENT0 + i)
+            )
+            this.generation.assertCurrent('draw buffers')
+            assertTextureOperation(this.gl, 'configure draw buffers', entry.label)
+            this.assertBuilding(group)
+          }
+          const status = this.gl.checkFramebufferStatus(this.gl.FRAMEBUFFER)
+          assertTextureOperation(this.gl, 'check framebuffer', entry.label)
+          this.assertBuilding(group)
+          if (status !== this.gl.FRAMEBUFFER_COMPLETE)
+            throw new IncompleteFramebufferError(
+              status,
+              `${entry.label} (RenderTarget revision ${group.revision})`
+            )
+        })
+        this.assertBuilding(group)
+        group.record = Object.freeze({
+          target,
+          generation: this.generation.token,
+          framebuffer: group.framebuffer!,
+          colors: Object.freeze([...group.colors]),
+          depth: group.depth,
           width,
           height,
           revision
         })
-      })
-    } catch (error: unknown) {
-      if (!gl.isContextLost()) {
-        if (framebuffer !== null) gl.deleteFramebuffer(framebuffer)
-        for (const texture of colors) gl.deleteTexture(texture)
-        if (depth !== null) gl.deleteRenderbuffer(depth)
+        group.phase = 'current'
+        group.busy = false
+        entry.building = null
+        entry.current = group
+        if (old) this.retire(old)
+      } catch (cause) {
+        group.busy = false
+        this.retire(group)
+        entry.building = null
+        if (this.abandonIfLost()) throw preserveWebGLContextLoss(cause, 'build framebuffer')
+        try {
+          this.cleanup(group)
+        } catch (cleanup) {
+          throw new AggregateError([cause, cleanup], 'Framebuffer creation and rollback failed')
+        }
+        if (this.generation.lost) throw preserveWebGLContextLoss(cause, 'rollback framebuffer')
+        throw cause
       }
-      throw error
+      // 已发布的新组不能因旧组清理失败而进入候选回滚。
+      this.drain(entry)
+      this.assertGroup(group)
+      return group.record
     } finally {
-      if (!gl.isContextLost()) {
-        gl.bindFramebuffer(gl.FRAMEBUFFER, previousFramebuffer)
-        gl.bindRenderbuffer(gl.RENDERBUFFER, previousRenderbuffer)
-      }
+      entry.busy = false
+      this.dropEmpty(entry)
+      this.hooks.invalidateState()
     }
   }
 
-  /** 只删除 owned GPU 对象。调用前已将对应 entry 从 Map 移除或替换。 */
-  private deleteResource(resource: WebGL1RenderTargetResource): void {
-    this.gl.deleteFramebuffer(resource.framebuffer)
-    for (const texture of resource.colorTextures) this.gl.deleteTexture(texture)
-    if (resource.depthAttachment !== null) this.gl.deleteRenderbuffer(resource.depthAttachment)
+  assertRecordUsable(record: WebGL1RenderTargetResource): void {
+    this.assertAvailable()
+    const entry = this.entries.get(record.target),
+      group = entry?.current
+    if (!entry || entry.busy || group?.record !== record)
+      throw new RenderTargetUnavailableError(
+        record.target.label,
+        'foreign or unavailable framebuffer record'
+      )
+    this.assertGroup(group)
   }
 
-  /** CPU 已 disposed 时仍可 release；不通过 descriptor getter 读取被清空的数据。 */
+  /** target 的 GPU release 不释放其借用的 CPU/GPU 存储。 */
   release(target: RenderTarget): void {
-    if (this.lost || this.gl.isContextLost()) {
-      this.invalidateForContextLoss()
-      return
-    }
-
+    if (this.abandonIfLost()) return
     const entry = this.entries.get(target)
-    if (entry === undefined) return
-
-    this.entries.delete(target)
-    entry.unsubscribe()
-    this.deleteResource(entry.resource)
-    this.hooks.invalidateState()
+    if (!entry) return
+    entry.closing = true
+    if (entry.current) this.retire(entry.current)
+    if (entry.building) this.retire(entry.building)
+    if (entry.busy) throw this.busyFailure(entry.label)
+    entry.busy = true
+    try {
+      this.drain(entry)
+    } finally {
+      entry.busy = false
+      this.dropEmpty(entry)
+      this.hooks.invalidateState()
+    }
   }
 
-  /** Lost 清 cache、退订，但不 delete；旧 Manager 不会随 context 恢复自动复活。 */
+  /** 允许 retiring/历史 own record；正常返回才允许其 owner 删除 storage。 */
+  releaseTexture(record: WebGL1TextureResource): void {
+    if (this.abandonIfLost()) return
+    this.textures.assertRecordOwned(record)
+    this.releaseUsers(this.textureUsers.get(record))
+  }
+  releaseDepthBuffer(record: WebGL1DepthBufferResource): void {
+    if (this.abandonIfLost()) return
+    this.depths.assertRecordOwned(record)
+    this.releaseUsers(this.depthUsers.get(record))
+  }
+
   invalidateForContextLoss(): void {
-    this.lost = true
-    for (const entry of this.entries.values()) entry.unsubscribe()
+    this.generation.invalidate()
+    for (const entry of this.entries.values()) {
+      entry.unsubscribe()
+      const groups = [...entry.retired, entry.current, entry.building]
+      for (const group of groups)
+        if (group) {
+          group.framebuffer = null
+          group.phase = 'retiring'
+        }
+    }
     this.entries.clear()
+    this.textureUsers.clear()
+    this.depthUsers.clear()
     this.hooks.invalidateState()
   }
-
-  /** 先退订全部 CPU 通知，再清理 owned GPU 对象；不释放逻辑 RenderTarget。 */
   dispose(): void {
-    if (this.disposed) return
-    this.disposed = true
-
-    const entries = [...this.entries.values()]
-    this.entries.clear()
-    for (const entry of entries) entry.unsubscribe()
-
-    if (this.lost || this.gl.isContextLost()) {
-      this.invalidateForContextLoss()
-      return
+    this.closing = true
+    if (this.abandonIfLost()) return
+    if (this.disposing) throw this.busyFailure('dispose')
+    this.disposing = true
+    try {
+      for (const target of [...this.entries.keys()]) this.release(target)
+    } finally {
+      this.disposing = false
     }
-
-    for (const entry of entries) this.deleteResource(entry.resource)
-    this.hooks.invalidateState()
   }
 
-  private assertReady(): void {
-    if (this.disposed) throw new WebGLBackendDisposedError('get render target')
-    if (this.lost || this.gl.isContextLost()) {
-      this.invalidateForContextLoss()
-      throw new WebGLContextLostError('get render target')
+  private preflight(
+    views: readonly TextureWriteView[],
+    depth: RenderTarget['attachments']['depth'],
+    label: string
+  ): void {
+    const gl = this.gl,
+      caps = this.capabilities
+    assertTextureOperation(gl, 'begin framebuffer allocation', label)
+    if (views.length > 1) {
+      if (!caps.drawBuffers)
+        throw new UnsupportedRenderFeatureError('MRT', 'WEBGL_draw_buffers is required')
+      const max = Math.min(
+        requireTextureLimit(
+          gl,
+          caps.drawBuffers.MAX_COLOR_ATTACHMENTS_WEBGL,
+          'MAX_COLOR_ATTACHMENTS_WEBGL'
+        ),
+        requireTextureLimit(gl, caps.drawBuffers.MAX_DRAW_BUFFERS_WEBGL, 'MAX_DRAW_BUFFERS_WEBGL')
+      )
+      if (views.length > max)
+        throw new UnsupportedRenderFeatureError('MRT', 'attachment count exceeds device limit')
     }
+    for (const view of views) {
+      if (view.mipLevel !== 0 && !caps.fboRenderMipmap)
+        throw new UnsupportedRenderFeatureError(
+          'framebuffer mip',
+          'OES_fbo_render_mipmap is required'
+        )
+      const descriptor = view.texture.descriptor
+      if (descriptor.storage.type === 'float32' && !caps.colorBufferFloat)
+        throw new UnsupportedRenderFeatureError(
+          'float framebuffer',
+          'WEBGL_color_buffer_float is required'
+        )
+      validateWebGL1TextureStorage(
+        gl,
+        caps,
+        descriptor,
+        view.texture.defaultSampler,
+        null,
+        label,
+        () => null
+      )
+    }
+    if (depth) {
+      const maximum = requireTextureLimit(gl, gl.MAX_RENDERBUFFER_SIZE, 'MAX_RENDERBUFFER_SIZE')
+      if (depth.width > maximum || depth.height > maximum)
+        throw new UnsupportedRenderFeatureError(
+          'depth framebuffer',
+          'dimensions exceed MAX_RENDERBUFFER_SIZE'
+        )
+    }
+    assertTextureOperation(gl, 'validate framebuffer', label)
+  }
+
+  private withBindings(label: string, action: () => void): void {
+    const gl = this.gl
+    const framebuffer = gl.getParameter(gl.FRAMEBUFFER_BINDING) as WebGLFramebuffer | null
+    assertTextureOperation(gl, 'capture framebuffer binding', label)
+    const renderbuffer = gl.getParameter(gl.RENDERBUFFER_BINDING) as WebGLRenderbuffer | null
+    assertTextureOperation(gl, 'capture renderbuffer binding', label)
+    const failures: unknown[] = []
+    try {
+      action()
+    } catch (cause) {
+      failures.push(cause)
+    }
+    const restorations = [
+      () => gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer),
+      () => gl.bindRenderbuffer(gl.RENDERBUFFER, renderbuffer)
+    ]
+    for (const restore of restorations)
+      if (!this.generation.lost) {
+        try {
+          restore()
+          assertTextureOperation(gl, 'restore framebuffer bindings', label)
+        } catch (cause) {
+          failures.push(cause)
+        }
+      }
+    if (this.generation.lost && !failures.some((c) => c instanceof WebGLContextLostError))
+      failures.push(new WebGLContextLostError('restore framebuffer bindings'))
+    if (failures.length === 1) throw failures[0]
+    if (failures.length > 1)
+      throw new AggregateError(failures, 'Framebuffer allocation or binding restoration failed')
+  }
+
+  private assertAvailable(): void {
+    if (this.closing) throw new WebGLBackendDisposedError('get framebuffer')
+    if (this.abandonIfLost()) throw new WebGLContextLostError('get framebuffer')
+    this.hooks.assertAvailable()
+  }
+  private assertEntry(entry: Entry, revision: number): void {
+    this.assertAvailable()
+    entry.target.assertUsable()
+    if (
+      entry.closing ||
+      this.entries.get(entry.target) !== entry ||
+      entry.target.revision !== revision
+    )
+      throw this.unavailable(entry, 'target released or attachments changed')
+  }
+  private assertStorage(group: Group): void {
+    for (const color of group.colors) this.textures.assertRecordUsable(color.storage)
+    if (group.depth) this.depths.assertRecordUsable(group.depth)
+  }
+  private assertBuilding(group: Group): void {
+    this.assertEntry(group.entry, group.revision)
+    this.assertStorage(group)
+    this.assertEntry(group.entry, group.revision)
+    if (group.phase !== 'building' || group.entry.building !== group)
+      throw this.unavailable(group.entry, 'framebuffer candidate was retired')
+  }
+  private assertGroup(group: Group): void {
+    this.assertEntry(group.entry, group.revision)
+    this.assertStorage(group)
+    this.assertEntry(group.entry, group.revision)
+    if (group.phase !== 'current' || group.entry.current !== group || group.busy)
+      throw this.unavailable(group.entry, 'framebuffer was retired')
+  }
+  private addUser<T>(index: Map<T, Set<Group>>, record: T, group: Group): void {
+    let users = index.get(record)
+    if (!users) {
+      users = new Set()
+      index.set(record, users)
+    }
+    users.add(group)
+  }
+  private removeUser<T>(index: Map<T, Set<Group>>, record: T, group: Group): void {
+    const users = index.get(record)
+    users?.delete(group)
+    if (users?.size === 0) index.delete(record)
+  }
+  private retire(group: Group): void {
+    group.phase = 'retiring'
+    if (group.entry.current === group) group.entry.current = null
+    group.entry.retired.add(group)
+  }
+  private releaseUsers(users: Set<Group> | undefined): void {
+    const groups = [...(users ?? [])]
+    for (const group of groups) this.retire(group)
+    try {
+      for (const group of groups) this.cleanup(group)
+    } finally {
+      this.hooks.invalidateState()
+    }
+  }
+  private drain(entry: Entry): void {
+    for (const group of [...entry.retired]) this.cleanup(group)
+  }
+  private cleanup(group: Group): void {
+    if (this.abandonIfLost()) return
+    if (group.busy) throw this.busyFailure(group.entry.label)
+    group.busy = true
+    try {
+      if (group.framebuffer !== null) {
+        try {
+          assertTextureOperation(this.gl, 'begin delete framebuffer', group.entry.label)
+          this.gl.deleteFramebuffer(group.framebuffer)
+          assertTextureOperation(this.gl, 'delete framebuffer', group.entry.label)
+        } catch (cause) {
+          const lost = this.abandonIfLost()
+          if (lost && cause instanceof WebGLContextLostError) return
+          throw new CleanupFailureError(group.entry.label, [
+            {
+              phase: 'gpu-delete',
+              label: 'framebuffer cleanup',
+              cause: lost ? preserveWebGLContextLoss(cause, 'delete framebuffer') : cause
+            }
+          ])
+        }
+        group.framebuffer = null
+      }
+      for (const color of group.colors) this.removeUser(this.textureUsers, color.storage, group)
+      if (group.depth) this.removeUser(this.depthUsers, group.depth, group)
+      const entry = group.entry
+      entry.retired.delete(group)
+      if (entry.current === group) entry.current = null
+      if (entry.building === group) entry.building = null
+      this.dropEmpty(entry)
+    } finally {
+      group.busy = false
+    }
+  }
+  private dropEmpty(entry: Entry): void {
+    if (!entry.busy && !entry.current && !entry.building && entry.retired.size === 0) {
+      entry.unsubscribe()
+      if (this.entries.get(entry.target) === entry) this.entries.delete(entry.target)
+    }
+  }
+  private abandonIfLost(): boolean {
+    if (!this.generation.lost) return false
+    this.invalidateForContextLoss()
+    return true
+  }
+  private busyFailure(label: string): CleanupFailureError {
+    return new CleanupFailureError(label, [
+      {
+        phase: 'gpu-dependency',
+        label: 'framebuffer cleanup completion',
+        cause: new Error('Framebuffer operation is still running')
+      }
+    ])
+  }
+  private unavailable(entry: Entry, reason: string): RenderTargetUnavailableError {
+    return new RenderTargetUnavailableError(entry.label, reason)
   }
 }

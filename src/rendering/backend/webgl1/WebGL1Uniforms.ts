@@ -1,3 +1,4 @@
+import type { WebGL1Capabilities } from './WebGL1Capabilities'
 import { mat3, mat4 } from 'gl-matrix'
 import { assertNever } from '@/errors/helper/helpers'
 import {
@@ -10,10 +11,14 @@ import type { DrawSubmission } from '@/rendering/backend/RenderBackend'
 import type { MaterialParameter } from '@/rendering/resources/Material'
 import type { ParameterBlock } from '@/rendering/resources/ParameterBlock'
 import type { Texture2DSamplingSource } from '@/rendering/resources/Texture2DSamplingSource'
-import type { CubeTexture } from '@/rendering/resources/CubeTexture'
+import {
+  resolveTextureSamplingSource,
+  type CubeTextureSamplingSource
+} from '@/rendering/resources/textureSamplingSource'
+import type { TextureSamplingBinding } from '@/rendering/resources/TextureSamplingBinding'
 import type { BuiltInUniformSemantic } from '@/rendering/resources/ShaderModule'
 import type { WebGL1ProgramResource } from './WebGL1ProgramManager'
-import type { WebGL1CubeTextureResource } from './WebGL1CubeTextureManager'
+import type { WebGL1TextureResource } from './WebGL1TextureManager'
 
 /** 一条已经验证输入、尚未执行的同步上传命令；只能在本次 draw 内使用。 */
 export type PreparedUniformUpload = () => void
@@ -70,7 +75,10 @@ function copyFloat32(values: readonly number[], length: number, field: string): 
 export class WebGL1Uniforms {
   private readonly gl: WebGLRenderingContext
   private readonly maxTextureUnits: number
-  private readonly resolveCube: (texture: CubeTexture) => WebGL1CubeTextureResource
+  private readonly resolveCube: (
+    texture: CubeTextureSamplingSource,
+    uniformName: string
+  ) => Pick<WebGL1TextureResource, 'handle' | 'target'>
 
   /** 由 Backend 分流 CPU 纹理与附件地址；结果只在本次 draw 内借用。 */
   private readonly resolve2D: (source: Texture2DSamplingSource, uniformName: string) => WebGLTexture
@@ -85,10 +93,34 @@ export class WebGL1Uniforms {
   constructor(
     gl: WebGLRenderingContext,
     maxTextureUnits: number,
-    resolveCube: (texture: CubeTexture) => WebGL1CubeTextureResource,
-    resolve2D: (source: Texture2DSamplingSource, uniformName: string) => WebGLTexture
+    resolveCube: (
+      texture: CubeTextureSamplingSource,
+      uniformName: string
+    ) => Pick<WebGL1TextureResource, 'handle' | 'target'>,
+    resolve2D: (source: Texture2DSamplingSource, uniformName: string) => WebGLTexture,
+    private readonly preflightSamples?: (
+      requests: readonly { name: string; binding: TextureSamplingBinding }[]
+    ) => void,
+    assertCurrent: () => void = () => {},
+    private readonly stageLimits?: Pick<
+      WebGL1Capabilities,
+      'maxVertexTextureUnits' | 'maxCombinedTextureUnits'
+    >
   ) {
-    this.gl = gl
+    // A lost event may arrive synchronously inside any GL call. Check the captured
+    // generation both before and after each call, not only around the upload batch.
+    this.gl = new Proxy(gl, {
+      get(target, key) {
+        const value: unknown = Reflect.get(target, key, target)
+        if (typeof value !== 'function') return value
+        return (...args: unknown[]): unknown => {
+          if (key !== 'isContextLost') assertCurrent()
+          const result: unknown = Reflect.apply(value, target, args)
+          if (key !== 'isContextLost') assertCurrent()
+          return result
+        }
+      }
+    })
     this.maxTextureUnits = maxTextureUnits
     this.resolveCube = resolveCube
     this.resolve2D = resolve2D
@@ -125,27 +157,42 @@ export class WebGL1Uniforms {
       builtIns.set(name, semantic as BuiltInUniformSemantic)
     }
 
-    /**
-     * [DESIGN-WEIGHT:3][uniform-sampler-unit-allocation]
-     * 两种 sampler 共用 fragment 单元预算；先统计，再调用任何纹理 resolver。
-     * 每个 active uniform 分配独立单元，即使两个参数借用同一个来源也不合并。
-     * 本批不提供 sampler 数组或通用 vertex texture 的能力协商。
-     */
-    const samplerCount = layout.filter(
-      (entry) => entry.type === this.gl.SAMPLER_2D || entry.type === this.gl.SAMPLER_CUBE
-    ).length
-
-    if (samplerCount > this.maxTextureUnits) {
-      throw new UnsupportedRenderFeatureError(
-        'texture units',
-        'active sampler uniforms exceed the fragment texture-unit limit'
-      )
+    // Count active stage references, before any sampled storage resolver.
+    // A shared-stage sampler consumes both stage budgets and two combined entries.
+    let vertexCount = 0
+    let fragmentCount = 0
+    for (const entry of layout) {
+      const sampler = entry.type === this.gl.SAMPLER_2D || entry.type === this.gl.SAMPLER_CUBE
+      const declared = Object.hasOwn(shader.textureUsage, entry.name)
+        ? shader.textureUsage[entry.name]
+        : undefined
+      if (!sampler) {
+        if (declared !== undefined)
+          throw new InvalidMaterialError(entry.name, 'textureUsage names an active non-sampler')
+        continue
+      }
+      const stage = declared ?? 'fragment'
+      if (stage !== 'fragment') vertexCount++
+      if (stage !== 'vertex') fragmentCount++
+    }
+    const vertexLimit = this.stageLimits?.maxVertexTextureUnits ?? 0
+    const combinedLimit = this.stageLimits?.maxCombinedTextureUnits ?? this.maxTextureUnits
+    for (const [stage, count, limit] of [
+      ['vertex', vertexCount, vertexLimit],
+      ['fragment', fragmentCount, this.maxTextureUnits],
+      ['combined', vertexCount + fragmentCount, combinedLimit]
+    ] as const) {
+      if (count > limit)
+        throw new UnsupportedRenderFeatureError(
+          'texture units',
+          'active samplers exceed the ' + stage + ' texture-unit limit'
+        )
     }
 
     // 游标属于一次 prepare，不能跨 draw 延续；uniform1i 接收下标而非 TEXTURE0 枚举。
     let nextTextureUnit = 0
 
-    const uploads = layout.map((entry): PreparedUniformUpload => {
+    const values = layout.map((entry) => {
       const semantic = builtIns.get(entry.name)
 
       const parameter =
@@ -161,9 +208,41 @@ export class WebGL1Uniforms {
         throw new InvalidMaterialError(entry.name, 'parameter type does not match active uniform')
       }
 
+      if (parameter.type !== 'cubeTexture' && parameter.type !== 'texture2D')
+        this.numericUpload(entry.location, entry.name, parameter)
+      return { entry, parameter }
+    })
+    const requests = values.flatMap(({ entry, parameter }) =>
+      parameter.type === 'cubeTexture' || parameter.type === 'texture2D'
+        ? [
+            {
+              name: entry.name,
+              binding: resolveTextureSamplingSource(
+                parameter.value,
+                parameter.type === 'cubeTexture' ? 'cube' : '2d',
+                entry.name
+              )
+            }
+          ]
+        : []
+    )
+    const samplers = new Map<object, string>()
+    for (const { name, binding } of requests) {
+      const key = [
+        binding.sampler.wrapS,
+        binding.sampler.wrapT,
+        binding.sampler.minFilter,
+        binding.sampler.magFilter
+      ].join('/')
+      if (samplers.has(binding.texture) && samplers.get(binding.texture) !== key)
+        throw new InvalidMaterialError(name, 'conflicting samplers for the same texture')
+      samplers.set(binding.texture, key)
+    }
+    this.preflightSamples?.(requests)
+    const uploads = values.map(({ entry, parameter }): PreparedUniformUpload => {
       if (parameter.type === 'cubeTexture') {
         const unit = nextTextureUnit++
-        const resource = this.resolveCube(parameter.value)
+        const resource = this.resolveCube(parameter.value, entry.name)
 
         return () => {
           this.gl.activeTexture(this.gl.TEXTURE0 + unit)

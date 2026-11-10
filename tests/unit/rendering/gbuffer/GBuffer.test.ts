@@ -1,9 +1,11 @@
+import { replaceTestGBufferStorage } from '../../../helpers/replaceTestGBufferStorage'
 import { describe, expect, it, onTestFinished } from 'vitest'
 import type { DrawSubmission } from '@/rendering/backend/RenderBackend'
 import type { RenderSurfaceScopeDescriptor } from '@/rendering/backend/RenderSurface'
 import { Resource } from '@/rendering/core/Resource'
 import {
   InvalidGBufferError,
+  CleanupFailureError,
   ResourceDisposedError,
   ResourceHasSceneReferencesError,
   RenderTargetUnavailableError
@@ -128,18 +130,18 @@ describe('GBuffer producer resources', () => {
    * 改错槽位、格式或 nearest 会破坏后续数值采样，此处不测试常量的文本。
    */
   it('语义地址指向四个 rgba32f nearest 槽位，并保留 depth16', () => {
-    const target = createGBufferTarget(8, 5, 'test/layout')
-    onTestFinished(() => target.dispose())
-    expect(target.label).toBe('test/layout')
-    expect(target.descriptor).toEqual({
-      width: 8,
-      height: 5,
-      colors: Array.from({ length: 4 }, () => ({
-        format: 'rgba32f',
-        sampler: { minFilter: 'nearest', magFilter: 'nearest' }
-      })),
-      depth: { format: 'depth16' }
-    })
+    const owner = createGBufferTarget(8, 5, 'test/layout')
+    const target = owner.target
+    onTestFinished(() => owner.dispose())
+    expect(owner.label).toBe('test/layout')
+    expect([target.width, target.height]).toEqual([8, 5])
+    expect(new Set(target.attachments.colors.map((view) => view.texture)).size).toBe(4)
+    expect(target.attachments.colors).toHaveLength(4)
+    for (const { texture } of target.attachments.colors) {
+      expect(texture.descriptor.storage).toEqual({ format: 'rgba', type: 'float32' })
+      expect(texture.defaultSampler).toMatchObject({ minFilter: 'nearest', magFilter: 'nearest' })
+    }
+    expect(target.attachments.depth?.format).toBe('depth16')
     expect([
       target.getColorAttachment(GBufferSlot.baseColorLinear).index,
       target.getColorAttachment(GBufferSlot.viewDepth).index,
@@ -167,8 +169,8 @@ describe('GBuffer producer resources', () => {
       b.dispose()
     })
     a.resize(3, 2)
-    expect(b.descriptor.width).toBe(2)
-    expect(b.revision).toBe(0)
+    expect(b.target.width).toBe(2)
+    expect(b.target.revision).toBe(0)
   })
 
   /** Given 专用工厂；Then 矩阵由 Backend 提供，颜色纹理由 Material 借用。 */
@@ -243,12 +245,12 @@ describe('GBufferPass ordering and lifetime', () => {
     )
     const oldParameters = f.material.getParameterEntries()
     f.backend.beforeScope = () => {
-      expect(f.pass.target.descriptor.width).toBe(4)
-      expect(f.pass.target.descriptor.height).toBe(3)
+      expect(f.pass.target.width).toBe(4)
+      expect(f.pass.target.height).toBe(3)
     }
     f.backend.beforeDraw = () => {
-      expect(f.pass.target.descriptor.width).toBe(4)
-      expect(f.pass.target.descriptor.height).toBe(3)
+      expect(f.pass.target.width).toBe(4)
+      expect(f.pass.target.height).toBe(3)
       expect(() => f.pass.getOutput(context)).toThrow(RenderTargetUnavailableError)
     }
     f.backend.afterScope = () => {
@@ -403,8 +405,8 @@ describe('GBufferPass ordering and lifetime', () => {
     expect(() => f.pass.getOutput(context)).toThrow(RenderTargetUnavailableError)
     f.pass.execute(context)
     expect(() => f.pass.getOutput({ ...context })).toThrow(RenderTargetUnavailableError)
-    f.pass.target.resize(8, 3)
-    f.pass.target.resize(4, 3)
+    replaceTestGBufferStorage(f.pass.target, 8, 3)
+    replaceTestGBufferStorage(f.pass.target, 4, 3)
     expect(() => f.pass.getOutput(context)).toThrow(RenderTargetUnavailableError)
   })
 
@@ -428,7 +430,7 @@ describe('GBufferPass ordering and lifetime', () => {
     const f = fixture()
     const context = f.context()
     f.backend.afterScope = () => {
-      f.pass.target.resize(5, 3)
+      replaceTestGBufferStorage(f.pass.target, 5, 3)
     }
     expect(() => f.pass.execute(context)).toThrow(RenderTargetUnavailableError)
     expect(() => f.pass.getOutput(context)).toThrow(RenderTargetUnavailableError)
@@ -467,11 +469,44 @@ describe('GBufferPass ordering and lifetime', () => {
     const target = f.pass.target
     target.retainSceneReference()
     try {
-      expect(() => f.pass.dispose()).toThrow(ResourceHasSceneReferencesError)
+      const attachments = target.attachments
+      try {
+        f.pass.dispose()
+        throw new Error('Expected target reference to block cleanup')
+      } catch (error) {
+        expect(error).toBeInstanceOf(CleanupFailureError)
+        if (!(error instanceof CleanupFailureError)) throw error
+        expect(error.failures[0]?.cause).toBeInstanceOf(ResourceHasSceneReferencesError)
+      }
+      expect(attachments.colors.every(({ texture }) => !texture.disposed)).toBe(true)
+      expect(attachments.depth?.disposed).toBe(false)
       expect(() => f.pass.execute(f.context())).toThrow(ResourceDisposedError)
     } finally {
       target.releaseSceneReference()
     }
     expect(() => f.pass.dispose()).not.toThrow()
   })
+})
+
+it('C5 rejects GBuffer output after a full recovery between reads', () => {
+  const f = fixture()
+  const context = f.context()
+  f.pass.execute(context)
+  expect(f.pass.getOutput(context).target).toBe(f.pass.target)
+  f.backend.ready = false
+  f.backend.ready = true
+  expect(() => f.pass.getOutput(context)).toThrow(RenderTargetUnavailableError)
+  const next = f.context()
+  f.pass.execute(next)
+  expect(f.pass.getOutput(next).target).toBe(f.pass.target)
+})
+it('C5 rejects GBuffer publication if the backend changes epoch during scope exit', () => {
+  const f = fixture()
+  const context = f.context()
+  f.backend.afterScope = () => {
+    f.backend.ready = false
+    f.backend.ready = true
+  }
+  expect(() => f.pass.execute(context)).toThrow(RenderTargetUnavailableError)
+  expect(() => f.pass.getOutput(context)).toThrow(RenderTargetUnavailableError)
 })

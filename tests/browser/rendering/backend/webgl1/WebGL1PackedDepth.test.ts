@@ -6,7 +6,7 @@ import type { Mat4Tuple } from '@/rendering/core/math/tuples'
 import { requireNonNull } from '@/rendering/core/requireNonNull'
 import { Geometry } from '@/rendering/resources/Geometry'
 import { Material, type RenderStateInput } from '@/rendering/resources/Material'
-import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
 import { ShaderModule } from '@/rendering/resources/ShaderModule'
 import { VertexAttribute } from '@/rendering/resources/VertexAttribute'
 import { setShadowBias } from '@/rendering/shadows/setShadowBias'
@@ -64,16 +64,20 @@ function fixture() {
     })
   )
   const target = own(
-    new RenderTarget(
-      {
-        width: 1,
-        height: 1,
-        colors: [{ format: 'rgba8', sampler: { minFilter: 'nearest', magFilter: 'nearest' } }],
-        depth: { format: 'depth16' }
-      },
-      { label: 'test/packed-depth/shadow-map' }
-    )
-  )
+    new RenderTargetBundle({
+      width: 1,
+      height: 1,
+      label: 'test/packed-depth/shadow-map',
+      colors: [
+        {
+          storage: { format: 'rgba', type: 'uint8' },
+          colorSpace: 'data',
+          defaultSampler: { minFilter: 'nearest', magFilter: 'nearest' }
+        }
+      ],
+      depth: true
+    })
+  ).target
 
   /** 每个 shader 使用相同 built-in 语义；不把 modelMatrix 写进共享 Material 参数。 */
   function material(

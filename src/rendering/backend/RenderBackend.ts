@@ -1,3 +1,4 @@
+import type { RenderTexture } from '@/rendering/resources/RenderTexture'
 import type { RenderItem } from '@/rendering/frame/RenderItem'
 import type { ViewState } from '@/rendering/frame/ViewState'
 import type { RenderSurfaceScopeDescriptor } from './RenderSurface'
@@ -6,6 +7,8 @@ import type { RenderSurfaceScopeDescriptor } from './RenderSurface'
 export interface DrawSubmission {
   readonly item: RenderItem
   readonly view: ViewState
+  /** 指定标签后，Backend 检查提交前后的设备命令错误。 */
+  readonly errorLabel?: string
 }
 
 /**
@@ -18,6 +21,12 @@ export interface DrawSubmission {
 export interface RenderBackend {
   /** 设备已就绪、未 lost 且未 disposed 时才为 true。 */
   readonly ready: boolean
+
+  /** Opaque storage generation identity; null while unavailable. Not proof of produced pixels. */
+  readonly resourceEpoch: object | null
+
+  /** 显式生成完整 mip 链；调用者负责 base 内容，无活动 SurfaceScope 时才可调用。 */
+  generateMipmaps(texture: RenderTexture): void
 
   /** 调整默认 drawing buffer，不修改离屏目标；不能在活动 scope 中调用。 */
   resizeDrawingBuffer(cssWidth: number, cssHeight: number, pixelRatio: number): void

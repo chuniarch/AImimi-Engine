@@ -347,3 +347,60 @@ describe('Scene resource retention', () => {
     expect(resource.cpuDisposeCount).toBe(1)
   })
 })
+
+describe('Scene retained references versus pending cleanup', () => {
+  /** 防止失败后用第二次 releaseSceneReference 重试，导致计数下溢。 */
+  it('活动 Scene 保留失败清理，重试不再次减少引用且仍可 retain', () => {
+    const scene = new Scene()
+    const resource = scene.retain(new TestResource())
+    let attempts = 0
+    resource.onDispose(() => {
+      if (++attempts === 1) throw new Error('GPU')
+    })
+    expect(() => scene.release(resource)).toThrow()
+    expect(resource.sceneReferenceCount).toBe(0)
+    expect(scene.cleanupState).toBe('not-started')
+    scene.retryPendingCleanup()
+    expect(resource.sceneReferenceCount).toBe(0)
+    expect(resource.cleanupState).toBe('complete')
+    scene.retain(new TestResource())
+    scene.dispose()
+  })
+
+  /** 独立 B 仍须交还，共享资源在另一个 Scene 的引用不能被重复减少。 */
+  it('dispose 聚合失败并继续其他资源，后续只推进未完成项', () => {
+    const scene = new Scene()
+    const other = new Scene()
+    const first = scene.retain(new TestResource())
+    const second = scene.retain(new TestResource())
+    const shared = scene.retain(other.retain(new TestResource()))
+    let attempts = 0
+    first.onDispose(() => {
+      if (++attempts === 1) throw new Error('first')
+    })
+    expect(() => scene.dispose()).toThrow()
+    expect(scene.cleanupState).toBe('failed')
+    expect(second.cpuDisposeCount).toBe(1)
+    expect(shared.sceneReferenceCount).toBe(1)
+    scene.dispose()
+    expect(scene.cleanupState).toBe('complete')
+    expect(shared.sceneReferenceCount).toBe(1)
+    expect(second.cpuDisposeCount).toBe(1)
+    other.dispose()
+  })
+
+  /** 回调中的整场景重入不得把还在 running 的 Resource 误标完成。 */
+  it('引用交还期间拒绝整轮重入且不关闭活动 Scene', () => {
+    const scene = new Scene()
+    const resource = scene.retain(new TestResource())
+    resource.onDispose(() => {
+      expect(() => scene.dispose()).toThrow()
+      expect(() => scene.retryPendingCleanup()).toThrow()
+      expect(scene.cleanupState).toBe('not-started')
+      expect(scene.release(resource)).toBe(false)
+    })
+    scene.release(resource)
+    scene.dispose()
+    expect(scene.cleanupState).toBe('complete')
+  })
+})

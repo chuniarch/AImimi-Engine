@@ -1,4 +1,5 @@
 import {
+  CleanupFailureError,
   InvalidGBufferError,
   ResourceDisposedError,
   RenderTargetUnavailableError
@@ -14,9 +15,10 @@ import {
   assertGBufferShaderModule
 } from '@/rendering/gbuffer/createGBufferMaterial'
 import { Geometry } from '@/rendering/resources/Geometry'
-import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import type { RenderTarget } from '@/rendering/resources/RenderTarget'
+import type { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
 import type { ShaderModule } from '@/rendering/resources/ShaderModule'
-import { Texture2D } from '@/rendering/resources/Texture2D'
+import { resolveTextureSamplingSource } from '@/rendering/resources/textureSamplingSource'
 import { VertexAttributeSemantic } from '@/rendering/resources/VertexAttributeSemantic'
 import type { RenderPass } from './RenderPass'
 import type { RenderPassContext } from './RenderPassContext'
@@ -38,13 +40,16 @@ export interface GBufferPassOptions {
  */
 export class GBufferPass implements RenderPass {
   public readonly name: string = 'GBufferPass'
-  private readonly targetValue: RenderTarget
+  private readonly owner: RenderTargetBundle
   private readonly shaderModule: ShaderModule
   private executing = false
   private closing = false
   private disposed = false
+  /** 同步清理重入不能被解释成已完成。 */
+  private cleaning = false
   private completed: {
     readonly context: RenderPassContext
+    readonly epoch: object
     readonly output: GBufferOutput
   } | null = null
 
@@ -52,7 +57,7 @@ export class GBufferPass implements RenderPass {
   constructor(options: GBufferPassOptions) {
     assertGBufferShaderModule(options.shaderModule)
     this.shaderModule = options.shaderModule
-    this.targetValue = createGBufferTarget(1, 1, options.label)
+    this.owner = createGBufferTarget(1, 1, options.label)
   }
 
   /**
@@ -62,6 +67,10 @@ export class GBufferPass implements RenderPass {
   get target(): RenderTarget {
     this.assertUsable()
     return this.targetValue
+  }
+
+  private get targetValue(): RenderTarget {
+    return this.owner.target
   }
 
   /** Pass 生命周期检查；目标和 shader 另有各自 Resource 检查。 */
@@ -79,7 +88,8 @@ export class GBufferPass implements RenderPass {
    */
   private assertItem(item: RenderItem): void {
     const source = requireGBufferBaseColorSource(item.material, this.shaderModule)
-    if (!(source instanceof Texture2D) && source.target === this.targetValue) {
+    const binding = resolveTextureSamplingSource(source, '2d', 'material.uBaseColorMap')
+    if (this.targetValue.attachments.colors.some((view) => view.texture === binding.texture)) {
       throw new InvalidGBufferError('material.uBaseColorMap', 'cannot sample this Pass output')
     }
     if (!(item.geometry instanceof Geometry)) {
@@ -108,15 +118,20 @@ export class GBufferPass implements RenderPass {
     this.executing = true
     try {
       assertGBufferShaderModule(this.shaderModule)
-      if (!context.backend.ready) {
+      const epoch = context.backend.resourceEpoch
+      if (!context.backend.ready || epoch === null) {
         throw new RenderTargetUnavailableError(this.targetValue.label, 'backend is not ready')
       }
       for (const item of context.renderList.opaque) this.assertItem(item)
-      this.targetValue.resize(context.frame.drawingBufferWidth, context.frame.drawingBufferHeight)
-      const revision = this.targetValue.revision
+      this.owner.resize(context.frame.drawingBufferWidth, context.frame.drawingBufferHeight)
+      const target = this.targetValue
+      const revision = target.revision
+      if (context.backend.resourceEpoch !== epoch) {
+        throw new RenderTargetUnavailableError(target.label, 'device changed before production')
+      }
       context.backend.withRenderSurface(
         {
-          surface: { kind: 'render-target', target: this.targetValue },
+          surface: { kind: 'render-target', target },
           clear: { color: [0, 0, 0, 0], depth: 1 }
         },
         () => {
@@ -128,7 +143,11 @@ export class GBufferPass implements RenderPass {
       )
       // 这是同步命令提交完成，不是等待 GPU 实际执行完毕。
       this.targetValue.assertUsable()
-      if (!context.backend.ready || this.targetValue.revision !== revision) {
+      if (
+        !context.backend.ready ||
+        context.backend.resourceEpoch !== epoch ||
+        target.revision !== revision
+      ) {
         throw new RenderTargetUnavailableError(
           this.targetValue.label,
           'output changed during production'
@@ -142,7 +161,7 @@ export class GBufferPass implements RenderPass {
         normalView: this.targetValue.getColorAttachment(GBufferSlot.normalView),
         positionView: this.targetValue.getColorAttachment(GBufferSlot.positionView)
       })
-      this.completed = { context, output }
+      this.completed = { context, epoch, output }
     } finally {
       this.executing = false
     }
@@ -154,7 +173,7 @@ export class GBufferPass implements RenderPass {
    * @remarks
    * [DESIGN-WEIGHT:3][gbuffer-producer-before-consumer]
    * 同 frameNumber 的另一 context 也不能消费，resize 后必须重画。
-   * ready 不是 generation token；恢复后仍须新 context + execute，
+   * epoch 变化后仍须新 context + execute，
    * 不允许保存旧 context 在恢复后单独重放 Lighting。
    *
    * @throws RenderTargetUnavailableError 未生产、正在生产、设备失效或结果过期。
@@ -162,8 +181,13 @@ export class GBufferPass implements RenderPass {
    */
   getOutput(context: RenderPassContext): GBufferOutput {
     this.assertUsable()
-    this.targetValue.assertUsable()
-    if (!context.backend.ready) this.completed = null
+    void this.targetValue.attachments
+    const epoch = context.backend.resourceEpoch
+    if (
+      this.completed?.context === context &&
+      (!context.backend.ready || epoch === null || this.completed.epoch !== epoch)
+    )
+      this.completed = null
     const completed = this.completed
     if (
       this.executing ||
@@ -184,14 +208,31 @@ export class GBufferPass implements RenderPass {
    * @remarks
    * [DESIGN-WEIGHT:2][gbuffer-borrowed-scene-resources]
    * 首次清理即停止接收新帧。target.dispose 失败时允许显式重试，
-   * 不吞错，不在 scope 活动时清理。沿用 Resource 已有的底层清理语义。
+   * 不吞错，不在 scope 活动时清理。只有 bundle.cleanupState=complete 才结束 Pass。
+   * [DESIGN-WEIGHT:3][cleanup-reentry]
    */
   dispose(): void {
     if (this.disposed) return
-    if (this.executing) throw new InvalidGBufferError('dispose', 'cannot dispose during execute')
+    if (this.executing || this.cleaning) {
+      throw new InvalidGBufferError('dispose', 'operation in progress')
+    }
     this.closing = true
     this.completed = null
-    this.targetValue.dispose()
-    this.disposed = true
+    this.cleaning = true
+    try {
+      this.owner.dispose()
+      if (this.owner.cleanupState !== 'complete') {
+        throw new CleanupFailureError(this.name, [
+          {
+            phase: 'owner-child',
+            label: 'target bundle',
+            cause: new Error('Target cleanup is still ' + this.owner.cleanupState)
+          }
+        ])
+      }
+      this.disposed = true
+    } finally {
+      this.cleaning = false
+    }
   }
 }

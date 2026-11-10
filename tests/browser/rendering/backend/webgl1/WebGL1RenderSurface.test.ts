@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest'
 import { WebGL1State } from '@/rendering/backend/webgl1/WebGL1State'
 import { WebGL1SurfaceScope } from '@/rendering/backend/webgl1/WebGL1SurfaceScope'
 import { requireNonNull } from '@/rendering/core/requireNonNull'
-import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
+import { WebGL1ResourceManager } from '@/rendering/backend/webgl1/WebGL1ResourceManager'
+import { detectWebGL1Capabilities } from '@/rendering/backend/webgl1/WebGL1Capabilities'
 
 /**
  * 真实 WebGL1 设备测试，仅验证 scope 与 clear，不冒充 Backend 的三角形 draw 验收。
@@ -25,36 +27,18 @@ function fixture() {
     () => new Error('Browser test requires WebGL1')
   )
 
-  const framebuffer = requireNonNull(
-    gl.createFramebuffer(),
-    () => new Error('Test framebuffer allocation failed')
-  )
-
-  const texture = requireNonNull(
-    gl.createTexture(),
-    () => new Error('Test texture allocation failed')
-  )
-
-  gl.bindTexture(gl.TEXTURE_2D, texture)
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 8, 8, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-
-  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer)
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0)
-
-  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
-    gl.deleteFramebuffer(framebuffer)
-    gl.deleteTexture(texture)
-    throw new Error('Test framebuffer is incomplete')
-  }
-
-  const target = new RenderTarget(
-    { width: 8, height: 8, colors: [{ format: 'rgba8' }] },
-    { label: 'test/browser-surface' }
-  )
+  const owner = new RenderTargetBundle({
+    width: 8,
+    height: 8,
+    label: 'test/browser-surface',
+    colors: [{ storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'data' }]
+  })
+  const target = owner.target
+  const resources = new WebGL1ResourceManager(gl, detectWebGL1Capabilities(gl), {
+    invalidateState: () => {}
+  })
+  const record = resources.renderTargets.get(target)
+  const framebuffer = record.framebuffer
 
   const scope = new WebGL1SurfaceScope(gl, new WebGL1State(gl), {
     assertReady: () => {
@@ -65,8 +49,9 @@ function fixture() {
 
     resolveTarget: (requested) => {
       if (requested !== target) throw new Error('Unknown test target')
-      return { framebuffer, width: 8, height: 8 }
-    }
+      return record
+    },
+    assertTargetUsable: (value) => resources.renderTargets.assertRecordUsable(value)
   })
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, null)
@@ -85,9 +70,8 @@ function fixture() {
 
     dispose(): void {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null)
-      gl.deleteFramebuffer(framebuffer)
-      gl.deleteTexture(texture)
-      target.dispose()
+      owner.dispose()
+      resources.dispose()
     }
   }
 }

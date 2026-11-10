@@ -1,5 +1,7 @@
+import { assertTextureOperation } from './WebGL1TextureUploadSupport'
 import { assertNever } from '@/errors/helper/helpers'
 import {
+  CleanupFailureError,
   ResourceDisposedError,
   UnsupportedIndexTypeError,
   WebGLBackendDisposedError,
@@ -54,6 +56,11 @@ export interface WebGL1GeometryManagerHooks {
 interface GeometryEntry {
   readonly resource: WebGL1GeometryResource
   readonly unsubscribe: () => void
+  /** 停止借用与清理完成分开；失败后仍保留该记录。 */
+  closing: boolean
+  dependencyReleased: boolean
+  readonly buffers: readonly WebGLBuffer[]
+  nextBufferIndex: number
 }
 
 /**
@@ -111,6 +118,8 @@ export class WebGL1GeometryManager {
     }
 
     const cached = this.entries.get(geometry)
+    if (cached?.closing)
+      throw new WebGLOperationError('get resource', 'Geometry', 'cleanup is pending')
     if (cached !== undefined) return cached.resource
 
     // 先做 CPU 预检；Uint32 无法降级时，一个 GPU buffer 都不创建。
@@ -182,8 +191,16 @@ export class WebGL1GeometryManager {
         primitiveMode: mode
       })
 
-      const unsubscribe = geometry.onDispose(() => this.release(geometry))
-      this.entries.set(geometry, { resource, unsubscribe })
+      const unsubscribe = geometry.onDispose(() => this.releaseFromResource(geometry))
+
+      this.entries.set(geometry, {
+        resource,
+        unsubscribe,
+        closing: false,
+        dependencyReleased: false,
+        buffers: Object.freeze([...owned]),
+        nextBufferIndex: 0
+      })
 
       return resource
     } catch (error) {
@@ -201,7 +218,7 @@ export class WebGL1GeometryManager {
   }
 
   /**
-   * 先解除所有关联顶点输入记录，再取消订阅并删除 buffers。
+   * 先解除关联顶点输入记录，再逐个删除 buffers；全部成功后才取消订阅。
    *
    * @remarks
    * [DESIGN-WEIGHT:3][webgl-before-delete-order]
@@ -209,41 +226,91 @@ export class WebGL1GeometryManager {
    * beforeDelete 抛错时不越过屏障；保留 entry 供显式重试。
    * 同步重入同一 release 安全返回，避免同一 buffer 被重复删除。
    */
+
   release(geometry: Geometry): void {
     const entry = this.entries.get(geometry)
-
     if (entry === undefined || this.releasing.has(geometry)) return
-
     if (this.gl.isContextLost() || this.lostValue) {
       this.invalidateForContextLoss()
       return
     }
-
     this.releasing.add(geometry)
-
+    entry.closing = true
     try {
-      this.hooks.beforeDelete?.(geometry)
+      if (!entry.dependencyReleased) {
+        if (
+          !this.cleanupStep('gpu-dependency', 'vertex input', () => {
+            this.hooks.beforeDelete?.(geometry)
+          })
+        )
+          return
 
-      if (this.gl.isContextLost() || this.lostValue) {
-        this.invalidateForContextLoss()
-        return
+        entry.dependencyReleased = true
       }
 
+      while (entry.nextBufferIndex < entry.buffers.length) {
+        const index = entry.nextBufferIndex
+        if (
+          !this.cleanupStep('gpu-delete', 'buffer ' + index, () => {
+            this.gl.deleteBuffer(entry.buffers[index]!)
+          })
+        )
+          return
+        entry.nextBufferIndex += 1
+      }
+
+      // 完成之前保留订阅：直接 release 中重入 Resource.dispose 也能观察到任务。
       entry.unsubscribe()
       this.entries.delete(geometry)
-
-      for (const attribute of entry.resource.attributes.values()) {
-        this.gl.deleteBuffer(attribute.buffer)
-      }
-
-      if (entry.resource.indexBuffer !== null) {
-        this.gl.deleteBuffer(entry.resource.indexBuffer)
-      }
-
-      this.hooks.invalidateState()
     } finally {
       this.releasing.delete(geometry)
+      this.hooks.invalidateState()
     }
+  }
+
+  /** release 的 no-op 不等于完成；Resource 捕获任务必须确认剩余记录为空。 */
+  private releaseFromResource(geometry: Geometry): void {
+    this.release(geometry)
+    if (this.lostValue || this.gl.isContextLost()) {
+      this.invalidateForContextLoss()
+      return
+    }
+    if (this.releasing.has(geometry) || this.entries.has(geometry)) {
+      throw new CleanupFailureError('Geometry', [
+        {
+          phase: 'gpu-dependency',
+          label: 'cleanup completion',
+          cause: new Error('GPU cleanup is still pending or running')
+        }
+      ])
+    }
+  }
+
+  /**
+   * 冷路径清理步骤：成功返回后才能推进进度，lost 则放弃旧代责任。
+   * [DESIGN-WEIGHT:3][cleanup-dependency-barrier]
+   */
+  private cleanupStep(
+    phase: 'gpu-dependency' | 'gpu-delete',
+    label: string,
+    action: () => void
+  ): boolean {
+    if (this.lostValue || this.gl.isContextLost()) {
+      this.invalidateForContextLoss()
+      return false
+    }
+    try {
+      assertTextureOperation(this.gl, 'begin cleanup ' + label, 'Geometry')
+      action()
+      assertTextureOperation(this.gl, 'cleanup ' + label, 'Geometry')
+    } catch (cause) {
+      if (this.lostValue || this.gl.isContextLost()) {
+        this.invalidateForContextLoss()
+        return false
+      }
+      throw new CleanupFailureError('Geometry', [{ phase, label, cause }])
+    }
+    return true
   }
 
   /** lost 只丢弃本 context 的记录与订阅，不删除 GPU，也不修改 CPU Geometry。 */
@@ -257,21 +324,27 @@ export class WebGL1GeometryManager {
   }
 
   /**
-   * 先关闭正常服务，再取消全部订阅并释放 GPU 资源。
+   * 先关闭正常服务，逐项完成 GPU 清理后再取消相应订阅。
    *
    * @remarks
    * 依赖清理失败后仍然保持关闭状态，但可再次调用以重试剩余条目。
    * disposing 只阻止本次调用栈内的递归，不阻止后续显式重试。
    */
   dispose(): void {
-    if (this.disposing) return
+    if (this.disposing || this.releasing.size > 0) {
+      throw new CleanupFailureError('WebGL1GeometryManager', [
+        {
+          phase: 'gpu-dependency',
+          label: 'dispose',
+          cause: new Error('A cleanup operation is still running')
+        }
+      ])
+    }
 
     this.disposedValue = true
     this.disposing = true
 
     try {
-      for (const entry of this.entries.values()) entry.unsubscribe()
-
       for (const geometry of [...this.entries.keys()]) this.release(geometry)
     } finally {
       this.disposing = false

@@ -1,3 +1,4 @@
+import type { WebGL1ResourceGeneration } from './WebGL1ResourceGeneration'
 import { UnsupportedRenderFeatureError, WebGLContextLostError } from '@/rendering/core/errors'
 import { WebGLOperationError } from '@/rendering/core/errors/WebGLOperationError'
 
@@ -46,49 +47,99 @@ export function requireTextureLimit(
 }
 
 /**
- * 在当前 texture unit 上建立同步上传作用域，结束后恢复真实旧状态。
+ * 在当前 texture unit 上传，结束后尽力恢复真实状态。
  *
  * @remarks
  * [DESIGN-WEIGHT:3][texture-upload-state-scope]
+ * 不切换到硬编码 TEXTURE0；alignment=1 支持紧密 RGB，禁止隐式翻转、预乘和转换。
+ * callback 必须同步且不得切换 active unit 或修改另一种 texture target 的绑定。
+ * ImageBitmap 的解码方向/预乘仍由创建者负责。
  *
- * 不切换到硬编码的 TEXTURE0；只改当前 unit 的指定 target 绑定。
- * alignment=1 支持宽度为 3 的紧密 RGB 数据；不能继承外部 alignment=4/8。
- * 固定不翻转、不预乘、不执行隐式浏览器颜色转换。
- * ImageBitmap 的方向和预乘还要求创建者提供正确的解码选项，不能靠 pixelStore 补救。
- * lost 后旧绑定全部无效，不尝试恢复。
+ * [DESIGN-WEIGHT:3][webgl-manager-context-ownership]
+ * 每条命令前后检查共享 generation；即使物理 context 已恢复也不恢复旧代绑定。
+ * 只 invalidate CPU State 缓存不能恢复 GL，调用方仍须在 finally invalidateState。
  *
- * @internal callback 必须同步，不得切换 active unit 或修改其他 target 的绑定。
+ * [DESIGN-WEIGHT:3][texture-upload-state-recovery]
+ * active unit 确认恢复后才绑定该 unit 的旧 texture；四项 unpack 独立恢复。
+ * 恢复失败不会吞掉业务异常；throw undefined 也计入失败。
+ * 失败必须中止本次生产，不能把未完整恢复描述为成功。
  */
 export function withTextureUploadState<T>(
   gl: WebGLRenderingContext,
   target: number,
+  generation: WebGL1ResourceGeneration,
   callback: () => T
 ): T {
-  const activeUnit = gl.getParameter(gl.ACTIVE_TEXTURE) as number
-  const bindingParameter =
-    target === gl.TEXTURE_CUBE_MAP ? gl.TEXTURE_BINDING_CUBE_MAP : gl.TEXTURE_BINDING_2D
-  const texture = gl.getParameter(bindingParameter) as WebGLTexture | null
-  const alignment = gl.getParameter(gl.UNPACK_ALIGNMENT) as number
-  const flip = gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL) as boolean
-  const premultiply = gl.getParameter(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL) as boolean
-  const conversion = gl.getParameter(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL) as number
-
-  if (gl.isContextLost()) throw new WebGLContextLostError('capture texture upload state')
-
-  try {
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
-    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
-    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE)
-    return callback()
-  } finally {
-    if (!gl.isContextLost()) {
-      gl.activeTexture(activeUnit)
-      gl.bindTexture(target, texture)
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, alignment)
-      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, flip)
-      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, premultiply)
-      gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, conversion)
+  /** 检查 GL error 与永久代次状态，不能由物理 ready 替代 generation。 */
+  function operation<V>(name: string, action: () => V): V {
+    generation.assertCurrent(name)
+    try {
+      const result = action()
+      generation.assertCurrent(name)
+      assertTextureOperation(gl, name, 'texture upload state')
+      generation.assertCurrent(name)
+      return result
+    } catch (cause) {
+      // JS 异常可能使正常返回后的检查不可达，仍要锁存观察到的物理 lost。
+      if (generation.lost) generation.invalidate()
+      throw cause
     }
   }
+  function read<V>(parameter: number): V {
+    return operation('capture texture upload state', () => gl.getParameter(parameter) as V)
+  }
+  const activeUnit = read<number>(gl.ACTIVE_TEXTURE)
+  const bindingParameter =
+    target === gl.TEXTURE_CUBE_MAP ? gl.TEXTURE_BINDING_CUBE_MAP : gl.TEXTURE_BINDING_2D
+  const texture = read<WebGLTexture | null>(bindingParameter)
+  const alignment = read<number>(gl.UNPACK_ALIGNMENT)
+  const flip = read<boolean>(gl.UNPACK_FLIP_Y_WEBGL)
+  const premultiply = read<boolean>(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL)
+  const conversion = read<number>(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL)
+  const failures: unknown[] = []
+  let result!: T
+  try {
+    operation('set upload alignment', () => gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1))
+    operation('set upload flip', () => gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false))
+    operation('set upload premultiply', () =>
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
+    )
+    operation('set upload color conversion', () =>
+      gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE)
+    )
+    result = operation('run texture upload', callback)
+  } catch (cause) {
+    failures.push(cause)
+  }
+
+  /** lost 后不继续发 GL；此前存在业务错误时将 lost 原因一同保存。 */
+  function restore(name: string, action: () => void): boolean {
+    if (generation.lost) {
+      if (!failures.some((cause) => cause instanceof WebGLContextLostError))
+        failures.push(new WebGLContextLostError(name))
+      return false
+    }
+    try {
+      operation(name, action)
+      return true
+    } catch (cause) {
+      failures.push(cause)
+      return false
+    }
+  }
+  if (restore('restore active texture unit', () => gl.activeTexture(activeUnit)))
+    restore('restore texture binding', () => gl.bindTexture(target, texture))
+  restore('restore upload alignment', () => gl.pixelStorei(gl.UNPACK_ALIGNMENT, alignment))
+  restore('restore upload flip', () => gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, flip))
+  restore('restore upload premultiply', () =>
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, premultiply)
+  )
+  restore('restore upload color conversion', () =>
+    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, conversion)
+  )
+
+  if (failures.length === 1) throw failures[0]
+  if (failures.length > 1)
+    throw new AggregateError(failures, 'Texture upload or state restoration failed')
+  return result
 }

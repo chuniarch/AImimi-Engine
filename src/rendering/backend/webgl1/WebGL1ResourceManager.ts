@@ -1,7 +1,12 @@
-import { WebGLBackendDisposedError, WebGLContextLostError } from '@/rendering/core/errors'
+import { WebGL1ResourceGeneration } from './WebGL1ResourceGeneration'
+import {
+  CleanupFailureError,
+  WebGLBackendDisposedError,
+  WebGLContextLostError
+} from '@/rendering/core/errors'
 import type { WebGL1Capabilities } from './WebGL1Capabilities'
-import { WebGL1Texture2DManager } from './WebGL1Texture2DManager'
-import { WebGL1CubeTextureManager } from './WebGL1CubeTextureManager'
+import { WebGL1TextureManager } from './WebGL1TextureManager'
+import { WebGL1DepthBufferManager } from './WebGL1DepthBufferManager'
 import { WebGL1GeometryManager } from './WebGL1GeometryManager'
 import { WebGL1ProgramManager } from './WebGL1ProgramManager'
 import { WebGL1RenderTargetManager } from './WebGL1RenderTargetManager'
@@ -42,12 +47,12 @@ interface ManagedLifecycle {
  * Getter 不是 JavaScript 引用撤销机制，无法收回已经交给调用者的对象。
  */
 export class WebGL1ResourceManager {
-  private readonly gl: WebGLRenderingContext
+  private readonly generation: WebGL1ResourceGeneration
 
   private readonly programsValue: WebGL1ProgramManager
   private readonly geometriesValue: WebGL1GeometryManager
-  private readonly textures2DValue: WebGL1Texture2DManager
-  private readonly cubeTexturesValue: WebGL1CubeTextureManager
+  private readonly texturesValue: WebGL1TextureManager
+  private readonly depthBuffersValue: WebGL1DepthBufferManager
   private readonly renderTargetsValue: WebGL1RenderTargetManager
   private readonly vertexInputsValue: WebGL1VertexInputManager
   private readonly disposalOrder: readonly ManagedLifecycle[]
@@ -78,7 +83,7 @@ export class WebGL1ResourceManager {
   ) {
     if (gl.isContextLost()) throw new WebGLContextLostError('create resource manager')
 
-    this.gl = gl
+    this.generation = new WebGL1ResourceGeneration(gl)
 
     this.vertexInputsValue = createWebGL1VertexInputManager(gl, capabilities, hooks)
 
@@ -104,22 +109,46 @@ export class WebGL1ResourceManager {
       }
     })
 
-    this.textures2DValue = new WebGL1Texture2DManager(gl, capabilities, hooks)
-    this.cubeTexturesValue = new WebGL1CubeTextureManager(gl, capabilities, hooks)
-    this.renderTargetsValue = new WebGL1RenderTargetManager(gl, capabilities, hooks)
+    this.texturesValue = new WebGL1TextureManager(gl, capabilities, this.generation, {
+      invalidateState: hooks.invalidateState,
+      assertAvailable: () => this.assertAvailable(),
+      beforeDelete: (record) => {
+        this.renderTargetsValue.releaseTexture(record)
+      }
+    })
+    this.depthBuffersValue = new WebGL1DepthBufferManager(gl, this.generation, {
+      invalidateState: hooks.invalidateState,
+      assertAvailable: () => this.assertAvailable(),
+      beforeDelete: (record) => {
+        this.renderTargetsValue.releaseDepthBuffer(record)
+      }
+    })
+    this.renderTargetsValue = new WebGL1RenderTargetManager(
+      gl,
+      capabilities,
+      this.generation,
+      this.texturesValue,
+      this.depthBuffersValue,
+      { invalidateState: hooks.invalidateState, assertAvailable: () => this.assertAvailable() }
+    )
 
     // 先结束借用方，再结束被借用的 GPU 资源所有者。
     this.disposalOrder = Object.freeze([
       this.vertexInputsValue,
       this.renderTargetsValue,
-      this.textures2DValue,
-      this.cubeTexturesValue,
+      this.texturesValue,
+      this.depthBuffersValue,
       this.geometriesValue,
       this.programsValue
     ])
   }
 
   /** 借用 program Manager；关闭或 lost 后拒绝从协调器开始新工作。 */
+  /** Shared storage guard includes loss observed without a DOM event. */
+  get available(): boolean {
+    return !this.closing && !this.lost && !this.generation.lost
+  }
+
   get programs(): WebGL1ProgramManager {
     this.assertAvailable()
     return this.programsValue
@@ -131,19 +160,16 @@ export class WebGL1ResourceManager {
     return this.geometriesValue
   }
 
-  /**
-   * 借用静态 CPU 二维纹理的 GPU Manager，不取得 CPU 来源的生命周期。
-   * RenderTarget 附件由 renderTargets 拥有，不能交给本 Manager 重复上传。
-   */
-  get textures2D(): WebGL1Texture2DManager {
+  /** 借用当前代唯一 TextureResource owner；删除前先结束所有 FBO 借用。 */
+  get textures(): WebGL1TextureManager {
     this.assertAvailable()
-    return this.textures2DValue
+    return this.texturesValue
   }
 
-  /** 借用 cubemap Manager，与二维纹理共用当前 generation 的生命周期。 */
-  get cubeTextures(): WebGL1CubeTextureManager {
+  /** 借用当前代唯一 depth16 RBO owner；与纹理/FBO 共享失效守卫。 */
+  get depthBuffers(): WebGL1DepthBufferManager {
     this.assertAvailable()
-    return this.cubeTexturesValue
+    return this.depthBuffersValue
   }
 
   /** 借用 RenderTarget Manager；surface 作用域的捕获/恢复仍属于 Backend。 */
@@ -169,6 +195,7 @@ export class WebGL1ResourceManager {
    * 不在这里恢复 context，也不重新上传 CPU 数据或重跑烘焙 Pipeline。
    */
   invalidateForContextLoss(): void {
+    this.generation.invalidate()
     if (this.lost) return
 
     this.lost = true
@@ -184,7 +211,7 @@ export class WebGL1ResourceManager {
    * @remarks
    * [DESIGN-WEIGHT:3][webgl-resource-manager-disposal]
    *
-   * vertexInputs → renderTargets → textures2D → cubeTextures → geometries → programs。
+   * vertexInputs → renderTargets → textures → depthBuffers → geometries → programs。
    *
    * 某一步抛错：立即向调用者传播，停在该步，不删除后续依赖资源。
    * 下一次显式 dispose 从该步重试，已完成的步骤不重复执行。
@@ -192,17 +219,26 @@ export class WebGL1ResourceManager {
    *
    * closing 在首次调用时即置 true，即使清理失败也不能恢复绘制。
    * 调用者必须处理异常并决定重试或报告失败；本方法不吞错、不自动循环重试。
-   * 不改变 Resource 基类尚未固定的 listener 异常传播语义。
+   * Resource 清理任务采用显式重试；此处以子 Manager 正常返回作为完成屏障。
    */
   dispose(): void {
-    if (this.disposing || this.disposalIndex === this.disposalOrder.length) return
+    if (this.disposing) {
+      throw new CleanupFailureError('WebGL1ResourceManager', [
+        {
+          phase: 'gpu-dependency',
+          label: 'dispose',
+          cause: new Error('Resource Manager cleanup is already running')
+        }
+      ])
+    }
+    if (this.disposalIndex === this.disposalOrder.length) return
 
     this.closing = true
     this.disposing = true
 
     try {
       while (this.disposalIndex < this.disposalOrder.length) {
-        if (this.gl.isContextLost()) this.invalidateForContextLoss()
+        if (this.generation.lost) this.invalidateForContextLoss()
 
         // 下标由 while 上界和仅成功后递增的不变量保证有效。
         const manager = this.disposalOrder[this.disposalIndex]!
@@ -220,7 +256,7 @@ export class WebGL1ResourceManager {
       throw new WebGLBackendDisposedError('access resource manager')
     }
 
-    if (this.lost || this.gl.isContextLost()) {
+    if (this.lost || this.generation.lost) {
       this.invalidateForContextLoss()
       throw new WebGLContextLostError('access resource manager')
     }

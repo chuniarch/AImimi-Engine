@@ -1,10 +1,12 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WebGL1Backend } from '@/rendering/backend/webgl1/WebGL1Backend'
 import type { DrawSubmission } from '@/rendering/backend/RenderBackend'
 import {
+  InvalidMaterialError,
+  CleanupFailureError,
   RenderTargetUnavailableError,
   ResourceDisposedError,
-  UnsupportedRenderFeatureError,
   ProgramLinkError,
   ShaderCompilationError,
   WebGLBackendDisposedError,
@@ -355,7 +357,7 @@ function samplingTexture(): DataTexture2D {
 
 /** 两个目标可同名；反馈检查和 GPU 缓存不得使用 label 作为身份。 */
 function samplingTarget(): RenderTarget {
-  const target = new RenderTarget(
+  const target = legacyTarget(
     {
       width: 4,
       height: 4,
@@ -482,8 +484,9 @@ describe('WebGL1Backend Texture2D integration', () => {
   /** 无法采样的深度 RBO 必须在分配前被拒绝，不能断言为 WebGLTexture。 */
   it('depth16 采样拒绝，不分配目标、不上传 uniform、不 draw', () => {
     const f = createFixture()
-    useSamplingSource(f, samplingTarget().getDepthAttachment()!)
-    expect(() => f.draw()).toThrow(UnsupportedRenderFeatureError)
+    expect(() => useSamplingSource(f, samplingTarget().getDepthAttachment()!)).toThrow(
+      InvalidMaterialError
+    )
     expect(f.fake.calls.createFramebuffer).not.toHaveBeenCalled()
     expect(f.fake.calls.uniform1i).not.toHaveBeenCalled()
     expect(f.fake.calls.drawArrays).not.toHaveBeenCalled()
@@ -546,3 +549,133 @@ describe('WebGL1Backend Texture2D integration', () => {
     })
   })
 })
+
+/**
+ * C0 联合验收：使用正式 Backend/Managers/Resources，故障只注入 GL 边界。
+ *
+ * @remarks
+ * [DESIGN-WEIGHT:3][cleanup-dependency-barrier]
+ * ready=false 是关闭绘制，cleanupState=complete 才是 Resource 清理完成。
+ * 此处不伪造 Backend 私有 cursor，也不直接调用其私有 generation。
+ */
+describe('WebGL1Backend resumable cleanup', () => {
+  /** 两个 buffer 中第二个失败：前一个不重放，program 等到下一轮再释放。 */
+  it('Backend 关闭后重试未完成 buffer，不越过 program 依赖屏障', () => {
+    const f = createFixture(true)
+    f.draw()
+    const remove = f.fake.vertex.calls.deleteBuffer.getMockImplementation()!
+    f.fake.vertex.calls.deleteBuffer.mockImplementationOnce(remove).mockImplementationOnce(() => {
+      throw new Error('second buffer')
+    })
+    expect(() => f.backend.dispose()).toThrow(CleanupFailureError)
+    expect(f.backend.ready).toBe(false)
+    expect(() => f.draw()).toThrow(WebGLBackendDisposedError)
+    expect(f.fake.vertex.calls.deleteProgram).not.toHaveBeenCalled()
+    const completed = f.fake.vertex.calls.deleteBuffer.mock.calls[0]![0]
+
+    f.backend.dispose()
+    expect(
+      f.fake.vertex.calls.deleteBuffer.mock.calls.filter(([handle]) => handle === completed)
+    ).toHaveLength(1)
+    expect(f.fake.vertex.calls.deleteProgram).toHaveBeenCalledTimes(1)
+    expect(f.geometry.disposed).toBe(false)
+  })
+
+  /** Backend 先完成 GPU 回收后，Resource 已捕获的任务仍能安全确认并完成 CPU 阶段。 */
+  it('Resource 失败后由 Backend 完成 GPU，Resource 重试不重复删除', () => {
+    const f = createFixture()
+    f.draw()
+    const independent = vi.fn()
+    f.geometry.onDispose(independent)
+    f.fake.vertex.calls.deleteBuffer.mockImplementationOnce(() => {
+      throw new Error('buffer')
+    })
+    expect(() => f.geometry.dispose()).toThrow(CleanupFailureError)
+    expect(f.geometry.cleanupState).toBe('failed')
+    expect(independent).toHaveBeenCalledTimes(1)
+
+    f.backend.dispose()
+    const deletions = f.fake.vertex.calls.deleteBuffer.mock.calls.length
+    f.geometry.dispose()
+    f.geometry.dispose()
+    expect(f.geometry.cleanupState).toBe('complete')
+    expect(independent).toHaveBeenCalledTimes(1)
+    expect(f.fake.vertex.calls.deleteBuffer).toHaveBeenCalledTimes(deletions)
+  })
+
+  /** 嵌套 Backend.dispose 经 coordinator 的 running 错误退出，不能设置 cleanupComplete。 */
+  it('GPU 删除内重入 Backend.dispose 不提前完成，下一轮仍执行剩余清理', () => {
+    const f = createFixture()
+    f.draw()
+    f.fake.vertex.calls.deleteBuffer.mockImplementationOnce(() => f.backend.dispose())
+    expect(() => f.backend.dispose()).toThrow(CleanupFailureError)
+    expect(f.fake.vertex.calls.deleteProgram).not.toHaveBeenCalled()
+    expect(f.backend.ready).toBe(false)
+
+    f.backend.dispose()
+    expect(f.fake.vertex.calls.deleteProgram).toHaveBeenCalledTimes(1)
+    expect(f.fake.vertex.calls.deleteBuffer).toHaveBeenCalledTimes(2)
+  })
+
+  /** 失败任务指向旧 Manager；恢复后重试旧 Resource 不得删除新代的 buffer。 */
+  it('lost/restored 后旧 Resource 清理任务不触碰新代 GPU 对象', () => {
+    const f = createFixture()
+    f.draw()
+    f.fake.vertex.calls.deleteBuffer.mockImplementationOnce(() => {
+      throw new Error('old')
+    })
+    expect(() => f.geometry.dispose()).toThrow(CleanupFailureError)
+    f.fake.loseContext()
+    f.fake.restoreContext()
+
+    const geometry = new Geometry({
+      attributes: {
+        position: new VertexAttribute({
+          data: new Float32Array([-1, -1, 0, 1, -1, 0, 0, 1, 0]),
+          itemSize: 3
+        })
+      }
+    })
+    cleanups.push(() => geometry.dispose())
+    f.backend.withRenderSurface({ surface: { kind: 'default-framebuffer' } }, () => {
+      f.backend.draw({
+        ...f.submission,
+        item: { ...f.submission.item, geometry }
+      })
+    })
+    const before = f.fake.vertex.calls.deleteBuffer.mock.calls.length
+    f.geometry.dispose()
+    expect(f.geometry.cleanupState).toBe('complete')
+    expect(f.fake.vertex.calls.deleteBuffer).toHaveBeenCalledTimes(before)
+    f.backend.dispose()
+    expect(f.fake.vertex.calls.deleteBuffer).toHaveBeenCalledTimes(before + 1)
+  })
+})
+
+const owners = new WeakMap<RenderTarget, RenderTargetBundle>()
+function legacyTarget(
+  descriptor: {
+    width: number
+    height: number
+    colors: readonly {
+      format: string
+      sampler?: { minFilter: 'nearest' | 'linear'; magFilter: 'nearest' | 'linear' }
+    }[]
+    depth?: unknown
+  },
+  options: { label: string }
+) {
+  const owner = new RenderTargetBundle({
+    label: options.label,
+    width: descriptor.width,
+    height: descriptor.height,
+    colors: descriptor.colors.map((c) => ({
+      storage: { format: 'rgba', type: c.format === 'rgba32f' ? 'float32' : 'uint8' },
+      colorSpace: 'data',
+      defaultSampler: c.sampler
+    })),
+    depth: descriptor.depth !== undefined
+  })
+  owners.set(owner.target, owner)
+  return owner.target
+}

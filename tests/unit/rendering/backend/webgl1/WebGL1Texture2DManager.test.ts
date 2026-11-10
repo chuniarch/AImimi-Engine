@@ -1,3 +1,5 @@
+import { WebGL1ResourceGeneration } from '@/rendering/backend/webgl1/WebGL1ResourceGeneration'
+import { CleanupFailureError } from '@/rendering/core/errors/CleanupFailureError'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   DataTexture2D,
@@ -15,7 +17,7 @@ import {
   WebGLResourceCreationError
 } from '@/rendering/core/errors'
 import { WebGLOperationError } from '@/rendering/core/errors/WebGLOperationError'
-import { WebGL1Texture2DManager } from '@/rendering/backend/webgl1/WebGL1Texture2DManager'
+import { WebGL1TextureManager } from '@/rendering/backend/webgl1/WebGL1TextureManager'
 import { createFakeWebGL1TextureContext } from '../fakes/createFakeWebGL1TextureContext'
 
 /** 独立生成完整像素，不借用被测 Manager 的通道映射来计算期望值。 */
@@ -42,10 +44,11 @@ function dataTexture(width = 2, height = 2, options: Partial<TextureOptions> = {
 function setup(float = false, linear = false) {
   const fake = createFakeWebGL1TextureContext()
   const invalidateState = vi.fn(() => undefined)
-  const manager = new WebGL1Texture2DManager(
+  const manager = new WebGL1TextureManager(
     fake.gl,
     { textureFloat: float ? {} : null, textureFloatLinear: linear ? {} : null },
-    { invalidateState }
+    new WebGL1ResourceGeneration(fake.gl),
+    { invalidateState, assertAvailable: () => {}, beforeDelete: () => undefined }
   )
   return { ...fake, manager, invalidateState }
 }
@@ -82,7 +85,7 @@ function imageTexture(source: object, options: Partial<TextureOptions> = {}) {
 
 afterEach(() => vi.unstubAllGlobals())
 
-describe('WebGL1Texture2DManager', () => {
+describe('WebGL1TextureManager', () => {
   /**
    * @remarks
    * [DESIGN-WEIGHT:3][texture2d-upload-transaction]
@@ -163,7 +166,8 @@ describe('WebGL1Texture2DManager', () => {
       constructor() {
         super(
           { label: 'custom', storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'data' },
-          (reason) => new InvalidTextureSourceError('custom', reason)
+          (reason) => new InvalidTextureSourceError('custom', reason),
+          { width: 1, height: 1 }
         )
       }
       protected disposeCPUData(): void {}
@@ -358,10 +362,15 @@ describe('WebGL1Texture2DManager', () => {
     expect(f.api.deleteTexture).not.toHaveBeenCalled()
     f.setLost(false)
     expect(() => f.manager.get(cpu)).toThrow(WebGLContextLostError)
-    const next = new WebGL1Texture2DManager(
+    const next = new WebGL1TextureManager(
       f.gl,
       { textureFloat: null, textureFloatLinear: null },
-      { invalidateState: f.invalidateState }
+      new WebGL1ResourceGeneration(f.gl),
+      {
+        invalidateState: f.invalidateState,
+        assertAvailable: () => {},
+        beforeDelete: () => undefined
+      }
     )
     expect(() => next.get(cpu)).not.toThrow()
     expect(cpu.disposed).toBe(false)
@@ -406,7 +415,7 @@ describe('WebGL1Texture2DManager', () => {
       .mockImplementationOnce(() => {
         throw failure
       })
-    expect(() => f.manager.dispose()).toThrow(failure)
+    expectCleanupCause(() => f.manager.dispose(), failure)
     expect(() => f.manager.get(a)).toThrow(WebGLBackendDisposedError)
     expect(a.disposed).toBe(false)
     expect(b.disposed).toBe(false)
@@ -432,3 +441,72 @@ describe('WebGL1Texture2DManager', () => {
     expect(f.api.deleteTexture).not.toHaveBeenCalled()
   })
 })
+
+describe('Texture cleanup progress', () => {
+  /** 真实 Resource 的捕获任务应能在删除失败后继续，而不是找不到已移出的 Entry。 */
+  it('Resource.dispose 失败后再次调用会完成 GPU 清理', () => {
+    const f = setup()
+    const cpu = dataTexture()
+    const gpu = f.manager.get(cpu)
+    f.api.deleteTexture.mockImplementationOnce(() => {
+      throw new Error('delete texture')
+    })
+    expect(() => cpu.dispose()).toThrow(CleanupFailureError)
+    expect(cpu.cleanupState).toBe('failed')
+    cpu.dispose()
+    expect(cpu.cleanupState).toBe('complete')
+    expect(f.deleted.filter((value) => value === gpu.handle)).toHaveLength(1)
+  })
+
+  /** 直接 Manager.release 中触发 Resource.dispose 时，注册任务仍须存在。 */
+  it('同步重入不重复删除，也不让 Resource 提前 complete', () => {
+    const f = setup()
+    const cpu = dataTexture()
+    const gpu = f.manager.get(cpu)
+    const remove = f.api.deleteTexture.getMockImplementation()!
+    f.api.deleteTexture.mockImplementationOnce((handle) => {
+      expect(() => cpu.dispose()).toThrow(CleanupFailureError)
+      expect(cpu.cleanupState).toBe('failed')
+      remove(handle)
+    })
+    f.manager.release(cpu)
+    cpu.dispose()
+    expect(cpu.cleanupState).toBe('complete')
+    expect(f.deleted.filter((value) => value === gpu.handle)).toHaveLength(1)
+  })
+
+  /** 关闭失败不恢复 get；正常返回的 dispose 才可让上层继续依赖清理。 */
+  it('整体关闭失败后继续剩余工作，running 重入必须报告未完成', () => {
+    const f = setup()
+    const cpu = dataTexture()
+    f.manager.get(cpu)
+    f.api.deleteTexture.mockImplementationOnce(() => {
+      expect(() => f.manager.dispose()).toThrow(CleanupFailureError)
+      throw new Error('first delete')
+    })
+    expect(() => f.manager.dispose()).toThrow(CleanupFailureError)
+    expect(() => f.manager.get(cpu)).toThrow(WebGLBackendDisposedError)
+    f.manager.dispose()
+    expect(f.api.deleteTexture).toHaveBeenCalledTimes(2)
+  })
+})
+
+/** 清理错误统一包装，但最底层原始异常的身份必须完整保留。 */
+function expectCleanupCause(action: () => void, expected: unknown): void {
+  let failure: unknown
+  try {
+    action()
+  } catch (error) {
+    failure = error
+  }
+  expect(failure).toBeInstanceOf(CleanupFailureError)
+  const causes: unknown[] = []
+  const visit = (error: unknown): void => {
+    causes.push(error)
+    if (error instanceof CleanupFailureError) {
+      for (const entry of error.failures) visit(entry.cause)
+    }
+  }
+  visit(failure)
+  expect(causes).toContain(expected)
+}

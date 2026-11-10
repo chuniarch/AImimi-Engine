@@ -1,3 +1,4 @@
+import { replaceTestGBufferStorage } from '../../../helpers/replaceTestGBufferStorage'
 import { describe, expect, it, onTestFinished } from 'vitest'
 import type { DrawSubmission } from '@/rendering/backend/RenderBackend'
 import type { RenderSurfaceScopeDescriptor } from '@/rendering/backend/RenderSurface'
@@ -193,7 +194,7 @@ describe('DeferredLightingPass frame consumption', () => {
     const f = fixture()
     const ctx = f.produce()
     expect(() => f.pass.execute(f.context())).toThrow(RenderTargetUnavailableError)
-    f.producer.target.resize(8, 6)
+    replaceTestGBufferStorage(f.producer.target, 8, 6)
     expect(() => f.pass.execute(ctx)).toThrow(RenderTargetUnavailableError)
     expect(f.backend.scopes).toHaveLength(0)
     f.pass.execute(f.produce())
@@ -216,7 +217,7 @@ describe('DeferredLightingPass frame consumption', () => {
   it('进入默认输出后再检查生产记录', () => {
     const f = fixture()
     const ctx = f.produce()
-    f.backend.beforeScope = () => f.producer.target.resize(9, 9)
+    f.backend.beforeScope = () => replaceTestGBufferStorage(f.producer.target, 9, 9)
     expect(() => f.pass.execute(ctx)).toThrow(RenderTargetUnavailableError)
     expect(f.backend.submissions).toHaveLength(0)
   })

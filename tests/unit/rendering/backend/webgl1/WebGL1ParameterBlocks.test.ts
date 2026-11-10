@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { onTestFinished, describe, expect, it, vi } from 'vitest'
 import { InvalidMaterialError, ResourceDisposedError } from '@/rendering/core/errors'
 import { WebGL1Uniforms } from '@/rendering/backend/webgl1/WebGL1Uniforms'
 import { WebGL1ProgramManager } from '@/rendering/backend/webgl1/WebGL1ProgramManager'
@@ -8,7 +8,7 @@ import { VertexAttribute } from '@/rendering/resources/VertexAttribute'
 import { Material, type MaterialParameter } from '@/rendering/resources/Material'
 import { ParameterBlock } from '@/rendering/resources/ParameterBlock'
 import { ShaderModule } from '@/rendering/resources/ShaderModule'
-import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
 import type { Texture2DSamplingSource } from '@/rendering/resources/Texture2DSamplingSource'
 import type { Mat4Tuple } from '@/rendering/core/math/tuples'
 import { createFakeWebGL1ResourceContext } from '../fakes/createFakeWebGL1ResourceContext'
@@ -147,10 +147,14 @@ describe('WebGL1 ParameterBlock draw lookup', () => {
 
   /** inactive 项不需要解析纹理或读其资源；块本身仍必须存活。 */
   it('只读 active 块项，忽略 unused 的已释放纹理', () => {
-    const target = new RenderTarget(
-      { width: 1, height: 1, colors: [{ format: 'rgba8' }] },
-      { label: 'unused' }
-    )
+    const owner = new RenderTargetBundle({
+      width: 1,
+      height: 1,
+      label: 'unused',
+      colors: [{ storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'data' }]
+    })
+    onTestFinished(() => owner.dispose())
+    const target = owner.target
     const f = setup([['uBias', 0x1406]], {
       uBias: { type: 'float', value: 1 },
       uUnused: { type: 'texture2D', value: target.getColorAttachment(0) }
@@ -182,10 +186,14 @@ describe('WebGL1 ParameterBlock draw lookup', () => {
 
   /** 块纹理仍通过唯一 resolver；失败不能被块层吞掉或直接绑定为 GPU handle。 */
   it('块中的附件地址与 uniform 名传给 resolve2D，保留原始失败', () => {
-    const target = new RenderTarget(
-      { width: 1, height: 1, colors: [{ format: 'rgba8' }] },
-      { label: 'map' }
-    )
+    const owner = new RenderTargetBundle({
+      width: 1,
+      height: 1,
+      label: 'map',
+      colors: [{ storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'data' }]
+    })
+    onTestFinished(() => owner.dispose())
+    const target = owner.target
     const ref = target.getColorAttachment(0)
     const f = setup([['uMap', 0x8b5e]], { uMap: { type: 'texture2D', value: ref } })
     const error = new Error('feedback rejected by resolver')

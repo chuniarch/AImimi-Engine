@@ -1,3 +1,4 @@
+import { resolveTextureSamplingSource } from '@/rendering/resources/textureSamplingSource'
 import { mat4, vec3 } from 'gl-matrix'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -106,7 +107,7 @@ function resources(scene: Scene): Resource[] {
     background.geometry,
     background.material,
     background.material.shaderModule,
-    texture.value
+    resolveTextureSamplingSource(texture.value, 'cube', 'uSkyboxMap').texture
   ]
 }
 

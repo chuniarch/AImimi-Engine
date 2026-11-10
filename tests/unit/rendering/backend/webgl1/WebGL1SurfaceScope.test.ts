@@ -1,3 +1,5 @@
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
+import type { WebGL1RenderTargetResource } from '@/rendering/backend/webgl1/WebGL1RenderTargetManager'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { RenderSurfaceScopeDescriptor } from '@/rendering/backend/RenderSurface'
@@ -116,14 +118,7 @@ function harness() {
 
   const gl = { ...base.gl, ...constants, ...calls } as unknown as WebGLRenderingContext
 
-  const resources = new Map<
-    RenderTarget,
-    {
-      framebuffer: WebGLFramebuffer
-      width: number
-      height: number
-    }
-  >()
+  const resources = new Map<RenderTarget, WebGL1RenderTargetResource>()
 
   const resolve = vi.fn((target: RenderTarget) => {
     const resource = resources.get(target)
@@ -138,7 +133,10 @@ function harness() {
       if (!current || gl.isContextLost()) throw new WebGLContextLostError('test scope')
     },
     isCurrent: () => current,
-    resolveTarget: resolve
+    resolveTarget: resolve,
+    assertTargetUsable: (record) => {
+      for (const color of record.colors) color.storage.texture.assertUsable()
+    }
   })
 
   return {
@@ -157,12 +155,28 @@ function harness() {
     },
 
     target(width = 16, height = 8) {
-      const target = new RenderTarget(
-        { width, height, colors: [{ format: 'rgba8' }] },
-        { label: 'test/surface-scope' }
-      )
-
-      const resource = { framebuffer: {}, width, height }
+      const owner = new RenderTargetBundle({
+        width,
+        height,
+        label: 'test/surface-scope',
+        colors: [{ storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'data' }]
+      })
+      const target = owner.target
+      owners.set(target, owner)
+      const generation = Symbol()
+      const resource: WebGL1RenderTargetResource = {
+        target,
+        generation,
+        revision: target.revision,
+        framebuffer: {},
+        width,
+        height,
+        depth: null,
+        colors: target.attachments.colors.map((view) => ({
+          view,
+          storage: { texture: view.texture, generation, handle: {}, target: gl.TEXTURE_2D }
+        }))
+      }
       resources.set(target, resource)
 
       return { target, resource }
@@ -406,7 +420,7 @@ describe('WebGL1SurfaceScope', () => {
           surface: { kind: 'render-target', target }
         },
         () => {
-          target.resize(64, 64)
+          owners.get(target)!.resize(64, 64)
         }
       )
     ).toThrow(RenderTargetUnavailableError)
@@ -497,23 +511,31 @@ describe('WebGL1SurfaceScope sampling boundary', () => {
     })
 
     h.scope.run(at(a.target), () => {
-      expect(() => h.scope.assertCanSample(a.target, 'uShadow')).toThrow(
-        RenderTargetUnavailableError
-      )
-      expect(() => h.scope.assertCanSample(a.target, 'uShadow')).toThrow('uShadow')
-      expect(() => h.scope.assertCanSample(a.target, 'uShadow')).toThrow(a.target.label)
+      expect(() =>
+        h.scope.assertCanSample(a.target.attachments.colors[0]!.texture, 'uShadow')
+      ).toThrow(RenderTargetUnavailableError)
+      expect(() =>
+        h.scope.assertCanSample(a.target.attachments.colors[0]!.texture, 'uShadow')
+      ).toThrow('uShadow')
+      expect(() =>
+        h.scope.assertCanSample(a.target.attachments.colors[0]!.texture, 'uShadow')
+      ).toThrow(a.target.attachments.colors[0]!.texture.label)
       h.scope.run(at(b.target), () => {
-        expect(() => h.scope.assertCanSample(a.target, 'uShadow')).not.toThrow()
-        expect(() => h.scope.assertCanSample(b.target, 'uSelf')).toThrow(
-          RenderTargetUnavailableError
-        )
+        expect(() =>
+          h.scope.assertCanSample(a.target.attachments.colors[0]!.texture, 'uShadow')
+        ).not.toThrow()
+        expect(() =>
+          h.scope.assertCanSample(b.target.attachments.colors[0]!.texture, 'uSelf')
+        ).toThrow(RenderTargetUnavailableError)
       })
-      expect(() => h.scope.assertCanSample(a.target, 'uShadow')).toThrow(
-        RenderTargetUnavailableError
-      )
+      expect(() =>
+        h.scope.assertCanSample(a.target.attachments.colors[0]!.texture, 'uShadow')
+      ).toThrow(RenderTargetUnavailableError)
     })
     h.scope.run(SCREEN, () => {
-      expect(() => h.scope.assertCanSample(a.target, 'uShadow')).not.toThrow()
+      expect(() =>
+        h.scope.assertCanSample(a.target.attachments.colors[0]!.texture, 'uShadow')
+      ).not.toThrow()
     })
   })
 
@@ -521,11 +543,15 @@ describe('WebGL1SurfaceScope sampling boundary', () => {
   it('没有 scope 或物理 lost 时仍拒绝采样准备', () => {
     const h = harness()
     const source = h.target().target
-    expect(() => h.scope.assertCanSample(source, 'uMap')).toThrow(WebGLOperationError)
+    expect(() => h.scope.assertCanSample(source.attachments.colors[0]!.texture, 'uMap')).toThrow(
+      WebGLOperationError
+    )
     expect(() =>
       h.scope.run(SCREEN, () => {
         h.base.setLost(true)
-        expect(() => h.scope.assertCanSample(source, 'uMap')).toThrow(WebGLContextLostError)
+        expect(() =>
+          h.scope.assertCanSample(source.attachments.colors[0]!.texture, 'uMap')
+        ).toThrow(WebGLContextLostError)
       })
     ).toThrow(WebGLContextLostError)
   })
@@ -543,11 +569,11 @@ describe('WebGL1SurfaceScope sampling boundary', () => {
     expect(() =>
       h.scope.run({ surface: { kind: 'render-target', target: a } }, () => {
         h.scope.run({ surface: { kind: 'render-target', target: b } }, () => {
-          if (operation === 'resize') a.resize(32, 32)
+          if (operation === 'resize') owners.get(a)!.resize(32, 32)
           else a.dispose()
-          expect(() => h.scope.assertCanSample(source, 'uMap')).toThrow(
-            RenderTargetUnavailableError
-          )
+          expect(() =>
+            h.scope.assertCanSample(source.attachments.colors[0]!.texture, 'uMap')
+          ).toThrow(RenderTargetUnavailableError)
           checked = true
         })
       })
@@ -555,3 +581,5 @@ describe('WebGL1SurfaceScope sampling boundary', () => {
     expect(checked).toBe(true)
   })
 })
+
+const owners = new WeakMap<RenderTarget, RenderTargetBundle>()

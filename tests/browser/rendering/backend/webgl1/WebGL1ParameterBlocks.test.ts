@@ -9,7 +9,7 @@ import { Geometry } from '@/rendering/resources/Geometry'
 import { Material } from '@/rendering/resources/Material'
 import { ParameterBlock } from '@/rendering/resources/ParameterBlock'
 import { ShaderModule } from '@/rendering/resources/ShaderModule'
-import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
 import { VertexAttribute } from '@/rendering/resources/VertexAttribute'
 
 const IDENTITY: Mat4Tuple = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
@@ -128,11 +128,13 @@ describe('ParameterBlock real WebGL1 acceptance', () => {
   it('块附件可被采样，但不能反馈读当前输出', () => {
     const f = fixture()
     const target = f.own(
-      new RenderTarget(
-        { width: 4, height: 4, colors: [{ format: 'rgba8' }] },
-        { label: 'shared-target' }
-      )
-    )
+      new RenderTargetBundle({
+        width: 4,
+        height: 4,
+        label: 'shared-target',
+        colors: [{ storage: { format: 'rgba', type: 'uint8' }, colorSpace: 'data' }]
+      })
+    ).target
     const color = f.own(
       new ParameterBlock({
         label: 'blue',

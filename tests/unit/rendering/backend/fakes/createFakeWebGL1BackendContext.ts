@@ -51,6 +51,8 @@ export function createFakeWebGL1BackendContext() {
     getParameter: vi.fn((pname: number): unknown => {
       if (pname === gl.MAX_VERTEX_ATTRIBS) return 8
       if (pname === gl.MAX_TEXTURE_IMAGE_UNITS) return 8
+      if (pname === gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) return 0
+      if (pname === gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS) return 8
       if (pname === gl.MAX_VIEWPORT_DIMS) return new Int32Array([4096, 4096])
       if (pname === gl.VIEWPORT) return new Int32Array(viewport)
       return vertexParameters.includes(pname)
@@ -82,6 +84,8 @@ export function createFakeWebGL1BackendContext() {
     SAMPLER_CUBE: 0x8b60,
     MAX_VERTEX_ATTRIBS: 0x8869,
     MAX_TEXTURE_IMAGE_UNITS: 0x8872,
+    MAX_VERTEX_TEXTURE_IMAGE_UNITS: 0x8b4c,
+    MAX_COMBINED_TEXTURE_IMAGE_UNITS: 0x8b4d,
     MAX_VIEWPORT_DIMS: 0x0d3a,
     FRAMEBUFFER: 0x8d40,
     FRAMEBUFFER_BINDING: 0x8ca6,

@@ -1,9 +1,12 @@
+import type { RenderPassContext } from '@/rendering/passes/RenderPassContext'
+import type { DirectionalShadowSnapshot } from '@/rendering/frame/LightFrameSnapshot'
 import { Resource } from '@/rendering/core/Resource'
-import { InvalidDirectionalShadowError } from '@/rendering/core/errors'
+import { CleanupFailureError, InvalidDirectionalShadowError } from '@/rendering/core/errors'
 import type { Mat4Tuple, Vec3Tuple } from '@/rendering/core/math/tuples'
 import { assertNonArrayObject } from '@/rendering/core/validation'
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
 import { ParameterBlock } from '@/rendering/resources/ParameterBlock'
-import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import type { RenderTarget } from '@/rendering/resources/RenderTarget'
 import {
   copyDirectionalShadowSettings,
   copyShadowVector,
@@ -17,6 +20,12 @@ import { requireShadowBias } from './requireShadowBias'
 /** label 与存储/投影设置分开：重名允许，缓存仍按对象身份。 */
 export interface DirectionalLightShadowOptions extends DirectionalShadowSettingsInput {
   readonly label: string
+}
+
+interface ShadowProduction {
+  readonly context: RenderPassContext
+  readonly snapshot: DirectionalShadowSnapshot
+  readonly epoch: object
 }
 
 /** clip.w=0 让现有接收者 shader 走“无阴影”分支；不是单位矩阵。 */
@@ -37,8 +46,11 @@ export class DirectionalLightShadow extends Resource {
 
   public readonly label: string
   private settingsValue: DirectionalShadowSettings
-  private readonly targetValue: RenderTarget
+  private readonly owner: RenderTargetBundle
   private readonly blockValue: ParameterBlock
+  private published:
+    | (ShadowProduction & { readonly revision: number; readonly blockVersion: number })
+    | null = null
 
   /** 先验证全部配置，再创建 CPU 子资源；此处不申请 GPU 内存。 */
   constructor(options: DirectionalLightShadowOptions) {
@@ -50,15 +62,19 @@ export class DirectionalLightShadow extends Resource {
     this.label = requireShadowLabel(options.label)
     this.settingsValue = copyDirectionalShadowSettings(this.label, options)
     const { mapSize, bias } = this.settingsValue
-    this.targetValue = new RenderTarget(
-      {
-        width: mapSize,
-        height: mapSize,
-        colors: [{ format: 'rgba8', sampler: { minFilter: 'nearest', magFilter: 'nearest' } }],
-        depth: { format: 'depth16' }
-      },
-      { label: this.label + '/map' }
-    )
+    this.owner = new RenderTargetBundle({
+      label: this.label + '/map',
+      width: mapSize,
+      height: mapSize,
+      colors: [
+        {
+          storage: { format: 'rgba', type: 'uint8' },
+          colorSpace: 'data',
+          defaultSampler: { minFilter: 'nearest', magFilter: 'nearest' }
+        }
+      ],
+      depth: true
+    })
     this.blockValue = new ParameterBlock({
       label: this.label + '/parameters',
       entries: {
@@ -73,6 +89,16 @@ export class DirectionalLightShadow extends Resource {
   get settings(): DirectionalShadowSettings {
     this.assertUsable()
     return this.settingsValue
+  }
+
+  private get targetValue(): RenderTarget {
+    return this.owner.target
+  }
+
+  /** 按已提取的帧尺寸准备整组附件。 */
+  prepareSize(mapSize: number): void {
+    this.assertChildrenUsable()
+    this.owner.resize(mapSize, mapSize)
   }
 
   /** 借用逻辑目标；不转交所有权，不能单独由 Scene.retain 管理。 */
@@ -120,6 +146,7 @@ export class DirectionalLightShadow extends Resource {
    */
   publishNoShadow(): void {
     this.assertChildrenUsable()
+    this.published = null
     this.blockValue.set('uLightViewProjection', { type: 'mat4', value: NO_SHADOW_MATRIX })
   }
 
@@ -134,7 +161,12 @@ export class DirectionalLightShadow extends Resource {
    * 多次 block.set 不是事务；调用者必须先 publishNoShadow，并在任何异常时中止
    * 后续消费者。需要上一帧像素回滚时，应另行实现双缓冲，不能靠此方法保证。
    */
-  publish(lightViewProjection: Mat4Tuple, bias: number, expectedTargetRevision: number): void {
+  publish(
+    lightViewProjection: Mat4Tuple,
+    bias: number,
+    expectedTargetRevision: number,
+    production?: ShadowProduction
+  ): void {
     this.assertChildrenUsable()
     if (
       !Number.isSafeInteger(expectedTargetRevision) ||
@@ -155,8 +187,46 @@ export class DirectionalLightShadow extends Resource {
       bias,
       (reason, details) => new InvalidDirectionalShadowError(this.label, 'bias', reason, details)
     )
+    if (
+      production !== undefined &&
+      (!production.context.backend.ready ||
+        production.context.backend.resourceEpoch !== production.epoch ||
+        production.snapshot.resource !== this ||
+        !production.context.lights.some(
+          (light) => light.castShadow && light.shadow === production.snapshot
+        ))
+    ) {
+      throw new InvalidDirectionalShadowError(this.label, 'production', 'frame or device changed')
+    }
+    this.published = null
     this.blockValue.set('uShadowBias', { type: 'float', value })
     this.blockValue.set('uLightViewProjection', { type: 'mat4', value: matrix })
+    if (production !== undefined) {
+      this.published = {
+        ...production,
+        revision: expectedTargetRevision,
+        blockVersion: this.blockValue.version
+      }
+    }
+  }
+
+  /** 检查发布结果是否仍对应当前帧、设备代次及纹理和参数版本。 */
+  hasPublishedResult(context: RenderPassContext): boolean {
+    this.assertChildrenUsable()
+    const published = this.published
+    return (
+      published?.context === context &&
+      context.backend.ready &&
+      context.backend.resourceEpoch === published.epoch &&
+      this.targetValue.revision === published.revision &&
+      this.blockValue.version === published.blockVersion &&
+      context.lights.some((light) => light.castShadow && light.shadow === published.snapshot)
+    )
+  }
+
+  /** 在 HW1 接收者绘制前校验本帧生产结果，过期时沿用无阴影哨兵。 */
+  prepareSampling(context: RenderPassContext): void {
+    if (!this.hasPublishedResult(context)) this.publishNoShadow()
   }
 
   /** 候选全部验证成功后才替换 settings，不修改 target 或 block。 */
@@ -174,14 +244,33 @@ export class DirectionalLightShadow extends Resource {
   }
 
   /**
-   * 先断开块内借用，再释放目标；即使块清理抛错也尝试释放目标。
-   * Resource 自身 listener 抛错仍可能阻止进入本方法，本批不改写该基类约定。
+   * 先成功断开 ParameterBlock 的借用，再清理 target。
+   *
+   * @remarks
+   * [DESIGN-WEIGHT:3][cleanup-dependency-barrier]
+   * 每个子资源只有 cleanupState=complete 才可越过；disposed 仅代表禁止正常使用。
+   * Resource 可能重试本 CPU 钩子，已经成功的子项不重复执行。
+   * 私有字段持续保留所有权，不通过已经关闭的公开 getter 读取子资源。
    */
   protected override disposeCPUData(): void {
-    try {
-      this.blockValue.dispose()
-    } finally {
-      this.targetValue.dispose()
+    this.published = null
+    for (const [label, child] of [
+      ['parameters', this.blockValue],
+      ['target', this.owner]
+    ] as const) {
+      // 普通 boolean helper 不把调用前的属性收窄带过 dispose()；后者会推进状态。
+      const isComplete = (): boolean => child.cleanupState === 'complete'
+      if (isComplete()) continue
+      child.dispose()
+      if (!isComplete()) {
+        throw new CleanupFailureError(this.label, [
+          {
+            phase: 'owner-child',
+            label,
+            cause: new Error('Child cleanup is still ' + child.cleanupState)
+          }
+        ])
+      }
     }
   }
 }

@@ -1,144 +1,274 @@
+import type { CleanupState } from '@/rendering/core/CleanupState'
 import { Resource } from '@/rendering/core/Resource'
-import { ResourceDisposedError } from '@/rendering/core/errors'
+import {
+  CleanupFailureError,
+  ResourceDisposedError,
+  type CleanupFailure
+} from '@/rendering/core/errors'
 import { Group } from '@/rendering/scene/Group'
 
 /**
- * 场景图根节点及其共享 CPU Resource 引用的管理者。
+ * 场景图根节点，以及 Scene 引用和遗留清理责任的管理者。
  *
  * @remarks
- * [DESIGN-WEIGHT:3][scene-resource-retention]
+ * [DESIGN-WEIGHT:3][scene-reference-versus-cleanup]
  *
- * Scene 同时承担两项职责：
- *
- * - 作为 Group 保存场景节点树；
- * - 为通过 retain() 登记的每个 Resource 持有一个 Scene 引用。
- *
- * 同一个 Scene 中多个 Mesh 使用同一 Geometry 时，该 Scene 仍然只持有一个引用；
- * 多个 Scene 使用同一 Geometry 时，每个 Scene 分别贡献一个引用。最后一个 Scene
- * 引用消失后，由 Resource 自动执行真正清理。
- *
- * Scene 不持有 WebGL context 或 GPU handle，也不直接删除 GPU 对象。
+ * retainedResources 表示“我仍要求资源存活”，每项贡献一个 Scene 引用。
+ * pendingCleanup 表示“引用已经交还，但我还负责推进未完成的清理”，不增加引用。
+ * 活动 Scene 的某次 release 失败，不会使整个 Scene 自动关闭。
  */
 export class Scene extends Group {
-  /**
-   * Scene 是否已经开始或完成释放。
-   *
-   * @remarks
-   * 这是单向状态：false 可以变成 true，但不能重新变回 false。
-   */
-  private disposedValue = false
+  /** Scene 自身 dispose 的进度；活动时 release 失败不会修改此状态。 */
+  private cleanupStateValue: CleanupState = 'not-started'
 
-  /**
-   * 当前 Scene 已经登记过的共享 Resource。
-   *
-   * @remarks
-   * Set 保证每个 Scene 对同一 Resource 最多贡献一个引用。该 Set 记录的是当前 Scene
-   * 自己的登记关系；总引用数量保存在每个 Resource.sceneReferenceCount 中。
-   */
+  /** 当前 Scene 持有的资源引用，按对象身份去重。 */
   private readonly retainedResources = new Set<Resource>()
 
-  /**
-   * 为 debugLabel 提供稳定的 Scene 类型。
-   *
-   * @remarks
-   * [DESIGN-WEIGHT:2][scene-node-stable-debug-type]
-   */
+  /** 已交还最后引用后仍待完成的清理，以及稳定的本地诊断标签。 */
+  private readonly pendingCleanup = new Map<Resource, string>()
+
+  /** 仅用于 pendingCleanup 诊断，不是 Resource 的机器身份。 */
+  private nextCleanupTaskId = 1
+
+  /** 标记 dispose/retryPendingCleanup 整轮正在执行。 */
+  private cleanupBusy = false
+
+  /** 标记正在交还引用的调用，防止其回调重入整轮清理。 */
+  private readonly releasingResources = new Set<Resource>()
+
+  /** 子节点已成功断开后，失败重试不重复该步骤。 */
+  private childrenDetached = false
+
+  /** 不依赖类名压缩的诊断类型。 */
   protected override get debugType(): string {
     return 'Scene'
   }
 
-  /**
-   * 获取 Scene 是否已经进入 disposed 状态。
-   */
+  /** Scene.dispose 已开始；此后禁止 retain，release 返回 false。 */
   get disposed(): boolean {
-    return this.disposedValue
+    return this.cleanupStateValue !== 'not-started'
   }
 
-  /**
-   * 为当前 Scene 登记一个 Resource 存活引用。
-   *
-   * @param resource - 当前 Scene 将要使用的 Resource。
-   * @returns 原样返回具体 Resource 子类型，方便创建和登记写在同一个表达式中。
-   *
-   * @throws {@link ResourceDisposedError}
-   * Scene 已经开始释放，或者 Resource 已经真正释放时抛出。
-   *
-   * @remarks
-   * 方法先检查 Set。重复 retain 同一个对象时直接返回，不重复增加引用。
-   *
-   * 首次登记时先调用 Resource.retainSceneReference()，成功后才写入 Set。这样如果
-   * Resource 已经 disposed 并拒绝 retain，Scene 不会留下错误的登记记录。
-   *
-   * @example
-   * ```ts
-   * const geometry = scene.retain(new Geometry(...))
-   * ```
-   */
+  /** Scene.dispose 的进度，不等同于活动 Scene 是否存在失败的 release。 */
+  get cleanupState(): CleanupState {
+    return this.cleanupStateValue
+  }
+
+  /** 为本 Scene 登记一次存活引用，保留具体 Resource 子类型。 */
   retain<T extends Resource>(resource: T): T {
-    if (this.disposedValue) throw new ResourceDisposedError('Scene')
+    if (this.disposed) throw new ResourceDisposedError('Scene')
 
     if (this.retainedResources.has(resource)) return resource
 
     resource.retainSceneReference()
     this.retainedResources.add(resource)
-
     return resource
   }
 
   /**
-   * 释放当前 Scene 对一个 Resource 的存活引用。
+   * 交还本 Scene 持有的一次引用。
    *
-   * @param resource - 当前 Scene 不再使用的 Resource。
-   * @returns 当前 Scene 确实持有该引用并成功释放时返回 true；否则返回 false。
+   * @returns 没有该登记或 Scene 已关闭时返回 false；成功交还返回 true。
+   * @throws CleanupFailureError 引用交还触发的清理失败，或不允许的同步重入。
    *
    * @remarks
-   * 方法先从 Set 删除，再调用 Resource.releaseSceneReference()。这个顺序保证最后一个
-   * 引用触发同步 dispose listener 时，listener 再次调用 `scene.release(resource)`
-   * 会看到该登记已经不存在，不会递归释放同一个引用。
-   *
-   * Scene.dispose() 开始后返回 false，防止一个 Resource listener 取消同一轮中尚未
-   * 处理的其他 Resource 引用。
+   * 先删除登记再触发回调，重入 release(同一资源) 因而返回 false。
+   * 最后引用的清理失败时，计数不会补回；随后调用 retryPendingCleanup()。
    */
   release(resource: Resource): boolean {
-    if (this.disposedValue) return false
+    if (this.disposed || !this.retainedResources.has(resource)) return false
 
-    if (!this.retainedResources.delete(resource)) return false
+    if (this.cleanupBusy) {
+      throw this.createBusyError('release')
+    }
 
-    resource.releaseSceneReference()
+    try {
+      this.releaseRetainedResource(resource)
+    } catch (cause) {
+      throw new CleanupFailureError(this.debugLabel, [
+        { phase: 'scene-reference', label: 'releaseSceneReference', cause }
+      ])
+    }
 
     return true
   }
 
   /**
-   * 以幂等方式释放场景层级和当前 Scene 持有的所有 Resource 引用。
+   * 在保持 Scene 活动的情况下，重试此前 release 留下的清理。
    *
    * @remarks
-   * [DESIGN-WEIGHT:3][scene-dispose-order]
+   * 不再减少引用计数，每项待办本轮至多调用一次 Resource.dispose()。
+   * Scene.dispose 已开始后，统一通过 Scene.dispose() 继续清理。
+   */
+  retryPendingCleanup(): void {
+    if (this.disposed) throw new ResourceDisposedError('Scene')
+    this.assertCleanupIdle('retryPendingCleanup')
+
+    this.cleanupBusy = true
+    const failures: CleanupFailure[] = []
+
+    try {
+      for (const [resource, label] of [...this.pendingCleanup]) {
+        try {
+          this.retryResourceCleanup(resource, label)
+        } catch (cause) {
+          failures.push({ phase: 'scene-cleanup', label, cause })
+        }
+      }
+
+      if (failures.length > 0) {
+        throw new CleanupFailureError(this.debugLabel, failures)
+      }
+    } finally {
+      this.cleanupBusy = false
+    }
+  }
+
+  /**
+   * 关闭 Scene，断开子节点，并推进所有引用交还与遗留清理。
    *
-   * 正常路径顺序固定为：
+   * @remarks
+   * [DESIGN-WEIGHT:3][scene-reference-versus-cleanup]
+   * [DESIGN-WEIGHT:3][cleanup-reentry]
    *
-   * 1. 把 Scene 标记为 disposed；
-   * 2. 断开全部直接 child；
-   * 3. 对每个 retained Resource 调用 releaseSceneReference()；
-   * 4. 清空当前 Scene 的 retainedResources Set。
+   * 独立资源失败不会阻止其他资源交还引用。进入本轮前已有的待办可以重试；
+   * 本轮刚失败的任务保留到下次，避免一次调用反复尝试同一失败。
    *
-   * Scene 不再直接调用 Resource.dispose()。如果其他 Scene 仍持有同一 Resource，
-   * 引用数只会减少；如果当前 Scene 持有最后一个引用，Resource 会自动真正清理。
-   *
-   * Resource listener 抛错时是否继续释放剩余资源仍遵循
-   * `src/rendering/TODOList.md` 中尚未确定的异常策略。
+   * 重入本方法抛错，不能让上层把“内层直接返回”当成 Scene 已完成。
+   * 只有 complete 后重复调用才直接返回。
    */
   dispose(): void {
-    if (this.disposedValue) return
+    if (this.cleanupStateValue === 'complete') return
+    this.assertCleanupIdle('dispose')
 
-    this.disposedValue = true
+    const pendingAtStart = [...this.pendingCleanup]
+    const retainedAtStart = [...this.retainedResources]
+    const failures: CleanupFailure[] = []
 
-    this.removeAllChildren()
+    this.cleanupStateValue = 'running'
+    this.cleanupBusy = true
 
-    for (const resource of this.retainedResources) {
-      resource.releaseSceneReference()
+    try {
+      if (!this.childrenDetached) {
+        try {
+          this.removeAllChildren()
+          this.childrenDetached = true
+        } catch (cause) {
+          failures.push({ phase: 'owner-child', label: 'removeAllChildren', cause })
+        }
+      }
+
+      // 场景树断开是引用交还的前置步骤，失败时保持该依赖屏障。
+      if (this.childrenDetached) {
+        for (const resource of retainedAtStart) {
+          try {
+            this.releaseRetainedResource(resource)
+          } catch (cause) {
+            failures.push({ phase: 'scene-reference', label: 'releaseSceneReference', cause })
+          }
+        }
+
+        for (const [resource, label] of pendingAtStart) {
+          try {
+            this.retryResourceCleanup(resource, label)
+          } catch (cause) {
+            failures.push({ phase: 'scene-cleanup', label, cause })
+          }
+        }
+      }
+
+      if (failures.length > 0) {
+        throw new CleanupFailureError(this.debugLabel, failures)
+      }
+
+      this.cleanupStateValue = 'complete'
+    } finally {
+      if (this.cleanupStateValue === 'running') {
+        this.cleanupStateValue = 'failed'
+      }
+      this.cleanupBusy = false
+    }
+  }
+
+  /**
+   * 实际交还引用，公开 release 和整场景 dispose 共用此顺序。
+   *
+   * @remarks
+   * 回调之前发布 pending 责任和正在交还标记；完成之后才删除 pending。
+   * 此处不恢复已交还的引用，也不在 finally 再次调用 releaseSceneReference。
+   */
+  private releaseRetainedResource(resource: Resource): void {
+    if (!this.retainedResources.delete(resource)) return
+
+    const releasesLastReference = resource.sceneReferenceCount === 1
+    const label = 'resource cleanup ' + this.nextCleanupTaskId
+
+    if (releasesLastReference) {
+      this.nextCleanupTaskId += 1
+      this.pendingCleanup.set(resource, label)
     }
 
-    this.retainedResources.clear()
+    this.releasingResources.add(resource)
+
+    try {
+      resource.releaseSceneReference()
+
+      if (releasesLastReference) {
+        this.assertResourceCleanupComplete(resource, label)
+      }
+    } finally {
+      if (resource.cleanupState === 'complete') {
+        this.pendingCleanup.delete(resource)
+      }
+      this.releasingResources.delete(resource)
+    }
+  }
+
+  /** 对已交还引用的资源继续清理；该方法永远不减少引用计数。 */
+  private retryResourceCleanup(resource: Resource, label: string): void {
+    if (!this.pendingCleanup.has(resource)) return
+
+    if (resource.cleanupState !== 'complete') {
+      resource.dispose()
+    }
+
+    this.assertResourceCleanupComplete(resource, label)
+    this.pendingCleanup.delete(resource)
+  }
+
+  /**
+   * 防止把 Resource.dispose 的同步重入 no-op 当作完成。
+   *
+   * @remarks
+   * disposed=true 只说明不能继续使用，无法证明 GPU/CPU 清理已经结束。
+   */
+  private assertResourceCleanupComplete(resource: Resource, label: string): void {
+    if (resource.cleanupState !== 'complete') {
+      throw new CleanupFailureError(this.debugLabel, [
+        {
+          phase: 'scene-cleanup',
+          label,
+          cause: new Error('Resource cleanup is ' + resource.cleanupState + ', not complete')
+        }
+      ])
+    }
+  }
+
+  /** 整轮清理不能插入尚未返回的引用交还或另一轮清理。 */
+  private assertCleanupIdle(operation: string): void {
+    if (this.cleanupBusy || this.releasingResources.size > 0) {
+      throw this.createBusyError(operation)
+    }
+  }
+
+  /** 以领域错误报告同步调用尚未结束；不改变清理状态或责任记录。 */
+  private createBusyError(operation: string): CleanupFailureError {
+    return new CleanupFailureError(this.debugLabel, [
+      {
+        phase: 'scene-cleanup',
+        label: operation,
+        cause: new Error('Scene cleanup or reference release is already running')
+      }
+    ])
   }
 }

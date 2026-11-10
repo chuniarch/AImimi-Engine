@@ -1,3 +1,5 @@
+import type { TextureResource } from '@/rendering/resources/TextureResource'
+import type { WebGL1RenderTargetResource } from './WebGL1RenderTargetManager'
 import type {
   ClearDescriptor,
   RenderSurface,
@@ -11,7 +13,7 @@ import {
 } from '@/rendering/core/errors'
 import { WebGLOperationError } from '@/rendering/core/errors/WebGLOperationError'
 import { RenderTarget } from '@/rendering/resources/RenderTarget'
-import { WebGL1State, type SurfaceStateSnapshot, type WebGL1SurfaceResource } from './WebGL1State'
+import { WebGL1State, type SurfaceStateSnapshot } from './WebGL1State'
 
 /**
  * 由 WebGL1Backend 接线的内部协作点，不对应用层开放。
@@ -24,11 +26,13 @@ import { WebGL1State, type SurfaceStateSnapshot, type WebGL1SurfaceResource } fr
 export interface WebGL1SurfaceScopeHooks {
   readonly assertReady: () => undefined
   readonly isCurrent: () => boolean
-  readonly resolveTarget: (target: RenderTarget) => WebGL1SurfaceResource
+  readonly resolveTarget: (target: RenderTarget) => WebGL1RenderTargetResource
+  readonly assertTargetUsable: (record: WebGL1RenderTargetResource) => void
 }
 
 /** 每层记录逻辑目标版本和 drawing buffer 尺寸，不取得资源所有权。 */
 interface ActiveScope {
+  resource: WebGL1RenderTargetResource | null
   readonly target: RenderTarget | null
   readonly revision: number
   readonly drawingWidth: number
@@ -199,6 +203,7 @@ export class WebGL1SurfaceScope {
     const target = next.surface.kind === 'render-target' ? next.surface.target : null
 
     const frame: ActiveScope = {
+      resource: null,
       target,
       revision: target === null ? 0 : target.revision,
       drawingWidth: this.gl.drawingBufferWidth,
@@ -213,6 +218,7 @@ export class WebGL1SurfaceScope {
 
     try {
       const resource = target === null ? null : this.hooks.resolveTarget(target)
+      frame.resource = resource
 
       this.assertDrawable()
       this.state.bindSurface(resource)
@@ -266,22 +272,22 @@ export class WebGL1SurfaceScope {
    * [DESIGN-WEIGHT:3][surface-texture-feedback]
    * 先通过 assertDrawable 检查当前代、活动 scope 和所有祖先的生命周期/revision；
    * 然后只比较栈顶：外层 A 暂停、内层写 B 时可以读取 A，返回 A 后不能读取 A。
-   * 本阶段每个 RenderTarget 独占其存储，因此 target 身份足以判断颜色槽位冲突。
-   * 不检查纹理格式或附件 index；这些由 RenderTargetManager 负责。
+   * 比较栈顶实际 record 的 Texture 身份；不同 target、face 或 mip 不解除反馈冲突。
+   * 所有祖先 record 的存储依赖也必须仍可用。
    *
-   * @param target 采样地址指向的逻辑目标，不是 WebGLFramebuffer。
+   * @param texture 本次采样解析得到的实际纹理身份。
    * @param uniformName 用于定位发生冲突的材质参数。
    * @throws RenderTargetUnavailableError 当前 draw 试图读取自己的输出时抛出。
    */
-  assertCanSample(target: RenderTarget, uniformName: string): void {
+  assertCanSample(texture: TextureResource, uniformName: string): void {
     this.assertDrawable()
 
     // assertDrawable 已确认存在活动 scope；不把暂停中的祖先当作当前输出。
     const current = this.stack[this.stack.length - 1]!
 
-    if (current.target === target) {
+    if (current.resource?.colors.some((color) => color.storage.texture === texture)) {
       throw new RenderTargetUnavailableError(
-        target.label,
+        texture.label,
         'uniform ' + uniformName + ' cannot sample the current render target'
       )
     }
@@ -331,6 +337,7 @@ export class WebGL1SurfaceScope {
       ) {
         throw new RenderTargetUnavailableError('active scope', 'target was disposed or resized')
       }
+      if (frame.resource) this.hooks.assertTargetUsable(frame.resource)
     }
   }
 

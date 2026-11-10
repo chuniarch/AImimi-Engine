@@ -1,186 +1,172 @@
+import type { CleanupState } from './CleanupState'
 import {
+  CleanupFailureError,
   ResourceDisposedError,
   ResourceHasSceneReferencesError,
-  ResourceSceneReferenceUnderflowError
+  ResourceSceneReferenceUnderflowError,
+  type CleanupFailure
 } from './errors'
 
 /**
- * Resource 开始真正释放时同步调用的监听器。
+ * 同步、可安全重试的清理任务。
  *
  * @remarks
- * WebGL1 ResourceManager 用它删除当前 context 自己持有的 GPU 表示。Scene 引用数减少但
- * 仍然大于零时不会调用 listener；只有最后一个引用消失或无引用资源被直接 dispose 时
- * 才会通知。
+ * [DESIGN-WEIGHT:3][cleanup-dependency-barrier]
+ *
+ * 正常返回表示该任务负责的清理已经完成；抛错表示仍有剩余工作。
+ * 任务若已经产生部分副作用，必须自己保存进度或保证重复执行安全。
+ *
+ * 不允许 async/Promise 清理。这里的 void 类型不会阻止 TypeScript 接受
+ * async 函数；同步执行是注册者必须遵守的契约。
  */
 export type DisposeListener = () => void
 
 /**
- * 所有 CPU 逻辑渲染资源共享的生命周期基类。
+ * CPU 逻辑渲染资源的生命周期和清理进度管理。
  *
  * @remarks
- * `Resource` 不持有 WebGL context 或 GPU handle。它只负责一次性释放状态、同步通知
- * 各 context 的 Manager，并在通知结束后让具体子类释放自己的 CPU 数据。
+ * [DESIGN-WEIGHT:3][resource-disposal-progress]
  *
- * 抽象成员要求每个具体子类说明稳定的诊断类型以及 CPU 数据的释放方式；私有状态则
- * 阻止子类把已经释放的对象重新变为可用。
+ * 基类先关闭使用入口，再推进各 context 的独立清理任务。
+ * 所有任务成功后才释放 CPU 数据；失败后保留剩余责任，等待显式重试。
+ * 本类不保存 WebGL handle，也不自动安排重试。
  */
 export abstract class Resource {
-  /** 由基类独占维护的单向生命周期状态。 */
-  private disposedValue: boolean = false
+  /** 唯一生命周期状态；disposed 由它推导，避免两个字段互相矛盾。 */
+  private cleanupStateValue: CleanupState = 'not-started'
 
-  /**
-   * 当前持有该 Resource 的 Scene 数量。
-   *
-   * @remarks
-   * 该字段只通过 retainSceneReference() 和 releaseSceneReference() 修改。
-   * 它不表示 JavaScript 的真实对象引用数量，也不统计 Mesh 数量或 WebGL context 数量。
-   */
+  /** Scene 存活引用数，不统计 Mesh、JavaScript 引用或 GPU context 数量。 */
   private sceneReferenceCountValue = 0
 
-  /**
-   * 按注册顺序保存 listener。`readonly` 禁止替换 Set，但允许增删其中的 listener。
-   */
+  /** 尚未开始释放时的注册集合；此时允许退订。 */
   private readonly disposeListeners = new Set<DisposeListener>()
 
-  // ==================== protected ====================
-
   /**
-   * 子类提供的稳定资源类型，不依赖可能被生产压缩器改写的 `constructor.name`。
+   * 已经接手的清理任务及其稳定序号。
+   *
+   * @remarks
+   * 释放开始时从注册集合捕获。成功任务被移除，失败任务保留。
+   * 退订函数不能修改此集合，避免“先退订、后抛错”遗失清理责任。
    */
+  private readonly pendingDisposeListeners = new Map<DisposeListener, number>()
+
+  /** 子类提供稳定的诊断类型，不依赖 constructor.name。 */
   protected abstract readonly resourceType: string
 
   /**
-   * 由具体资源释放其 CPU 侧数据。
+   * 清理具体资源的 CPU 数据。
    *
    * @remarks
-   * 基类保证正常路径上先通知所有 listener，再调用此方法。当前尚未定义 listener
-   * 抛错时的容错策略，相关决策记录在 `src/rendering/TODOList.md`。
+   * 仅在所有注册清理任务完成后调用。此方法抛错时，下轮只重试 CPU 阶段。
+   * 组合资源须保存子资源进度；不能因为子资源 disposed=true 就认为它已完成清理。
+   * 使用私有字段完成清理，不能调用要求资源仍可用的 getter。
    */
   protected abstract disposeCPUData(): void
 
-  // ==================== public ====================
-
-  /**
-   * 供子类与外部借用者在使用本资源前统一验证生命周期。
-   *
-   * @remarks
-   * [DESIGN-WEIGHT:3][resource-lifecycle-guard]
-   *
-   * 错误中的稳定类型由资源自己的 resourceType 提供，调用者无需重复传入名称。
-   * 此方法只读取状态，不 retain、不 dispose，也不改变 listener 或 CPU 数据。
-   * finalizeDisposal() 在通知 listener 前标记 disposed，因此释放期间就已拒绝使用。
-   * 成功只证明本次检查时 CPU 资源存活，不保证 GPU 上传或 context 可用；
-   * 跨 await 后如需继续使用，调用方仍须遵守所有权约定并在消费处重新检查。
-   *
-   * @throws {@link ResourceDisposedError} 当资源已经完成或开始释放。
-   */
+  /** 只检查当前可用性，不增加引用、不触发清理。 */
   public assertUsable(): void {
-    if (this.disposedValue) {
+    if (this.disposed) {
       throw new ResourceDisposedError(this.resourceType)
     }
   }
 
-  /** 当前资源是否已经进入 disposed 状态。 */
+  /** 已退出正常使用。running、failed、complete 三种状态均返回 true。 */
   get disposed(): boolean {
-    return this.disposedValue
+    return this.cleanupStateValue !== 'not-started'
   }
 
-  /**
-   * 获取当前持有该 Resource 的 Scene 数量。
-   *
-   * @returns 非负整数；调用者只能读取，不能直接修改。
-   */
+  /** 清理的实际进度；只有 complete 表示本对象的工作全部完成。 */
+  get cleanupState(): CleanupState {
+    return this.cleanupStateValue
+  }
+
+  /** 当前持有该资源的 Scene 数量。 */
   get sceneReferenceCount(): number {
     return this.sceneReferenceCountValue
   }
 
   /**
-   * 注册一个同步释放监听器。
+   * 注册同步、可安全重试的清理任务。
    *
-   * @param listener - Resource 首次释放时调用的清理函数。
-   * @returns 幂等的取消订阅函数；Manager 先于 Resource 销毁时必须调用它。
-   * @throws {@link ResourceDisposedError} 当资源已经释放，避免创建永远不会触发的订阅。
+   * @returns 幂等退订函数。释放开始前可取消注册，开始后不取消已接手的任务。
+   * @throws ResourceDisposedError 已开始释放时不再接受新任务。
+   *
+   * @remarks
+   * 同一函数对象重复注册仍按 Set 去重。任务可能在一次失败后再次被调用；
+   * 不应在这里放置无法安全重复的普通业务事件。
    */
   onDispose(listener: DisposeListener): () => void {
     this.assertUsable()
-
     this.disposeListeners.add(listener)
 
     return () => {
-      this.disposeListeners.delete(listener)
+      if (this.cleanupStateValue === 'not-started') {
+        this.disposeListeners.delete(listener)
+      }
     }
   }
 
-  /**
-   * 登记一个新的 Scene 存活引用。
-   *
-   * @remarks
-   * retain 在引用计数语义中表示：“新增一个要求该 Resource 继续存活的持有者。”
-   * 同一个 Scene 的对象身份去重由 Scene 内部 Set 负责，本方法只处理计数。
-   *
-   * @throws {@link ResourceDisposedError}
-   * 已经真正释放的 Resource 不能重新恢复为可用状态。
-   */
+  /** 登记一个 Scene 存活引用；已经关闭使用入口的资源不能重新 retain。 */
   retainSceneReference(): void {
     this.assertUsable()
     this.sceneReferenceCountValue += 1
   }
 
   /**
-   * 释放一个 Scene 存活引用。
+   * 交还一个 Scene 引用；1 → 0 时立即开始清理。
    *
    * @remarks
-   * 方法先验证当前计数，之后只减少一次。计数从 1 变成 0 时，立即自动执行真正清理，
-   * 避免产生“已经没有所有者，但仍等待其他代码调用 dispose”的泄漏状态。
+   * [DESIGN-WEIGHT:3][scene-reference-versus-cleanup]
    *
-   * @throws {@link ResourceSceneReferenceUnderflowError}
-   * 当前计数已经为 0 时抛出，且状态保持不变。
+   * 计数只减少一次。清理失败后计数仍为 0，重试必须调用 dispose()，
+   * 不能再次调用 releaseSceneReference()。
    */
   releaseSceneReference(): void {
-    if (this.sceneReferenceCountValue === 0)
+    if (this.sceneReferenceCountValue === 0) {
       throw new ResourceSceneReferenceUnderflowError(this.resourceType)
+    }
 
     this.sceneReferenceCountValue -= 1
 
-    if (this.sceneReferenceCountValue === 0) this.finalizeDisposal()
+    if (this.sceneReferenceCountValue === 0) {
+      this.finalizeDisposal()
+    }
   }
 
   /**
-   * 尝试立即释放 Resource，而不把“仍有 Scene 引用”当成异常。
+   * 在允许清理时执行一轮。
    *
-   * @returns 调用结束后 Resource 已经 disposed 时返回 true；仍有 Scene 引用时返回 false。
-   *
-   * @remarks
-   * [DESIGN-WEIGHT:2][resource-safe-try-dispose]
-   *
-   * 适用于“资源可能仍被共享”这一正常业务分支。返回 false 时，引用计数、listener、
-   * disposed 状态和 CPU 数据全部保持不变。
+   * @returns 已完成清理返回 true；仍有 Scene 引用或当前正在清理返回 false。
+   * @throws CleanupFailureError 本轮清理失败。失败不转换成 false。
    */
   tryDispose(): boolean {
-    if (this.disposedValue) return true
+    if (this.cleanupStateValue === 'complete') return true
 
-    if (this.sceneReferenceCountValue > 0) return false
+    if (this.cleanupStateValue === 'running' || this.sceneReferenceCountValue > 0) {
+      return false
+    }
 
     this.finalizeDisposal()
-
     return true
   }
 
   /**
-   * 严格要求 Resource 立即完成释放。
+   * 无 Scene 引用时开始或继续清理。
    *
    * @remarks
-   * [DESIGN-WEIGHT:3][resource-strict-dispose]
+   * [DESIGN-WEIGHT:3][cleanup-reentry]
    *
-   * 没有 Scene 引用时，直接执行真正清理；已经 disposed 时保持幂等；仍有 Scene 引用
-   * 时抛出领域错误。调用成功返回后，调用者可以确定 `disposed === true`。
+   * complete 时幂等返回；running 时同步重入只返回，不递归执行任务。
+   * 因而在回调中调用 dispose() 的正常返回不证明 complete：
+   * owner 必须检查 cleanupState，由最外层调用负责最终结果。
    *
-   * @throws {@link ResourceHasSceneReferencesError}
-   * 一个或多个 Scene 仍然持有 Resource 时抛出，状态保持不变。对于正常的非异常尝试，
-   * 调用 tryDispose()。
+   * @throws ResourceHasSceneReferencesError 仍有 Scene 引用，状态保持不变。
+   * @throws CleanupFailureError 本轮剩余任务未全部成功。
    */
   dispose(): void {
-    if (this.disposedValue) return
+    if (this.cleanupStateValue === 'complete' || this.cleanupStateValue === 'running') {
+      return
+    }
 
     if (this.sceneReferenceCountValue > 0) {
       throw new ResourceHasSceneReferencesError(this.resourceType, this.sceneReferenceCountValue)
@@ -190,28 +176,67 @@ export abstract class Resource {
   }
 
   /**
-   * 执行唯一的真正清理流程。
+   * 推进一轮清理：捕获任务 → 关闭使用入口 → 独立任务 → CPU 阶段。
    *
    * @remarks
-   * 只有两个入口可以抵达这里：
+   * [DESIGN-WEIGHT:3][resource-disposal-progress]
    *
-   * - 无 Scene 引用时调用 dispose()/tryDispose()；
-   * - releaseSceneReference() 把最后一个引用从 1 减到 0。
-   *
-   * 顺序固定为：标记 disposed → 按注册顺序通知 listener → 清空 listener →
-   * disposeCPUData()。先标记状态可以阻止 listener 在释放期间重新使用资源。
+   * 每轮对每个待办至多尝试一次。一个任务失败后继续尝试其他独立任务，
+   * 成功任务立即移出待办。存在依赖的操作应封装在同一个任务内部。
    */
   private finalizeDisposal(): void {
-    if (this.disposedValue) return
-
-    this.disposedValue = true
-
-    for (const listener of this.disposeListeners) {
-      listener()
+    if (this.cleanupStateValue === 'complete' || this.cleanupStateValue === 'running') {
+      return
     }
 
-    this.disposeListeners.clear()
+    if (this.cleanupStateValue === 'not-started') {
+      let taskIndex = 1
+      for (const listener of this.disposeListeners) {
+        this.pendingDisposeListeners.set(listener, taskIndex)
+        taskIndex += 1
+      }
+      this.disposeListeners.clear()
+    }
 
-    this.disposeCPUData()
+    this.cleanupStateValue = 'running'
+    const failures: CleanupFailure[] = []
+
+    try {
+      for (const [listener, taskIndex] of [...this.pendingDisposeListeners]) {
+        try {
+          listener()
+          this.pendingDisposeListeners.delete(listener)
+        } catch (cause) {
+          failures.push({
+            phase: 'listener',
+            label: 'dispose listener ' + taskIndex,
+            cause
+          })
+        }
+      }
+
+      if (this.pendingDisposeListeners.size === 0) {
+        try {
+          this.disposeCPUData()
+        } catch (cause) {
+          failures.push({
+            phase: 'cpu',
+            label: 'disposeCPUData',
+            cause
+          })
+        }
+      }
+
+      if (failures.length > 0) {
+        throw new CleanupFailureError(this.resourceType, failures)
+      }
+
+      this.cleanupStateValue = 'complete'
+    } finally {
+      // 无论哪一步退出，只要尚未完成，都不能永远停留在 running。
+      if (this.cleanupStateValue === 'running') {
+        this.cleanupStateValue = 'failed'
+      }
+    }
   }
 }

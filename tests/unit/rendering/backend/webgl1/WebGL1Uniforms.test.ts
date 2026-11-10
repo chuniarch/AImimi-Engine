@@ -1,3 +1,4 @@
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
 import { describe, expect, it, vi } from 'vitest'
 import {
   InvalidMaterialError,
@@ -410,7 +411,7 @@ describe('WebGL1Uniforms draw input contract', () => {
 
     test.uniforms.upload(test.uniforms.prepare(test.program, test.submission))
 
-    expect(test.resolveCube).toHaveBeenCalledWith(texture)
+    expect(test.resolveCube).toHaveBeenCalledWith(texture, 'uEnv')
 
     expect(test.calls.activeTexture).toHaveBeenCalledWith(test.fake.gl.TEXTURE0)
 
@@ -538,7 +539,7 @@ describe('WebGL1Uniforms mixed samplers', () => {
 
   /** 附件保持逻辑地址，名称也传给 resolver 以构成反馈错误现场。 */
   it('附件地址与 uniform 名一起交给二维 resolver', () => {
-    const target = new RenderTarget(
+    const target = legacyTarget(
       { width: 2, height: 2, colors: [{ format: 'rgba8' }] },
       { label: 'uniform-target' }
     )
@@ -602,3 +603,31 @@ describe('WebGL1Uniforms mixed samplers', () => {
     expect(f.calls.uniform1i).not.toHaveBeenCalled()
   })
 })
+
+const owners = new WeakMap<RenderTarget, RenderTargetBundle>()
+function legacyTarget(
+  descriptor: {
+    width: number
+    height: number
+    colors: readonly {
+      format: string
+      sampler?: { minFilter: 'nearest' | 'linear'; magFilter: 'nearest' | 'linear' }
+    }[]
+    depth?: unknown
+  },
+  options: { label: string }
+) {
+  const owner = new RenderTargetBundle({
+    label: options.label,
+    width: descriptor.width,
+    height: descriptor.height,
+    colors: descriptor.colors.map((c) => ({
+      storage: { format: 'rgba', type: c.format === 'rgba32f' ? 'float32' : 'uint8' },
+      colorSpace: 'data',
+      defaultSampler: c.sampler
+    })),
+    depth: descriptor.depth !== undefined
+  })
+  owners.set(owner.target, owner)
+  return owner.target
+}

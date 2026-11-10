@@ -129,9 +129,9 @@ describe('Deferred scene real GPU', () => {
     for (let i = 0; i < dark.length; i += 4) expect([...dark.slice(i, i + 3)]).toEqual([0, 0, 0])
     f.light.setIntensity(Math.PI)
     expectFront(f.render(80, 48), 80, 48)
-    const target = (f.passes[0] as GBufferPass).target
-    expect(target.descriptor.width).toBe(80)
-    expect(target.descriptor.height).toBe(48)
+    const target = f.passes.find((pass) => pass instanceof GBufferPass)!.target
+    expect(target.width).toBe(80)
+    expect(target.height).toBe(48)
   })
 
   /** CPU Scene/Pass 保留，恢复只重建 GPU 表示；生产者必须重新画全部附件。 */

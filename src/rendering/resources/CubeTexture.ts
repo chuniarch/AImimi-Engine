@@ -2,6 +2,7 @@ import { assertNever } from '@/errors/helper/helpers'
 import { InvalidCubeTextureError } from '@/rendering/core/errors'
 import {
   Texture,
+  createTextureDescriptorSnapshot,
   type TextureOptions,
   type TextureStorageDescriptor
 } from '@/rendering/resources/Texture'
@@ -12,6 +13,7 @@ import {
   type TexturePixelSource2D
 } from '@/rendering/resources/texturePixelSnapshot'
 import { assertValidCubeFaceDimensions } from '@/rendering/resources/assertValidCubeFaceDimensions'
+import { textureImageDimensions } from './textureImageDimensions'
 import type { TextureImageSource } from '@/rendering/resources/Texture2D'
 
 /**
@@ -43,6 +45,8 @@ export interface CubeTextureOptions extends TextureOptions {
 }
 
 interface CubeImageSnapshot {
+  readonly width: number
+  readonly height: number
   readonly kind: 'images'
   readonly faces: CubeFaces<TextureImageSource>
 }
@@ -82,9 +86,9 @@ function copyCubeFaces<T>(faces: CubeFaces<T>): CubeFaces<T> {
  * @remarks
  * [DESIGN-WEIGHT:2][cubemap-borrowed-image-source]
  *
- * 此处只验证 backend-independent 的最小结构。图片是否已经加载、是否确实可以
- * 传给 texImage2D、六面是否同尺寸以及 WebGL1 NPOT 限制，由后续
- * WebGL1CubeTextureManager 在上传时验证。
+ * 此处只验证 backend-independent 的最小结构。图片必须已解码且六面为同尺寸正方形，构造时确定固定布局。是否确实可以
+ * 传给 texImage2D、来源此刻是否仍有效以及 WebGL1 NPOT 限制，由后续
+ * WebGL1TextureManager 在上传时验证。
  */
 function createCubeImageSnapshot(label: string, source: CubeImageSource): CubeImageSnapshot {
   /*
@@ -122,9 +126,22 @@ function createCubeImageSnapshot(label: string, source: CubeImageSource): CubeIm
     }
   }
 
+  const size = (index: number) =>
+    textureImageDimensions(
+      faces[index],
+      'source.faces.' + index,
+      (field, reason, details) => new InvalidCubeTextureError(label, field + ': ' + reason, details)
+    )
+  const dimensions = [size(0), size(1), size(2), size(3), size(4), size(5)] as const
+  assertValidCubeFaceDimensions(
+    dimensions,
+    (reason, details) => new InvalidCubeTextureError(label, reason, details)
+  )
   return Object.freeze({
     kind: 'images',
-    faces: copyCubeFaces(faces)
+    faces: copyCubeFaces(faces),
+    width: dimensions[0].width,
+    height: dimensions[0].height
   })
 }
 
@@ -172,7 +189,7 @@ function createCubeDataFaceSnapshot(
  *
  * Cubemap 的六面共享同一个 GPU storage，因此必须具有相同宽高。这里验证的是
  * backend-independent 的 cubemap 结构不变量；WebGL1 的 NPOT、format 支持和
- * mipmap 能力仍由 WebGL1CubeTextureManager 验证。
+ * mipmap 能力仍由 WebGL1TextureManager 验证。
  */
 function createCubeDataSnapshot(
   label: string,
@@ -260,7 +277,7 @@ function createCubeSourceSnapshot(
  * - 不保存 `WebGLTexture`；
  * - 不执行 WebGL1 NPOT、format extension 或 mipmap capability 验证。
  *
- * 后续 WebGL1CubeTextureManager 以 CubeTexture 对象身份为 key，为每个 WebGL
+ * 后续 WebGL1TextureManager 以 CubeTexture 对象身份为 key，为每个 WebGL
  * context 创建并管理独立的 GPU handle。
  */
 export class CubeTexture extends Texture {
@@ -274,11 +291,13 @@ export class CubeTexture extends Texture {
    * @throws {@link InvalidCubeTextureError} source 或纹理描述违反约束时抛出。
    */
   constructor(options: CubeTextureOptions) {
-    const textureLabel = getCubeDiagnosticLabel(options.label)
-
-    super(options, (reason) => new InvalidCubeTextureError(textureLabel, reason))
-
-    this.sourceValue = createCubeSourceSnapshot(this.label, options.source, this.storage)
+    const textureLabel = getCubeDiagnosticLabel(options?.label)
+    const fail = (reason: string) => new InvalidCubeTextureError(textureLabel, reason)
+    const descriptor = createTextureDescriptorSnapshot(options, fail)
+    const source = createCubeSourceSnapshot(textureLabel, options.source, descriptor.storage)
+    const dimensions = source.kind === 'images' ? source : source.faces[0]
+    super(options, fail, { dimension: 'cube', width: dimensions.width, height: dimensions.height })
+    this.sourceValue = source
   }
 
   /**

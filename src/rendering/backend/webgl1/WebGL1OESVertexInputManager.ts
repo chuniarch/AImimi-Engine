@@ -1,4 +1,9 @@
-import { WebGLContextLostError, WebGLResourceCreationError } from '@/rendering/core/errors'
+import {
+  CleanupFailureError,
+  WebGLBackendDisposedError,
+  WebGLContextLostError,
+  WebGLResourceCreationError
+} from '@/rendering/core/errors'
 import { requireNonNull } from '@/rendering/core/requireNonNull'
 import type { Geometry } from '@/rendering/resources/Geometry'
 import type { WebGL1GeometryResource } from './WebGL1GeometryManager'
@@ -10,6 +15,8 @@ import { WebGL1VertexInputSupport } from './WebGL1VertexInputSupport'
 interface VertexArrayEntry {
   readonly vao: WebGLVertexArrayObjectOES
   readonly gpuGeometry: WebGL1GeometryResource
+  readonly geometry: Geometry
+  readonly program: WebGLProgram
 }
 
 /**
@@ -33,6 +40,10 @@ export class WebGL1OESVertexInputManager implements WebGL1VertexInputManager {
 
   /** 本策略最近一次成功绑定的 VAO；不代表可以容忍任意外部 GL 状态修改。 */
   private currentVAO: WebGLVertexArrayObjectOES | null = null
+  /** 已退出缓存但尚未删除成功的 VAO；依赖身份持续可达。 */
+  private readonly retired = new Set<VertexArrayEntry>()
+  private closing = false
+  private busy = false
 
   constructor(
     gl: WebGLRenderingContext,
@@ -60,8 +71,12 @@ export class WebGL1OESVertexInputManager implements WebGL1VertexInputManager {
     gpuGeometry: WebGL1GeometryResource,
     program: WebGL1ProgramResource
   ): void {
+    if (this.closing) throw new WebGLBackendDisposedError('bind vertex input')
+    this.assertNotBusy()
+    this.busy = true
     try {
       this.support.assertBindable(geometry)
+      if (!this.drainRetired()) throw new WebGLContextLostError('bind vertex input')
 
       const cached = this.entries.get(geometry)?.get(program.program)
 
@@ -109,14 +124,12 @@ export class WebGL1OESVertexInputManager implements WebGL1VertexInputManager {
 
         const programs = this.entries.get(geometry) ?? new Map<WebGLProgram, VertexArrayEntry>()
 
-        programs.set(program.program, { vao, gpuGeometry })
+        programs.set(program.program, { vao, gpuGeometry, geometry, program: program.program })
         this.entries.set(geometry, programs)
         this.currentVAO = vao
 
         // 同一 CPU Geometry 的 GPU 表示若被重新创建，不能复用旧 buffers 的 VAO。
-        if (cached !== undefined) {
-          this.extension.deleteVertexArrayOES(cached.vao)
-        }
+        if (cached !== undefined) this.retired.add(cached)
       } catch (error) {
         if (!this.support.contextLost) {
           this.extension.bindVertexArrayOES(previousVAO)
@@ -126,6 +139,8 @@ export class WebGL1OESVertexInputManager implements WebGL1VertexInputManager {
 
         throw error
       }
+      // 发布之后的旧 VAO 清理独立于候选回滚；失败不能删除已发布的新 VAO。
+      if (!this.drainRetired()) throw new WebGLContextLostError('retire replaced VAO')
     } catch (error) {
       if (!this.support.disposed && this.support.contextLost) {
         this.invalidateForContextLoss()
@@ -134,112 +149,132 @@ export class WebGL1OESVertexInputManager implements WebGL1VertexInputManager {
 
       throw error
     } finally {
+      this.busy = false
       // VAO 切换改变 EBO；配置过程还会临时改变全局 ARRAY_BUFFER。
       this.hooks.invalidateState()
     }
   }
 
-  /** 回到默认 VAO，不删除缓存；默认 VAO 自己原有的状态仍然存在。 */
+  /** 回到默认 VAO；成功检查后才提交 currentVAO=null。 */
   unbind(): void {
     if (this.support.disposed) return
-
+    this.assertNotBusy()
     if (this.support.contextLost) {
       this.invalidateForContextLoss()
       return
     }
-
-    this.extension.bindVertexArrayOES(null)
-    this.currentVAO = null
-    this.hooks.invalidateState()
+    this.busy = true
+    try {
+      this.unbindCurrent()
+    } finally {
+      this.busy = false
+      this.hooks.invalidateState()
+    }
   }
 
-  /**
-   * 删除关联此 Geometry 的全部 VAO。
-   *
-   * @remarks
-   * Geometry 可以已经 disposed；这里只按对象身份查关联，不再读其 CPU getter。
-   * 不删除 GeometryManager 拥有的 buffers。
-   */
+  /** buffers 删除之前，结束所有借用此 Geometry 的当前及退役 VAO。 */
   releaseGeometry(geometry: Geometry): void {
-    if (this.support.disposed) return
-
-    if (this.support.contextLost) {
-      this.invalidateForContextLoss()
-      return
-    }
-
-    const programs = this.entries.get(geometry)
-
-    if (programs === undefined) return
-
-    for (const entry of programs.values()) {
-      this.deleteEntry(entry)
-    }
-
-    this.entries.delete(geometry)
+    this.releaseMatching((entry) => entry.geometry === geometry)
   }
 
-  /** 删除该实际 program 的所有关联 VAO，不影响其他 program，也不删除 program。 */
+  /** linked program 删除之前，结束所有依赖它的 VAO。 */
   releaseProgram(program: WebGLProgram): void {
-    if (this.support.disposed) return
-
-    if (this.support.contextLost) {
-      this.invalidateForContextLoss()
-      return
-    }
-
-    for (const [geometry, programs] of this.entries) {
-      const entry = programs.get(program)
-
-      if (entry === undefined) continue
-
-      this.deleteEntry(entry)
-      programs.delete(program)
-
-      if (programs.size === 0) {
-        this.entries.delete(geometry)
-      }
-    }
-
+    this.releaseMatching((entry) => entry.program === program)
     this.support.forgetProgram(program)
   }
 
-  /** lost 只丢记录；恢复时工厂应创建新策略实例并使用重新取得的扩展对象。 */
+  /**
+   * 先转移到退役集合，再逐条删除；成功条目立即移除，失败条目仍可达。
+   * [DESIGN-WEIGHT:3][cleanup-retired-records]
+   */
+  private releaseMatching(matches: (entry: VertexArrayEntry) => boolean): void {
+    if (this.support.disposed) return
+    this.assertNotBusy()
+    if (this.support.contextLost) {
+      this.invalidateForContextLoss()
+      return
+    }
+    this.busy = true
+    try {
+      for (const [geometry, programs] of this.entries) {
+        for (const [program, entry] of programs) {
+          if (!matches(entry)) continue
+          this.retired.add(entry)
+          programs.delete(program)
+        }
+        if (programs.size === 0) this.entries.delete(geometry)
+      }
+      this.drainRetired(matches)
+    } finally {
+      this.busy = false
+      this.hooks.invalidateState()
+    }
+  }
+
+  /** false 表示旧代已失效，不再发送任何旧 handle 删除命令。 */
+  private drainRetired(matches: (entry: VertexArrayEntry) => boolean = () => true): boolean {
+    for (const entry of [...this.retired]) {
+      if (!matches(entry)) continue
+      if (this.support.contextLost) {
+        this.invalidateForContextLoss()
+        return false
+      }
+      let phase: 'gpu-dependency' | 'gpu-delete' = 'gpu-dependency'
+      try {
+        if (this.currentVAO === entry.vao) this.unbindCurrent()
+        phase = 'gpu-delete'
+        this.extension.deleteVertexArrayOES(entry.vao)
+        this.support.checkError('delete VAO')
+      } catch (cause) {
+        if (this.support.contextLost) {
+          this.invalidateForContextLoss()
+          return false
+        }
+        throw new CleanupFailureError('WebGL1OESVertexInputManager', [
+          { phase, label: 'vertex-array', cause }
+        ])
+      }
+      this.retired.delete(entry)
+    }
+    return true
+  }
+
+  /** 调用方持有同步 busy 标记；解绑失败时不能先清空 currentVAO。 */
+  private unbindCurrent(): void {
+    this.extension.bindVertexArrayOES(null)
+    this.support.checkError('unbind VAO')
+    this.currentVAO = null
+  }
+
+  /** context loss 仅丢弃本代责任，不删除旧 VAO。 */
   invalidateForContextLoss(): void {
     this.entries.clear()
+    this.retired.clear()
     this.currentVAO = null
     this.support.invalidateForContextLoss()
     this.hooks.invalidateState()
   }
 
-  /** 只删除自己创建的 VAO，绝不删除 program 或 buffers。 */
+  /** 关闭后拒绝 bind；全部当前/退役 VAO 成功处理后才关闭 Support。 */
   dispose(): void {
     if (this.support.disposed) return
-
-    if (this.support.contextLost) {
-      this.invalidateForContextLoss()
-    } else {
-      this.unbind()
-
-      for (const programs of this.entries.values()) {
-        for (const entry of programs.values()) {
-          this.extension.deleteVertexArrayOES(entry.vao)
-        }
-      }
-
-      this.entries.clear()
-    }
-
+    this.assertNotBusy()
+    this.closing = true
+    this.releaseMatching(() => true)
     this.support.dispose()
     this.hooks.invalidateState()
   }
 
-  /** 删除当前 VAO 前先解绑；删除非当前 VAO 不打断另一个当前布局。 */
-  private deleteEntry(entry: VertexArrayEntry): void {
-    if (this.currentVAO === entry.vao) {
-      this.unbind()
+  /** 顶点输入屏障中的 no-op 会让 buffer/program 被提前删除，因此必须明确报未完成。 */
+  private assertNotBusy(): void {
+    if (this.busy) {
+      throw new CleanupFailureError('WebGL1OESVertexInputManager', [
+        {
+          phase: 'gpu-dependency',
+          label: 'vertex input',
+          cause: new Error('Vertex input operation is already running')
+        }
+      ])
     }
-
-    this.extension.deleteVertexArrayOES(entry.vao)
   }
 }

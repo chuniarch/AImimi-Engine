@@ -216,7 +216,7 @@ describe('CubeTexture CPU resource', () => {
    *
    * 3×3、repeat 和 generated mipmap 对 WebGL1 来说是 NPOT 限制问题，但不是
    * CubeTexture 逻辑数据本身的错误。CPU Resource 必须允许它存在，由
-   * WebGL1CubeTextureManager 根据具体 context 能力拒绝或降级。
+   * WebGL1TextureManager 根据具体 context 能力拒绝或降级。
    */
   it('不在通用 CubeTexture 中执行 WebGL1 NPOT 限制', () => {
     const texture = new CubeTexture({

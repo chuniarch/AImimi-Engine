@@ -5,7 +5,7 @@ import {
   requireBoolean,
   requireFiniteNumber
 } from '@/rendering/core/validation'
-import { CubeTexture } from '@/rendering/resources/CubeTexture'
+import { copyTextureSamplingSource, type CubeTextureSamplingSource } from './textureSamplingSource'
 import {
   copyTexture2DSamplingSource,
   type Texture2DSamplingSource,
@@ -32,10 +32,10 @@ export type Vec4ParameterValue = readonly [number, number, number, number]
  * mat3/mat4 用平坦的列主序数组表示，运行时分别要求恰好 9/16 个有限数值。
  * int 要求有符号 32 位整数；bool 只接受 boolean，不把 0/1 隐式转换为布尔值。
  *
- * WebGL1 Backend 已接通当前 revision 的颜色附件解析，并在采样前拒绝当前输出反馈环。
+ * C2提案支持固定纹理绑定和活动槽位；旧Backend对新协议的接线在C3/C4完成。
  * resize 或 context 恢复只重建附件存储；内容仍须由生产者重新绘制，Material 不负责重画。
  *
- * TODO(material-render-target-bindings): 后续补充可采样深度与 face/mip/layer 子资源视图，
+ * TODO(material-render-target-bindings): C3/C4接通统一采样与feedback；后续可采样深度/layer，
  * 并与生产者协作设计附件内容有效性跟踪及恢复后的重画调度；当前不自动恢复附件内容。
  */
 export type MaterialParameter =
@@ -48,7 +48,7 @@ export type MaterialParameter =
   | { readonly type: 'mat3'; readonly value: readonly number[] }
   | { readonly type: 'mat4'; readonly value: readonly number[] }
   | { readonly type: 'texture2D'; readonly value: Texture2DSamplingSource }
-  | { readonly type: 'cubeTexture'; readonly value: CubeTexture }
+  | { readonly type: 'cubeTexture'; readonly value: CubeTextureSamplingSource }
 
 /**
  * 为运行时验证保留允许的类型名。
@@ -97,35 +97,6 @@ function copyNumberArray(
   }
 
   return copy
-}
-
-/**
- * 验证 材质或参数块借用的 cubemap，并返回原资源。
- *
- * @remarks
- * [DESIGN-WEIGHT:3][material-borrowed-resources]
- *
- * 本函数不导出；参数复制器通过 createError 保留调用方自己的领域诊断。
- * 先检查资源类型，再让 CubeTexture 自己验证生命周期，避免非法值触发 TypeError。
- * 不复制像素、不 retain，也不接管释放责任；参数包装由 copyParameter 创建。
- *
- * @param value - 尚未验证的参数资源引用。
- * @param fieldName - 调用方参数的诊断路径。
- * @returns 原始 CubeTexture 实例。
- * @throws createError 返回的错误：输入不是 CubeTexture。
- * @throws ResourceDisposedError cubemap 已开始或完成释放。
- */
-function requireCubeTexture(
-  value: unknown,
-  fieldName: string,
-  createError: ParameterErrorFactory
-): CubeTexture {
-  if (!(value instanceof CubeTexture))
-    throw createError(fieldName, 'must reference a CubeTexture resource')
-
-  value.assertUsable()
-
-  return value
 }
 
 /**
@@ -210,7 +181,7 @@ export function copyParameter(
     case 'cubeTexture':
       return {
         type: 'cubeTexture',
-        value: requireCubeTexture(parameter.value, fieldName, createError)
+        value: copyTextureSamplingSource(parameter.value, 'cube', fieldName, createError)
       }
 
     default:

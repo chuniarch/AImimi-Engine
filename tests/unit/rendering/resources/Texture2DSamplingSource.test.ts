@@ -1,21 +1,24 @@
-import { describe, expect, it } from 'vitest'
+import { onTestFinished, describe, expect, it } from 'vitest'
 
 import { InvalidMaterialError, ResourceDisposedError } from '@/rendering/core/errors'
-import { RenderTarget } from '@/rendering/resources/RenderTarget'
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
 import { DataTexture2D, ImageTexture2D } from '@/rendering/resources/Texture2D'
 import { copyTexture2DSamplingSource } from '@/rendering/resources/Texture2DSamplingSource'
 
 /** 创建真实 CPU 目标；两个颜色槽和可选深度用于验证地址，不创建 WebGL context。 */
-function createTarget(withDepth = true): RenderTarget {
-  return new RenderTarget(
-    {
-      width: 32,
-      height: 16,
-      colors: [{ format: 'rgba8' }, { format: 'rgba8' }],
-      ...(withDepth ? { depth: { format: 'depth16' as const } } : {})
-    },
-    { label: 'shadow/main' }
-  )
+function createOwner(withDepth = true): RenderTargetBundle {
+  const owner = new RenderTargetBundle({
+    width: 32,
+    height: 16,
+    label: 'shadow/main',
+    depth: withDepth,
+    colors: Array.from({ length: 2 }, () => ({
+      storage: { format: 'rgba', type: 'uint8' },
+      colorSpace: 'data'
+    }))
+  })
+  onTestFinished(() => owner.dispose())
+  return owner
 }
 
 describe('Texture2DSamplingSource CPU contract', () => {
@@ -53,8 +56,9 @@ describe('Texture2DSamplingSource CPU contract', () => {
    * 如果直接返回或冻结输入，隔离断言或原对象可写断言会失败。
    */
   it('复制并冻结地址，不冻结原包装和目标，不捕获 revision', () => {
-    const target = createTarget()
-    const replacement = createTarget()
+    const owner = createOwner()
+    const target = owner.target
+    const replacement = createOwner().target
     const input = { target, kind: 'color', index: 1 }
     const snapshot = copyTexture2DSamplingSource(input, 'parameters.uShadowMap')
 
@@ -72,13 +76,13 @@ describe('Texture2DSamplingSource CPU contract', () => {
     expect(snapshot).not.toHaveProperty('texture')
     expect(target.sceneReferenceCount).toBe(0)
 
-    target.resize(64, 32)
+    owner.resize(64, 32)
     expect(copyTexture2DSamplingSource(snapshot, 'parameters.uShadowMap')).toEqual({
       target,
       kind: 'color',
       index: 1
     })
-    expect(target.descriptor.width).toBe(64)
+    expect(target.width).toBe(64)
     target.dispose()
     expect(() => copyTexture2DSamplingSource(snapshot, 'parameters.uShadowMap')).toThrow(
       ResourceDisposedError
@@ -86,19 +90,18 @@ describe('Texture2DSamplingSource CPU contract', () => {
     replacement.dispose()
   })
 
-  /** Given 合法槽位；When 仅验证逻辑地址；Then 不把 depth16 的 GPU 可采样性混进 CPU 层。 */
-  it('接受两个颜色槽与存在的 depth[0]，但不按相同 label 合并目标', () => {
-    const target = createTarget()
-    const other = createTarget()
-    for (const input of [
-      target.getColorAttachment(0),
-      target.getColorAttachment(1),
-      target.getDepthAttachment()!
-    ]) {
+  /** Given 合法槽位；When 验证颜色地址并拒绝 depth16 采样。 */
+  it('接受两个颜色槽，拒绝 depth16 采样且不合并同名目标', () => {
+    const target = createOwner().target
+    const other = createOwner().target
+    for (const input of [target.getColorAttachment(0), target.getColorAttachment(1)]) {
       const snapshot = copyTexture2DSamplingSource(input, 'parameters.uMap')
       expect(snapshot).toEqual(input)
       expect(snapshot).not.toBe(input)
     }
+    expect(() =>
+      copyTexture2DSamplingSource(target.getDepthAttachment(), 'parameters.uMap')
+    ).toThrow(InvalidMaterialError)
     expect(copyTexture2DSamplingSource(other.getColorAttachment(0), 'parameters.uMap')).toEqual({
       target: other,
       kind: 'color',
@@ -134,7 +137,7 @@ describe('Texture2DSamplingSource CPU contract', () => {
     { kind: 'color', index: 2 },
     { kind: 'depth', index: 1 }
   ])('拒绝非法附件地址 %#', (address) => {
-    const target = createTarget()
+    const target = createOwner().target
     expect(() => copyTexture2DSamplingSource({ target, ...address }, 'parameters.uMap')).toThrow(
       InvalidMaterialError
     )
@@ -145,7 +148,7 @@ describe('Texture2DSamplingSource CPU contract', () => {
 
   /** depth[0] 只有在 descriptor 真正配置了 depth 时才是有效地址。 */
   it('拒绝不存在的深度附件', () => {
-    const target = createTarget(false)
+    const target = createOwner(false).target
     expect(() =>
       copyTexture2DSamplingSource({ target, kind: 'depth', index: 0 }, 'parameters.uDepth')
     ).toThrow(InvalidMaterialError)

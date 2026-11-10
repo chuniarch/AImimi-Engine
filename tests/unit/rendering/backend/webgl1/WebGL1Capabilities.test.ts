@@ -13,7 +13,7 @@ import { createFakeWebGL1Context } from '../fakes/createFakeWebGL1Context'
  */
 describe('WebGL1Capabilities', () => {
   /** 扩展缺失是合法结果；字符串拼错或查询错 limit 都会使本测试失败。 */
-  it('查询七个扩展和两个上限，冻结快照但不冻结扩展对象', () => {
+  it('查询九个扩展和四个上限，冻结快照但不冻结扩展对象', () => {
     const fake = createFakeWebGL1Context()
     const vaoExtension = { label: 'context-A-vao' }
     fake.extensions.set('OES_vertex_array_object', vaoExtension)
@@ -27,11 +27,15 @@ describe('WebGL1Capabilities', () => {
       'WEBGL_depth_texture',
       'OES_texture_float',
       'OES_texture_float_linear',
-      'WEBGL_color_buffer_float'
+      'WEBGL_color_buffer_float',
+      'OES_fbo_render_mipmap',
+      'EXT_shader_texture_lod'
     ])
     expect(fake.calls.getParameter.mock.calls).toEqual([
       [fake.gl.MAX_VERTEX_ATTRIBS],
-      [fake.gl.MAX_TEXTURE_IMAGE_UNITS]
+      [fake.gl.MAX_TEXTURE_IMAGE_UNITS],
+      [fake.gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS],
+      [fake.gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS]
     ])
     expect(result).toEqual({
       vertexArrayObject: vaoExtension,
@@ -41,8 +45,12 @@ describe('WebGL1Capabilities', () => {
       textureFloat: null,
       textureFloatLinear: null,
       colorBufferFloat: null,
+      fboRenderMipmap: null,
       maxVertexAttributes: 16,
-      maxTextureUnits: 8
+      maxTextureUnits: 8,
+      maxVertexTextureUnits: 0,
+      maxCombinedTextureUnits: 8,
+      shaderTextureLod: null
     })
     expect(result.vertexArrayObject).toBe(vaoExtension)
     expect(Object.isFrozen(result)).toBe(true)
@@ -131,4 +139,49 @@ describe('WebGL1Capabilities', () => {
       }
     }
   )
+})
+
+/** [DESIGN-WEIGHT:3][texture-write-view-subresource] */
+describe('C3 FBO mip capability', () => {
+  it('G04: 非零 mip 能力独立于 float 三项，并在新探测中更新', () => {
+    const fake = createFakeWebGL1Context()
+    const mip = {}
+    fake.extensions.set('OES_fbo_render_mipmap', mip)
+    const first = detectWebGL1Capabilities(fake.gl)
+    expect(first.fboRenderMipmap).toBe(mip)
+    expect(first.textureFloat).toBeNull()
+    expect(first.textureFloatLinear).toBeNull()
+    expect(first.colorBufferFloat).toBeNull()
+    fake.extensions.delete('OES_fbo_render_mipmap')
+    expect(detectWebGL1Capabilities(fake.gl).fboRenderMipmap).toBeNull()
+    expect(first.fboRenderMipmap).toBe(mip)
+    expect(Object.isFrozen(mip)).toBe(false)
+  })
+  it('G04: mip 扩展探测发生 lost 时不能发布正常快照', () => {
+    const fake = createFakeWebGL1Context()
+    fake.calls.getExtension.mockImplementation((name) => {
+      if (name === 'OES_fbo_render_mipmap') fake.setLost(true)
+      return null
+    })
+    expect(() => detectWebGL1Capabilities(fake.gl)).toThrow(WebGLContextLostError)
+  })
+})
+
+it('accepts zero vertex units but rejects invalid vertex and combined budgets', () => {
+  const f = createFakeWebGL1Context()
+  expect(detectWebGL1Capabilities(f.gl).maxVertexTextureUnits).toBe(0)
+  for (const value of [-1, 1.5, null, '8', Infinity]) {
+    f.limits.set(f.gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS, value)
+    expect(() => detectWebGL1Capabilities(f.gl)).toThrow(UnsupportedRenderFeatureError)
+  }
+  f.limits.set(f.gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS, 0)
+  f.limits.set(f.gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS, 0)
+  expect(() => detectWebGL1Capabilities(f.gl)).toThrow(UnsupportedRenderFeatureError)
+})
+it('keeps explicit shader LOD independent of framebuffer mip attachment', () => {
+  const f = createFakeWebGL1Context()
+  const lod = {}
+  f.extensions.set('EXT_shader_texture_lod', lod)
+  expect(detectWebGL1Capabilities(f.gl).shaderTextureLod).toBe(lod)
+  expect(detectWebGL1Capabilities(f.gl).fboRenderMipmap).toBeNull()
 })

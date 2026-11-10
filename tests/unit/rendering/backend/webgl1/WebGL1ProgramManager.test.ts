@@ -1,3 +1,4 @@
+import { CleanupFailureError } from '@/rendering/core/errors/CleanupFailureError'
 import { describe, expect, it, vi } from 'vitest'
 import { WebGL1ProgramManager } from '@/rendering/backend/webgl1/WebGL1ProgramManager'
 import {
@@ -199,7 +200,7 @@ describe('WebGL1ProgramManager', () => {
     expect(f.hooks.invalidateState).toHaveBeenCalled()
   })
 
-  it('Manager dispose 先取消全部订阅，不释放 CPU 数据', () => {
+  it('Manager dispose 逐项成功后取消订阅，不释放 CPU 数据', () => {
     const f = setup()
     const a = createShader()
     const b = createShader()
@@ -216,9 +217,9 @@ describe('WebGL1ProgramManager', () => {
     f.manager.get(a)
     f.manager.get(b)
 
+    let dependencyCalls = 0
     f.hooks.beforeDelete.mockImplementation(() => {
-      expect(cancelled).toContain('a')
-      expect(cancelled).toContain('b')
+      expect(cancelled).toEqual(dependencyCalls++ === 0 ? [] : ['a'])
 
       return undefined
     })
@@ -226,6 +227,7 @@ describe('WebGL1ProgramManager', () => {
     f.manager.dispose()
     f.manager.dispose()
 
+    expect(cancelled).toEqual(['a', 'b'])
     expect(f.calls.deleteProgram).toHaveBeenCalledTimes(2)
     expect(a.disposed).toBe(false)
     expect(b.vertexSource).toContain('position')
@@ -243,7 +245,7 @@ describe('WebGL1ProgramManager', () => {
       throw failure
     })
 
-    expect(() => f.manager.dispose()).toThrow(failure)
+    expectCleanupCause(() => f.manager.dispose(), failure)
     expect(f.calls.deleteProgram).not.toHaveBeenCalled()
 
     f.manager.dispose()
@@ -464,3 +466,62 @@ describe('WebGL1ProgramManager', () => {
     expect(f.calls.createProgram).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('Program cleanup progress', () => {
+  /** useProgram(null) 失败时 program 必须保留，下一次不能跳过解绑。 */
+  it('解绑失败保留 program，解绑成功后删除失败不重放依赖屏障', () => {
+    const f = setup()
+    const cpu = createShader()
+    const gpu = f.manager.get(cpu)
+    f.gl.useProgram(gpu.program)
+    f.calls.useProgram.mockImplementationOnce(() => {
+      throw new Error('unbind')
+    })
+    expect(() => f.manager.release(cpu)).toThrow(CleanupFailureError)
+    expect(f.calls.deleteProgram).not.toHaveBeenCalled()
+    f.calls.deleteProgram.mockImplementationOnce(() => {
+      throw new Error('delete')
+    })
+    expect(() => f.manager.release(cpu)).toThrow(CleanupFailureError)
+    f.manager.release(cpu)
+    expect(f.hooks.beforeDelete).toHaveBeenCalledTimes(1)
+    expect(f.calls.deleteProgram).toHaveBeenCalledTimes(2)
+    expect(f.gl.getParameter(f.gl.CURRENT_PROGRAM)).toBeNull()
+  })
+
+  /** 取消订阅前必须完成 GPU；否则外部 release 中的 Resource.dispose 会提前成功。 */
+  it('Resource 重入不能因 Manager 防重入返回而完成', () => {
+    const f = setup()
+    const cpu = createShader()
+    f.manager.get(cpu)
+    f.hooks.beforeDelete.mockImplementationOnce(() => {
+      expect(() => cpu.dispose()).toThrow(CleanupFailureError)
+      return undefined
+    })
+    f.manager.release(cpu)
+    expect(cpu.cleanupState).toBe('failed')
+    cpu.dispose()
+    expect(cpu.cleanupState).toBe('complete')
+    expect(f.calls.deleteProgram).toHaveBeenCalledTimes(1)
+  })
+})
+
+/** 清理错误统一包装，但最底层原始异常的身份必须完整保留。 */
+function expectCleanupCause(action: () => void, expected: unknown): void {
+  let failure: unknown
+  try {
+    action()
+  } catch (error) {
+    failure = error
+  }
+  expect(failure).toBeInstanceOf(CleanupFailureError)
+  const causes: unknown[] = []
+  const visit = (error: unknown): void => {
+    causes.push(error)
+    if (error instanceof CleanupFailureError) {
+      for (const entry of error.failures) visit(entry.cause)
+    }
+  }
+  visit(failure)
+  expect(causes).toContain(expected)
+}

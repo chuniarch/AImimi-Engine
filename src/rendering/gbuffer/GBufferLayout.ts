@@ -1,4 +1,6 @@
-import { RenderTarget, type RenderTargetAttachmentRef } from '@/rendering/resources/RenderTarget'
+import type { RenderTarget, RenderTargetAttachmentRef } from '@/rendering/resources/RenderTarget'
+
+import { RenderTargetBundle } from '@/rendering/resources/RenderTargetBundle'
 
 /**
  * 四项表面数据的逻辑槽位；不是 WebGL COLOR_ATTACHMENT 枚举。
@@ -45,17 +47,20 @@ export interface GBufferOutput {
  * @param label - 稳定诊断标签，不是共享缓存 key。
  * @throws InvalidRenderTargetError 尺寸或标签无效。
  */
-export function createGBufferTarget(width: number, height: number, label: string): RenderTarget {
-  return new RenderTarget(
-    {
-      width,
-      height,
-      colors: Array.from({ length: 4 }, () => ({
-        format: 'rgba32f',
-        sampler: { minFilter: 'nearest', magFilter: 'nearest' }
-      })),
-      depth: { format: 'depth16' }
-    },
-    { label }
-  )
+export function createGBufferTarget(
+  width: number,
+  height: number,
+  label: string
+): RenderTargetBundle {
+  return new RenderTargetBundle({
+    label,
+    width,
+    height,
+    colors: Array.from({ length: 4 }, () => ({
+      storage: { format: 'rgba', type: 'float32' },
+      colorSpace: 'data',
+      defaultSampler: { minFilter: 'nearest', magFilter: 'nearest' }
+    })),
+    depth: true
+  })
 }

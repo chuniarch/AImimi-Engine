@@ -1,3 +1,4 @@
+import { CleanupFailureError } from '@/rendering/core/errors/CleanupFailureError'
 import { describe, expect, it, vi } from 'vitest'
 import { createWebGL1VertexInputManager } from '@/rendering/backend/webgl1/WebGL1VertexInputManager'
 import { WebGL1OESVertexInputManager } from '@/rendering/backend/webgl1/WebGL1OESVertexInputManager'
@@ -602,6 +603,102 @@ describe('manual-specific behavior', () => {
 
     f.manager.releaseProgram(program.program)
 
+    expect(f.readCurrent().enabled).toEqual([])
+    expect(f.readCurrent().indexBuffer).toBeNull()
+  })
+})
+
+describe('Vertex input cleanup progress', () => {
+  /** 第一个 VAO 已成功删除时，第二个失败不能让重试再次删除第一个。 */
+  it('OES 同一 Geometry 多个 program 的 VAO 逐条推进', () => {
+    const f = setup(true)
+    const cpu = createGeometry()
+    const gpu = f.geometries.get(cpu)
+    f.manager.bind(cpu, gpu, f.program())
+    const first = f.readCurrent().vao
+    f.manager.bind(cpu, gpu, f.program())
+    const second = f.readCurrent().vao
+    const remove = f.oes.deleteVertexArrayOES.getMockImplementation()!
+    f.oes.deleteVertexArrayOES.mockImplementationOnce(remove).mockImplementationOnce(() => {
+      throw new Error('second VAO')
+    })
+    expect(() => f.manager.releaseGeometry(cpu)).toThrow(CleanupFailureError)
+    f.manager.releaseGeometry(cpu)
+    expect(f.oes.deleteVertexArrayOES.mock.calls.map(([vao]) => vao)).toEqual([
+      first,
+      second,
+      second
+    ])
+  })
+
+  /** 发布后删除旧 VAO 失败，不能落入候选 catch 把新 VAO 一并删掉。 */
+  it('OES replacement 保留新 VAO 和旧退役记录', () => {
+    const f = setup(true)
+    const cpu = createGeometry()
+    const gpu = f.geometries.get(cpu)
+    const program = f.program()
+    f.manager.bind(cpu, gpu, program)
+    const old = f.readCurrent().vao
+    f.oes.deleteVertexArrayOES.mockImplementationOnce(() => {
+      throw new Error('old VAO')
+    })
+    expect(() => f.manager.bind(cpu, { ...gpu }, program)).toThrow(CleanupFailureError)
+    const next = f.readCurrent().vao
+    expect(next).not.toBe(old)
+    expect(f.oes.deleteVertexArrayOES.mock.calls.map(([vao]) => vao)).toEqual([old])
+    f.manager.dispose()
+    expect(f.oes.deleteVertexArrayOES.mock.calls.filter(([vao]) => vao === old)).toHaveLength(2)
+    expect(f.oes.deleteVertexArrayOES.mock.calls.filter(([vao]) => vao === next)).toHaveLength(1)
+  })
+
+  /** JS 抛错和 GL error 都必须保留解绑责任；错误检查前不能清空借用关系。 */
+  it.each(['throw', 'gl-error'] as const)('manual %s 失败后仍可解除同一 Geometry', (fault) => {
+    const f = setup(false)
+    const cpu = createGeometry()
+    const gpu = f.geometries.get(cpu)
+    f.manager.bind(cpu, gpu, f.program())
+    const failure = new Error('disable')
+    if (fault === 'throw') {
+      f.calls.disableVertexAttribArray.mockImplementationOnce(() => {
+        throw failure
+      })
+    } else {
+      f.calls.disableVertexAttribArray.mockImplementationOnce(() => {
+        // 模拟 GL 拒绝禁用：真实 enabled 集合仍含该 location，重试必须再禁用。
+        f.setError(0x0502)
+      })
+    }
+    let observed: unknown
+    try {
+      f.manager.releaseGeometry(cpu)
+    } catch (cause) {
+      observed = cause
+    }
+    expect(observed).toBeInstanceOf(CleanupFailureError)
+    const failures = (observed as CleanupFailureError).failures
+    expect(failures).toHaveLength(1)
+    expect(failures[0]!.phase).toBe('gpu-dependency')
+    if (fault === 'throw') expect(failures[0]!.cause).toBe(failure)
+    else expect(failures[0]!.cause).toBeInstanceOf(WebGLOperationError)
+    f.manager.releaseGeometry(cpu)
+    expect(f.readCurrent().enabled).toEqual([])
+    expect(f.readCurrent().indexBuffer).toBeNull()
+    f.manager.dispose()
+  })
+
+  /** 解绑失败不能在 finally 中把 Support 永久关闭，否则下次已经无法解绑。 */
+  it('manual dispose 失败保持关闭但保留 Support，第二次完成解绑', () => {
+    const f = setup(false)
+    const cpu = createGeometry()
+    const gpu = f.geometries.get(cpu)
+    const program = f.program()
+    f.manager.bind(cpu, gpu, program)
+    f.calls.disableVertexAttribArray.mockImplementationOnce(() => {
+      throw new Error('disable')
+    })
+    expect(() => f.manager.dispose()).toThrow()
+    expect(() => f.manager.bind(cpu, gpu, program)).toThrow(WebGLBackendDisposedError)
+    f.manager.dispose()
     expect(f.readCurrent().enabled).toEqual([])
     expect(f.readCurrent().indexBuffer).toBeNull()
   })

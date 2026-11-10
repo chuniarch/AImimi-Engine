@@ -1,3 +1,4 @@
+import { RenderTexture } from '@/rendering/resources/RenderTexture'
 import type { DrawSubmission, RenderBackend } from '@/rendering/backend/RenderBackend'
 import type { RenderSurfaceScopeDescriptor } from '@/rendering/backend/RenderSurface'
 import {
@@ -9,9 +10,9 @@ import {
   WebGLOperationError
 } from '@/rendering/core/errors'
 import { Geometry } from '@/rendering/resources/Geometry'
-import { Texture2D } from '@/rendering/resources/Texture2D'
+import type { TextureSamplingBinding } from '@/rendering/resources/TextureSamplingBinding'
 import { Material } from '@/rendering/resources/Material'
-import { detectWebGL1Capabilities } from './WebGL1Capabilities'
+import { detectWebGL1Capabilities, type WebGL1Capabilities } from './WebGL1Capabilities'
 import {
   WebGLContextLifecycle,
   type WebGLContextFailure,
@@ -21,8 +22,11 @@ import { WebGL1ResourceManager } from './WebGL1ResourceManager'
 import { WebGL1State } from './WebGL1State'
 import { WebGL1Uniforms } from './WebGL1Uniforms'
 import { WebGL1SurfaceScope } from './WebGL1SurfaceScope'
+import { assertTextureOperation } from './WebGL1TextureUploadSupport'
 
 interface Generation {
+  readonly capabilities: WebGL1Capabilities
+  readonly commands: WebGLRenderingContext
   readonly token: object
   readonly state: WebGL1State
   readonly resources: WebGL1ResourceManager
@@ -116,7 +120,11 @@ export class WebGL1Backend implements RenderBackend {
 
     if (this.gl.isContextLost()) this.invalidateGeneration()
 
-    return this.lifecycle.isReady && this.generation.valid
+    return this.lifecycle.isReady && this.generation.valid && this.generation.resources.available
+  }
+
+  get resourceEpoch(): object | null {
+    return this.ready ? this.generation.token : null
   }
 
   /** 恢复失败是可观察状态，不会被转换成静默的 draw no-op。 */
@@ -176,6 +184,27 @@ export class WebGL1Backend implements RenderBackend {
     this.requireGeneration('finish drawing-buffer resize')
   }
 
+  generateMipmaps(texture: RenderTexture): void {
+    const generation = this.requireGeneration('generate mipmaps')
+    this.assertOutsideScope(generation, 'generate mipmaps')
+    if (!(texture instanceof RenderTexture)) {
+      throw new UnsupportedRenderFeatureError('generate mipmaps', 'requires a RenderTexture')
+    }
+    texture.assertUsable()
+    if (
+      texture.descriptor.storage.type === 'float32' &&
+      (generation.capabilities.colorBufferFloat === null ||
+        generation.capabilities.textureFloatLinear === null)
+    ) {
+      throw new UnsupportedRenderFeatureError(
+        'generate mipmaps',
+        'float32 requires colorBufferFloat and textureFloatLinear'
+      )
+    }
+    generation.resources.textures.generateMipmaps(texture)
+    this.requireGeneration('finish mipmaps')
+  }
+
   /** Scope 负责目标绑定、入口清除，以及正常/异常/嵌套退出时的 surface 恢复。 */
   withRenderSurface(descriptor: RenderSurfaceScopeDescriptor, callback: () => undefined): void {
     this.requireGeneration('enter render surface').scope.run(descriptor, callback)
@@ -204,7 +233,17 @@ export class WebGL1Backend implements RenderBackend {
     }
 
     const { geometry, material } = submission.item
+    const { errorLabel } = submission
+    if (errorLabel !== undefined) {
+      assertTextureOperation(generation.commands, 'before draw', errorLabel)
+    }
 
+    if (
+      material.shaderModule.requiresShaderTextureLod &&
+      generation.capabilities.shaderTextureLod === null
+    ) {
+      throw new UnsupportedRenderFeatureError('shader LOD', 'EXT_shader_texture_lod is required')
+    }
     const program = generation.resources.programs.get(material.shaderModule)
     const buffers = generation.resources.geometries.get(geometry)
     const commands = generation.uniforms.prepare(program, submission)
@@ -212,23 +251,31 @@ export class WebGL1Backend implements RenderBackend {
     this.assertCurrentDraw(generation)
 
     generation.state.useProgram(program.program)
-    this.applyDrawState(material, generation.state)
+    this.applyDrawState(material, generation.state, generation.commands)
     generation.uniforms.upload(commands)
     generation.resources.vertexInputs.bind(geometry, buffers, program)
 
     this.assertCurrentDraw(generation)
 
     if (buffers.indexBuffer === null) {
-      this.gl.drawArrays(buffers.primitiveMode, 0, buffers.drawCount)
+      generation.commands.drawArrays(buffers.primitiveMode, 0, buffers.drawCount)
     } else {
       if (buffers.indexType === null) {
         throw new WebGLOperationError('draw', 'Geometry', 'index buffer has no index type')
       }
 
-      this.gl.drawElements(buffers.primitiveMode, buffers.drawCount, buffers.indexType, 0)
+      generation.commands.drawElements(
+        buffers.primitiveMode,
+        buffers.drawCount,
+        buffers.indexType,
+        0
+      )
     }
 
     this.assertCurrentDraw(generation)
+    if (errorLabel !== undefined) {
+      assertTextureOperation(generation.commands, 'draw', errorLabel)
+    }
   }
 
   /**
@@ -258,7 +305,24 @@ export class WebGL1Backend implements RenderBackend {
   /** 创建一代独立 Manager；恢复不复活旧 handles，也不立即上传全部 CPU 资源。 */
   private createGeneration(): Generation {
     const capabilities = detectWebGL1Capabilities(this.gl)
-    const state = new WebGL1State(this.gl)
+    const token = {}
+    const check = () => {
+      if (this.requireGeneration('execute generation command').token !== token)
+        throw new WebGLContextLostError('execute stale generation command')
+    }
+    const commands = new Proxy(this.gl, {
+      get(target, key) {
+        const value: unknown = Reflect.get(target, key, target)
+        if (typeof value !== 'function') return value
+        return (...args: unknown[]): unknown => {
+          if (key !== 'isContextLost') check()
+          const result: unknown = Reflect.apply(value, target, args)
+          if (key !== 'isContextLost') check()
+          return result
+        }
+      }
+    })
+    const state = new WebGL1State(commands)
 
     const resources = new WebGL1ResourceManager(this.gl, capabilities, {
       invalidateState: () => {
@@ -266,42 +330,47 @@ export class WebGL1Backend implements RenderBackend {
       }
     })
 
-    const token = {}
-
-    const scope = new WebGL1SurfaceScope(this.gl, state, {
+    const scope = new WebGL1SurfaceScope(commands, state, {
       assertReady: () => {
         this.requireGeneration('use render surface')
       },
 
       isCurrent: () =>
-        !this.disposedValue && this.generation?.token === token && this.generation.valid,
+        !this.disposedValue &&
+        this.generation?.token === token &&
+        this.generation.valid &&
+        resources.available,
 
-      resolveTarget: (target) => resources.renderTargets.get(target)
+      resolveTarget: (target) => resources.renderTargets.get(target),
+      assertTargetUsable: (record) => resources.renderTargets.assertRecordUsable(record)
     })
 
-    /**
-     * [DESIGN-WEIGHT:3][texture2d-source-borrowing]
-     * 两条逻辑来源最终都解析成当前 context 的 WebGLTexture，但所有者不同：
-     * CPU Texture2D 由 textures2D 上传；附件由 renderTargets 分配、由生产者 draw 填充。
-     * 先创建 scope，再注入解析闭包；反馈检查必须早于附件 get 的分配/重建。
-     * 不把 handle 写回 Material，也不把本次解析结果跨 draw 缓存。
-     *
-     * [DESIGN-WEIGHT:3][attachment-content-rebuild]
-     * 恢复只创建新 generation；CPU 来源可重传，附件内容必须由生产者重画。
-     */
+    // Capture the complete CPU sampling plan before any sampler allocation/binding.
+    const samples = new Map<string, TextureSamplingBinding>()
+    const resolve = (name: string) => {
+      const binding = samples.get(name)
+      if (!binding) throw new InvalidMaterialError(name, 'missing sampling preflight')
+      scope.assertCanSample(binding.texture, name)
+      return resources.textures.sample(binding)
+    }
     const uniforms = new WebGL1Uniforms(
       this.gl,
       capabilities.maxTextureUnits,
-      (texture) => resources.cubeTextures.get(texture),
-      (source, uniformName) => {
-        if (source instanceof Texture2D) return resources.textures2D.get(source).handle
-
-        scope.assertCanSample(source.target, uniformName)
-        return resources.renderTargets.resolveSampledColor(source)
-      }
+      (_source, name) => resolve(name),
+      (_source, name) => resolve(name).handle,
+      (requests) => {
+        samples.clear()
+        for (const { name, binding } of requests) {
+          scope.assertCanSample(binding.texture, name)
+          resources.textures.validateSampling(binding)
+          samples.set(name, binding)
+        }
+      },
+      () => scope.assertDrawable(),
+      capabilities
     )
 
-    return { token, state, resources, uniforms, scope, valid: true }
+    return { capabilities, commands, token, state, resources, uniforms, scope, valid: true }
   }
 
   /**
@@ -314,9 +383,7 @@ export class WebGL1Backend implements RenderBackend {
    * 编码深度的 draw 关闭，后续普通颜色 draw 可以重新开启。
    * 不承诺 scope 退出恢复所有 GL 状态；下一笔 draw 重新应用自己的状态。
    */
-  private applyDrawState(material: Material, state: WebGL1State): void {
-    const gl = this.gl
-
+  private applyDrawState(material: Material, state: WebGL1State, gl: WebGLRenderingContext): void {
     for (const capability of [
       gl.BLEND,
       gl.STENCIL_TEST,
@@ -358,6 +425,11 @@ export class WebGL1Backend implements RenderBackend {
 
     if (this.lifecycle.state === 'restoring' || this.lifecycle.state === 'restore-failed') {
       throw new WebGLOperationError(operation, 'WebGL1Backend', this.lifecycle.state)
+    }
+
+    if (!this.generation.resources.available) {
+      this.invalidateGeneration()
+      throw new WebGLContextLostError(operation)
     }
 
     if (!this.generation.valid || !this.lifecycle.isReady) {

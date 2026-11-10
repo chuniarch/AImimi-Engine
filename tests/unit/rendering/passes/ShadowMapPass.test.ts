@@ -5,6 +5,7 @@ import { InvalidDirectionalShadowError, ResourceDisposedError } from '@/renderin
 import { RenderListBuilder } from '@/rendering/frame/RenderListBuilder'
 import type { RenderPassContext } from '@/rendering/passes/RenderPassContext'
 import { RenderPipeline } from '@/rendering/passes/RenderPipeline'
+import { ForwardPass } from '@/rendering/passes/ForwardPass'
 import { ShadowMapPass } from '@/rendering/passes/ShadowMapPass'
 import { ShaderModule } from '@/rendering/resources/ShaderModule'
 import { DirectionalLight } from '@/rendering/scene/lights/DirectionalLight'
@@ -151,8 +152,8 @@ describe('ShadowMapPass frame producer', () => {
     f.shadow.setMapSize(32)
     f.shadow.setBias(0.02)
     f.backend.onEnter = () => {
-      expect(f.shadow.target.descriptor.width).toBe(16)
-      expect(f.shadow.target.descriptor.height).toBe(16)
+      expect(f.shadow.target.width).toBe(16)
+      expect(f.shadow.target.height).toBe(16)
     }
     f.pass.execute(first)
     const oldMatrix = matrix(f.shadow)
@@ -161,7 +162,7 @@ describe('ShadowMapPass frame producer', () => {
     expect(f.shadow.block.get('uShadowBias')).toEqual({ type: 'float', value: 0.003 })
     f.backend.onEnter = undefined
     f.pass.execute(f.build())
-    expect(f.shadow.target.descriptor.width).toBe(32)
+    expect(f.shadow.target.width).toBe(32)
     expect(matrix(f.shadow)).not.toEqual(oldMatrix)
     expect(f.shadow.block.get('uShadowBias')).toEqual({ type: 'float', value: 0.02 })
   })
@@ -323,7 +324,7 @@ describe('ShadowMapPass frame producer', () => {
     const publish = vi.spyOn(f.shadow, 'publish')
     f.backend.onLeave = () => {
       if (fault === 'not-ready') f.backend.ready = false
-      if (fault === 'revision') f.shadow.target.resize(9, 9)
+      if (fault === 'revision') f.shadow.prepareSize(9)
       if (fault === 'disposed') f.shadow.dispose()
     }
     expect(() => f.pass.execute(f.build())).toThrow(
@@ -463,3 +464,69 @@ describe('ShadowMapPass frame producer', () => {
     }
   )
 })
+
+describe('ShadowMapPass owned material cleanup progress', () => {
+  /** 通过真实 draw submission 借到自有 Material，避免突破 private 字段。 */
+  it('Material 任务失败后 Pass 保持关闭，后续继续同一任务', () => {
+    const f = fixture()
+    const context = f.build()
+    f.pass.execute(context)
+    const material = f.backend.submissions[0]!.item.material
+    let attempts = 0
+    material.onDispose(() => {
+      if (++attempts === 1) throw new Error('material')
+    })
+    expect(() => f.pass.dispose()).toThrow()
+    expect(() => f.pass.execute(context)).toThrow(ResourceDisposedError)
+    f.pass.dispose()
+    f.pass.dispose()
+    expect(material.cleanupState).toBe('complete')
+    expect(attempts).toBe(2)
+    expect(f.shader.disposed).toBe(false)
+  })
+})
+
+it('C5 rejects shadow publication if the epoch changes during scope exit', () => {
+  const f = fixture()
+  f.backend.onLeave = () => {
+    f.backend.ready = false
+    f.backend.ready = true
+  }
+  expect(() => f.pass.execute(f.build())).toThrow(InvalidDirectionalShadowError)
+  expect(matrix(f.shadow)).toEqual(Array(16).fill(0))
+})
+it('C5 validates the shadow immediately before a receiver samples its block', () => {
+  const f = fixture()
+  const context = f.build()
+  f.pass.execute(context)
+  const receiver = new ForwardPass((frame) => f.shadow.prepareSampling(frame))
+  const zero = Array(16).fill(0)
+  f.backend.onDraw = () => expect(matrix(f.shadow)).not.toEqual(zero)
+  receiver.execute(context)
+  // Recover after ForwardPass has entered the framebuffer boundary but before receiver draw.
+  f.backend.onEnter = () => {
+    f.backend.ready = false
+    f.backend.ready = true
+  }
+  f.backend.onDraw = () => expect(matrix(f.shadow)).toEqual(zero)
+  receiver.execute(context)
+  f.backend.onDraw = f.backend.onEnter = undefined
+  const next = f.build()
+  f.pass.execute(next)
+  f.backend.onDraw = () => expect(matrix(f.shadow)).not.toEqual(zero)
+  receiver.execute(next)
+})
+
+it.each(['frame', 'revision', 'block'] as const)(
+  'C5 disables shadow sampling when the published %s changes',
+  (change) => {
+    const f = fixture()
+    const frame = f.build()
+    f.pass.execute(frame)
+    expect(matrix(f.shadow)).not.toEqual(Array(16).fill(0))
+    if (change === 'revision') f.shadow.prepareSize(16)
+    if (change === 'block') f.shadow.block.set('uShadowBias', { type: 'float', value: 0.01 })
+    f.shadow.prepareSampling(change === 'frame' ? f.build() : frame)
+    expect(matrix(f.shadow)).toEqual(Array(16).fill(0))
+  }
+)

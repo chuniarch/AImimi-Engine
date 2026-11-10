@@ -81,7 +81,21 @@ export function createRenderFixture() {
  * scope finally 是测试替身的行为，真实实现仍由 Task 15 单独验收。
  */
 export class RecordingBackend implements RenderBackend {
-  ready = true
+  private epoch = {}
+  private readyValue = true
+  get resourceEpoch(): object | null {
+    return this.ready ? this.epoch : null
+  }
+  generateMipmaps(): void {
+    throw new Error('mipmap generation is unsupported by this test backend')
+  }
+  get ready(): boolean {
+    return this.readyValue
+  }
+  set ready(ready: boolean) {
+    if (ready && !this.readyValue) this.epoch = {}
+    this.readyValue = ready
+  }
 
   readonly events: string[] = []
   readonly scopes: RenderSurfaceScopeDescriptor[] = []

@@ -10,6 +10,8 @@ import { InvalidShaderModuleError } from '@/rendering/core/errors'
  */
 export type WebGLShaderLanguage = 'glsl-es-100' | 'glsl-es-300'
 
+export type ShaderTextureStage = 'vertex' | 'fragment' | 'both'
+
 /** 两种语言版本共享的 ShaderModule 构造字段。 */
 interface ShaderModuleBaseOptions {
   /**
@@ -19,6 +21,13 @@ interface ShaderModuleBaseOptions {
    * name 不依赖 constructor.name，也不充当 GPU cache key。Manager 应使用
    * ShaderModule 对象身份作为 cache key。
    */
+  /** Author-declared stages; omitted samplers retain legacy fragment-only semantics.
+   * WebGL1 reflection cannot recover stages. Linker validation remains authoritative.
+   * Declarations optimized out by the compiler consume no budget.
+   */
+  readonly textureUsage?: Readonly<Record<string, ShaderTextureStage>>
+  /** Requires EXT_shader_texture_lod; source must enable the extension itself. */
+  readonly requiresShaderTextureLod?: boolean
   readonly name: string
 
   /** 完整 vertex shader 源码。 */
@@ -177,6 +186,8 @@ function createBuiltInUniformSnapshot(
  * 编译成互不共享的 GPU program。
  */
 export class ShaderModule extends Resource {
+  public readonly textureUsage: Readonly<Record<string, ShaderTextureStage>>
+  public readonly requiresShaderTextureLod: boolean
   /** 不依赖 constructor.name 的稳定资源诊断类型。 */
   protected readonly resourceType = 'ShaderModule'
 
@@ -224,6 +235,28 @@ export class ShaderModule extends Resource {
       )
     }
 
+    const usage = options.textureUsage
+    if (
+      usage !== undefined &&
+      (usage === null || typeof usage !== 'object' || Array.isArray(usage))
+    ) {
+      throw new InvalidShaderModuleError(shaderName, 'textureUsage must be a stage map')
+    }
+    const entries = Object.entries(usage ?? {})
+    for (const [name, stage] of entries) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || !['vertex', 'fragment', 'both'].includes(stage))
+        throw new InvalidShaderModuleError(
+          shaderName,
+          'textureUsage requires uniform names and vertex/fragment/both stages'
+        )
+    }
+    if (
+      options.requiresShaderTextureLod !== undefined &&
+      typeof options.requiresShaderTextureLod !== 'boolean'
+    )
+      throw new InvalidShaderModuleError(shaderName, 'requiresShaderTextureLod must be boolean')
+    this.textureUsage = Object.freeze(Object.fromEntries(entries))
+    this.requiresShaderTextureLod = options.requiresShaderTextureLod ?? false
     this.language = language
     this.vertexSourceValue = requireNonBlankText(shaderName, 'vertexSource', options.vertexSource)
     this.fragmentSourceValue = requireNonBlankText(
