@@ -135,6 +135,7 @@ export default defineConfig(({ command, mode, isPreview }) => {
           open: false
         }
       : undefined,
+    preview: { host: true },
     build: {
       assetsDir: 'bundle',
       minify: 'terser',
@@ -144,7 +145,9 @@ export default defineConfig(({ command, mode, isPreview }) => {
           drop_debugger: true // 删除断点语句
           // 不设置 drop_console：保证 Logger 的生产日志能够输出
         }
-      }
+      },
+      sourcemap: true,
+      emptyOutDir: true
     }
   }
 })
